@@ -7,7 +7,8 @@
     "dev": "vite --host 127.0.0.1",
     "build": "vite build",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "node --test test/protocol.test.mjs"
+    "test": "node --test test/protocol.test.mjs",
+    "test:e2e": "playwright test"
   },
   "dependencies": {
     "@flyx/mvp-protocol": "workspace:*",
@@ -15,6 +16,7 @@
     "react-dom": "^19.1.1"
   },
   "devDependencies": {
+    "@playwright/test": "^1.61.1",
     "@types/react": "^19.1.8",
     "@types/react-dom": "^19.1.7",
     "@vitejs/plugin-react": "^5.0.2",

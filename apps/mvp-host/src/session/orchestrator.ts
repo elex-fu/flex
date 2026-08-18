@@ -348,6 +348,15 @@ export class SessionOrchestrator {
     }
   }
 
+  /**
+   * Public entry point for an injected adapter (e.g. the deterministic test
+   * adapter) to feed provider events through the same durable pipeline the
+   * built-in ClaudeAdapter uses.
+   */
+  ingestAdapterEvent(event: AdapterEvent): void {
+    this.enqueueAdapterEvent(event);
+  }
+
   private enqueueAdapterEvent(event: AdapterEvent): void {
     this.eventTail = this.eventTail.then(() => this.handleAdapterEvent(event)).catch((error) => {
       this.degraded = true;

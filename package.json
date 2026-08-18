@@ -1,0 +1,20 @@
+{
+  "name": "flyx-mvp",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@11.17.0",
+  "scripts": {
+    "dev:host": "pnpm --filter @flyx/mvp-host dev",
+    "start:host": "bash scripts/start-host.sh",
+    "dev:web": "pnpm --filter @flyx/mvp-web dev",
+    "build": "pnpm -r build",
+    "typecheck": "pnpm -r typecheck",
+    "test": "pnpm --filter @flyx/mvp-protocol test && pnpm --filter @flyx/mvp-host test && pnpm --filter @flyx/mvp-web test",
+    "test:spike": "pnpm --filter @flyx/mvp-host test:spike",
+    "test:e2e": "pnpm --filter @flyx/mvp-web test:e2e"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.2",
+    "tsx": "^4.20.3"
+  }
+}

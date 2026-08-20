@@ -1,0 +1,89 @@
+name: Dependency Report
+
+# Weekly scheduled + manual: dependency audit / outdated report.
+# Never blocks the repository (design doc §5.8: lockfile、audit、兼容矩阵提醒).
+on:
+  schedule:
+    # Every Monday 03:00 UTC.
+    - cron: "0 3 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  report:
+    name: Audit & Outdated
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      # Reads the pinned version from package.json `packageManager` (pnpm@11.17.0).
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Set up Node 24 with pnpm cache
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # Security audit of production dependencies. Reported but non-blocking.
+      - name: Audit production dependencies
+        continue-on-error: true
+        run: |
+          set -Eeuo pipefail
+          mkdir -p /tmp/flyx-dep-report
+          pnpm audit --prod | tee /tmp/flyx-dep-report/audit.txt
+
+      # Outdated dependencies overview. Reported but non-blocking.
+      - name: List outdated dependencies
+        continue-on-error: true
+        run: |
+          set -Eeuo pipefail
+          pnpm outdated --format list | tee /tmp/flyx-dep-report/outdated.txt
+
+      - name: Write job summary
+        if: always()
+        run: |
+          {
+            echo "## Dependency Report"
+            echo
+            echo "- Commit: \`${GITHUB_SHA}\`"
+            echo "- Node: $(node --version), pnpm: $(pnpm --version)"
+            echo
+            echo "### Production audit"
+            echo '```'
+            if [ -f /tmp/flyx-dep-report/audit.txt ]; then
+              cat /tmp/flyx-dep-report/audit.txt
+            else
+              echo "(audit step did not produce output)"
+            fi
+            echo '```'
+            echo
+            echo "### Outdated packages"
+            echo '```'
+            if [ -f /tmp/flyx-dep-report/outdated.txt ]; then
+              cat /tmp/flyx-dep-report/outdated.txt
+            else
+              echo "(outdated step did not produce output)"
+            fi
+            echo '```'
+            echo
+            echo "_This workflow is informational only and never blocks merges._"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Keep the raw report as a short-lived artifact for traceability.
+      - name: Upload dependency report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dependency-report-${{ github.run_id }}
+          path: /tmp/flyx-dep-report/
+          if-no-files-found: ignore
+          retention-days: 7

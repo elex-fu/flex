@@ -1,0 +1,98 @@
+name: Browser E2E
+
+# Playwright + deterministic Host (design doc §5.8).
+# Runs on push to main and manual dispatch; on PRs only when the
+# `run-e2e` label is added (optional label trigger).
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+  pull_request:
+    types: [labeled]
+
+concurrency:
+  group: browser-e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  e2e:
+    name: Playwright (deterministic Host)
+    # Push to main, manual runs, or PR labelled `run-e2e`.
+    if: >-
+      github.event_name == 'push' ||
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'pull_request' && github.event.label.name == 'run-e2e')
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      # packages/claude-fixtures is a nested git repo that is NOT tracked by
+      # the outer repository, so it does not exist after checkout. The
+      # deterministic Host (apps/mvp-host/src/test-support/e2e-main.ts) honours
+      # FLYX_WORKSPACE, so point it at a scratch fixture created below.
+      # NOTE: keep this OUTSIDE <repo>/.flyx-e2e — the E2E host wipes that
+      # directory on every start.
+      FLYX_WORKSPACE: ${{ runner.temp }}/flyx-fixture-workspace
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      # Reads the pinned version from package.json `packageManager` (pnpm@11.17.0).
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Set up Node 24 with pnpm cache
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # better-sqlite3 is a native module; ensure it matches the CI Node ABI.
+      - name: Rebuild better-sqlite3 for the current Node ABI
+        run: pnpm rebuild better-sqlite3
+
+      - name: Install Playwright chromium
+        run: pnpm --filter @flyx/mvp-web exec playwright install --with-deps chromium
+
+      # The host requires FLYX_WORKSPACE to be an existing Git repository
+      # (see assertFixtureWorkspace in apps/mvp-host/src/main.ts), so create a
+      # clean git dir with an initial commit in $RUNNER_TEMP.
+      - name: Prepare fixture workspace
+        run: |
+          set -Eeuo pipefail
+          git init --initial-branch=main "$FLYX_WORKSPACE"
+          cd "$FLYX_WORKSPACE"
+          git config user.name "flyx-e2e-bot"
+          git config user.email "flyx-e2e-bot@example.invalid"
+          printf '# Flyx E2E fixture workspace\n\nDeterministic-adapter scratch git repo for CI browser E2E.\n' > README.md
+          mkdir -p src
+          printf 'export const answer = 42;\n' > src/answer.ts
+          git add .
+          git commit -m "chore: fixture workspace initial commit"
+          git log --oneline -n 1
+
+      # global-setup builds mvp-web, spawns the deterministic Host and exports
+      # FLYX_E2E_BASE_URL / FLYX_E2E_PAIRING_TOKEN for the specs. The env above
+      # (FLYX_WORKSPACE) is inherited by the spawned host process.
+      - name: Run browser E2E tests
+        run: pnpm test:e2e
+
+      # Deterministic environment: no real Claude credentials exist in these
+      # artifacts (pairing tokens are random one-time grants minted per run),
+      # so they are safe to upload per the design doc's redaction rules.
+      # Failure artifacts are retained 14 days (doc §5.8).
+      - name: Upload failure artifacts (E2E output)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-artifacts-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            apps/mvp-web/e2e/.artifacts
+            apps/mvp-web/playwright-report
+          if-no-files-found: ignore
+          retention-days: 14

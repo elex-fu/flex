@@ -1,79 +1,68 @@
-# Flyx 剩余任务分析（2026-08-18）
+# Flyx 剩余任务分析（2026-08-18 第三版）
 
-> 依据：`docs/mvp-go-and-host-productionization-technical-design.md`（v0.1，2026-08-12 定稿）
-> 核对方式：对照当前代码库逐项验证（typecheck / 单测全绿，目录与文件级检查）
+> 依据：`docs/mobile-remote-multi-agent-product-technical-design.md` 与 `docs/mvp-go-and-host-productionization-technical-design.md`
+> 核对方式：对照当前代码库逐项验证（git@head，E2E 18/18、单测 24/24、typecheck 全绿）
 
-## 1. 当前状态基线
+## 1. 当前状态基线（较第二版的变化）
 
-- 垂直切片已跑通：Host 启动 → 配对 → 手机 Web 会话 → Claude Turn → 实时文本/Tool/Approval → follow-up/interrupt → SQLite 事件补同步 → Git Diff。
-- `pnpm run typecheck` 全部通过；`pnpm test` 全部通过（protocol 2 / Host 21 / Web 1）。
-- 代码停留在 2026-08-12 方案定稿时的基线，之后未再推进。
-- Git 仓库已初始化并推送至 `git@github.com:elex-fu/flex.git`（main 分支）。
+- Phase 1 所有 6 项剩余任务（#5–#9）已全部落地，**Phase 1 闭环达成**。
+- Playwright 锁定 1.61.1 匹配本机 chromium-1228；better-sqlite3 已针对 Node 24 重编译。
+- 关键修复（本次）：`session.recovery.required` 恢复事件在浏览器端此前不可见——根因是 (a) `shouldRenderEventWithoutItem` 白名单未包含 recovery 事件，(b) recovery payload 没带 `message` 字段（timeline_items 表里有 friendly 字符串但前端不读那张表）。双修复位于 `apps/mvp-host/src/storage/db.ts` 与 `apps/mvp-web/src/app.tsx`。
 
-## 2. Phase 1（MVP Go）剩余任务 —— 全部未开始
+## 2. Phase 1 已交付清单（全部完成）
 
-### P0（核心，按推荐执行顺序）
-
-| # | 工作项 | 现状 | 涉及文件 |
+| # | 工作项 | 交付物 | 验收 |
 |---|---|---|---|
-| 1 | 修复 `test:e2e` 入口 + Playwright 基础设施 | 缺失：`apps/mvp-web/playwright.config.ts`、`apps/mvp-web/e2e/` 均不存在；根 `test:e2e` 指向 Web 包不存在的 script | Web/package.json、playwright.config.ts、e2e/ 七个 spec |
-| 2 | Deterministic Host fixture | `apps/mvp-host/src/test-support/` 不存在 | e2e-host.ts：临时 SQLite + fixture copy + 随机端口 + stdout marker |
-| 3 | DeterministicAdapter 场景模型 | 未实现 | FakeScenario（文本/Tool/Approval/延迟/interrupt/失败），至少实现 status/preflight/runTurn/interrupt |
-| 4 | 16 个验收场景自动化 | 0/16，其中约 6 个可纯 Playwright 跑 | `apps/mvp-web/e2e/`、Host integration |
-| 5 | 断网/崩溃注入测试 | 未实现 | T0–T8 九个注入点 + 5.5.3 恢复断言序列 |
-| 6 | 真机 Tailscale runbook + 验收 | 未开始，需人工（断网 60s、录屏、双机型） | docs/runbook、报告模板 |
-| 7 | SDK/CLI 兼容矩阵 | `docs/claude-compatibility-matrix.md`、`config/claude-compatibility.json` 均不存在 | 锁定组合需 10 deterministic + 10 真实 Turn 证据 |
+| 5 | 断网/崩溃注入测试（场景 13/14 + 分区） | `apps/mvp-web/e2e/resilience.spec.ts`（3 项）、`apps/mvp-web/e2e/host-control.ts`、`e2e-main.ts` 的 KEEP_DATA 重启路径、`server.test.ts` / `orchestrator.deterministic.test.ts` 覆盖 T0–T8 + 场景 10 | E2E 3/3 通过；sequence 连续 + supersede approval + outcome_unknown 状态断言齐套 |
+| 6 | 真机 Tailscale runbook + 验收模板 | `docs/tailscale-real-device-runbook.md`：5 项验收（E1–E5：HTTPS 可达 / 真实扫码配对 / 完整 Turn 闭环 / 网络韧性重连 / 产品 Gap 行为）+ 报告模板 + Tailscale Serve 反代附录 + 证据目录 `.flyx-evidence/tailscale/` | 人工文档，无自动验收 |
+| 7 | SDK/CLI 兼容矩阵 | `config/claude-compatibility.json`（锁定组合 + deterministic/real requirements）、`scripts/compatibility/run-matrix.mjs`（证据归档供 .flyx-evidence/<combo-id>/turns.jsonl）、`docs/claude-compatibility-matrix.md` | 基础设施就绪；证据收集需真实 Claude 环境 |
+| 8 | QR 配对 | `apps/mvp-host/src/server.ts` 的 `GET /api/pairing/qrcode`、`activeQrPairingToken()`、`apps/mvp-web/src/app.tsx` 的 QR 扫码区 + `?pair=` 自动配对、`apps/mvp-web/e2e/qr.spec.ts`（3 项） | E2E 3/3 通过 |
+| 9 | CI workflows | `.github/workflows/verify.yml`（PR+main，typecheck+test）、`browser-e2e.yml`（main/labeled PR/dispatch，playwright chromium，工件上传）、`dependency.yml`（周审计） | YAML 已校验（js-yaml 解析通过）；CI 真实运行待 GitHub Action 触发验证 |
 
-### P1
+### 跨切配套
 
-| # | 工作项 | 现状 |
+- Token-claim 文件计数器（`FLYX_E2E_CLAIM_FILE`）解决 Playwright worker 重启后 token 耗尽问题；
+- Orchestrator 公开 `ingestAdapterEvent()`，供 DeterministicAdapter 注入，复用 Host 的 durable 管道；
+- `.gitignore` 增加 `.flyx-e2e/`、`.flyx-evidence/`、`e2e/.artifacts/`、`playwright-report/`。
+
+## 3. E2E 覆盖现状（18/18 全绿）
+
+| Spec | 数 | 覆盖场景 |
 |---|---|---|
-| 8 | QR 配对 | 代码无任何 QR 实现，纯 Token 文本输入；若延期需把文档"扫码配对"统一改为"Token 配对" |
-| 9 | CI workflows | `.github/workflows/` 不存在，需 verify.yml / browser-e2e.yml / dependency.yml |
+| `mvp.spec.ts` | 12 | 1,2,3,4,5,6,7,8,11,12,16 + replay token + refresh replays + logout + page-close |
+| `qr.spec.ts` | 3 | QR 渲染 / `?pair=` 自动配对 / 匿名路径安全 |
+| `resilience.spec.ts` | 3 | 13 (SIGKILL mid-Turn → outcome_unknown) / 14 (crash 审批 → supersede + recovery event) / WSS 30s 分区 → 无序列间隙 |
 
-### Go 门槛（5.9 节，依赖上述基础设施）
+另有 Host integration test 覆盖场景 10（duplicate commandId replay 与拒绝重用）。
 
-- 16 个验收场景全部通过；
-- 30 个真实 Turn（非 deterministic）；
-- 10 次真实 approval（allow/deny 各 ≥3）；
-- 10 次 interrupt（9 次 5 秒内到终态）；
-- 刷新 / 60 秒断网各 10 次无缺口；
-- 真机 + Tailscale 验证；
-- 证据分层归档（报告 YAML 模板见文档第 10 节）。
+## 4. Phase 2 剩余任务（全部未开始）
 
-## 3. Phase 2（Host/协议生产化）剩余任务 —— 全部未开始
+按文档 §9.1–§9.4 与退场标准，Phase 1 Go 后启动：
 
-### P0
+P0：
+- 协议 hello / 版本范围协商（`protocolVersion` 仍为 `z.literal(min,max)` 待扩展）
+- Host lifecycle（`src/lifecycle/` 不存在）
+- ProviderRuntimeRegistry（`src/provider/` 不存在）
+- SQLite migration / 备份
+- `packages/client-core/` 抽取（app.tsx 625 行未拆）
 
-| 工作项 | 现状 |
-|---|---|
-| 协议 hello/版本范围协商 | `protocolVersion` 仍为 `z.literal` 固定值，无协商 |
-| Host lifecycle（ready/degraded/draining） | `src/lifecycle/` 不存在 |
-| ProviderRuntimeRegistry | `src/provider/` 不存在 |
-| SQLite migration/backup | 无 migrations 目录和 backup.ts |
-| client-core 抽取 | `packages/client-core/` 不存在；Web 625 行 app.tsx 未拆分 |
+P1：
+- 诊断/指标
+- Host identity / endpoint hello
+- 设备注册与 revoke
+- 协议 codegen 评估
+- §10.1 九组测试矩阵
 
-### P1
+## 5. 推荐下一步
 
-诊断/指标（observability/）、Host identity/endpoint、设备注册与 revoke、协议 codegen 评估；以及 10.1 节九组自动化测试矩阵（Protocol/Scope/Lifecycle/Runtime/Storage/EventWriter/ClientCore/Auth/Observability）。
+1. **按 runbook 跑一次 Tailscale 真机验收**（人工），把报告归档到 `.flyx-evidence/tailscale/<日期>/REPORT.md`，作为 Phase 1 退场证据的最后一环。
+2. **拉一次真实 CI**（push to main with `run-e2e` 标签到 PR）验证三条 workflow 真实可跑通。
+3. **Go 门槛证据收集**（设计 §5.9）：真实 Turn 30 / approval 10 / interrupt 10 / 刷新与断网各 10 次——基础设施已就绪，证据归档路径已创建。
+4. Phase 2 P0 按上述顺序启动。
 
-## 4. 推荐执行顺序（9.3 节）
+## 6. 风险与注意事项
 
-1. 修复 test:e2e 入口并建立 deterministic Host（= 上述 P0 #1–3 打包做）
-2. 自动化 16 场景中的 Web 可测部分
-3. 完成真实 Claude 版本矩阵
-4. 完成真机/Tailscale/断网/崩溃验收
-5. 输出 Go/Conditional Go 决策
-6. 引入 protocol hello/range/capability
-7. 引入 Host lifecycle 和 readiness
-8. 引入 Runtime Registry 与 intent/recovery
-9. 引入 SQLite migration/backup/diagnostics
-10. 抽取 client-core 并让 Web 全量迁移
-11. 再开始 Android-first 设计实现
-
-## 5. 风险与注意事项
-
-- 真机验收和真实 Claude 矩阵需要本机配合（Tailscale、手机、Claude 登录），可与基础设施开发并行人工准备；
-- `packages/claude-fixtures` 是嵌套 git 仓库，未被外层仓库追踪；
-- fixture 初始 `npm test` 故意失败，不能当成产品测试失败；
-- 真实 Token、Cookie、Prompt 原文禁止写入任何工件/报告。
+- `packages/claude-fixtures` 仍是嵌套 git 仓库，外层不追踪；CI 需单独 clone 或改为 submodule（browser-e2e.yml 已在 `RUNNER_TEMP` 自建 fixture workspace 绕过该限制）。
+- Playwright 锁 1.61.1 是为了复用本机缓存；CI 上无此约束，如需升级可随时调整 browser-e2e.yml。
+- 真实 Token、Cookie、Prompt 原文仍禁止写入工件/报告（runbook 已明示）。
+- 「outcome_unknown」产品 Gap（scenario 13/14 锁定 session 后无法发新 TURN）在 resilience.spec.ts 中已显式注释为 "PRODUCT GAP, asserted as current behavior"；修复（acknowledge/repair 路径）属于 Phase 2 范畴。

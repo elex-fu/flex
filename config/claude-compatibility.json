@@ -1,0 +1,67 @@
+{
+  "$id": "flyx/claude-compatibility-matrix",
+  "version": 1,
+  "description": "Claude SDK / Claude CLI / Node 兼容矩阵（机器可读定义）。由 scripts/compatibility/run-matrix.mjs 读取并回写验证状态。人读文档见 docs/claude-compatibility-matrix.md。设计依据：docs/mvp-go-and-host-productionization-technical-design.md 第 5.6 节。",
+  "matrixPrompt": {
+    "id": "matrix-fixed-ok",
+    "text": "回复 OK 两个字母，不要做任何其他事"
+  },
+  "deterministicRequirements": {
+    "turns": 10
+  },
+  "realRequirements": {
+    "turns": 10,
+    "approvals": 10,
+    "interrupts": 10
+  },
+  "verificationLevels": [
+    "pending",
+    "deterministic-verified",
+    "fully-verified",
+    "broken"
+  ],
+  "lockedCombinations": [
+    {
+      "id": "sdk-0.3.220_cli-2.1.216_node-24.18.0",
+      "sdkVersion": "0.3.220",
+      "claudeCliVersion": "2.1.216",
+      "nodeVersion": "24.18.0",
+      "os": "macOS 25.5.0 arm64",
+      "executableSource": "sdk-bundled",
+      "decision": "locked-candidate",
+      "hostVersion": "unknown",
+      "status": "pending",
+      "evidence": {
+        "turns": ".flyx-evidence/sdk-0.3.220_cli-2.1.216_node-24.18.0/turns.jsonl",
+        "approvals": ".flyx-evidence/sdk-0.3.220_cli-2.1.216_node-24.18.0/approvals.jsonl",
+        "interrupts": ".flyx-evidence/sdk-0.3.220_cli-2.1.216_node-24.18.0/interrupts.jsonl",
+        "summary": ".flyx-evidence/sdk-0.3.220_cli-2.1.216_node-24.18.0/summary.json"
+      },
+      "observed": {
+        "nodeVersion": "24.18.0",
+        "claudeCliVersion": null
+      },
+      "lastRun": {
+        "at": "2026-08-18T16:23:57.839Z",
+        "turnsPerLayer": 1,
+        "deterministic": {
+          "status": "passed",
+          "completed": 1,
+          "failed": 0
+        },
+        "real": {
+          "status": "skipped",
+          "reason": "claude CLI 不在 PATH 上（未安装或未暴露给当前 shell）"
+        },
+        "approvalsEvidence": 0,
+        "interruptsEvidence": 0,
+        "promptId": "matrix-fixed-ok",
+        "promptHash": "2e0d626a4d9aecbd598c69d0db809bde0f52262bc8ca5581832c8ff5666584df"
+      },
+      "notes": [
+        "初始状态：sdkVersion 取自 apps/mvp-host/package.json 的 @anthropic-ai/claude-agent-sdk@0.3.220；claudeCliVersion 取自设计文档 5.6 节当前候选 2.1.216；nodeVersion 为本机锁定版本。尚未做任何验证。",
+        "2026-08-18T16:23:57.839Z run(1 turns/层): det=passed, real=skipped, 冒烟运行（1 < 要求 10 turns，不提升等级）, det turns 1/1; real reason: claude CLI 不在 PATH 上（未安装或未暴露给当前 shell） → pending"
+      ]
+    }
+  ]
+}

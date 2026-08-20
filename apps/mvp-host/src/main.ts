@@ -28,6 +28,10 @@ const address = await server.start();
 console.log(`Flyx MVP Host listening at ${address}`);
 console.log(`Workspace: ${workspace}`);
 console.log(`Pairing token: ${server.auth.pairingUrlToken}`);
+// The scannable URL is the QR content served by /api/pairing/qrcode; print it
+// verbatim so the terminal alone is enough to pair a phone (QR + text token
+// fallback per the design doc 5.7).
+console.log(`Pairing URL: ${address}/?pair=${server.auth.pairingUrlToken}`);
 
 const shutdown = async () => {
   await server.stop();

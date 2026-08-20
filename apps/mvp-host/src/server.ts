@@ -8,6 +8,7 @@ import websocket from "@fastify/websocket";
 import fastifyStatic from "@fastify/static";
 import { FrameSchema } from "@flyx/mvp-protocol";
 import { z } from "zod";
+import * as QRCode from "qrcode";
 import { OrchestratorError, SessionOrchestrator } from "./session/orchestrator.js";
 
 const SESSION_COOKIE = "flyx_session";
@@ -35,7 +36,7 @@ type PairingAttempt = { startedAt: number; count: number };
 export type PairingConfirmation = () => boolean | Promise<boolean>;
 
 class AuthManager {
-  private readonly pairingToken: string;
+  private pairingToken: string;
   private readonly credentials = new Map<string, number>();
   private readonly tickets = new Map<string, PendingTicket>();
   private readonly pairingAttempts = new Map<string, PairingAttempt>();
@@ -50,6 +51,20 @@ class AuthManager {
 
   get pairingUrlToken(): string {
     return this.pairingToken;
+  }
+
+  /**
+   * The token embedded in the pairing QR.  Grants are single-use, so once the
+   * startup token has been consumed (or expired) rotate to a freshly minted
+   * short-lived grant instead of encoding a dead token into a scannable URL.
+   * Only the grant hash is persisted, exactly like the startup grant.
+   */
+  activeQrPairingToken(): string {
+    if (this.orchestrator.store.hasActivePairingGrant(hash(this.pairingToken))) return this.pairingToken;
+    const token = randomBytes(24).toString("base64url");
+    this.orchestrator.store.createPairingGrant(hash(token), new Date(Date.now() + 5 * 60_000).toISOString());
+    this.pairingToken = token;
+    return token;
   }
 
   async exchangePairingToken(token: string, rateKey = "unknown"): Promise<string> {
@@ -207,6 +222,29 @@ export function createHostServer(options: HostServerOptions): HostServer {
     catch (error) {
       const rpcError = toRpcError(error, "PAIRING_INVALID");
       return reply.code(rpcError.code === "PAIRING_RATE_LIMITED" ? 429 : 403).send({ error: rpcError });
+    }
+  });
+
+  // Deliberately anonymous: a phone must see the pairing QR before it holds
+  // any credential, exactly like the token text input on the same screen.
+  // There is no global auth hook here; each protected route calls `subject()`
+  // itself, so this route simply does not.
+  app.get("/api/pairing/qrcode", async (request, reply) => {
+    noStore(reply);
+    // Build the URL from the request's own origin so it stays correct behind
+    // Tailscale Serve (x-forwarded-host/proto, trusted via trustProxy).  The
+    // grant rides in the query, not the fragment, because the phone opens the
+    // URL directly from the camera app before any page exists to read a hash.
+    const origin = expectedRequestOrigin(request) ?? `http://${request.headers.host ?? "127.0.0.1"}`;
+    const pairingUrl = `${origin}/?pair=${encodeURIComponent(auth.activeQrPairingToken())}`;
+    // The SVG only encodes the URL into module geometry; it never embeds local
+    // paths, and QR generation failing must not block the token text fallback.
+    try {
+      const svg = await QRCode.toString(pairingUrl, { type: "svg", errorCorrectionLevel: "M", margin: 1 });
+      return reply.type("image/svg+xml; charset=utf-8").send(svg);
+    } catch (error) {
+      app.log.error({ err: error }, "QR generation failed");
+      return reply.code(500).send({ error: { code: "QR_UNAVAILABLE", message: "QR code unavailable; use the token text input", retryable: true } });
     }
   });
 

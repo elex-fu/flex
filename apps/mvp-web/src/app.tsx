@@ -89,6 +89,7 @@ function shouldRenderEventWithoutItem(event: SessionEvent): boolean {
     || event.type === "turn.interrupt.unavailable"
     || event.type === "approval.resolve.unavailable"
     || event.type === "turn.reconciled"
+    || event.type === "session.recovery.required"
     || event.type === "host.event_persist_failed"
     || event.type === "diagnostic";
 }
@@ -263,6 +264,7 @@ export function App() {
   const [status, setStatus] = useState("连接中");
   const [prompt, setPrompt] = useState("");
   const [pairingToken, setPairingToken] = useState("");
+  const [qrSvg, setQrSvg] = useState<string | null>(null);
   const [error, setError] = useState("");
   const [diff, setDiff] = useState<{ branch?: string; head?: string; dirty: boolean; files: Array<{ path: string }>; diff: string; truncated: boolean; baselineWarning?: string } | null>(null);
   const [hostStatus, setHostStatus] = useState<HostStatus | null>(null);
@@ -401,7 +403,7 @@ export function App() {
         // transient WebSocket failure. Stop the reconnect loop and let the
         // pairing screen ask for a fresh one-time grant.
         authenticatedRef.current = false;
-        const token = pairingToken || new URLSearchParams(window.location.search).get("pairing") || window.location.hash.slice(1);
+        const token = pairingToken || new URLSearchParams(window.location.search).get("pair") || new URLSearchParams(window.location.search).get("pairing") || window.location.hash.slice(1);
         if (!token) throw new Error("请输入电脑终端显示的一次性配对 Token");
         const credential = await fetchJson<{ credential: string }>("/api/pairing/exchange", {
           method: "POST",
@@ -510,6 +512,32 @@ export function App() {
 
   connectRef.current = connect;
 
+  // A phone that scanned the pairing QR opens /?pair=<token>; surface that
+  // grant in the input so auto-pairing and a manual retry share one source.
+  const pairParam = useMemo(() => new URLSearchParams(window.location.search).get("pair") ?? new URLSearchParams(window.location.search).get("pairing") ?? (window.location.hash.startsWith("#") ? window.location.hash.slice(1) : ""), []);
+  useEffect(() => { if (pairParam && !pairingToken) setPairingToken(pairParam); }, [pairParam, pairingToken]);
+
+  // The pairing screen also offers the scannable QR served by the Host.  The
+  // fetch is anonymous on purpose (the phone has no credential yet), and a
+  // failed/unavailable QR must never block the token text fallback.
+  useEffect(() => {
+    if (snapshot !== null) {
+      if (qrSvg !== null) setQrSvg(null);
+      return;
+    }
+    if (qrSvg !== null) return;
+    let cancelled = false;
+    void (async () => {
+      try {
+        const response = await fetch("/api/pairing/qrcode", { cache: "no-store" });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const svg = await response.text();
+        if (!cancelled && svg.includes("<svg")) setQrSvg(svg);
+      } catch { /* keep the text-token pairing path fully usable */ }
+    })();
+    return () => { cancelled = true; };
+  }, [snapshot, qrSvg]);
+
   useEffect(() => {
     const lifecycle = ++lifecycleRef.current;
     void connect(true);
@@ -606,7 +634,7 @@ export function App() {
   const interactionReady = status === "已同步";
   return <main className="shell">
     <header className="topbar"><div><span className="eyebrow">FLYX / CLAUDE MVP</span><h1>远程执行台</h1></div><div className="topbar-actions"><span className={`connection ${status.includes("断") || status.includes("失败") ? "offline" : ""}`}>{status}</span>{snapshot && <button className="ghost" onClick={() => void logout()}>退出配对</button>}</div></header>
-    {!snapshot && <section className="card pairing"><h2>连接电脑 Host</h2><p>把 Host 终端显示的一次性 Token 粘贴到这里。Token 只使用一次，浏览器会保存 HttpOnly 会话。</p><input value={pairingToken} onChange={(event) => setPairingToken(event.target.value)} placeholder="配对 Token" /><button onClick={() => void connect(true)}>配对并连接</button>{error && <p className="error">{error}</p>}</section>}
+    {!snapshot && <section className="card pairing"><h2>连接电脑 Host</h2><p>用手机相机扫描二维码，或把 Host 终端显示的一次性 Token 粘贴到下方。Token 只使用一次，浏览器会保存 HttpOnly 会话。</p><div className="pairing-qr"><div className="qr-canvas" data-testid="pairing-qr" role="img" aria-label="扫码配对二维码">{qrSvg !== null ? <span dangerouslySetInnerHTML={{ __html: qrSvg }} /> : <span className="qr-unavailable">二维码暂不可用<em>请使用下方 Token 手动配对</em></span>}</div></div><input value={pairingToken} onChange={(event) => setPairingToken(event.target.value)} placeholder="配对 Token" /><button onClick={() => void connect(true)}>配对并连接</button>{error && <p className="error">{error}</p>}</section>}
     {snapshot && <>
       <section className="status-grid"><div className="card"><span className="label">工作区</span><strong>{bootstrap ? "Claude / default" : "加载中"}</strong><small>{hostStatus?.git.branch ?? snapshot.session.activityState}{hostStatus?.git.dirty ? " · dirty" : ""}</small></div><div className="card"><span className="label">Claude</span><strong>{hostStatus?.provider.claudeVersion ?? "检查中"}</strong><small>{hostStatus?.provider.sdkVersion ?? "SDK"}</small></div><div className="card"><span className="label">待审批</span><strong>{approvalItems.length}</strong><small>{snapshot.session.headSequence > 0 ? "可继续对话" : "新会话"}</small></div></section>
       <section className="timeline card"><div className="section-head"><h2>执行 Timeline</h2><div className="section-actions"><button className="ghost" onClick={() => void loadDiff()}>查看 Diff</button><button className="ghost" onClick={() => window.location.reload()}>刷新恢复</button></div></div>{items.length === 0 && <p className="muted">等待 Claude 事件…</p>}{items.map((item) => <TimelineCard key={item.itemId} item={item} onApproval={approval} disabled={!interactionReady} />)}</section>

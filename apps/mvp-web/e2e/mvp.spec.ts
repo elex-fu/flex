@@ -1,49 +1,10 @@
-import { appendFileSync, readFileSync } from "node:fs";
-import { expect, test, type Page } from "@playwright/test";
-
-const BASE_URL = () => process.env.FLYX_E2E_BASE_URL!;
-const PAIRING_TOKEN = () => process.env.FLYX_E2E_PAIRING_TOKEN!;
-
-const availableTokens: string[] = JSON.parse(process.env.FLYX_E2E_PAIRING_TOKENS ?? "[]");
+import { expect, test } from "@playwright/test";
+import { baseUrl, pair, sendPrompt, waitForIdle } from "./helpers";
 
 /**
- * Claim a dedicated one-time pairing token.  The counter lives in a file so
- * it survives Playwright worker restarts (a failed test recycles the worker
- * and would otherwise reset an in-memory queue and re-serve consumed tokens).
+ * Pairing-token claiming, pairing, prompting and idle helpers live in
+ * ./helpers so the resilience specs share the exact same browser flows.
  */
-function claimToken(): string {
-  const claimFile = process.env.FLYX_E2E_CLAIM_FILE;
-  if (!claimFile) return availableTokens.shift() ?? PAIRING_TOKEN();
-  appendFileSync(claimFile, "x\n");
-  const claimed = readFileSync(claimFile, "utf8").split("\n").length - 1;
-  return availableTokens[claimed - 1] ?? PAIRING_TOKEN();
-}
-
-/** Pair a fresh browser context like a phone entering the one-time token. */
-async function pair(page: Page): Promise<string> {
-  const token = claimToken();
-  await page.goto(BASE_URL());
-  await expect(page.getByRole("heading", { name: "连接电脑 Host" })).toBeVisible();
-  await page.getByPlaceholder("配对 Token").fill(token);
-  await page.getByRole("button", { name: "配对并连接" }).click();
-  await expect(page.getByRole("heading", { name: "执行 Timeline" })).toBeVisible({ timeout: 15_000 });
-  return token;
-}
-
-/** Send a prompt through the composer. */
-async function sendPrompt(page: Page, text: string): Promise<void> {
-  await page.locator("textarea").fill(text);
-  await page.getByRole("button", { name: "发送任务" }).click();
-  // The deterministic Turn can finish before the click's state update lands,
-  // so assert durable progress instead of the transient disabled state.
-  await expect(page.locator("article", { hasText: text }).first()).toBeVisible({ timeout: 15_000 });
-}
-
-async function waitForIdle(page: Page): Promise<void> {
-  // The composer textarea is only gated on the session activity state; the
-  // send button is additionally disabled while the prompt box is empty.
-  await expect(page.locator("textarea")).toBeEnabled({ timeout: 30_000 });
-}
 
 test.describe("Flyx MVP deterministic browser E2E", () => {
   test("pairing shows the timeline and rejects a replayed token", async ({ page }) => {
@@ -159,7 +120,7 @@ test.describe("Flyx MVP deterministic browser E2E", () => {
     // A fresh page in the same context shares the HttpOnly session cookie;
     // verify the Turn survived the page closure and reached its terminal state.
     const verify = await page.context().newPage();
-    await verify.goto(BASE_URL());
+    await verify.goto(baseUrl());
     await expect(verify.getByRole("heading", { name: "执行 Timeline" })).toBeVisible({ timeout: 15_000 });
     await expect(verify.getByText("deterministic result: slow scenario completed").last()).toBeVisible({ timeout: 30_000 });
     await waitForIdle(verify);

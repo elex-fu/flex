@@ -34,7 +34,7 @@ function startDeterministicHost(): { child: NodeJS.ChildProcess } {
   return { child };
 }
 
-function waitForHostReady(child: NodeJS.ChildProcess): Promise<{ baseUrl: string; token: string }> {
+function waitForHostReady(child: NodeJS.ChildProcess): Promise<{ baseUrl: string; token: string; tokens: string[]; pid?: number }> {
   return new Promise((resolvePromise, rejectPromise) => {
     let buffered = "";
     const timeout = setTimeout(() => {
@@ -42,12 +42,12 @@ function waitForHostReady(child: NodeJS.ChildProcess): Promise<{ baseUrl: string
     }, 30_000);
     const onData = (chunk: string): void => {
       buffered += chunk;
-      const match = /^FLYX_E2E_HOST_READY base=(\S+) token=(\S+)(?: tokens=([\S]+))?\s*$/m.exec(buffered);
+      const match = /^FLYX_E2E_HOST_READY base=(\S+) token=(\S+)(?: tokens=([\S]+))?(?: pid=(\d+))?\s*$/m.exec(buffered);
       if (match) {
         clearTimeout(timeout);
         child.stdout!.off("data", onData);
         const tokens = match[3] ? match[3].split(",") : [match[2]!];
-        resolvePromise({ baseUrl: match[1]!, token: match[2]!, tokens });
+        resolvePromise({ baseUrl: match[1]!, token: match[2]!, tokens, ...(match[4] ? { pid: Number(match[4]) } : {}) });
       }
     };
     child.stdout!.on("data", onData);
@@ -59,11 +59,23 @@ function waitForHostReady(child: NodeJS.ChildProcess): Promise<{ baseUrl: string
 export default async function globalSetup(_config: FullConfig): Promise<() => Promise<void>> {
   buildWeb();
   const { child } = startDeterministicHost();
-  const { baseUrl, token, tokens } = await waitForHostReady(child);
+  const { baseUrl, token, tokens, pid } = await waitForHostReady(child);
   // Env mutations here propagate to every test worker.
   process.env.FLYX_E2E_BASE_URL = baseUrl;
   process.env.FLYX_E2E_PAIRING_TOKEN = token;
   process.env.FLYX_E2E_PAIRING_TOKENS = JSON.stringify(tokens);
+  // The resilience specs SIGKILL the Host process and respawn it with the
+  // exact same command line.  globalSetup and the test workers are separate
+  // processes, so the handle is passed through the environment instead of a
+  // shared module.  `pid` is the real server process printed by e2e-main
+  // (killing the pnpm wrapper would leave the server orphaned and listening).
+  process.env.FLYX_E2E_HOST_PID = pid ? String(pid) : String(child.pid ?? "");
+  process.env.FLYX_E2E_HOST_CMD = JSON.stringify({
+    command: "pnpm",
+    args: ["--filter", "@flyx/mvp-host", "exec", "tsx", "src/test-support/e2e-main.ts"],
+    cwd: repoRoot,
+    env: { FLYX_WEB_ROOT: distRoot, FLYX_E2E_ROOT: resolve(repoRoot, ".flyx-e2e") },
+  });
   // A file-based claim counter survives worker restarts (Playwright recycles
   // the worker after a failed test, which would otherwise reset in-memory
   // token queues and hand out already-consumed tokens).

@@ -718,12 +718,14 @@ export class SqliteStore {
           WHERE id = ?
         `).run(timestamp, row.session_id);
 
+        const recoveryMessage = "Host restarted while this Turn was executing; result is unknown and it was not replayed.";
         const recoveryPayload = {
           turnId: row.id,
           commandId: row.command_id,
           previousStatus: row.status,
           reason: "host_restart",
           pendingApprovalIds: pending.map((approval) => approval.approval_id),
+          message: recoveryMessage,
         };
         this.appendEventWithProjectionInternal(row.session_id, "session.recovery.required", recoveryPayload, {
           activityState: "outcome_unknown",
@@ -735,7 +737,6 @@ export class SqliteStore {
             status: "outcome_unknown",
             content: {
               ...recoveryPayload,
-              message: "Host restarted while this Turn was executing; result is unknown and it was not replayed.",
             },
           },
         }, timestamp);

@@ -8,6 +8,7 @@ dist/
 .workbuddy/
 .flyx-e2e/
 .flyx-e2e-debug/
+.flyx-evidence/
 e2e/.artifacts/
 playwright-report/
 apps/mvp-web/e2e/.artifacts/

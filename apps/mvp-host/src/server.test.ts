@@ -58,6 +58,30 @@ describe("MVP HTTP pairing surface", () => {
     expect(responses[5]?.json().error.code).toBe("PAIRING_RATE_LIMITED");
   });
 
+  it("serves an anonymous pairing QR SVG without local paths, rotating consumed grants", async () => {
+    const workspace = resolve(process.cwd(), "../../packages/claude-fixtures");
+    const orchestrator = new SessionOrchestrator({ workspace });
+    const server = createHostServer({ orchestrator, pairingConfirmation: () => true });
+    openServers.push(server);
+    await server.app.ready();
+    // The phone has no credential yet, so the QR must be reachable anonymously.
+    const qr = await server.app.inject({ method: "GET", url: "/api/pairing/qrcode", headers: { host: "127.0.0.1:4173" } });
+    expect(qr.statusCode).toBe(200);
+    expect(qr.headers["content-type"]).toContain("image/svg+xml");
+    expect(qr.body).toContain("<svg");
+    // Only the pairing URL is encoded; no absolute local path may leak.
+    expect(qr.body).not.toContain(workspace);
+    expect(qr.body).not.toContain("claude-fixtures");
+    // After the startup grant is consumed, the endpoint rotates to a fresh
+    // active grant instead of rendering a dead QR.
+    const exchange = await server.app.inject({ method: "POST", url: "/api/pairing/exchange", payload: { token: server.auth.pairingUrlToken } });
+    expect(exchange.statusCode).toBe(200);
+    const rotated = await server.app.inject({ method: "GET", url: "/api/pairing/qrcode", headers: { host: "127.0.0.1:4173" } });
+    expect(rotated.statusCode).toBe(200);
+    const exchangedToken = await server.app.inject({ method: "POST", url: "/api/pairing/exchange", payload: { token: server.auth.activeQrPairingToken() } });
+    expect(exchangedToken.statusCode).toBe(200);
+  });
+
   it("does not expose the absolute workspace path in diagnostics", async () => {
     const orchestrator = new SessionOrchestrator({ workspace: resolve(process.cwd(), "../../packages/claude-fixtures") });
     const server = createHostServer({ orchestrator, pairingConfirmation: () => true });

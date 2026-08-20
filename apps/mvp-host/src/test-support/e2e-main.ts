@@ -20,6 +20,10 @@ import { DeterministicAdapter } from "./deterministic-adapter.js";
  *   FLYX_WORKSPACE git fixture workspace (defaults to packages/claude-fixtures)
  *   FLYX_E2E_ROOT  scratch directory for the throwaway database (defaults to
  *                  <repo>/.flyx-e2e, recreated on every start)
+ *   FLYX_E2E_KEEP_DATA  when "1", keep the existing scratch directory and
+ *                  SQLite database across restarts (crash-recovery specs
+ *                  SIGKILL this process and respawn it to verify durable
+ *                  recovery); startup and shutdown cleanup are skipped
  */
 
 // The browser talks to the loopback HTTP listener directly; without this flag
@@ -30,13 +34,16 @@ const repoRoot = resolve(process.cwd(), "../..");
 const workspace = realpathSync(resolve(process.env.FLYX_WORKSPACE ?? resolve(repoRoot, "packages/claude-fixtures")));
 const e2eRoot = resolve(process.env.FLYX_E2E_ROOT ?? resolve(repoRoot, ".flyx-e2e"));
 const webRoot = process.env.FLYX_WEB_ROOT;
+const keepData = process.env.FLYX_E2E_KEEP_DATA === "1";
 
 if (!webRoot) {
   console.error("FLYX_WEB_ROOT is required; build mvp-web first (pnpm --filter @flyx/mvp-web build)");
   process.exit(1);
 }
 
-await rm(e2eRoot, { recursive: true, force: true });
+if (!keepData) {
+  await rm(e2eRoot, { recursive: true, force: true });
+}
 await mkdir(dirname(resolve(e2eRoot, "host.sqlite")), { recursive: true });
 
 // The injected deterministic adapter must feed its events through the same
@@ -71,14 +78,14 @@ for (let index = 0; index < 24; index += 1) {
   orchestrator.store.createPairingGrant(createHash("sha256").update(token).digest("hex"), grantExpiry);
   mintedTokens.push(token);
 }
-console.log(`FLYX_E2E_HOST_READY base=${address} token=${server.auth.pairingUrlToken} tokens=${mintedTokens.join(",")}`);
+console.log(`FLYX_E2E_HOST_READY base=${address} token=${server.auth.pairingUrlToken} tokens=${mintedTokens.join(",")} pid=${process.pid}`);
 
 const shutdown = async () => {
   try {
     await server.stop();
   } finally {
     orchestrator.close();
-    await rm(e2eRoot, { recursive: true, force: true });
+    if (!keepData) await rm(e2eRoot, { recursive: true, force: true });
     process.exit(0);
   }
 };

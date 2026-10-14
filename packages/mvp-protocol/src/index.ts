@@ -132,3 +132,5 @@ export * from "./connection-offer.js";
 export * from "./relay-control.js";
 
 export * from "./bounded-content.js";
+
+export * from "./timeline-projection.js";

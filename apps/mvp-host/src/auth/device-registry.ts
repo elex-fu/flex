@@ -51,6 +51,8 @@ export type OpenLeaseOptions = {
   close: (code: number, reason: string) => void;
 };
 
+export type CredentialAfterCommit = (effect: () => unknown) => void;
+
 export type DeviceRegistryOptions = {
   now?: () => number;
   leaseTtlMs?: number;
@@ -58,6 +60,8 @@ export type DeviceRegistryOptions = {
   recoverLeases?: boolean;
   /** Poll external SQLite revocations (for the local device-management CLI). */
   revocationPollMs?: number;
+  /** Local diagnostics only; a post-commit effect failure cannot undo committed credentials. */
+  onCredentialEffectError?: (error: unknown) => void;
 };
 
 type ActiveSocket = { close: OpenLeaseOptions["close"]; timer: ReturnType<typeof setTimeout> };
@@ -68,12 +72,15 @@ export class DeviceRegistry {
   private readonly pollMs: number;
   private readonly sockets = new Map<string, ActiveSocket>();
   private poller: ReturnType<typeof setInterval> | undefined;
+  private readonly credentialEffects: Array<Array<() => unknown>> = [];
+  private readonly credentialEffectError: ((error: unknown) => void) | undefined;
 
   constructor(readonly store: SqliteStore, readonly hostId: string, options: DeviceRegistryOptions = {}) {
     if (!hostId) throw new AccessError("HOST_IDENTITY_INVALID", "Host identity is required");
     this.now = options.now ?? Date.now;
     this.leaseTtlMs = positiveDuration(options.leaseTtlMs ?? LEASE_TTL_MS);
     this.pollMs = positiveDuration(options.revocationPollMs ?? 1_000);
+    this.credentialEffectError = options.onCredentialEffectError;
     if (options.recoverLeases !== false) {
       this.store.db.transaction(() => {
         for (const lease of this.store.listActiveProtocolSessions(hostId)) {
@@ -253,6 +260,8 @@ export class DeviceRegistry {
   }
 
   closeLease(leaseId: string, code: string | number = "CONNECTION_CLOSED"): void {
+    if (this.credentialEffects.length) { this.credentialEffects.at(-1)!.push(() => this.closeLease(leaseId, code)); return; }
+    if (this.store.db.inTransaction) throw new AccessError("CREDENTIAL_COMMIT_REQUIRED", "Connection closure requires the outer transaction to commit");
     const socket = this.sockets.get(leaseId);
     if (socket) {
       clearTimeout(socket.timer);
@@ -283,6 +292,30 @@ export class DeviceRegistry {
       this.audit("session.revoke", "OK", { ...(auth?.deviceId ? { deviceId: auth.deviceId } : {}), targetType: "auth_session", targetId: authSessionId });
     })();
     this.closeDisconnectedSockets("AUTH_REVOKED");
+  }
+
+  /** Own the outer credential/receipt transaction. Nested calls join this commit boundary;
+   * an unmanaged SQLite transaction is rejected before any mutation or socket publication. */
+  credentialTransaction<T>(work: (afterCommit: CredentialAfterCommit) => T): T {
+    const parent = this.credentialEffects.at(-1);
+    if (this.store.db.inTransaction && !parent) throw new AccessError("CREDENTIAL_COMMIT_REQUIRED", "Credential mutations require an explicit outer commit boundary");
+    const effects: Array<() => unknown> = [];
+    let accepting = true;
+    this.credentialEffects.push(effects);
+    let result: T;
+    try {
+      result = this.store.db.transaction(() => {
+        const value = work((effect) => {
+          if (!accepting || typeof effect !== "function") throw new AccessError("CREDENTIAL_TRANSACTION_CLOSED", "Credential commit effects must be registered synchronously");
+          effects.push(effect);
+        });
+        if (value && typeof value === "object" && "then" in value) throw new AccessError("CREDENTIAL_ASYNC_TRANSACTION", "Credential transactions must be synchronous");
+        return value;
+      })();
+    } finally { accepting = false; this.credentialEffects.pop(); }
+    if (parent) parent.push(...effects);
+    else this.publishCredentialEffects(effects);
+    return result;
   }
 
   revokeSelf(deviceId: string): boolean {
@@ -428,6 +461,7 @@ export class DeviceRegistry {
   }
 
   private revoke(deviceId: string, actorDeviceId: string | undefined, code: string, requiredScope?: string): boolean {
+    this.assertCredentialBoundary();
     const changed = this.store.db.transaction(() => {
       if (actorDeviceId && requiredScope) this.assertDeviceScope(actorDeviceId, requiredScope);
       const target = this.getDevice(deviceId);
@@ -439,11 +473,12 @@ export class DeviceRegistry {
       this.audit("device.revoke", "OK", { ...(actorDeviceId ? { deviceId: actorDeviceId } : {}), targetType: "device", targetId: deviceId });
       return true;
     })();
-    this.closeDisconnectedSockets(code);
+    this.deferCredentialEffect(() => this.closeDisconnectedSockets(code));
     return changed;
   }
 
   private revokeAllInternal(actorDeviceId?: string): number {
+    this.assertCredentialBoundary();
     const changed = this.store.db.transaction(() => {
       if (actorDeviceId) this.assertDeviceScope(actorDeviceId, "access:admin");
       const timestamp = this.timestamp();
@@ -460,7 +495,7 @@ export class DeviceRegistry {
       this.audit("device.revoke_all", "OK", { ...(actorDeviceId ? { deviceId: actorDeviceId } : {}), targetType: "host", targetId: this.hostId });
       return count;
     })();
-    this.closeDisconnectedSockets("DEVICE_REVOKED");
+    this.deferCredentialEffect(() => this.closeDisconnectedSockets("DEVICE_REVOKED"));
     return changed;
   }
 
@@ -487,6 +522,27 @@ export class DeviceRegistry {
     })();
     this.closeDisconnectedSockets("CREDENTIAL_ROTATED");
     return { deviceId: device.id, refreshCredential, credentialRevision, expiresAt, scopes: [...device.scopes] };
+  }
+
+  private assertCredentialBoundary(): void {
+    if (this.store.db.inTransaction && this.credentialEffects.length === 0) throw new AccessError("CREDENTIAL_COMMIT_REQUIRED", "Credential mutations require an explicit outer commit boundary");
+  }
+
+  private deferCredentialEffect(effect: () => unknown): void {
+    const pending = this.credentialEffects.at(-1);
+    if (pending) pending.push(effect);
+    else { this.assertCredentialBoundary(); this.publishCredentialEffects([effect]); }
+  }
+
+  private publishCredentialEffects(effects: Array<() => unknown>): void {
+    if (this.store.db.inTransaction) throw new AccessError("CREDENTIAL_COMMIT_REQUIRED", "Credential effects require the outer transaction to commit");
+    const report = (error: unknown) => { try { this.credentialEffectError?.(error); } catch { /* diagnostics cannot change the committed result */ } };
+    for (const effect of effects) {
+      try {
+        const result = effect();
+        if (result && typeof result === "object" && "then" in result) void Promise.resolve(result).catch(report);
+      } catch (error) { report(error); }
+    }
   }
 
   private closeDisconnectedSockets(code: string): void {

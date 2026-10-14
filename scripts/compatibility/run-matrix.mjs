@@ -1,720 +1,249 @@
 #!/usr/bin/env node
-/**
- * Claude SDK/CLI 兼容矩阵执行器（设计文档 5.6 节）。
- *
- * 读取 config/claude-compatibility.json，对 status=pending 的锁定组合执行两层验证：
- *
- *   1. deterministic 层：spawn apps/mvp-host/src/test-support/e2e-main.ts
- *      （与 Playwright E2E 相同的真实 server 栈 + DeterministicAdapter），通过
- *      Host HTTP/WSS API 发 N 个 Turn，验证 Flyx 编排/状态机。
- *   2. real 层：spawn apps/mvp-host/src/main.ts（真实 ClaudeAdapter，真正调用
- *      Claude SDK/CLI——这正是"真实矩阵"的意义），同样通过 HTTP/WSS API 发
- *      N 个 Turn。
- *
- * 每次一个 Turn：发送矩阵固定安全 prompt（config.matrixPrompt.text）→ 等待
- * 权威终态事件（turn.completed / turn.failed / turn.cancelled）→ 把脱敏记录
- * （turnId、prompt 哈希、终态、耗时、错误摘要）追加到
- * .flyx-evidence/<combo>/turns.jsonl。绝不写入 prompt 原文、token、明文成本。
- *
- * 降级规则（不能装作验证过）：
- *   - 所选 Claude runtime 不存在或版本不匹配 → real 层记 skipped（含原因），退出码 0；
- *   - Host 无法启动（依赖缺失、preflight 失败等环境问题）→ 该层记 blocked，
- *     组合状态保持不变；
- *   - 只有 Turn 真正执行且出现非 completed 终态/超时，才把组合标记 broken。
- *
- * 用法：
- *   node scripts/compatibility/run-matrix.mjs [--deterministic-only]
- *        [--combo <id>] [--turns <n>] [--config <path>] [--evidence-root <path>]
- */
-
-import { spawn, execFile as execFileCallback } from "node:child_process";
+/** Controlled compatibility evidence. Real calls require --real AND RUN_REAL_<PROVIDER>=1. */
+import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { createInterface } from "node:readline";
-import { appendFile, mkdir, readFile, rm, writeFile } from "node:fs/promises";
-import { dirname, resolve } from "node:path";
+import { appendFile, chmod, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { arch, release } from "node:os";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { promisify } from "node:util";
+import { environmentMatches, evaluateVerification, parseArgs, parseNativeEvidence, readPrivateArtifact, readReadiness } from "./evidence.mjs";
 
-const execFile = promisify(execFileCallback);
-
-const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..");
-const DEFAULT_CONFIG_PATH = resolve(REPO_ROOT, "config/claude-compatibility.json");
-const DEFAULT_EVIDENCE_ROOT = resolve(REPO_ROOT, ".flyx-evidence");
-const FIXTURE_WORKSPACE = resolve(REPO_ROOT, "packages/claude-fixtures");
-const HOST_PACKAGE_FILTER = "@flyx/mvp-host";
-
-const STATUS_RANK = { pending: 0, "deterministic-verified": 1, "fully-verified": 2 };
-const TERMINAL_EVENT_TYPES = new Set(["turn.completed", "turn.failed", "turn.cancelled"]);
-const TURN_TIMEOUT_MS = { deterministic: 30_000, real: 300_000 };
-const HOST_READY_TIMEOUT_MS = { deterministic: 60_000, real: 180_000 };
-
-const log = (message) => console.log(`[matrix] ${message}`);
-const fail = (message) => console.error(`[matrix] ERROR: ${message}`);
-
-function sha256(text) {
-  return createHash("sha256").update(text, "utf8").digest("hex");
-}
-
-function extractSemver(text) {
-  return /\b\d+\.\d+\.\d+\b/.exec(text ?? "")?.[0] ?? null;
-}
-
-/** 错误摘要只保留结构化 code / 已知标签，绝不携带原始 message（可能含路径/密钥）。 */
-function summarizeError(error) {
-  if (error && typeof error === "object" && typeof error.code === "string") return error.code;
-  if (error instanceof Error) {
-    if (/^ready timeout/i.test(error.message)) return "HOST_READY_TIMEOUT";
-    if (/timeout/i.test(error.message)) return "TURN_TIMEOUT";
-    return "ERROR";
-  }
-  return "ERROR";
-}
-
-function redactLine(line) {
-  return line
-    .replace(/token=[^\s,]+/g, "token=[redacted]")
-    .replace(/Pairing token: \S+/g, "Pairing token: [redacted]");
-}
-
-// ---------------------------------------------------------------------------
-// CLI 参数
-// ---------------------------------------------------------------------------
-
-function parseArgs(argv) {
-  const options = { deterministicOnly: false, combo: undefined, turns: undefined, config: DEFAULT_CONFIG_PATH, evidenceRoot: DEFAULT_EVIDENCE_ROOT };
-  for (let index = 0; index < argv.length; index += 1) {
-    const arg = argv[index];
-    switch (arg) {
-      case "--help":
-      case "-h":
-        process.stdout.write(USAGE);
-        process.exit(0);
-        break;
-      case "--deterministic-only":
-        options.deterministicOnly = true;
-        break;
-      case "--combo":
-        options.combo = argv[++index];
-        if (!options.combo) { fail("--combo 需要一个组合 id 参数"); process.exit(2); }
-        break;
-      case "--turns": {
-        const value = Number(argv[++index]);
-        if (!Number.isInteger(value) || value < 1 || value > 100) { fail("--turns 需要一个 1-100 的整数"); process.exit(2); }
-        options.turns = value;
-        break;
-      }
-      case "--config":
-        options.config = argv[++index];
-        if (!options.config) { fail("--config 需要一个路径参数"); process.exit(2); }
-        break;
-      case "--evidence-root":
-        options.evidenceRoot = argv[++index];
-        if (!options.evidenceRoot) { fail("--evidence-root 需要一个路径参数"); process.exit(2); }
-        break;
-      default:
-        fail(`未知参数 ${arg}（用 --help 查看用法）`);
-        process.exit(2);
-    }
-  }
-  return options;
-}
-
-const USAGE = `用法: node scripts/compatibility/run-matrix.mjs [选项]
-
-选项:
-  --deterministic-only   只跑 deterministic 层（DeterministicAdapter），不跑真实 Claude Turn
-  --combo <id>           只跑指定组合（默认跑所有 status=pending 的组合）
-  --turns <n>            每层的 Turn 次数（默认取 config 的 deterministicRequirements.turns，即 10）
-  --config <path>        矩阵配置文件路径（默认 config/claude-compatibility.json）
-  --evidence-root <path> 证据输出根目录（默认 .flyx-evidence/）
-
-前置条件（真实层）: pnpm install 已执行、所选 system/bundled Claude runtime 与组合锁定版本一致且已登录。
-`;
-
-// ---------------------------------------------------------------------------
-// 配置读写
-// ---------------------------------------------------------------------------
-
-async function readJson(path) {
-  const text = await readFile(path, "utf8");
-  const value = JSON.parse(text);
-  if (!value || typeof value !== "object") throw new Error(`${path} 不是 JSON 对象`);
-  return value;
-}
+const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
+const TERMINALS = new Set(["turn.completed", "turn.failed", "turn.cancelled"]);
+const USAGE = "node scripts/compatibility/run-matrix.mjs [--deterministic-only | --real] [--combo id] [--turns 1-100] [--config path] [--evidence-root path]\nReal calls also require RUN_REAL_CLAUDE=1 or RUN_REAL_CODEX=1. Existing authentication and built artifacts are required.\n";
+const hash = (value) => createHash("sha256").update(value).digest("hex");
+const code = (error) => typeof error?.code === "string" && /^[A-Z][A-Z0-9_]{0,95}$/.test(error.code) ? error.code : "MATRIX_OPERATION_FAILED";
+const coded = (value) => Object.assign(new Error(value), { code: value });
+const log = (value) => process.stdout.write("[matrix] " + value + "\n");
 
 async function writeJson(path, value) {
-  await mkdir(dirname(path), { recursive: true });
-  await writeFile(path, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+  await mkdir(dirname(path), { recursive: true, mode: 0o700 });
+  await writeFile(path, JSON.stringify(value, null, 2) + "\n", { mode: 0o600 });
+  await chmod(path, 0o600);
 }
-
-function rankStatus(status) {
-  return STATUS_RANK[status] ?? -1;
-}
-
-// ---------------------------------------------------------------------------
-// 本机环境探测
-// ---------------------------------------------------------------------------
-
-async function detectClaudeCli() {
-  try {
-    const { stdout, stderr } = await execFile("claude", ["--version"], { timeout: 15_000 });
-    const raw = `${stdout} ${stderr}`.trim();
-    return { available: true, version: extractSemver(raw), raw };
-  } catch (error) {
-    const code = error?.code;
-    const reason = code === "ENOENT"
-      ? "claude CLI 不在 PATH 上（未安装或未暴露给当前 shell）"
-      : `claude --version 执行失败（${typeof code === "string" ? code : "unknown"}）`;
-    return { available: false, version: null, raw: null, reason };
+async function waitForReady(child, path, provider, timeoutMs) {
+  const until = Date.now() + timeoutMs;
+  while (Date.now() < until) {
+    if (!child.pid || child.exitCode !== null || child.signalCode !== null) throw coded("HOST_EXITED_BEFORE_READY");
+    try { return await readReadiness(path, { expectedProvider: provider }); }
+    catch (error) { if (error?.code !== "ENOENT") throw error; }
+    await new Promise((done) => setTimeout(done, 50));
   }
+  throw coded("HOST_READY_TIMEOUT");
 }
-
-async function detectBundledClaude() {
-  try {
-    const manifest = await readJson(resolve(REPO_ROOT, "apps/mvp-host/node_modules/@anthropic-ai/claude-agent-sdk/package.json"));
-    const sdkVersion = typeof manifest.version === "string" ? manifest.version : null;
-    const version = typeof manifest.claudeCodeVersion === "string" ? manifest.claudeCodeVersion : null;
-    if (!sdkVersion || !version) throw new Error("SDK manifest lacks version metadata");
-    return { available: true, version, sdkVersion, raw: `SDK ${sdkVersion}, bundled Claude Code ${version}` };
-  } catch (error) {
-    return {
-      available: false,
-      version: null,
-      sdkVersion: null,
-      raw: null,
-      reason: `无法读取 Claude Agent SDK bundled runtime（${error instanceof Error ? error.message : "unknown"}）`,
-    };
-  }
-}
-
-async function detectPnpm() {
-  try {
-    await execFile("pnpm", ["--version"], { timeout: 30_000 });
-    return { command: "pnpm", prefix: [] };
-  } catch {
-    try {
-      await execFile("corepack", ["pnpm", "--version"], { timeout: 30_000 });
-      return { command: "corepack", prefix: ["pnpm"] };
-    } catch {
-      return null;
-    }
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Host 进程管理
-// ---------------------------------------------------------------------------
-
-/**
- * spawn 一个 Host 子进程并等待其 stdout 就绪行。
- * spec.ready(rawLine) 命中时返回 info 对象，进程即认为就绪。
- * 失败时 reject，并附带脱敏后的 stdout/stderr 尾部用于诊断。
- */
-function startHost(spec) {
-  return new Promise((resolvePromise, rejectPromise) => {
-    const child = spawn(spec.command, [...spec.prefix, ...spec.args], {
-      cwd: spec.cwd ?? REPO_ROOT,
-      env: { ...process.env, ...spec.env },
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-    const tail = [];
-    const push = (line) => {
-      if (line.trim().length === 0) return;
-      tail.push(redactLine(line));
-      if (tail.length > 200) tail.shift();
-    };
-    let settled = false;
-    const finish = (error, info) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      if (error) {
-        child.removeAllListeners("exit");
-        child.kill("SIGKILL");
-        rejectPromise(Object.assign(error, { tail }));
-      } else {
-        resolvePromise({ child, info, tail });
-      }
-    };
-    const timer = setTimeout(() => {
-      finish(new Error(`${spec.label}: 等待就绪行超时（${spec.timeoutMs}ms）`));
-    }, spec.timeoutMs);
-
-    createInterface({ input: child.stdout }).on("line", (line) => {
-      push(line);
-      try {
-        const info = spec.ready(line);
-        if (info) finish(null, info);
-      } catch (error) {
-        finish(error);
-      }
-    });
-    child.stderr.setEncoding("utf8");
-    child.stderr.on("data", (chunk) => { for (const line of String(chunk).split("\n")) push(line); });
-    child.on("error", (error) => finish(new Error(`${spec.label}: 无法启动 ${spec.command}（${error.code ?? error.message}）`)));
-    child.on("exit", (code, signal) => {
-      finish(new Error(`${spec.label}: 就绪前退出（code=${code} signal=${signal}）\n  ${tail.slice(-6).join("\n  ")}`));
-    });
-  });
-}
-
 async function stopHost(child) {
-  if (child.exitCode !== null || child.signalCode !== null) return;
-  const exited = new Promise((resolvePromise) => child.once("exit", resolvePromise));
+  if (!child.pid || child.exitCode !== null || child.signalCode !== null) return { status: "already_exited", code: child.exitCode };
+  let forced = false;
+  const exited = new Promise((done) => child.once("exit", done));
   child.kill("SIGTERM");
-  const timeout = setTimeout(() => child.kill("SIGKILL"), 10_000);
+  const timer = setTimeout(() => { forced = true; child.kill("SIGKILL"); }, 10_000);
   await exited;
-  clearTimeout(timeout);
+  clearTimeout(timer);
+  return { status: forced ? "forced" : "graceful", code: child.exitCode };
 }
-
-// ---------------------------------------------------------------------------
-// Host API 客户端（HTTP 认证 + WSS RPC）
-// ---------------------------------------------------------------------------
-
-class RpcClient {
+async function startHost({ layer, combo, scratch, nativePath, runId }) {
+  const controlled = join(scratch, layer);
+  await mkdir(controlled, { recursive: true, mode: 0o700 });
+  await chmod(controlled, 0o700);
+  await mkdir(join(controlled, "web"), { mode: 0o700 });
+  const readinessPath = join(controlled, "ready.json");
+  const real = layer === "real";
+  const provider = combo.provider ?? "claude";
+  const child = spawn(process.execPath, real ? [join(ROOT, "apps/mvp-host/dist/main.js")] : ["--import", "tsx", "src/test-support/e2e-main.ts"], {
+    cwd: join(ROOT, "apps/mvp-host"),
+    env: {
+      ...process.env, PORT: "0", FLYX_PROVIDER: provider, FLYX_WORKSPACE: join(ROOT, "packages/claude-fixtures"),
+      FLYX_DB: join(controlled, "host.sqlite"), FLYX_IDENTITY_DIR: join(controlled, "identity"),
+      FLYX_E2E_ROOT: join(controlled, "e2e"), FLYX_WEB_ROOT: join(controlled, "web"),
+      FLYX_ALLOW_INSECURE_HTTP: "1", FLYX_REQUIRE_PAIRING_CONFIRM: "0",
+      FLYX_CONNECTIVITY_MODE: "local", FLYX_RELAY_ENABLED: "0", FLYX_PUBLIC_BASE_URL: "", FLYX_SKIP_PREFLIGHT: "0",
+      FLYX_TEST_CONTROLLED_ENTRY: "1", FLYX_TEST_READINESS_PATH: readinessPath,
+      FLYX_COMPATIBILITY_EVIDENCE_PATH: nativePath, FLYX_COMPATIBILITY_RUN_ID: runId,
+      ...(provider === "claude" ? { FLYX_CLAUDE_EXECUTABLE: combo.executableSource === "sdk-bundled" ? "" : combo.executablePath ?? "claude" } : { FLYX_CODEX_EXECUTABLE: combo.executablePath ?? "codex" }),
+    }, stdio: ["ignore", "ignore", "ignore"],
+  });
+  let spawnError;
+  child.once("error", () => { spawnError = coded("HOST_SPAWN_FAILED"); });
+  try {
+    const info = await waitForReady(child, readinessPath, real ? provider : "deterministic", real ? 180_000 : 60_000);
+    if (spawnError) throw spawnError;
+    if (info.pid !== child.pid) throw coded("READINESS_PID_MISMATCH");
+    return { child, info };
+  } catch (error) { await stopHost(child); throw spawnError ?? error; }
+}
+export class RpcClient {
   constructor(ws) {
-    this.ws = ws;
-    this.nextId = 0;
-    this.pending = new Map();
-    this.waiters = new Set();
-    ws.onmessage = (message) => {
-      try { this.handleFrame(JSON.parse(typeof message.data === "string" ? message.data : "")); } catch { /* 忽略非 JSON 帧 */ }
-    };
-    ws.onclose = () => {
-      for (const settle of this.pending.values()) settle({ type: "response", id: "?", ok: false, error: { code: "WS_CLOSED", message: "websocket closed", retryable: false } });
-      this.pending.clear();
-    };
+    this.ws = ws; this.next = 0; this.pending = new Map(); this.waiters = new Set(); this.events = [];
+    ws.onmessage = (message) => { try { this.handleFrame(JSON.parse(typeof message.data === "string" ? message.data : "")); } catch {} };
+    ws.onclose = () => { for (const settle of this.pending.values()) settle({ ok: false, error: { code: "WS_CLOSED" } }); this.pending.clear(); };
   }
-
   handleFrame(frame) {
-    if (!frame || typeof frame !== "object") return;
-    if (frame.type === "response") {
-      const settle = this.pending.get(frame.id);
-      if (settle) { this.pending.delete(frame.id); settle(frame); }
-      return;
-    }
-    if (frame.type === "event") {
-      for (const waiter of [...this.waiters]) {
-        if (waiter(frame.event)) this.waiters.delete(waiter);
-      }
+    if (frame?.type === "response") { const settle = this.pending.get(frame.id); if (settle) { this.pending.delete(frame.id); settle(frame); } }
+    if (frame?.type === "event") {
+      this.events.push(frame.event); if (this.events.length > 1024) this.events.shift();
+      for (const waiter of [...this.waiters]) if (waiter(frame.event)) this.waiters.delete(waiter);
     }
   }
-
   call(method, payload, commandId, timeoutMs = 30_000) {
-    this.nextId += 1;
-    const id = `matrix-${this.nextId}`;
-    const frame = { type: "request", id, method, ...(commandId ? { commandId } : {}), payload };
-    return new Promise((resolvePromise, rejectPromise) => {
-      const timer = setTimeout(() => {
-        this.pending.delete(id);
-        rejectPromise(new Error("request timeout"));
-      }, timeoutMs);
-      this.pending.set(id, (response) => { clearTimeout(timer); resolvePromise(response); });
-      try { this.ws.send(JSON.stringify(frame)); }
-      catch (error) { clearTimeout(timer); this.pending.delete(id); rejectPromise(error); }
+    const id = "matrix-" + (++this.next);
+    return new Promise((done, reject) => {
+      const timer = setTimeout(() => { this.pending.delete(id); reject(coded("RPC_TIMEOUT")); }, timeoutMs);
+      this.pending.set(id, (response) => { clearTimeout(timer); done(response); });
+      try { this.ws.send(JSON.stringify({ type: "request", id, method, payload, ...(commandId ? { commandId } : {}) })); }
+      catch (error) { clearTimeout(timer); this.pending.delete(id); reject(error); }
     });
   }
-
-  /** 等待指定 turn 的权威终态事件。 */
-  waitTerminal(turnId, timeoutMs) {
-    return new Promise((resolvePromise, rejectPromise) => {
-      const timer = setTimeout(() => {
-        this.waiters.delete(waiter);
-        rejectPromise(new Error("terminal timeout"));
-      }, timeoutMs);
-      const waiter = (event) => {
-        if (TERMINAL_EVENT_TYPES.has(event?.type) && event?.payload?.turnId === turnId) {
-          clearTimeout(timer);
-          this.waiters.delete(waiter);
-          resolvePromise(event);
-          return true;
-        }
-        return false;
-      };
+  waitEvent(predicate, timeoutMs) {
+    const existing = this.events.find(predicate);
+    if (existing) return Promise.resolve(existing);
+    return new Promise((done, reject) => {
+      const timer = setTimeout(() => { this.waiters.delete(waiter); reject(coded("EVENT_TIMEOUT")); }, timeoutMs);
+      const waiter = (event) => { if (!predicate(event)) return false; clearTimeout(timer); done(event); return true; };
       this.waiters.add(waiter);
     });
   }
-
-  close() {
-    try { this.ws.close(); } catch { /* already closed */ }
-  }
+  waitTerminal(turnId, timeoutMs) { return this.waitEvent((event) => TERMINALS.has(event?.type) && event?.payload?.turnId === turnId, timeoutMs); }
+  close() { this.ws.close(); }
 }
-
-async function openHostClient(base, pairingToken) {
+async function openClient(info) {
   const post = async (path, body, cookie) => {
-    const response = await fetch(new URL(path, base), {
-      method: "POST",
-      headers: { "content-type": "application/json", ...(cookie ? { cookie } : {}) },
-      body: JSON.stringify(body),
-    });
-    if (!response.ok) throw new Error(`${path} HTTP ${response.status}`);
-    return response;
+    const response = await fetch(new URL(path, info.baseUrl), { method: "POST", headers: { "content-type": "application/json", ...(cookie ? { cookie } : {}) }, body: JSON.stringify(body), signal: AbortSignal.timeout(15_000) });
+    if (!response.ok) throw coded("AUTH_EXCHANGE_FAILED"); return response;
   };
-
-  const credentialResponse = await post("/api/pairing/exchange", { token: pairingToken });
-  const { credential } = await credentialResponse.json();
-  const sessionResponse = await post("/api/auth/browser-session", { credential });
-  const sessionCookie = (sessionResponse.headers.getSetCookie?.() ?? [])
-    .map((entry) => entry.split(";")[0])
-    .find((entry) => entry.startsWith("flyx_session="));
-  if (!sessionCookie) throw new Error("browser session cookie 缺失");
-  const ticketResponse = await post("/api/auth/websocket-ticket", {}, sessionCookie);
-  const { ticket } = await ticketResponse.json();
-
-  const wsUrl = `${base.replace(/^http/, "ws")}/api/ws?ticket=${encodeURIComponent(ticket)}`;
-  const ws = new WebSocket(wsUrl, { headers: { origin: base } });
-  await new Promise((resolvePromise, rejectPromise) => {
-    const timer = setTimeout(() => rejectPromise(new Error("websocket connect timeout")), 15_000);
-    ws.onopen = () => { clearTimeout(timer); resolvePromise(); };
-    ws.onerror = () => { clearTimeout(timer); rejectPromise(new Error("websocket connect failed")); };
+  const { credential } = await (await post("/api/pairing/exchange", { token: info.token })).json();
+  const auth = await post("/api/auth/browser-session", { credential });
+  const cookie = (auth.headers.getSetCookie?.() ?? []).map((value) => value.split(";")[0]).find((value) => value.startsWith("flyx_session="));
+  if (!cookie) throw coded("AUTH_COOKIE_MISSING");
+  const { ticket } = await (await post("/api/auth/websocket-ticket", {}, cookie)).json();
+  const ws = new WebSocket(info.baseUrl.replace(/^http/, "ws") + "/api/ws?ticket=" + encodeURIComponent(ticket));
+  await new Promise((done, reject) => {
+    const timer = setTimeout(() => reject(coded("WS_CONNECT_TIMEOUT")), 15_000);
+    ws.onopen = () => { clearTimeout(timer); done(); }; ws.onerror = () => { clearTimeout(timer); reject(coded("WS_CONNECT_FAILED")); };
   });
   const client = new RpcClient(ws);
-  const subscribe = await client.call("session.subscribe", { afterSequence: 0 }, undefined, 15_000);
-  if (!subscribe.ok) { client.close(); throw new Error(`session.subscribe 失败: ${subscribe.error?.code ?? "unknown"}`); }
+  const subscribed = await client.call("session.subscribe", { afterSequence: 0 });
+  if (!subscribed.ok) { client.close(); throw coded("SUBSCRIBE_FAILED"); }
   return client;
 }
-
-// ---------------------------------------------------------------------------
-// Turn 执行
-// ---------------------------------------------------------------------------
-
-async function runTurns({ layer, turns, prompt, promptId, promptHash, client, timeoutMs, label }) {
+async function runTurn(client, { layer, index, prompt, scenario = "turn" }) {
+  const start = Date.now();
+  const record = { layer, scenario, index, promptHash: hash(prompt), startedAt: new Date(start).toISOString(), turnIdHash: null, terminalType: null, result: "failed", errorCode: null };
+  let turnId;
+  try {
+    const response = await client.call("session.startTurn", { prompt }, randomUUID());
+    if (!response.ok || typeof response.payload?.turnId !== "string") throw coded(response.error?.code ?? "TURN_ADMISSION_FAILED");
+    turnId = response.payload.turnId; record.turnIdHash = hash(turnId);
+    if (scenario === "approval") {
+      const request = await client.waitEvent((event) => event?.type === "approval.requested" && event?.payload?.turnId === turnId, 60_000);
+      const answer = await client.call("approval.respond", { approvalId: request.payload.approvalId, expectedVersion: request.payload.version ?? 0, action: "deny" }, randomUUID());
+      if (!answer.ok) throw coded("APPROVAL_RESPONSE_FAILED");
+    } else if (scenario === "interrupt") {
+      await client.waitEvent((event) => event?.type === "turn.started" && event?.payload?.turnId === turnId, 60_000);
+      const interrupt = await client.call("session.interrupt", {}, randomUUID());
+      if (!interrupt.ok) throw coded("INTERRUPT_REQUEST_FAILED");
+    }
+    const terminal = await client.waitTerminal(turnId, layer === "real" ? 300_000 : 30_000);
+    record.terminalType = terminal.type;
+    record.result = scenario === "interrupt" ? terminal.type === "turn.cancelled" ? "passed" : "failed" : terminal.type === "turn.completed" ? "passed" : "failed";
+  } catch (error) {
+    record.errorCode = code(error);
+    if (turnId) {
+      try { await client.call("session.interrupt", {}, randomUUID(), 15_000); await client.waitTerminal(turnId, 15_000); } catch {}
+    }
+  }
+  record.durationMs = Date.now() - start;
+  return record;
+}
+async function runLayer(layer, combo, context) {
+  let host;
+  let layerResult;
   const records = [];
-  for (let index = 1; index <= turns; index += 1) {
-    const commandId = randomUUID();
-    const startedAt = Date.now();
-    const record = {
-      layer,
-      index,
-      turnId: null,
-      promptId,
-      promptHash,
-      commandIdHash: sha256(commandId).slice(0, 16),
-      startedAt: new Date(startedAt).toISOString(),
-      terminalType: null,
-      turnStatus: null,
-      durationMs: null,
-      errorSummary: null,
-    };
+  try {
+    host = await startHost({ layer, combo, ...context });
+    const observed = { nodeVersion: process.versions.node, os: process.platform + " " + release() + " " + arch(), ...host.info.observed };
+    if (layer === "real") {
+      const match = environmentMatches(combo, observed);
+      if (!match.matched) return layerResult = { outcome: { status: "skipped", completed: 0, reasonCode: "RUNTIME_COMBINATION_UNVERIFIED", reasons: match.reasonCodes }, observed, records };
+    }
+    const client = await openClient(host.info);
     try {
-      const response = await client.call("session.startTurn", { prompt }, commandId, 30_000);
-      if (!response.ok) throw Object.assign(new Error("rpc"), { code: response.error?.code ?? "RPC_ERROR" });
-      record.turnId = response.payload?.turnId ?? null;
-      const terminal = await client.waitTerminal(record.turnId, timeoutMs);
-      record.terminalType = terminal.type;
-      record.turnStatus = terminal.type?.split(".")[1] ?? null;
-    } catch (error) {
-      record.errorSummary = summarizeError(error);
-      record.turnStatus = record.turnStatus ?? "error";
-      // 尽量把 session 拉回 idle，避免一个卡死的 Turn 拖垮后续样本；
-      // 恢复失败不影响本条证据（已如实记录）。
-      if (record.turnId) {
-        try {
-          await client.call("session.interrupt", {}, randomUUID(), 15_000);
-          await client.waitTerminal(record.turnId, 15_000).catch(() => undefined);
-        } catch { /* 尽力而为 */ }
+      for (let index = 1; index <= context.turns; index += 1) records.push(await runTurn(client, { layer, index, prompt: context.prompt }));
+      if (layer === "real") for (const scenario of ["approval", "interrupt"]) {
+        const spec = context.scenarios?.[scenario];
+        if (spec?.prompt) for (let index = 1; index <= (spec.repetitions ?? 1); index += 1) records.push(await runTurn(client, { layer, index, prompt: spec.prompt, scenario }));
+      }
+    } finally { client.close(); }
+    const turns = records.filter((record) => record.scenario === "turn");
+    return layerResult = { records, observed, outcome: { status: records.some((record) => record.result !== "passed") ? "failed" : "passed", completed: turns.filter((record) => record.result === "passed").length, scenarioResults: Object.fromEntries(["approval", "interrupt", "recovery"].map((kind) => [kind, { status: records.some((record) => record.scenario === kind) ? records.filter((record) => record.scenario === kind).every((record) => record.result === "passed") ? "passed" : "failed" : "skipped", reasonCode: records.some((record) => record.scenario === kind) ? null : "SCENARIO_NOT_CONFIGURED" }])) } };
+  } catch (error) { return layerResult = { records, observed: host?.info.observed ?? {}, outcome: { status: "blocked", completed: 0, reasonCode: code(error) } }; }
+  finally {
+    if (host) {
+      const stopped = await stopHost(host.child);
+      if (layerResult) {
+        layerResult.outcome.shutdown = stopped.status;
+        if (stopped.status === "forced" || stopped.code !== 0) {
+          layerResult.outcome.status = "blocked";
+          layerResult.outcome.reasonCode = "HOST_STOP_UNVERIFIED";
+        }
       }
     }
-    record.durationMs = Date.now() - startedAt;
-    record.finishedAt = new Date().toISOString();
-    records.push(record);
-    log(`${label} turn ${index}/${turns}: ${record.turnStatus ?? "?"}${record.errorSummary ? ` (${record.errorSummary})` : ""} in ${record.durationMs}ms`);
-  }
-  return records;
-}
-
-// ---------------------------------------------------------------------------
-// 组合验证
-// ---------------------------------------------------------------------------
-
-function layerOutcome(records) {
-  if (records.length === 0) return { status: "blocked", reason: "没有执行任何 Turn" };
-  const failed = records.filter((record) => record.turnStatus !== "completed");
-  return failed.length === 0
-    ? { status: "passed", completed: records.length, failed: 0 }
-    : { status: "failed", completed: records.length - failed.length, failed: failed.length, failures: failed.map((record) => record.errorSummary ?? record.terminalType ?? record.turnStatus) };
-}
-
-async function runDeterministicLayer(combo, { pnpm, evidenceDir, turns, prompt, promptId, promptHash }) {
-  const scratch = resolve(evidenceDir, "scratch");
-  const webRoot = resolve(scratch, "webroot");
-  await mkdir(webRoot, { recursive: true });
-  const spec = {
-    label: `deterministic host (${combo.id})`,
-    command: pnpm.command,
-    prefix: pnpm.prefix,
-    args: ["--filter", HOST_PACKAGE_FILTER, "exec", "tsx", "src/test-support/e2e-main.ts"],
-    env: {
-      FLYX_WORKSPACE: FIXTURE_WORKSPACE,
-      FLYX_WEB_ROOT: webRoot,
-      FLYX_E2E_ROOT: resolve(scratch, "det-e2e"),
-    },
-    timeoutMs: HOST_READY_TIMEOUT_MS.deterministic,
-    ready: (line) => {
-      const match = /^FLYX_E2E_HOST_READY base=(\S+) token=(\S+)/.exec(line);
-      return match ? { base: match[1], token: match[2] } : null;
-    },
-  };
-  log(`启动 deterministic Host（DeterministicAdapter，复用 Playwright E2E 入口）`);
-  const host = await startHost(spec);
-  try {
-    const client = await openHostClient(host.info.base, host.info.token);
-    try {
-      return await runTurns({
-        layer: "deterministic",
-        turns,
-        prompt,
-        promptId,
-        promptHash,
-        client,
-        timeoutMs: TURN_TIMEOUT_MS.deterministic,
-        label: `[${combo.id}] det`,
-      });
-    } finally {
-      client.close();
-    }
-  } finally {
-    await stopHost(host.child);
-    await rm(resolve(scratch, "det-e2e"), { recursive: true, force: true });
   }
 }
-
-async function runRealLayer(combo, { pnpm, evidenceDir, turns, prompt, promptId, promptHash }) {
-  const scratch = resolve(evidenceDir, "scratch", "real");
-  await mkdir(scratch, { recursive: true });
-  const readyCapture = { listening: undefined, token: undefined, preflight: undefined };
-  const spec = {
-    label: `real host (${combo.id})`,
-    command: pnpm.command,
-    prefix: pnpm.prefix,
-    args: ["--filter", HOST_PACKAGE_FILTER, "exec", "tsx", "src/main.ts"],
-    env: {
-      PORT: "0",
-      FLYX_WORKSPACE: FIXTURE_WORKSPACE,
-      FLYX_DB: resolve(scratch, "host.sqlite"),
-      // 矩阵脚本没有 TTY 也没有人工确认配对的场景，仅 loopback 本机测试。
-      FLYX_ALLOW_INSECURE_HTTP: "1",
-      FLYX_REQUIRE_PAIRING_CONFIRM: "0",
-      // The compatibility row decides the runtime source. An empty value is
-      // intentionally falsy in ClaudeAdapter and selects the SDK bundle.
-      FLYX_CLAUDE_EXECUTABLE: combo.executableSource === "sdk-bundled" ? "" : "claude",
-    },
-    timeoutMs: HOST_READY_TIMEOUT_MS.real,
-    ready: (line) => {
-      const readyState = readyCapture;
-      const listening = /^Flyx MVP Host listening at (\S+)/.exec(line);
-      const token = /^Pairing token: (\S+)/.exec(line);
-      const preflight = /^Claude preflight passed: claude-agent-sdk (\S+), runtime (\S+)/.exec(line);
-      readyState.listening = listening?.[1] ?? readyState.listening;
-      readyState.token = token?.[1] ?? readyState.token;
-      if (preflight) readyState.preflight = { sdkVersion: preflight[1], claudeVersion: preflight[2] };
-      return readyState.listening && readyState.token ? { ...readyState } : null;
-    },
-  };
-  log(`启动 real Host（真实 ClaudeAdapter + Claude SDK/CLI，preflight 将真实执行）`);
-  const host = await startHost(spec);
-  try {
-    const client = await openHostClient(host.info.listening, host.info.token);
-    try {
-      return await runTurns({
-        layer: "real",
-        turns,
-        prompt,
-        promptId,
-        promptHash,
-        client,
-        timeoutMs: TURN_TIMEOUT_MS.real,
-        label: `[${combo.id}] real`,
-      });
-    } finally {
-      client.close();
-    }
-  } finally {
-    await stopHost(host.child);
+export async function main(argv = process.argv.slice(2)) {
+  const options = parseArgs(argv, { config: join(ROOT, "config/claude-compatibility.json"), evidenceRoot: join(ROOT, ".flyx-evidence") });
+  if (options.help) { process.stdout.write(USAGE); return 0; }
+  const config = JSON.parse(await readFile(resolve(options.config), "utf8"));
+  const combos = config.lockedCombinations ?? [];
+  if (!Array.isArray(combos) || combos.some((combo) => !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(combo.id) || !["claude", "codex"].includes(combo.provider ?? "claude"))) throw coded("MATRIX_CONFIG_INVALID");
+  const selected = options.combo ? combos.filter((combo) => combo.id === options.combo) : combos.filter((combo) => ["pending", "deterministic-verified"].includes(combo.status));
+  const runId = randomUUID();
+  const evidenceRoot = resolve(options.evidenceRoot);
+  await mkdir(evidenceRoot, { recursive: true, mode: 0o700 });
+  if (selected.length === 0) {
+    await writeJson(join(evidenceRoot, "run-" + runId + ".json"), { v: 1, runId, status: "skipped", reasonCode: "NO_SELECTED_COMBINATIONS" });
+    log("skipped: NO_SELECTED_COMBINATIONS"); return options.combo ? 2 : 0;
   }
-}
-
-async function countJsonlLines(path) {
-  try {
-    const text = await readFile(path, "utf8");
-    const lines = text.split("\n").filter((line) => line.trim().length > 0);
-    let valid = 0;
-    for (const line of lines) {
-      try { JSON.parse(line); valid += 1; } catch { /* 跳过残缺行 */ }
-    }
-    return valid;
-  } catch {
-    return 0;
-  }
-}
-
-async function appendEvidence(path, records) {
-  if (records.length === 0) return;
-  await mkdir(dirname(path), { recursive: true });
-  await appendFile(path, records.map((record) => JSON.stringify(record)).join("\n") + "\n", "utf8");
-}
-
-// ---------------------------------------------------------------------------
-// 主流程
-// ---------------------------------------------------------------------------
-
-async function main() {
-  const options = parseArgs(process.argv.slice(2));
-  const config = await readJson(options.config);
-  const combos = Array.isArray(config.lockedCombinations) ? config.lockedCombinations : [];
-  if (combos.length === 0) { log("配置中没有任何 lockedCombinations"); return 0; }
-
-  const selected = options.combo
-    ? combos.filter((combo) => combo.id === options.combo)
-    : combos.filter((combo) => combo.status === "pending");
-  if (options.combo && selected.length === 0) { fail(`--combo ${options.combo} 不存在于 ${options.config}`); return 2; }
-  if (selected.length === 0) { log("没有 status=pending 的组合，矩阵已是最新（用 --combo <id> 可重跑指定组合）"); return 0; }
-
+  if (typeof config.matrixPrompt?.text !== "string" || !config.matrixPrompt.text) throw coded("MATRIX_PROMPT_MISSING");
   const turns = options.turns ?? config.deterministicRequirements?.turns ?? 10;
-  const promptText = config.matrixPrompt?.text;
-  if (!promptText) { fail("配置缺少 matrixPrompt.text"); return 2; }
-  const promptId = config.matrixPrompt.id ?? "matrix-prompt";
-  const promptHash = sha256(promptText);
-
-  const systemClaude = await detectClaudeCli();
-  const bundledClaude = await detectBundledClaude();
-  const pnpm = await detectPnpm();
-  if (systemClaude.available) log(`系统 claude CLI: ${systemClaude.raw}（解析版本 ${systemClaude.version ?? "unknown"}）`);
-  else log(`系统 claude CLI 不可用：${systemClaude.reason}`);
-  if (bundledClaude.available) log(`SDK bundled runtime: ${bundledClaude.raw}`);
-  else log(`SDK bundled runtime 不可用：${bundledClaude.reason}`);
-  if (!pnpm) { fail("找不到 pnpm 或 corepack，无法启动 Host；矩阵保持 pending 未验证"); return 0; }
-
+  if (!Number.isInteger(turns) || turns < 1 || turns > 100) throw coded("MATRIX_CONFIG_INVALID");
+  for (const kind of ["approval", "interrupt"]) {
+    const spec = config.realScenarios?.[kind];
+    if (spec && (typeof spec.prompt !== "string" || !spec.prompt || Buffer.byteLength(spec.prompt) > 65_536 || !Number.isInteger(spec.repetitions ?? 1) || (spec.repetitions ?? 1) < 1 || (spec.repetitions ?? 1) > 100)) throw coded("MATRIX_CONFIG_INVALID");
+  }
   let exitCode = 0;
-  for (const combo of selected) {
-    const claude = combo.executableSource === "sdk-bundled" ? bundledClaude : systemClaude;
-    log(`=== 组合 ${combo.id}（当前状态 ${combo.status}）===`);
-    const evidenceDir = resolve(REPO_ROOT, options.evidenceRoot, combo.id);
-    await mkdir(evidenceDir, { recursive: true });
-    const context = { pnpm, evidenceDir, turns, prompt: promptText, promptId, promptHash };
-
-    // --- deterministic 层 ---
-    let deterministic = { status: "blocked", reason: "未执行" };
-    let deterministicRecords = [];
+  for (const original of selected) {
+    const combo = { ...original, provider: original.provider ?? "claude" };
+    const directory = join(evidenceRoot, combo.id, runId);
+    await mkdir(directory, { recursive: true, mode: 0o700 });
+    await chmod(directory, 0o700);
+    const scratch = join(directory, "scratch");
+    const nativePath = join(directory, "native.jsonl");
+    const context = { scratch, nativePath, runId, turns, prompt: config.matrixPrompt.text, scenarios: config.realScenarios };
+    let deterministic, real;
     try {
-      deterministicRecords = await runDeterministicLayer(combo, context);
-      deterministic = layerOutcome(deterministicRecords);
-    } catch (error) {
-      deterministic = { status: "blocked", reason: summarizeError(error) === "ERROR" ? (error instanceof Error ? redactLine(error.message).slice(0, 300) : "unknown") : summarizeError(error) };
-      log(`deterministic 层未执行（blocked）: ${deterministic.reason}`);
-    }
-    await appendEvidence(resolve(evidenceDir, "turns.jsonl"), deterministicRecords);
-
-    // --- real 层 ---
-    let real = { status: "skipped", reason: "未执行" };
-    let realRecords = [];
-    if (options.deterministicOnly) {
-      real = { status: "skipped", reason: "--deterministic-only" };
-      log("real 层跳过（--deterministic-only）");
-    } else if (!claude.available) {
-      real = { status: "skipped", reason: claude.reason };
-      log(`real 层跳过（skipped）: ${real.reason}`);
-    } else if (claude.version !== combo.claudeCliVersion) {
-      real = { status: "skipped", reason: `本机 claude CLI ${claude.version ?? "unknown"} 与锁定版本 ${combo.claudeCliVersion} 不一致` };
-      log(`real 层跳过（skipped）: ${real.reason}`);
-    } else if (combo.executableSource === "sdk-bundled" && claude.sdkVersion !== combo.sdkVersion) {
-      real = { status: "skipped", reason: `SDK ${claude.sdkVersion ?? "unknown"} 与锁定版本 ${combo.sdkVersion} 不一致` };
-      log(`real 层跳过（skipped）: ${real.reason}`);
-    } else if (deterministic.status !== "passed") {
-      real = { status: "skipped", reason: `deterministic 层未通过（${deterministic.status}），按矩阵规则不进入真实 Turn` };
-      log(`real 层跳过: ${real.reason}`);
-    } else {
-      try {
-        realRecords = await runRealLayer(combo, context);
-        real = layerOutcome(realRecords);
-      } catch (error) {
-        real = { status: "blocked", reason: error instanceof Error ? redactLine(error.message).slice(0, 300) : "unknown" };
-        log(`real 层被环境阻塞（blocked）: ${real.reason}`);
-      }
-      await appendEvidence(resolve(evidenceDir, "turns.jsonl"), realRecords);
-    }
-
-    // --- 汇总与状态更新 ---
-    await rm(resolve(evidenceDir, "scratch"), { recursive: true, force: true });
-    const approvals = real.status === "passed" ? await countJsonlLines(resolve(evidenceDir, "approvals.jsonl")) : 0;
-    const interrupts = real.status === "passed" ? await countJsonlLines(resolve(evidenceDir, "interrupts.jsonl")) : 0;
-    const required = config.realRequirements ?? { turns: 10, approvals: 10, interrupts: 10 };
-
-    // 只有满足要求的 Turn 次数（默认 10）的运行才有资格提升等级；broken 无论样本数都生效。
-    const qualifies = turns >= (config.deterministicRequirements?.turns ?? 10);
-    let newStatus = combo.status;
-    if (deterministic.status === "failed" || real.status === "failed") newStatus = "broken";
-    else if (!qualifies) newStatus = combo.status;
-    else if (deterministic.status === "passed" && real.status === "passed"
-      && approvals >= (required.approvals ?? 10) && interrupts >= (required.interrupts ?? 10)) newStatus = "fully-verified";
-    else if (deterministic.status === "passed") newStatus = rankStatus("deterministic-verified") > rankStatus(combo.status) ? "deterministic-verified" : combo.status;
-    // blocked / skipped：状态保持不变，绝不装作验证过。
-
-    const noteBits = [`det=${deterministic.status}`, `real=${real.status}`];
-    if (!qualifies) noteBits.push(`冒烟运行（${turns} < 要求 ${config.deterministicRequirements?.turns ?? 10} turns，不提升等级）`);
-    if (deterministic.status === "passed") noteBits.push(`det turns ${deterministic.completed}/${turns}`);
-    if (real.status === "passed") noteBits.push(`real turns ${real.completed}/${turns}`);
-    if (real.status === "passed" && (approvals < (required.approvals ?? 10) || interrupts < (required.interrupts ?? 10))) {
-      noteBits.push(`等待 approvals(${approvals}/${required.approvals ?? 10}) / interrupts(${interrupts}/${required.interrupts ?? 10}) 证据后才能 fully-verified`);
-    }
-    const note = `${new Date().toISOString()} run(${turns} turns/层): ${noteBits.join(", ")}${deterministic.reason ? `; det reason: ${deterministic.reason}` : ""}${real.reason ? `; real reason: ${real.reason}` : ""} → ${newStatus}`;
-
-    combo.status = newStatus;
-    combo.observed = {
-      nodeVersion: process.versions.node,
-      ...(claude.sdkVersion ? { sdkVersion: claude.sdkVersion } : {}),
-      claudeCliVersion: claude.version,
-      ...(claude.available ? { claudeCliRaw: claude.raw } : {}),
-    };
-    combo.lastRun = {
-      at: new Date().toISOString(),
-      turnsPerLayer: turns,
-      deterministic,
-      real,
-      approvalsEvidence: approvals,
-      interruptsEvidence: interrupts,
-      promptId,
-      promptHash,
-    };
-    if (!Array.isArray(combo.notes)) combo.notes = [];
-    combo.notes.push(note);
-    if (combo.notes.length > 10) combo.notes = combo.notes.slice(-10);
-    combo.evidence = {
-      turns: `${relativeEvidence(options.evidenceRoot)}/${combo.id}/turns.jsonl`,
-      approvals: `${relativeEvidence(options.evidenceRoot)}/${combo.id}/approvals.jsonl`,
-      interrupts: `${relativeEvidence(options.evidenceRoot)}/${combo.id}/interrupts.jsonl`,
-      summary: `${relativeEvidence(options.evidenceRoot)}/${combo.id}/summary.json`,
-    };
-
-    await writeJson(resolve(evidenceDir, "summary.json"), {
-      comboId: combo.id,
-      ranAt: combo.lastRun.at,
-      expected: { sdkVersion: combo.sdkVersion, claudeCliVersion: combo.claudeCliVersion, nodeVersion: combo.nodeVersion },
-      observed: combo.observed,
-      layers: { deterministic, real },
-      turnsPerLayer: turns,
-      approvalsEvidence: approvals,
-      interruptsEvidence: interrupts,
-      result: newStatus,
-    });
-    await writeJson(options.config, config);
-    log(`组合 ${combo.id} → ${newStatus}（证据已写入 ${relativeEvidence(options.evidenceRoot)}/${combo.id}/）`);
-
-    if (deterministic.status === "failed" || real.status === "failed") exitCode = 1;
+      deterministic = await runLayer("deterministic", combo, context);
+      const allowed = options.real && !options.deterministicOnly && process.env[combo.provider === "claude" ? "RUN_REAL_CLAUDE" : "RUN_REAL_CODEX"] === "1";
+      real = !allowed ? { records: [], observed: {}, outcome: { status: "skipped", completed: 0, reasonCode: "REAL_EXECUTION_NOT_ENABLED" } }
+        : deterministic.outcome.status !== "passed" ? { records: [], observed: {}, outcome: { status: "skipped", completed: 0, reasonCode: "DETERMINISTIC_LAYER_NOT_PASSED" } }
+          : await runLayer("real", combo, context);
+      const records = [...deterministic.records, ...real.records];
+      if (records.length) await writeFile(join(directory, "turns.jsonl"), records.map((record) => JSON.stringify(record)).join("\n") + "\n", { mode: 0o600 });
+      let native = { records: [], invalid: 0 };
+      try { native = parseNativeEvidence(await readPrivateArtifact(nativePath, 8 * 1024 * 1024), { runId, provider: combo.provider }); }
+      catch (error) { if (error?.code !== "ENOENT") native = { records: [], invalid: 1 }; }
+      const evaluation = evaluateVerification({ combo, deterministic: deterministic.outcome, real: real.outcome, native, observed: real.observed, requirements: { deterministic: config.deterministicRequirements, real: config.realRequirements } });
+      const summary = { v: 2, runId, comboId: combo.id, provider: combo.provider, ranAt: new Date().toISOString(), expected: { nodeVersion: combo.nodeVersion, os: combo.os, sdkVersion: combo.sdkVersion, cliVersion: combo.claudeCliVersion ?? combo.codexCliVersion, executableSource: combo.executableSource, capabilities: combo.capabilities ?? [] }, observed: real.observed, deterministicObserved: deterministic.observed, layers: { deterministic: deterministic.outcome, real: real.outcome }, nativeEvidence: { counts: evaluation.counts, invalid: evaluation.invalidEvidence, complete: evaluation.nativeComplete }, result: evaluation.currentVerification, persistedStatus: evaluation.status, environment: evaluation.environment };
+      await writeJson(join(directory, "summary.json"), summary);
+      original.status = evaluation.status;
+      original.lastRun = { runId, at: summary.ranAt, deterministic: deterministic.outcome, real: real.outcome, result: evaluation.currentVerification, nativeEvidence: summary.nativeEvidence };
+      original.evidence = { summary: join(directory, "summary.json"), turns: join(directory, "turns.jsonl"), native: nativePath };
+      await writeJson(resolve(options.config), config);
+      log(combo.id + ": det=" + deterministic.outcome.status + " real=" + real.outcome.status + " current=" + evaluation.currentVerification);
+      if (evaluation.currentVerification === "broken") exitCode = 1;
+    } finally { await rm(scratch, { recursive: true, force: true }); }
   }
   return exitCode;
 }
-
-function relativeEvidence(evidenceRoot) {
-  const absolute = resolve(REPO_ROOT, evidenceRoot);
-  return absolute.startsWith(REPO_ROOT) ? absolute.slice(REPO_ROOT.length + 1) : absolute;
+if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  main().then((value) => { process.exitCode = value; }, (error) => { log("blocked: " + code(error)); process.exitCode = 2; });
 }
-
-const running = main();
-const shutdown = () => { fail("被中断，矩阵未完成，状态不会被标记为已验证"); process.exit(130); };
-process.once("SIGINT", shutdown);
-process.once("SIGTERM", shutdown);
-running.then((code) => process.exit(code ?? 0), (error) => {
-  fail(error instanceof Error ? redactLine(error.message) : String(error));
-  process.exit(2);
-});

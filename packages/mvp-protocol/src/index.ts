@@ -136,3 +136,4 @@ export * from "./bounded-content.js";
 export * from "./timeline-projection.js";
 export * from "./recovery-api.js";
 export * from "./checkpoint-api.js";
+export * from "./diagnostics.js";

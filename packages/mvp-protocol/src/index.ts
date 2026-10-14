@@ -130,3 +130,5 @@ export * from "./application-frames.js";
 export * from "./host-descriptor.js";
 export * from "./connection-offer.js";
 export * from "./relay-control.js";
+
+export * from "./bounded-content.js";

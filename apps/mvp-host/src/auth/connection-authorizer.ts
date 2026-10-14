@@ -44,6 +44,7 @@ const METHOD_SCOPES: Readonly<Record<string, DeviceScope>> = Object.freeze({
   "session.create": "session:read",
   "session.getEvents": "session:read",
   "session.getDiff": "session:read",
+  "content.getChunk": "session:read",
   "session.subscribe": "session:read",
   "command.getReceipt": "session:read",
   "session.startTurn": "session:write",

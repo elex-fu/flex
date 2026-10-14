@@ -1,11 +1,15 @@
 import { randomUUID } from "node:crypto";
-import { FrameSchema, ClientHelloV2Schema, ApplicationFrameSchema } from "@flyx/mvp-protocol";
+import { FrameSchema, ClientHelloV2Schema, ApplicationFrameSchema, BOUNDED_CONTENT_CAPABILITY } from "@flyx/mvp-protocol";
 import { z } from "zod";
 import { OrchestratorError, type SessionOrchestrator } from "../session/orchestrator.js";
 import { DeviceRegistry } from "../auth/device-registry.js";
 import { AccessError, assertMethodScope } from "../auth/connection-authorizer.js";
-import { publicEvent, toRpcError } from "./public-projection.js";
+import { publicEvent, publicValue, toRpcError } from "./public-projection.js";
 import { RpcDispatcher } from "./rpc-dispatcher.js";
+import { ContentStore } from "../content/content-store.js";
+import { FrameBudget } from "../content/frame-budget.js";
+import { BoundedRpcProjection } from "../content/bounded-rpc.js";
+import { PublicTextStream } from "../content/public-text.js";
 
 export interface DuplexTransport {
   readonly id: string;
@@ -28,6 +32,9 @@ export interface ConnectionGatewayOptions {
   assertIdentity?(): void;
   confirmPairing(): boolean | Promise<boolean>;
   heartbeatIntervalMs?: number;
+  contentStore?: ContentStore;
+  maxFrameBytes?: number;
+  responseBudgetBytes?: number;
 }
 
 const MAX_FRAME_BYTES = 256 * 1024;
@@ -40,14 +47,22 @@ const Refresh = z.object({ proposedDevicePublicKey: z.string().min(1).max(128), 
 export class ConnectionGateway {
   private readonly connections = new Set<(code?: number, reason?: string) => void>();
   private readonly dispatcher: RpcDispatcher;
+  private readonly contentStore: ContentStore | undefined;
+  private readonly capabilities: string[];
   constructor(private readonly options: ConnectionGatewayOptions) {
-    this.dispatcher = new RpcDispatcher(options);
+    this.contentStore = options.contentStore ?? (ContentStore.isAvailable(options.orchestrator.store.db) ? new ContentStore(options.orchestrator.store.db, { workspaceForSession: () => options.orchestrator.workspace }) : undefined);
+    this.capabilities = [...CAPABILITIES, ...(this.contentStore ? [BOUNDED_CONTENT_CAPABILITY] : [])];
+    this.dispatcher = new RpcDispatcher({ ...options, ...(this.contentStore ? { contentStore: this.contentStore } : {}) });
   }
 
   close(code = 1001, reason = "HOST_SHUTDOWN"): void { for (const stop of this.connections) stop(code, reason); }
 
   attach(transport: DuplexTransport, credential: GatewayCredential = {}): () => void {
     const { devices, orchestrator } = this.options;
+    const frameBudget = new FrameBudget({ ...(this.options.maxFrameBytes ? { maxFrameBytes: this.options.maxFrameBytes } : {}), ...(this.options.responseBudgetBytes ? { responseBytes: this.options.responseBudgetBytes } : {}) });
+    const bounded = new BoundedRpcProjection(orchestrator.sessionId, orchestrator.workspace, this.contentStore);
+    let clientCapabilities = new Set<string>();
+    const textStreams = new Map<string, PublicTextStream>();
     let deviceId = credential.deviceId;
     if (credential.remotePublicKey) {
       try { deviceId = devices.authenticatePublicKey(credential.remotePublicKey).id; }
@@ -81,7 +96,7 @@ export class ConnectionGateway {
       unsubscribe?.(); removeMessage?.(); removeClose?.();
       clearInterval(heartbeat); clearTimeout(helloTimeout); clearTimeout(closeDeadline);
       if (leaseId) devices.closeLease(leaseId, closeReason);
-      eventBuffer = []; bufferBytes = 0;
+      eventBuffer = []; bufferBytes = 0; textStreams.clear();
       this.connections.delete(stop);
     };
     const stop = (code = 1001, reason = "HOST_SHUTDOWN") => { cleanup(reason); transport.close(code, reason); };
@@ -97,11 +112,19 @@ export class ConnectionGateway {
       }
       else stop(code, reason);
     };
+    const withGeneration = (frame: Record<string, unknown>) => version === 2 ? { ...frame, transportGeneration: generation } : frame;
+    const publicError = (error: unknown, envelope: (error: unknown) => unknown) => {
+      const rpc = error instanceof z.ZodError ? { code: "INVALID_REQUEST", message: "Invalid RPC payload", retryable: false } : toRpcError(error);
+      let value = publicValue(rpc, orchestrator.workspace) as typeof rpc & { details?: unknown };
+      if (!frameBudget.fits(envelope(value))) value = { code: rpc.code.length <= 128 ? rpc.code : "INTERNAL_ERROR", message: "Host request failed; error details truncated", retryable: rpc.retryable, details: { truncated: true } };
+      frameBudget.assert(envelope(value));
+      return value;
+    };
     const send = (frame: Record<string, unknown>): Promise<void> => {
       if (stopped) return Promise.resolve();
-      const payload = JSON.stringify(version === 2 ? { ...frame, transportGeneration: generation } : frame);
+      // Business overflow is returned as an RPC error; it must not tear down a healthy lease.
+      const payload = frameBudget.encode(withGeneration(frame));
       const size = Buffer.byteLength(payload);
-      if (size > MAX_FRAME_BYTES) { stop(1009, "FRAME_TOO_LARGE"); return Promise.reject(new Error("Frame too large")); }
       if (outboundBytes + size > HIGH_WATER) { stop(1013, "RESYNC_REQUIRED"); return Promise.reject(new Error("Backpressure")); }
       outboundBytes += size;
       const sent = outbound.then(async () => { if (!stopped) await transport.send(payload); });
@@ -116,24 +139,45 @@ export class ConnectionGateway {
         const lease = devices.openLease(deviceId, {
           kind: transport.kind, generation, protocolVersion: version ?? 1,
           ...(credential.authSessionId ? { authSessionId: credential.authSessionId } : {}),
-          capabilities: CAPABILITIES, close: (code, reason) => requestClose(code, reason),
+          capabilities: [...clientCapabilities], close: (code, reason) => requestClose(code, reason),
         });
         leaseId = lease.leaseId;
       }
       return devices.assertLease(leaseId, generation);
     };
+    const eventFrame = (event: ReturnType<SessionOrchestrator["timeline"]>["events"][number], streamText = true) => {
+      let projected = publicEvent(event, orchestrator.workspace);
+      const payload = event.payload;
+      if (event.type === "assistant.message.delta" && payload && typeof payload === "object" && "itemId" in payload && typeof payload.itemId === "string" && "text" in payload && typeof payload.text === "string") {
+        const stored = this.contentStore?.publicDelta(event.sessionId, payload.itemId, event.sequence);
+        if (stored !== undefined) projected = publicEvent({ ...event, payload: { ...payload, text: stored } }, orchestrator.workspace);
+        else if (streamText) {
+          const stream = textStreams.get(payload.itemId) ?? new PublicTextStream([orchestrator.workspace]);
+          textStreams.set(payload.itemId, stream);
+          projected = publicEvent({ ...event, payload: { ...payload, text: stream.append(payload.text) } }, orchestrator.workspace);
+        }
+      }
+      if (event.type === "assistant.message.completed" && payload && typeof payload === "object" && "itemId" in payload && typeof payload.itemId === "string") textStreams.delete(payload.itemId);
+      const wrap = (body: unknown) => withGeneration({ type: "event", sessionId: projected.sessionId, event: { ...projected, payload: body } });
+      return { type: "event", sessionId: projected.sessionId, event: { ...projected, payload: bounded.bound(projected.payload, frameBudget, wrap, { allowRefs: clientCapabilities.has(BOUNDED_CONTENT_CAPABILITY), pinOwner: `event:${transport.id}:${event.sequence}` }) } };
+    };
     const sendEvent = (event: ReturnType<SessionOrchestrator["timeline"]>["events"][number]) => {
       if (stopped) return;
       try { ensureLease(); } catch (error) { stop(1008, authenticationCloseReason(error)); return; }
       if (catchingUp) {
-        bufferBytes += Buffer.byteLength(JSON.stringify(event));
+        // Buffer the bounded public value, not a multi-megabyte raw payload.
+        const buffered = eventFrame(event, false);
+        bufferBytes += frameBudget.bytes(withGeneration(buffered));
         if (bufferBytes > HIGH_WATER) { stop(1013, "RESYNC_REQUIRED"); return; }
-        eventBuffer.push(event);
-      } else void send({ type: "event", sessionId: event.sessionId, event: publicEvent(event, orchestrator.workspace) }).catch(() => {});
+        eventBuffer.push(buffered.event);
+      } else {
+        try { void send(eventFrame(event)).catch(() => {}); }
+        catch (error) { void send({ type: "event", sessionId: event.sessionId, event: { ...event, payload: { boundedContent: { truncated: true, requiresUpgrade: true, originalBytes: Buffer.byteLength(JSON.stringify(event.payload)) }, error: toRpcError(error) } } }).catch(() => {}); }
+      }
     };
     const subscribe = async (afterSequence: number) => {
       unsubscribe?.();
-      catchingUp = true; eventBuffer = []; bufferBytes = 0;
+      catchingUp = true; eventBuffer = []; bufferBytes = 0; textStreams.clear();
       unsubscribe = orchestrator.subscribe(sendEvent);
       const head = orchestrator.snapshot().session.headSequence;
       if (afterSequence > head) {
@@ -147,7 +191,7 @@ export class ConnectionGateway {
           const page = orchestrator.timeline(cursor, 200, head);
           for (const event of page.events) {
             if (stopped) throw new Error("Connection closed");
-            await send({ type: "event", sessionId: event.sessionId, event: publicEvent(event, orchestrator.workspace) });
+            await send(eventFrame(event));
             cursor = event.sequence;
           }
           if (!page.hasMore || page.events.length === 0) break;
@@ -156,7 +200,7 @@ export class ConnectionGateway {
           const batch = eventBuffer; eventBuffer = []; bufferBytes = 0;
           batch.sort((a, b) => a.sequence - b.sequence);
           for (const event of batch) if (event.sequence > cursor) {
-            await send({ type: "event", sessionId: event.sessionId, event: publicEvent(event, orchestrator.workspace) });
+            await send(eventFrame(event));
             cursor = event.sequence;
           }
         }
@@ -220,15 +264,16 @@ export class ConnectionGateway {
         if (hello.protocol.min > 2 || hello.protocol.max < 2) {
           await rejectProtocol("PROTOCOL_INCOMPATIBLE", "No mutually supported protocol version"); return;
         }
-        if (hello.requiredCapabilities?.some((capability) => !CAPABILITIES.includes(capability))) {
+        if (hello.requiredCapabilities?.some((capability) => !this.capabilities.includes(capability))) {
           await rejectProtocol("CAPABILITY_UNSUPPORTED", "A required protocol capability is unavailable"); return;
         }
+        clientCapabilities = new Set(hello.capabilities.filter((capability) => this.capabilities.includes(capability)));
         generation = hello.transportGeneration; version = 2; clearTimeout(helloTimeout);
         let lease;
         try { lease = deviceId ? ensureLease() : undefined; }
         catch (error) { stop(1008, authenticationCloseReason(error)); return; }
         const interval = this.options.heartbeatIntervalMs ?? 15_000;
-        await send({ type: "server.hello", hostId: this.options.hostId, hostFingerprint: this.options.fingerprint, protocolVersion: 2, capabilities: CAPABILITIES, leaseId: lease?.leaseId ?? `pairing-${transport.id}`, heartbeatIntervalMs: interval, maxFrameBytes: MAX_FRAME_BYTES });
+        await send({ type: "server.hello", hostId: this.options.hostId, hostFingerprint: this.options.fingerprint, protocolVersion: 2, capabilities: this.capabilities, leaseId: lease?.leaseId ?? `pairing-${transport.id}`, heartbeatIntervalMs: interval, maxFrameBytes: frameBudget.maxFrameBytes });
         heartbeat = setInterval(() => {
           if (pendingPing && Date.now() - pendingPing.at >= interval * 2) { stop(1001, "HEARTBEAT_TIMEOUT"); return; }
           if (!pendingPing) { pendingPing = { nonce: randomUUID(), at: Date.now() }; void send({ type: "ping", nonce: pendingPing.nonce }).catch(() => {}); }
@@ -253,6 +298,10 @@ export class ConnectionGateway {
       try {
         const result = await this.dispatcher.dispatch(frame, {
           subjectId: deviceId ?? "unpaired",
+          capabilities: clientCapabilities,
+          frameBudget,
+          responseEnvelope: (payload) => withGeneration({ type: "response", id: frame.id, ok: true, payload }),
+          assertContentScope: (scope) => { const principal = ensureLease(); if (!principal.scopes.has(scope)) throw new AccessError("FORBIDDEN", "Content requires additional permission"); },
           assertAuthorized: (method) => {
             if (!deviceId && transport.kind === "relay" && (method === "access.pair" || method === "access.refresh" || method === "host.getDescriptor")) return;
             const principal = ensureLease();
@@ -264,9 +313,11 @@ export class ConnectionGateway {
           },
           subscribe, access,
         });
-        await send({ type: "response", id: frame.id, ok: true, payload: result });
+        const envelope = (payload: unknown) => withGeneration({ type: "response", id: frame.id, ok: true, payload });
+        const payload = frame.method === "content.getChunk" ? result : bounded.bound(result, frameBudget, envelope, { allowRefs: clientCapabilities.has(BOUNDED_CONTENT_CAPABILITY), method: frame.method, subjectId: deviceId ?? "unpaired", pinOwner: `request:${transport.id}:${frame.id}` });
+        await send({ type: "response", id: frame.id, ok: true, payload });
       } catch (error) {
-        await send({ type: "response", id: frame.id, ok: false, error: error instanceof z.ZodError ? { code: "INVALID_REQUEST", message: "Invalid RPC payload", retryable: false } : toRpcError(error) });
+        await send({ type: "response", id: frame.id, ok: false, error: publicError(error, (error) => withGeneration({ type: "response", id: frame.id, ok: false, error })) });
       } finally {
         deferOwnClose = false;
         if (pendingClose) stop(pendingClose.code, pendingClose.reason);

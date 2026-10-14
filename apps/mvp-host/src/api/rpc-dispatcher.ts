@@ -1,4 +1,7 @@
 import { z } from "zod";
+import { BOUNDED_CONTENT_CAPABILITY, ContentChunkRequestSchema } from "@flyx/mvp-protocol";
+import type { ContentStore } from "../content/content-store.js";
+import type { FrameBudget } from "../content/frame-budget.js";
 import { OrchestratorError, type SessionOrchestrator } from "../session/orchestrator.js";
 import { publicEvent, publicGitDiff, publicGitStatus, publicProviderStatus, publicSnapshot, publicValue } from "./public-projection.js";
 
@@ -15,12 +18,17 @@ export interface RpcRequest {
 
 export interface RpcContext {
   subjectId: string;
+  capabilities?: ReadonlySet<string>;
+  frameBudget?: FrameBudget;
+  responseEnvelope?(payload: unknown): unknown;
+  assertContentScope?(scope: string): void;
   assertAuthorized(method: string): void;
   subscribe(afterSequence: number): Promise<unknown>;
   access(method: string, payload: unknown): Promise<unknown>;
 }
 
 export interface RpcDispatcherOptions {
+  contentStore?: ContentStore;
   orchestrator: SessionOrchestrator;
   bootstrap(): unknown;
   descriptor(): unknown;
@@ -58,12 +66,30 @@ export class RpcDispatcher {
         const payload = EventsPayload.parse(frame.payload);
         checkSession(payload.sessionId);
         const page = orchestrator.timeline(payload.afterSequence, payload.limit, payload.upTo);
-        return { ...page, events: page.events.map((event) => publicEvent(event, workspace)) };
+        return { ...page, events: page.events.map((event) => {
+          const raw = event.payload;
+          if (event.type === "assistant.message.delta" && raw && typeof raw === "object" && "itemId" in raw && typeof raw.itemId === "string") {
+            const text = this.options.contentStore?.publicDelta(event.sessionId, raw.itemId, event.sequence);
+            if (text !== undefined) return publicEvent({ ...event, payload: { ...raw, text } }, workspace);
+          }
+          return publicEvent(event, workspace);
+        }) };
       }
       case "session.getDiff": {
         const payload = z.object({ sessionId: SessionId }).parse(frame.payload);
         checkSession(payload.sessionId);
         return publicGitDiff(await orchestrator.gitDiff(), workspace);
+      }
+      case "content.getChunk": {
+        if (!context.capabilities?.has(BOUNDED_CONTENT_CAPABILITY) || !this.options.contentStore) throw new OrchestratorError("CAPABILITY_REQUIRED", "Bounded content capability is required");
+        const payload = ContentChunkRequestSchema.parse(frame.payload);
+        checkSession(payload.sessionId);
+        return this.options.contentStore.getChunk(payload, {
+          subjectId: context.subjectId,
+          ...(context.frameBudget ? { budget: context.frameBudget } : {}),
+          ...(context.responseEnvelope ? { envelope: context.responseEnvelope } : {}),
+          ...(context.assertContentScope ? { assertScope: context.assertContentScope } : {}),
+        });
       }
       case "command.getReceipt": {
         const payload = z.object({ commandId: z.string().min(1).max(128) }).parse(frame.payload);

@@ -9,7 +9,7 @@ function deferred<T>() {
   void promise.catch(() => undefined);
   return { promise, resolve, reject };
 }
-type Runtime = { adapter: ProviderAdapter; context?: DispatchContext | undefined; terminal?: AdapterEvent | undefined; acceptance?: ReturnType<typeof deferred<ProviderAcceptance>> | undefined; unknown: boolean };
+type Runtime = { adapter: ProviderAdapter; context?: DispatchContext | undefined; terminal?: AdapterEvent | undefined; acceptance?: ReturnType<typeof deferred<ProviderAcceptance>> | undefined; unknown: boolean; retained: boolean };
 export function sameDispatchContext(a: DispatchContext | undefined, b: DispatchContext | undefined): boolean {
   return !!a && !!b && a.hostOwnerId === b.hostOwnerId && a.hostOwnerGeneration === b.hostOwnerGeneration
     && a.sessionId === b.sessionId && a.flyxTurnId === b.flyxTurnId && a.runtimeId === b.runtimeId
@@ -22,29 +22,33 @@ export class RuntimeRegistry {
   constructor(private readonly options: { drainIngestion?(): Promise<void> } = {}) {}
   register(runtimeId: string, adapter: ProviderAdapter): void {
     if (this.runtimes.has(runtimeId)) throw new Error("RUNTIME_ALREADY_REGISTERED");
-    this.runtimes.set(runtimeId, { adapter, unknown: false });
+    this.runtimes.set(runtimeId, { adapter, unknown: false, retained: false });
   }
-  isBusy(runtimeId: string): boolean { const runtime = this.runtimes.get(runtimeId); return !!runtime?.context || !!runtime?.unknown; }
+  isBusy(runtimeId: string): boolean { const runtime = this.runtimes.get(runtimeId); return !!runtime?.context || !!runtime?.unknown || !!runtime?.retained; }
   matches(context: DispatchContext): boolean { return sameDispatchContext(this.runtimes.get(context.runtimeId)?.context, context); }
   begin(contextInput: DispatchContext, input: { prompt: string; resumeSessionId?: string }): ProviderRun {
     const context = dispatchContextForTurn(contextInput.flyxTurnId, contextInput);
     const runtime = this.runtimes.get(context.runtimeId);
     if (!runtime) throw new Error("RUNTIME_NOT_FOUND");
-    if (runtime.context || runtime.unknown) throw new Error("RUNTIME_BUSY");
+    if (runtime.context || runtime.unknown || runtime.retained) throw new Error("RUNTIME_BUSY");
     runtime.context = context;
     runtime.terminal = undefined;
-    runtime.acceptance = deferred<ProviderAcceptance>();
+    const acceptance = deferred<ProviderAcceptance>();
+    runtime.acceptance = acceptance;
     let source: { accepted?: Promise<ProviderAcceptance>; outcome: Promise<TurnOutcome> };
     try {
       source = runtime.adapter.beginTurn?.(context, input.prompt, input.resumeSessionId) ?? {
-        ...(runtime.adapter.provider === "codex" ? { accepted: runtime.acceptance.promise } : {}),
+        ...(runtime.adapter.provider === "codex" ? { accepted: acceptance.promise } : {}),
         outcome: Promise.resolve(runtime.adapter.runTurn(context.flyxTurnId, input.prompt, input.resumeSessionId, context)),
       };
     } catch (error) {
       source = { outcome: Promise.resolve(this.unknown(context, error)) };
     }
-    const outcome = source.outcome.then(async (value) => { await this.options.drainIngestion?.(); return this.classify(context, value); }, (error) => this.unknown(context, error))
-      .then((value) => { runtime.acceptance?.reject(new Error("NATIVE_ACK_UNAVAILABLE")); return value; });
+    const outcome = source.outcome.then(async (value) => {
+      await this.options.drainIngestion?.();
+      return this.matches(context) ? this.classify(context, value) : this.unknown(context, "RUNTIME_CONTEXT_CHANGED");
+    }, (error) => this.unknown(context, error))
+      .then((value) => { acceptance.reject(new Error("NATIVE_ACK_UNAVAILABLE")); return value; });
     const accepted = source.accepted ? Promise.race([source.accepted, outcome.then(() => { throw new Error("NATIVE_ACK_UNAVAILABLE"); })]) : undefined;
     return { ...(accepted ? { accepted } : {}), outcome };
   }
@@ -76,7 +80,7 @@ export class RuntimeRegistry {
     const runtime = this.runtimes.get(context.runtimeId);
     if (!runtime || !sameDispatchContext(runtime.context, context)) return;
     if (outcome.evidence.kind === "unknown") { runtime.unknown = true; return; }
-    if (runtime.unknown) return;
+    if (runtime.unknown || runtime.retained) return;
     runtime.context = undefined;
     runtime.terminal = undefined;
     runtime.acceptance = undefined;
@@ -87,11 +91,17 @@ export class RuntimeRegistry {
     const runtime = this.runtimes.get(context.runtimeId);
     if (!runtime || !sameDispatchContext(runtime.context, context)) throw new Error("RUNTIME_RECOVERY_CONTEXT_MISMATCH");
     runtime.unknown = false;
+    runtime.retained = false;
     this.finish(context, outcome);
+  }
+  /** Known business outcome with an independently retained execution gate. */
+  retainBinding(context: DispatchContext): void {
+    const runtime = this.runtimes.get(context.runtimeId);
+    if (runtime && (!runtime.context || sameDispatchContext(runtime.context, context))) { runtime.context ??= context; runtime.retained = true; }
   }
   retainUnknown(context: DispatchContext): void {
     const runtime = this.runtimes.get(context.runtimeId);
-    if (runtime) { runtime.context ??= context; runtime.unknown = true; }
+    if (runtime && (!runtime.context || sameDispatchContext(runtime.context, context))) { runtime.context ??= context; runtime.unknown = true; }
   }
   async control(context: DispatchContext, command: { kind: "interrupt_turn"; reason: string } | { kind: "respond_approval"; approvalId: string; action: "allow_once" | "deny" }): Promise<ProviderControlOutcome> {
     const runtime = this.runtimes.get(context.runtimeId);

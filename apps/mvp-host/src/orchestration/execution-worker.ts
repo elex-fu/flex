@@ -18,6 +18,7 @@ export type ExecutionWorkerOptions = {
   controlTimeoutMs?: number;
   /** Must return synchronously inside the same SQLite claim/marker transaction. */
   revalidateDevice(intent: ExecutionIntentRow): void;
+  assertWriteReady?(): void;
   onDispatch?(intent: ExecutionIntentRow, context: DispatchContext): Promise<void> | void;
   beforeDispatch?(intent: ExecutionIntentRow, context: DispatchContext): Promise<void> | void;
   afterTerminal?(intent: ExecutionIntentRow, outcome: ProviderOutcome): Promise<void> | void;
@@ -46,6 +47,7 @@ export class ExecutionWorker {
   private admission = true;
   constructor(readonly execution: ExecutionStore, readonly runtimes: RuntimeRegistry, private readonly options: ExecutionWorkerOptions) {}
   get size(): number { return this.operations.size; }
+  get isSealed(): boolean { return this.stopped; }
   registerOperation(kind: string, handler: OperationIntentHandler): void { this.operationHandlers.set(kind, handler); }
   registerControl(kind: string, handler: ControlIntentHandler, commit?: ExecutionWorkerOptions["onControlResult"]): void { this.handlers.set(kind, handler); if (commit) this.controlSettlers.set(kind, commit); }
   assertAdmission(kind: "start_turn" | "control"): void {
@@ -113,6 +115,11 @@ export class ExecutionWorker {
   }
   private async stage(stage: ExecutionStage, intent: ExecutionIntentRow): Promise<void> { await this.options.stage?.(stage, intent); }
   private validateDevice(intent: ExecutionIntentRow): void {
+    const readiness = this.options.assertWriteReady?.() as unknown;
+    if (readiness && typeof (readiness as { then?: unknown }).then === "function") {
+      void Promise.resolve(readiness).catch(() => undefined);
+      throw new Error("DISPATCH_REVALIDATION_MUST_BE_SYNCHRONOUS");
+    }
     const result = this.options.revalidateDevice(intent) as unknown;
     if (result && typeof (result as { then?: unknown }).then === "function") {
       void Promise.resolve(result).catch(() => undefined);
@@ -154,6 +161,7 @@ export class ExecutionWorker {
         this.wake();
         const nativeOutcome = this.track("producer", () => run.outcome);
         const outcome = this.track("producer", async () => {
+          let businessCommitted = false;
           try {
             const value = await deadline(nativeOutcome, this.options.outcomeTimeoutMs ?? 30 * 60_000,
               () => this.runtimes.unknown(intent.dispatchContext!, "PROVIDER_OUTCOME_TIMEOUT"));
@@ -161,10 +169,18 @@ export class ExecutionWorker {
             if (this.stopped) return;
             await this.stage("before_settle", intent);
             if (this.stopped) return;
-            if (value.evidence.kind !== "unknown") await this.options.afterTerminal?.(intent, value);
             await this.options.onStartOutcome(intent, value);
+            businessCommitted = true;
+            if (this.stopped) return;
+            if (value.evidence.kind !== "unknown") await this.options.afterTerminal?.(intent, value);
+            if (this.stopped) return;
             this.runtimes.finish(intent.dispatchContext!, value);
-          } catch (error) { if (!this.stopped) await this.recordFailure(intent, error, true); }
+          } catch (error) {
+            if (!this.stopped) {
+              if (businessCommitted) { this.runtimes.retainBinding(intent.dispatchContext!); this.options.failed?.(error, intent); }
+              else await this.recordFailure(intent, error, true);
+            }
+          }
         });
         void outcome.catch((error) => this.options.failed?.(error, intent));
         if (run.accepted) {
@@ -205,6 +221,9 @@ export class ExecutionWorker {
       const outcome: ProviderOutcome = invoked ? { status: "outcome_unknown", error: reason, evidence }
         : { status: "failed", error: reason, evidence };
       await this.options.onStartOutcome(intent, outcome);
+      if (this.stopped) return;
+      if (outcome.evidence.kind !== "unknown") await this.options.afterTerminal?.(intent, outcome);
+      if (this.stopped) return;
       if (intent.dispatchContext) this.runtimes.finish(intent.dispatchContext, outcome);
     } else await this.settleControl(intent, { status: invoked ? "outcome_unknown" : "not_dispatched", evidence, error: reason });
   }

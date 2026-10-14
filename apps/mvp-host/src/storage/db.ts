@@ -987,14 +987,16 @@ export class SqliteStore {
     return result.changes;
   }
 
-  recoverActiveTurns(): Array<{ sessionId: string; turnId: string }> {
+  recoverActiveTurns(input: { sessionId?: string; legacyOnly?: boolean } = {}): Array<{ sessionId: string; turnId: string }> {
     this.assertWriterOwner();
     const rows = this.db.prepare(`
       SELECT t.session_id, t.id, t.auth_subject_id, t.command_id, t.request_hash, t.status
       FROM sessions s JOIN turns t ON t.id = s.active_turn_id AND t.session_id = s.id
       WHERE t.status IN ('queued', 'running', 'waiting_approval', 'interrupting')
+        AND (? IS NULL OR t.session_id = ?)
+        AND (? = 0 OR NOT EXISTS (SELECT 1 FROM execution_intents intent WHERE intent.session_id = t.session_id AND intent.turn_id = t.id))
       ORDER BY t.created_at ASC
-    `).all() as Array<{
+    `).all(input.sessionId ?? null, input.sessionId ?? null, input.legacyOnly ? 1 : 0) as Array<{
       session_id: string;
       id: string;
       auth_subject_id: string;
@@ -1014,7 +1016,9 @@ export class SqliteStore {
           UPDATE turns SET status = 'outcome_unknown', finished_at = ?
           WHERE id = ? AND status IN ('queued', 'running', 'waiting_approval', 'interrupting')
             AND EXISTS (SELECT 1 FROM sessions WHERE active_turn_id = turns.id)
-        `).run(timestamp, row.id);
+            AND (? IS NULL OR session_id = ?)
+            AND (? = 0 OR NOT EXISTS (SELECT 1 FROM execution_intents intent WHERE intent.session_id = turns.session_id AND intent.turn_id = turns.id))
+        `).run(timestamp, row.id, input.sessionId ?? null, input.sessionId ?? null, input.legacyOnly ? 1 : 0);
         if (changed.changes !== 1) continue;
         recovered.push({ sessionId: row.session_id, turnId: row.id });
 

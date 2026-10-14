@@ -33,6 +33,34 @@ describe("runtime evidence and ownership", () => {
     expect(() => registry.reconcileVerified(context, { status: "outcome_unknown", error: "unverified", evidence: { kind: "unknown", reason: "unverified" } })).toThrow("RUNTIME_RECOVERY_EVIDENCE_REQUIRED");
     registry.reconcileVerified(context, verified); expect(registry.isBusy("runtime")).toBe(false);
   });
+  it("keeps a known business outcome separate from an independently retained execution binding", async () => {
+    const known = { status: "completed" as const, providerSessionId: "native", evidence: { kind: "native-terminal" as const, sourceId: "native-result" } };
+    const registry = new RuntimeRegistry(); registry.register("runtime", adapter(known)); registry.begin(context, { prompt: "actual" });
+    registry.retainBinding(context); expect(registry.classify(context, known).status).toBe("completed");
+    registry.finish(context, known); expect(registry.isBusy("runtime")).toBe(true); expect(registry.matches(context)).toBe(true);
+    registry.reconcileVerified(context, known); expect(registry.isBusy("runtime")).toBe(false);
+  });
+  it("does not let a recovered old outcome reject the next attempt's ACK or retain its binding", async () => {
+    const settlements: Array<(outcome: TurnOutcome) => void> = [];
+    const driver: ProviderAdapter = { ...adapter({ status: "failed", error: "unused" }), provider: "codex" };
+    driver.runTurn = () => new Promise((resolve) => { settlements.push(resolve); });
+    const registry = new RuntimeRegistry(); registry.register("runtime", driver);
+    const oldRun = registry.begin(context, { prompt: "old" }); void oldRun.accepted?.catch(() => undefined);
+    registry.retainUnknown(context);
+    const known = { status: "completed" as const, providerSessionId: "native", evidence: { kind: "native-terminal" as const, sourceId: "verified-result" } };
+    registry.reconcileVerified(context, known);
+    const next = dispatchContextForTurn("next-turn", { ...context, flyxTurnId: "next-turn", attemptId: "next-attempt", runtimeGeneration: 2 });
+    const nextRun = registry.begin(next, { prompt: "next" });
+    const nextAccepted = expect(nextRun.accepted).resolves.toMatchObject({ nativeSessionId: "next-native-session", nativeTurnId: "next-native-turn" });
+    settlements[0]!(known);
+    expect(await oldRun.outcome).toMatchObject({ status: "outcome_unknown", error: "RUNTIME_CONTEXT_CHANGED" });
+    registry.retainBinding(context); registry.retainUnknown(context);
+    registry.observe(fenceAdapterEvent(next, { kind: "native_binding", nativeSessionId: "next-native-session", nativeTurnId: "next-native-turn" }));
+    await nextAccepted;
+    settlements[1]!(known);
+    const nextOutcome = await nextRun.outcome; expect(nextOutcome.status).toBe("completed");
+    registry.finish(next, nextOutcome); expect(registry.isBusy("runtime")).toBe(false);
+  });
   it("records an actual terminal event and keeps boolean approval delivery at local evidence", async () => {
     let settle!: (outcome: TurnOutcome) => void;
     const driver = adapter({ status: "failed", error: "unused" }); driver.runTurn = () => new Promise((resolve) => { settle = resolve; });

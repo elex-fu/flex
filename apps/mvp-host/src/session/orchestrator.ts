@@ -4,6 +4,9 @@ import { dirname } from "node:path";
 import type { Bootstrap, SessionEvent, TimelineItem } from "@flyx/mvp-protocol";
 import { HostViews, type HostViewsOptions, type ViewInteractionReader, type ViewResourceResolver } from "../timeline/host-views.js";
 import { ProtocolVersion } from "@flyx/mvp-protocol";
+import { checkpointSummary } from "../checkpoint/checkpoint-service.js";
+import type { CheckpointContext, CheckpointManifest } from "../checkpoint/types.js";
+import type { ExecutionCheckpointBinding } from "./execution-integrations.js";
 import { ClaudeAdapter } from "../claude/adapter.js";
 import { HostOwnerLock, assertHostOwner, assertWorkspacePrivacy, createTestHostOwner, type HostOwnerHandle } from "../lifecycle/host-owner.js";
 import { openOwned } from "../storage/open-store.js";
@@ -14,7 +17,7 @@ import { dispatchContextForTurn } from "../provider/types.js";
 import { GitService, type GitDiff, type GitStatus } from "../git/git-service.js";
 import { CommandEngine, hashCommandRequest } from "../orchestration/command-engine.js";
 import { decideAcceptTurn, decideApprovalReservation, decideInterrupt } from "../orchestration/decider.js";
-import { ExecutionWorker, type ExecutionWorkerOptions } from "../orchestration/execution-worker.js";
+import { ExecutionWorker, type ExecutionWorkerOptions, type OperationIntentHandler } from "../orchestration/execution-worker.js";
 import { ProviderIngestion } from "../orchestration/provider-ingestion.js";
 import { RuntimeRegistry } from "../provider/runtime-registry.js";
 import type { CommandRequest, ExecutionIntentRow } from "../orchestration/command-contract.js";
@@ -61,6 +64,13 @@ export type OrchestratorOptions = {
   revalidateDevice?: (intent: ExecutionIntentRow) => void;
   /** Verified preparer/producer tree exit, independent of business terminal evidence. */
   canReleaseWorkspace?: (context: DispatchContext) => boolean;
+  checkpoints?: ExecutionCheckpointBinding;
+  genericOperations?: Readonly<Record<string, OperationIntentHandler>>;
+  /** Synchronous setup runs before startup recovery and dispatch scanning. */
+  executionSetup?: (host: SessionOrchestrator) => void;
+  /** Commits an R07 runtime gate without rewriting a known Provider terminal. */
+  onExecutionBlocked?: (intent: ExecutionIntentRow, reason: string) => void;
+  assertWriteReady?: () => void;
   runtimeId?: string;
   owner?: HostOwnerHandle;
   store?: SqliteStore;
@@ -76,6 +86,7 @@ export type OrchestratorOptions = {
 const MAX_PROMPT_BYTES = 16 * 1024;
 
 export class SessionOrchestrator {
+  readonly requestFormatVersions = [1, 2] as const;
   readonly store: SqliteStore;
   readonly views: HostViews | undefined = undefined;
   readonly owner: HostOwnerHandle;
@@ -100,6 +111,10 @@ export class SessionOrchestrator {
   private readonly runtimeId: string;
   private readonly dispatchContexts = new Map<string, DispatchContext>();
   private readonly canReleaseWorkspace: (context: DispatchContext) => boolean;
+  private readonly checkpointBinding: ExecutionCheckpointBinding | undefined;
+  private readonly onExecutionBlocked: OrchestratorOptions["onExecutionBlocked"];
+  private readonly capturedBefore = new Set<string>();
+  private readonly checkWriteReady: OrchestratorOptions["assertWriteReady"];
   private degraded = false;
   private baselinePromise: Promise<void> | undefined;
   private readonly session: SessionRow;
@@ -110,6 +125,9 @@ export class SessionOrchestrator {
     this.recoverOnStart = options.recoverOnStart ?? true;
     if (!this.ownsStore && (!options.owner || !options.store || !options.sessionId)) throw new Error("A shared Session runtime requires explicit owner, Store and Session ID");
     if (!this.ownsStore && this.recoverOnStart) throw new Error("Shared Session runtimes cannot recover the Host on construction");
+    this.checkpointBinding = options.checkpoints;
+    this.onExecutionBlocked = options.onExecutionBlocked;
+    this.checkWriteReady = options.assertWriteReady;
     const canonicalWorkspace = realpathSync(options.workspace);
     this.checkoutRoot = realpathSync(options.checkoutRoot ?? canonicalWorkspace);
     const provider = options.adapter?.provider ?? options.provider ?? "claude";
@@ -173,7 +191,7 @@ export class SessionOrchestrator {
         publish: (event) => this.notify(event),
         wake: () => this.worker?.wake(),
         admission: (request) => {
-          this.owner.assertActive();
+          this.owner.assertActive(); this.assertWriteReady();
           const device = this.store.getDevice(request.authSubjectId);
           if (!device && this.owner.mode !== "test") throw new OrchestratorError("DEVICE_REVOKED", "Device is no longer authorized");
           if (device?.revokedAt || (device?.expiresAt && device.expiresAt <= new Date().toISOString())) {
@@ -209,6 +227,13 @@ export class SessionOrchestrator {
     this.worker = new ExecutionWorker(this.execution, this.runtimes, {
       owner: { id: this.hostOwnerId, generation: this.hostOwnerGeneration }, sessionId: this.session.id,
       ...options.executionHooks,
+      beforeDispatch: async (intent, context) => {
+        if (intent.kind === "start_turn" && this.checkpointBinding) await this.captureBefore(intent, context);
+        if (this.worker.isSealed) return;
+        await options.executionHooks?.beforeDispatch?.(intent, context);
+      },
+      afterTerminal: (intent, outcome) => this.finalizeTurn(intent, outcome, options.executionHooks?.afterTerminal),
+      assertWriteReady: () => this.assertWriteReady(),
       revalidateDevice: (intent) => { this.revalidateIntentDevice(intent); return options.revalidateDevice?.(intent); },
       onDispatch: (intent, context) => {
         if (intent.turnId) this.dispatchContexts.set(intent.turnId, context);
@@ -222,15 +247,28 @@ export class SessionOrchestrator {
       drainIngestion: () => this.ingestion.drain(),
       failed: (error) => { if (error instanceof Error && !/^(DEVICE_|SCOPE_|PRE_DISPATCH_|DISPATCH_)/.test(error.message)) this.degraded = true; },
     });
+    for (const [kind, handler] of Object.entries(options.genericOperations ?? {})) this.worker.registerOperation(kind, handler);
+    const configured = options.executionSetup?.(this) as unknown;
+    if (configured && typeof (configured as { then?: unknown }).then === "function") {
+      void Promise.resolve(configured).catch(() => undefined);
+      throw new Error("EXECUTION_SETUP_MUST_BE_SYNCHRONOUS");
+    }
     if (this.recoverOnStart) {
       // Native dispatch phases decide recovery before any pending intent can run.
       this.worker.start();
       const legacy = this.store.getActiveTurn(this.session.id);
-      if (legacy && this.execution.list({ sessionId: this.session.id }).every((intent) => intent.turnId !== legacy.id)) this.store.recoverActiveTurns();
+      if (legacy && this.execution.list({ sessionId: this.session.id }).every((intent) => intent.turnId !== legacy.id)) this.store.recoverActiveTurns({ sessionId: this.session.id, legacyOnly: true });
     }
   }
 
   get workspaceLease(): WorkspaceLease | undefined { return this.activeWorkspaceLease; }
+
+  /** Created only at acceptance; old pending intents never receive a new fence. */
+  operationContext(resourceId: string, attemptId: string, runtimeGeneration: number): DispatchContext {
+    this.owner.assertActive();
+    return dispatchContextForTurn(resourceId, { hostOwnerId: this.hostOwnerId, hostOwnerGeneration: this.hostOwnerGeneration,
+      sessionId: this.session.id, flyxTurnId: resourceId, runtimeId: this.runtimeId, runtimeGeneration, attemptId });
+  }
 
   close(): void {
     if (this.closed) return;
@@ -332,15 +370,14 @@ export class SessionOrchestrator {
     return this.adapter.status();
   }
 
-  startTurn(authSubjectId: string, commandId: string, prompt: string): Promise<StartTurnResponse> {
+  startTurn(authSubjectId: string, commandId: string, prompt: string, targetRequest?: CommandRequest): Promise<StartTurnResponse> {
     return this.enqueueCommand(async () => {
       if (!commandId) throw new OrchestratorError("COMMAND_ID_REQUIRED", "Every write command needs commandId");
       if (Buffer.byteLength(prompt, "utf8") > MAX_PROMPT_BYTES) {
         throw new OrchestratorError("PROMPT_TOO_LARGE", "Prompt exceeds 16 KiB");
       }
       const method = "session.startTurn";
-      const requestHash = hashRequest(method, { prompt });
-      const request = this.commandRequest(authSubjectId, commandId, method, { prompt });
+      const request = this.commandRequest(authSubjectId, commandId, method, { prompt }, targetRequest);
       if (this.store.getCommandReceipt(authSubjectId, commandId)) {
         return this.commandEngine.commitRequest<StartTurnResponse>(request, () => { throw new Error("RECEIPT_DISAPPEARED"); }).result;
       }
@@ -371,9 +408,9 @@ export class SessionOrchestrator {
     });
   }
 
-  interrupt(authSubjectId: string, commandId: string): Promise<ControlResponse> {
+  interrupt(authSubjectId: string, commandId: string, targetRequest?: CommandRequest): Promise<ControlResponse> {
     return this.enqueueCommand(async () => {
-      const request = this.commandRequest(authSubjectId, commandId, "session.interrupt", {});
+      const request = this.commandRequest(authSubjectId, commandId, "session.interrupt", {}, targetRequest);
       return this.commandEngine.commitRequest(request, (facts, clock) => {
         this.assertWritable(); this.worker.assertAdmission("control");
         return decideInterrupt(facts, request, clock);
@@ -381,9 +418,9 @@ export class SessionOrchestrator {
     });
   }
 
-  respondApproval(authSubjectId: string, commandId: string, approvalId: string, action: "allow_once" | "deny"): Promise<ControlResponse> {
+  respondApproval(authSubjectId: string, commandId: string, approvalId: string, action: "allow_once" | "deny", targetRequest?: CommandRequest): Promise<ControlResponse> {
     return this.enqueueCommand(async () => {
-      const request = this.commandRequest(authSubjectId, commandId, "approval.respond", { approvalId, action });
+      const request = this.commandRequest(authSubjectId, commandId, "approval.respond", { approvalId, action }, targetRequest);
       return this.commandEngine.commitRequest(request, (facts, clock) => {
         this.assertWritable(); this.worker.assertAdmission("control");
         return decideApprovalReservation(facts, request, { approvalId, action }, clock);
@@ -391,8 +428,11 @@ export class SessionOrchestrator {
     });
   }
 
-  private commandRequest(authSubjectId: string, commandId: string, method: string, payload: unknown): CommandRequest {
-    return { authSubjectId, commandId, method, requestHash: hashRequest(method, payload), requestFormatVersion: 1,
+  private commandRequest(authSubjectId: string, commandId: string, method: string, payload: unknown, targetRequest?: CommandRequest): CommandRequest {
+    if (targetRequest && (targetRequest.authSubjectId !== authSubjectId || targetRequest.commandId !== commandId || targetRequest.method !== method
+      || targetRequest.targetSessionId !== this.session.id || !targetRequest.requestHash
+      || ![1, 2].includes(targetRequest.requestFormatVersion ?? 1))) throw new OrchestratorError("COMMAND_SCOPE_MISMATCH", "Command does not belong to this actor/resource");
+    return { authSubjectId, commandId, method, requestHash: targetRequest?.requestHash ?? hashRequest(method, payload), requestFormatVersion: targetRequest?.requestFormatVersion ?? 1,
       targetSessionId: this.session.id, actorKind: !this.store.getDevice(authSubjectId) && this.owner.mode === "test" ? "host" : "device",
       dispatchBinding: { hostOwnerId: this.hostOwnerId, hostOwnerGeneration: this.hostOwnerGeneration, runtimeId: this.runtimeId } };
   }
@@ -422,17 +462,79 @@ export class SessionOrchestrator {
     } else if (this.store.getCommandReceipt(intent.authSubjectId, intent.commandId)?.state === "accepted" && receiptUpdate) {
       this.commit("turn.receipt.reconciled", { turnId: turn.id, outcome }, { commandReceipt: receiptUpdate });
     }
-    if (outcome.evidence.kind !== "unknown") {
-      this.dispatchContexts.delete(turn.id);
-      let treeExitProved = false;
-      try { treeExitProved = !!intent.dispatchContext && this.canReleaseWorkspace(intent.dispatchContext); } catch { this.degraded = true; }
-      if (this.activeWorkspaceLease && !treeExitProved) {
-        this.activeWorkspaceLease.retain("producer_stop_unverified"); this.owner.retain("producer_stop_unverified");
-      } else if (!this.degraded && ["completed", "failed", "cancelled"].includes(this.store.getTurn(turn.id)?.status ?? "")) {
-        this.activeWorkspaceLease?.release(); this.activeWorkspaceLease = undefined;
-      } else this.activeWorkspaceLease?.retain("terminal_commit_unverified");
-    } else this.activeWorkspaceLease?.retain("turn_outcome_unverified");
+    if (outcome.evidence.kind === "unknown") this.activeWorkspaceLease?.retain("turn_outcome_unverified");
   }
+  private checkpointContext(intent: ExecutionIntentRow, dispatch: DispatchContext, lease: WorkspaceLease): CheckpointContext & { turnId: string; attemptId: string } {
+    if (!this.checkpointBinding) throw new Error("CHECKPOINT_SERVICE_UNAVAILABLE");
+    lease.assertActive();
+    const context = this.checkpointBinding.contextFor(intent, dispatch, lease);
+    const session = this.store.getSession(this.session.id)!;
+    if (context.sessionId !== dispatch.sessionId || context.turnId !== dispatch.flyxTurnId || context.attemptId !== dispatch.attemptId
+      || context.workspaceId !== session.workspaceId || context.runtimeGeneration !== dispatch.runtimeGeneration
+      || context.sessionRevision !== session.revision || !context.epoch || context.lease.workspaceId !== context.workspaceId
+      || context.lease.leaseId !== lease.operationId || context.lease.generation !== this.owner.generation) throw new Error("CHECKPOINT_BINDING_MISMATCH");
+    return context;
+  }
+  private async captureBefore(intent: ExecutionIntentRow, context: DispatchContext): Promise<void> {
+    const lease = this.activeWorkspaceLease;
+    if (!lease) throw new Error("WORKSPACE_LEASE_REQUIRED");
+    const manifest = await this.worker.track("checkpoint", () => this.checkpointBinding!.service.captureBefore(this.checkpointContext(intent, context, lease)));
+    if (this.worker.isSealed) return;
+    this.assertCheckpointManifest(intent, manifest, "before");
+    this.capturedBefore.add(intent.id);
+    this.commit("checkpoint.captured", checkpointSummary(manifest));
+  }
+  private assertCheckpointManifest(intent: ExecutionIntentRow, manifest: CheckpointManifest, phase: "before" | "after"): void {
+    if (manifest.sessionId !== intent.sessionId || manifest.turnId !== intent.turnId || manifest.attemptId !== intent.attemptId
+      || manifest.runtimeGeneration !== intent.runtimeGeneration || manifest.phase !== phase || manifest.status === "capturing") throw new Error("CHECKPOINT_BINDING_MISMATCH");
+  }
+  private retainExecution(intent: ExecutionIntentRow, reason: string): void {
+    this.activeWorkspaceLease?.retain(reason); this.owner.retain(reason);
+    if (intent.dispatchContext) this.runtimes.retainBinding(intent.dispatchContext);
+    const blocked = this.onExecutionBlocked?.(intent, reason) as unknown;
+    if (blocked && typeof (blocked as { then?: unknown }).then === "function") {
+      void Promise.resolve(blocked).catch(() => undefined);
+      throw new Error("EXECUTION_BLOCK_COMMIT_MUST_BE_SYNCHRONOUS");
+    }
+  }
+  private async finalizeTurn(intent: ExecutionIntentRow, outcome: ProviderOutcome, hook: ExecutionWorkerOptions["afterTerminal"]): Promise<void> {
+    if (this.worker.isSealed) return;
+    const context = intent.dispatchContext; const lease = this.activeWorkspaceLease;
+    if (!lease) { if (intent.turnId) this.dispatchContexts.delete(intent.turnId); return; }
+    try {
+      if (!context || !this.canReleaseWorkspace(context)) { this.retainExecution(intent, "producer_stop_unverified"); return; }
+      lease.assertActive();
+      const terminal = this.store.getTurn(intent.turnId!);
+      if (!terminal || !["completed", "failed", "cancelled"].includes(terminal.status)) throw new Error("TERMINAL_COMMIT_UNPROVEN");
+      if (this.checkpointBinding && this.capturedBefore.has(intent.id)) {
+        const source = this.store.db.prepare(`SELECT sequence FROM session_events WHERE session_id = ?
+          AND type IN ('turn.completed','turn.failed','turn.cancelled','turn.reconciled')
+          AND json_extract(payload_json,'$.turnId') = ? ORDER BY sequence DESC LIMIT 1`).get(intent.sessionId, intent.turnId) as { sequence: number } | undefined;
+        if (!source) throw new Error("TERMINAL_COMMIT_UNPROVEN");
+        const capture = this.checkpointContext(intent, context, lease);
+        const manifest = await this.worker.track("checkpoint", () => this.checkpointBinding!.service.captureAfter({ ...capture,
+          evidence: { producerStopped: true, terminalCommitted: true, terminalSequence: source.sequence } }));
+        if (this.worker.isSealed) return;
+        this.assertCheckpointManifest(intent, manifest, "after");
+        this.commit("checkpoint.captured", checkpointSummary(manifest));
+      }
+      await hook?.(intent, outcome);
+      if (this.worker.isSealed) return;
+      if (!this.canReleaseWorkspace(context)) { this.retainExecution(intent, "producer_stop_unverified"); return; }
+      if (this.store.getSession(intent.sessionId)?.recoveryState === "blocked") { this.retainExecution(intent, "runtime_recovery_required"); return; }
+      if (this.degraded) { this.retainExecution(intent, "terminal_commit_unverified"); return; }
+      lease.assertActive(); lease.release();
+      if (this.activeWorkspaceLease === lease) this.activeWorkspaceLease = undefined;
+      if (intent.turnId) this.dispatchContexts.delete(intent.turnId);
+      this.capturedBefore.delete(intent.id);
+    } catch (error) {
+      if (this.worker.isSealed) return;
+      this.degraded = true;
+      this.retainExecution(intent, "checkpoint_completion_unverified");
+      throw error;
+    }
+  }
+
   private settleControl(intent: ExecutionIntentRow, outcome: ProviderControlOutcome): void {
     if (this.store.getCommandReceipt(intent.authSubjectId, intent.commandId)?.state !== "accepted") return;
     const payload = isRecord(intent.payload) ? intent.payload : {};
@@ -746,7 +848,16 @@ export class SessionOrchestrator {
     return this.baselinePromise;
   }
 
+  private assertWriteReady(): void {
+    const readiness = this.checkWriteReady?.() as unknown;
+    if (readiness && typeof (readiness as { then?: unknown }).then === "function") {
+      void Promise.resolve(readiness).catch(() => undefined);
+      throw new Error("RESTORE_GATE_INVALID");
+    }
+  }
+
   private assertWritable(): void {
+    this.assertWriteReady();
     if (this.degraded) throw new OrchestratorError("HOST_DEGRADED", "Host event persistence is degraded; restart the Host before accepting commands", true);
   }
 

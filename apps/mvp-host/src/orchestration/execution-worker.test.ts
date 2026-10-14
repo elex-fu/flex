@@ -224,6 +224,14 @@ describe("durable execution dispatch windows", () => {
     expect(drained).toBe(false); release.resolve(); await drain; expect(drained).toBe(true); expect(ingress.size).toBe(0);
   });
 
+  it("checks restore readiness inside claim and sends no queued external operation", async () => {
+    const f = fixture({ wakeFails: true }); const accepted = f.start();
+    f.resultOptions.assertWriteReady = () => { throw new Error("RESTORE_EXTERNAL_STATE_UNVERIFIED"); };
+    f.worker.scan(); await f.worker.drainDispatch(); expect(f.calls).toHaveLength(0);
+    expect(f.execution.get(accepted.intents[0]!.id)?.state).toBe("settled");
+    expect(f.store.getCommandReceipt("device", "start")?.response).toMatchObject({ evidence: { kind: "not-dispatched" }, error: "RESTORE_EXTERNAL_STATE_UNVERIFIED" });
+  });
+
   it("enforces admission budgets and stops new start dispatch during drain", async () => {
     const f = fixture({ wakeFails: true }); f.start();
     const limited = new ExecutionWorker(f.execution, f.registry, { ...f.resultOptions, maxPending: 1 });

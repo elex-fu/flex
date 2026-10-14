@@ -22,3 +22,4 @@ export * from "./attention-route.js";
 export * from "./attention-client.js";
 
 export * from "./recovery-client.js";
+export * from "./session-client.js";

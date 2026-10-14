@@ -145,3 +145,4 @@ export * from "./attention-api.js";
 export * from "./session-api.js";
 export * from "./revert-api.js";
 export * from "./worktree-api.js";
+export * from "./session-service.js";

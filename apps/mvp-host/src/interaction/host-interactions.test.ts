@@ -6,6 +6,9 @@ import { createHostInteractionBindings, createHostInteractions, assertInteractio
 import { SessionOrchestrator } from "../session/orchestrator.js";
 import { createTestHostOwner } from "../lifecycle/host-owner.js";
 import { openOwned } from "../storage/open-store.js";
+import { SqliteStore } from "../storage/db.js";
+import { FROZEN_V6_SCHEMA } from "../test-support/frozen-v6-schema.js";
+import { applyCatalogMigration } from "../storage/migrations/007-catalog.js";
 import { applyInteractionMigration } from "../storage/migrations/008-interactions.js";
 import { DeviceRegistry } from "../auth/device-registry.js";
 import { ConnectionGateway, type DuplexTransport } from "../api/connection-gateway.js";
@@ -27,9 +30,11 @@ function fixture(options: {
   stage?: (stage: string, kind: string) => Promise<void> | void;
 } = {}) {
   const owner = createTestHostOwner();
-  const store = openOwned({ databasePath: ":memory:", owner });
-  if (options.migrated !== false)
-    applyInteractionMigration(store.db);
+  const store = options.migrated === false
+    ? new SqliteStore(":memory:", { mode: "test-fixture", fixtureSchema: FROZEN_V6_SCHEMA })
+    : openOwned({ databasePath: ":memory:", owner });
+  if (options.migrated === false) applyCatalogMigration(store.db);
+  else applyInteractionMigration(store.db);
   const workspace = resolve(process.cwd(), "../../packages/claude-fixtures");
   const outcome = barrier<ProviderOutcome>();
   let context: DispatchContext | undefined;

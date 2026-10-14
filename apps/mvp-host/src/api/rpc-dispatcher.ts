@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { ACCESS_RECEIPTS_CAPABILITY, type AccessCommandMethod } from "./access-command-receipts.js";
 import { BOUNDED_CONTENT_CAPABILITY, RecoveryCapability, RecoveryInspectPayloadSchema, RecoveryReconcilePayloadSchema, RecoveryAcknowledgePayloadSchema, ContentChunkRequestSchema, TIMELINE_PROJECTION_CAPABILITY, OpenViewRequestSchema, TimelinePageRequestSchema, TimelineSubscribeRequestSchema, TimelineUnsubscribeRequestSchema, type OpenViewRequest, type TimelinePageRequest, type TimelineSubscribeRequest } from "@flyx/mvp-protocol";
 import type { HostRecovery } from "../session/host-recovery.js";
 import { parseInteractionRpcPayload, type InteractionRpcPort, type InteractionMethod } from "../interaction/host-interactions.js";
@@ -22,6 +23,7 @@ export interface RpcRequest {
 
 export interface RpcContext {
   subjectId: string;
+  protocolVersion?: number;
   capabilities?: ReadonlySet<string>;
   frameBudget?: FrameBudget;
   responseEnvelope?(payload: unknown): unknown;
@@ -35,6 +37,9 @@ export interface RpcContext {
   assertAuthorized(method: string): void;
   subscribe(afterSequence: number): Promise<unknown>;
   access(method: string, payload: unknown): Promise<unknown>;
+  /** Bound by Gateway to its original actor, active lease, generation and negotiated v2 capabilities. */
+  accessCommand?(method: AccessCommandMethod, payload: unknown, commandId: string): unknown | Promise<unknown>;
+  accessReceipt?(payload: { commandId: string }): unknown | Promise<unknown>;
 }
 
 export interface CatalogRpcPort {
@@ -92,7 +97,21 @@ export class RpcDispatcher {
       }
       catch (error) { if (error instanceof InteractionRpcError) throw new OrchestratorError(error.code, error.message, error.retryable); throw error; }
     };
+    const accessReceipts = () => context.protocolVersion === 2 && context.capabilities?.has(ACCESS_RECEIPTS_CAPABILITY);
     switch (frame.method) {
+      case "access.getReceipt": {
+        if (!accessReceipts() || !context.accessReceipt) throw new OrchestratorError("CAPABILITY_REQUIRED", "Access receipts require negotiated v2 support");
+        const payload = z.object({ commandId: z.string().min(1).max(128) }).strict().parse(frame.payload);
+        return publicValue(await context.accessReceipt(payload), workspace);
+      }
+      case "access.revokeSelf":
+      case "access.revokeDevice":
+      case "access.revokeAll":
+      case "access.revokeAllDevices": {
+        if (!accessReceipts()) return context.access(frame.method, frame.payload);
+        if (!context.accessCommand) throw new OrchestratorError("CAPABILITY_REQUIRED", "Access receipts are unavailable");
+        return publicValue(await context.accessCommand(frame.method, frame.payload, commandId()), workspace);
+      }
       case "interaction.get":
       case "interaction.list":
       case "interaction.respondApproval":

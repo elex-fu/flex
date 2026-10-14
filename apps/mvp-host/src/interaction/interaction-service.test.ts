@@ -59,6 +59,42 @@ function snapshot(store: SqliteStore) { return { counts: Object.fromEntries(["se
 function intent(f: ReturnType<typeof setup>, command = "answer") { return f.service.execution.forCommand("device-a", command)[0]!; }
 function approval(f: ReturnType<typeof setup>, id = "approval"): ApprovalRow { return { approvalId: id, sessionId: f.session.id, turnId: f.turn.id, toolUseId: "native-approval", version: 0, status: "pending", request: { toolName: "Bash", title: "Run tests" }, createdAt: f.native.createdAt }; }
 describe("typed atomic Interaction service", () => {
+  it.each(["completed", "failed", "cancelled"] as const)("retires requests for an actual committed R07 %s source without confirming possibly delivered control", (status) => {
+    const f = setup(); f.ingest(); f.service.respondQuestion("device-a", "answer", f.input);
+    const accepted = intent(f); f.service.execution.claim(accepted.id, { id: "owner", generation: 1 }); f.service.execution.transition({ id: accepted.id, expectedStates: ["claimed"], state: "dispatching" });
+    f.store.commitEvent(f.session.id, "turn.recovery.reconciled", { turnId: f.turn.id, turnStatus: status, attemptId: f.context.attemptId, gate: "blocked" }, { turnId: f.turn.id, turnStatus: status });
+    expect(f.service.interactions.get("question")).toMatchObject({ version: 2, status: "superseded", deliveryState: "unconfirmed" });
+    expect(f.store.getCommandReceipt("device-a", "answer")).toMatchObject({ state: "outcome_unknown", response: { status: "superseded" } });
+    expect(f.store.db.prepare("SELECT count(*) AS n FROM interaction_delivery_evidence WHERE kind='native-ack'").get()).toEqual({ n: 0 });
+  });
+  it("retires actual R07 acknowledgement of unknown outcome while preserving unconfirmed control evidence", () => {
+    const f = setup(); f.ingest(); f.service.respondQuestion("device-a", "answer", f.input);
+    const accepted = intent(f); f.service.execution.claim(accepted.id, { id: "owner", generation: 1 }); f.service.execution.transition({ id: accepted.id, expectedStates: ["claimed"], state: "dispatching" });
+    f.store.commitEvent(f.session.id, "turn.recovery.acknowledged", { turnId: f.turn.id, turnStatus: "outcome_unknown", outcomePreserved: "outcome_unknown", attemptId: f.context.attemptId, gate: "released" }, { turnId: f.turn.id, turnStatus: "outcome_unknown" });
+    expect(f.service.interactions.get("question")).toMatchObject({ version: 2, status: "superseded", deliveryState: "unconfirmed" });
+    expect(f.store.getCommandReceipt("device-a", "answer")?.state).toBe("outcome_unknown"); expect(f.service.execution.get(accepted.id)?.state).toBe("outcome_unknown");
+    expect(f.store.db.prepare("SELECT count(*) AS n FROM interaction_delivery_evidence WHERE kind='native-ack'").get()).toEqual({ n: 0 });
+  });
+  it("does not retire a request for mismatched durable outcome, attempt or a failed recovery operation", () => {
+    const f = setup(); f.ingest();
+    f.store.commitEvent(f.session.id, "turn.recovery.reconciled", { turnId: f.turn.id, turnStatus: "completed", attemptId: f.context.attemptId });
+    expect(f.service.interactions.get("question")).toMatchObject({ version: 0, status: "pending" });
+    f.store.commitEvent(f.session.id, "turn.recovery.reconciled", { turnId: f.turn.id, turnStatus: "completed", attemptId: "another-attempt" }, { turnId: f.turn.id, turnStatus: "completed" });
+    expect(f.service.interactions.get("question")).toMatchObject({ version: 0, status: "pending" });
+    f.store.commitEvent(f.session.id, "recovery.operation.failed", { turnId: f.turn.id, gate: "blocked" });
+    expect(f.service.interactions.get("question")).toMatchObject({ version: 0, status: "pending" });
+  });
+  it("projects canonical recovery companions once before the genuine source and keeps one commit boundary", () => {
+    const f = setup(); f.ingest(); f.service.respondQuestion("device-a", "answer", f.input); const before = f.store.getSession(f.session.id)!.headSequence;
+    const committed = f.store.commitCommand({ sessionId: f.session.id, build: () => ({ result: undefined, events: [
+      ...f.service.planSupersessionEvents(f.session.id, { turnId: f.turn.id }, "recovery_reconciled"),
+      { type: "turn.recovery.reconciled", payload: { turnId: f.turn.id, turnStatus: "completed", attemptId: f.context.attemptId, gate: "blocked" }, options: { turnId: f.turn.id, turnStatus: "completed" } }
+    ] }) })!;
+    expect(committed.events.map((event) => event.type)).toEqual(["interaction.superseded", "turn.recovery.reconciled"]);
+    expect(f.service.interactions.get("question")).toMatchObject({ version: 2, status: "superseded" });
+    expect(f.store.listEventCommits(f.session.id).at(-1)).toMatchObject({ firstSequence: before + 1, lastSequence: before + 2 });
+  });
+
   it("gives only the first device a reservation, receipt, and durable typed intent", async () => {
     const f = setup();
     f.ingest();

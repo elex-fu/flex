@@ -5,6 +5,31 @@ import type { SqliteStore } from "../storage/db.js";
 import type { EventCommitRow } from "../orchestration/command-contract.js";
 import type { InteractionFence, InteractionReservationRow, InteractionRow, NativeInteractionEvidence, NativeInteractionMethod } from "./types.js";
 import type { SessionEvent } from "@flyx/mvp-protocol";
+type InteractionProjectionWriter = Pick<SqliteStore, "db" | "registerCommitHook">;
+type ProjectionLease = { writer: InteractionProjectionWriter; references: number; detach: () => void };
+const projectionLeases = new WeakMap<Database.Database, ProjectionLease>();
+
+/** One authoritative writer hook per shared connection; history construction never retains it. */
+export function retainInteractionProjection(store: InteractionProjectionWriter): () => void {
+  let lease = projectionLeases.get(store.db);
+  if (lease && lease.writer !== store) throw new Error("INTERACTION_WRITER_MISMATCH");
+  if (!lease) {
+    const projector = new InteractionStore(store.db);
+    lease = { writer: store, references: 0, detach: store.registerCommitHook((events, commit) => projector.projectCommittedBatch(events, commit)) };
+    projectionLeases.set(store.db, lease);
+  }
+  lease.references++;
+  const retained = lease;
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    if (--retained.references !== 0) return;
+    retained.detach();
+    projectionLeases.delete(store.db);
+  };
+}
+
 const OPEN = new Set<InteractionStatus>(["pending", "responding", "outcome_unknown"]);
 const METHODS = new Set<NativeInteractionMethod>(["canUseTool/AskUserQuestion", "item/tool/requestUserInput", "canUseTool/approval", "item/commandExecution/requestApproval", "item/fileChange/requestApproval"]);
 type SourcePayload = {
@@ -29,7 +54,7 @@ export class InteractionStore {
   attach(store: Pick<SqliteStore, "db" | "registerCommitHook">): () => void {
     if (store.db !== this.db)
       throw new Error("INTERACTION_CONNECTION_MISMATCH");
-    return store.registerCommitHook((events, commit) => this.projectCommittedBatch(events, commit));
+    return retainInteractionProjection(store);
   }
   get(interactionId: string): InteractionRow | undefined {
     const row = this.db.prepare("SELECT * FROM interactions WHERE interaction_id = ?").get(interactionId) as RawInteraction | undefined;
@@ -107,7 +132,8 @@ export class InteractionStore {
       else if (event.type === "approval.response.accepted" || event.type === "approval.resolved" || event.type === "approval.resolve.unavailable")
         this.mirrorLegacyApproval(event, commit);
       else if (["turn.completed", "turn.failed", "turn.cancelled", "session.recovery.required", "host.event_persist_failed"].includes(event.type)
-        || (event.type === "turn.reconciled" && isRecord(event.payload) && isRecord(event.payload.outcome) && ["completed", "failed", "cancelled", "outcome_unknown"].includes(String(event.payload.outcome.status))))
+        || (event.type === "turn.reconciled" && isRecord(event.payload) && isRecord(event.payload.outcome) && ["completed", "failed", "cancelled", "outcome_unknown"].includes(String(event.payload.outcome.status)))
+        || isRecoveryTerminal(event, this.db))
         this.obsoleteForTerminal(event, commit);
     }
   }
@@ -266,6 +292,15 @@ export class InteractionStore {
         .run(event.occurredAt, row.interactionId);
     }
   }
+}
+function isRecoveryTerminal(event: SessionEvent, db: Database.Database): boolean {
+  if ((event.type !== "turn.recovery.reconciled" && event.type !== "turn.recovery.acknowledged") || !isRecord(event.payload)
+    || typeof event.payload.turnId !== "string" || typeof event.payload.turnStatus !== "string") return false;
+  const status = event.payload.turnStatus;
+  if (event.type === "turn.recovery.reconciled" ? !["completed", "failed", "cancelled"].includes(status)
+    : status !== "outcome_unknown" || event.payload.outcomePreserved !== "outcome_unknown") return false;
+  const turn = db.prepare("SELECT status,attempt_id FROM turns WHERE session_id=? AND id=?").get(event.sessionId, event.payload.turnId) as { status: string; attempt_id: string | null } | undefined;
+  return turn?.status === status && (typeof event.payload.attemptId !== "string" || turn.attempt_id === event.payload.attemptId);
 }
 function validBinding(binding: InteractionFence & {
   nativeRequestId: string;

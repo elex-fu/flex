@@ -70,6 +70,7 @@ const METHOD_SCOPES: Readonly<Record<string, DeviceScope>> = Object.freeze({
   "interaction.list": "session:read",
   "interaction.respondApproval": "approval:write",
   "question.respond": "approval:write",
+  "access.getReceipt": "access:self",
   "access.refresh": "access:self",
   "access.revokeSelf": "access:self",
   "access.listDevices": "access:admin",

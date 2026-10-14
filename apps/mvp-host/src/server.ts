@@ -9,14 +9,16 @@ import fastifyStatic from "@fastify/static";
 import { encodeDirectPairingFragment, encodeRelayPairingFragment, type AdvertisedEndpoint } from "@flyx/mvp-protocol";
 import { z } from "zod";
 import * as QRCode from "qrcode";
-import { OrchestratorError, SessionOrchestrator } from "./session/orchestrator.js";
+import { OrchestratorError, type RuntimeCloseReport, type SessionOrchestrator } from "./session/orchestrator.js";
 import { DeviceRegistry } from "./auth/device-registry.js";
 import { assertMethodScope } from "./auth/connection-authorizer.js";
 import { createHostDescriptor, generateHostIdentity, getHostIdentityMirror, loadOrCreateHostIdentity, publicHostIdentity, type HostIdentityFileV1 } from "./identity/host-identity.js";
-import { ConnectionGateway, type DuplexTransport } from "./api/connection-gateway.js";
+import { ConnectionGateway, type ConnectionGatewayOptions, type DuplexTransport } from "./api/connection-gateway.js";
 import { publicEvent, publicGitDiff, publicGitStatus, publicProviderStatus, publicSnapshot, toRpcError } from "./api/public-projection.js";
 import { parseConnectivityConfig, type ConnectivityConfig } from "./connectivity/config.js";
 import { HostRelaySupervisor, type HostRelaySupervisorOptions } from "./relay/relay-supervisor.js";
+import { assertSynchronousAuthorization, type LegacyHost } from "./api/rpc-dispatcher.js";
+import type { SnapshotCoordinator } from "./operations/operation-files.js";
 
 const SESSION_COOKIE = "flyx_session";
 const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
@@ -33,7 +35,7 @@ class AuthManager {
   private readonly tickets = new Map<string, PendingTicket>();
   private readonly pairingAttempts = new Map<string, PairingAttempt>();
 
-  constructor(private readonly orchestrator: SessionOrchestrator, private readonly devices: () => DeviceRegistry, private readonly confirmPairing: PairingConfirmation = () => false) {
+  constructor(private readonly orchestrator: Pick<LegacyHost, "store">, private readonly devices: () => DeviceRegistry, private readonly confirmPairing: PairingConfirmation = () => false) {
     this.pairingToken = process.env.FLYX_PAIRING_TOKEN ?? randomBytes(32).toString("base64url");
     this.pairingExpiresAt = new Date(Date.now() + 5 * 60_000).toISOString();
     this.orchestrator.store.createPairingGrant(hash(this.pairingToken), this.pairingExpiresAt);
@@ -63,10 +65,10 @@ class AuthManager {
     const tokenHash = hash(token);
     if (!this.orchestrator.store.hasActivePairingGrant(tokenHash)) throw new OrchestratorError("PAIRING_INVALID", "Pairing token is invalid or expired");
     if (!(await this.confirmPairing())) throw new OrchestratorError("PAIRING_DENIED", "Pairing was denied on the Host");
-    const device = this.orchestrator.store.db.transaction(() => {
+    const device = this.devices().credentialTransaction(() => {
       if (!this.orchestrator.store.consumePairingGrant(tokenHash)) throw new OrchestratorError("PAIRING_INVALID", "Pairing token is invalid or expired");
       return this.devices().createBrowserDevice({ pairingGrant: token });
-    })();
+    });
     const credential = randomBytes(32).toString("base64url");
     this.credentials.set(hash(credential), { deviceId: device.id, expiresAt: Date.now() + 60_000 });
     return credential;
@@ -76,14 +78,14 @@ class AuthManager {
     this.pruneEphemeral(Date.now());
     const key = hash(credential);
     const pending = this.credentials.get(key);
-    this.credentials.delete(key);
     if (!pending || pending.expiresAt <= Date.now()) throw new OrchestratorError("PAIRING_INVALID", "Pairing credential is invalid or expired");
     const raw = randomBytes(32).toString("base64url");
-    this.orchestrator.store.db.transaction(() => {
+    this.devices().credentialTransaction(() => {
       this.orchestrator.store.createAuthSession(hash(raw), new Date(Date.now() + SESSION_TTL_MS).toISOString());
       const session = this.orchestrator.store.findAuthSession(hash(raw))!;
       this.devices().bindAuthSession(session.id, pending.deviceId);
-    })();
+    });
+    this.credentials.delete(key);
     return raw;
   }
 
@@ -100,9 +102,11 @@ class AuthManager {
     const subject = this.sessionSubject(rawCookie);
     if (!subject) return false;
     const device = this.devices().getDeviceForAuthSession(subject);
-    this.devices().revokeAuthSession(subject);
-    if (device) this.devices().revokeSelf(device.id);
-    for (const [key, ticket] of this.tickets) if (ticket.subject === subject) this.tickets.delete(key);
+    this.devices().credentialTransaction((afterCommit) => {
+      this.devices().revokeAuthSession(subject);
+      if (device) this.devices().revokeSelf(device.id);
+      afterCommit(() => { for (const [key, ticket] of this.tickets) if (ticket.subject === subject) this.tickets.delete(key); });
+    });
     return true;
   }
 
@@ -145,8 +149,19 @@ class AuthManager {
   }
 }
 
-export type HostServerOptions = {
-  orchestrator: SessionOrchestrator;
+export type HostTransportLifecycle = {
+  registerTransportShutdown?(close: () => Promise<void>): (() => void) | void;
+  shutdown?(deadlineMs?: number): Promise<{ stopped: boolean; recoveryRequired: boolean }>;
+  closeAndWait?(deadlineMs?: number): Promise<Pick<RuntimeCloseReport, "clean">>;
+};
+export type ServerLegacyHost = LegacyHost & Partial<Pick<SessionOrchestrator, "registerTransportShutdown" | "closeAndWait">>;
+export type HostServerOptions = Omit<ConnectionGatewayOptions, "hostId" | "fingerprint" | "devices" | "bootstrap" | "descriptor" | "confirmPairing" | "assertIdentity" | "orchestrator"> & {
+  orchestrator: ServerLegacyHost;
+  /** Host-global ownership remains with the bootstrap when these services are injected. */
+  devices?: DeviceRegistry;
+  lifecycle?: HostTransportLifecycle;
+  /** The same actual lane used by backup and trusted identity rotation. */
+  snapshotLane?: SnapshotCoordinator;
   host?: string;
   port?: number;
   webRoot?: string;
@@ -157,7 +172,7 @@ export type HostServerOptions = {
   /** Dependency injection for embedders/custom trust stores; production defaults remain strict TLS. */
   relayOptions?: Pick<HostRelaySupervisorOptions,
     "fetch" | "socketFactory" | "openTimeoutMs" | "handshakeTimeoutMs" | "heartbeatIntervalMs" | "livenessTimeoutMs"
-    | "allowInsecureLoopback" | "now" | "random" | "maxDataConnections">;
+    | "allowInsecureLoopback" | "now" | "random" | "maxDataConnections" | "withSnapshot" | "identity">;
 };
 
 export type HostServer = {
@@ -170,6 +185,7 @@ export type HostServer = {
   getRelayPairingUrl(appUrl?: string): string | undefined;
   start(): Promise<string>;
   stop(): Promise<void>;
+  closeTransports(): Promise<void>;
 };
 
 export function createHostServer(options: HostServerOptions): HostServer {
@@ -230,11 +246,14 @@ export function createHostServer(options: HostServerOptions): HostServer {
     const mirror = store.getHostIdentityMirror();
     if (mirror && (mirror.hostId !== identity.hostId || mirror.fingerprint !== identity.fingerprint)) throw new OrchestratorError("IDENTITY_MISMATCH", "Host identity does not match database");
     store.setHostIdentityMirror(getHostIdentityMirror(identity));
-    devices = new DeviceRegistry(store, identity.hostId);
-    gateway = new ConnectionGateway({ hostId: identity.hostId, fingerprint: identity.fingerprint, orchestrator: options.orchestrator, devices, bootstrap, descriptor, assertIdentity, confirmPairing: options.pairingConfirmation ?? (() => false) });
+    if (options.devices && (options.devices.store !== store || options.devices.hostId !== identity.hostId)) throw new OrchestratorError("HOST_SERVICE_BINDING_MISMATCH", "Device registry belongs to another Host Store");
+    devices = options.devices ?? new DeviceRegistry(store, identity.hostId);
+    gateway = new ConnectionGateway({ ...options, hostId: identity.hostId, fingerprint: identity.fingerprint, devices, bootstrap, descriptor, assertIdentity, confirmPairing: options.pairingConfirmation ?? (() => false) });
     if (connectivity.relayEnabled && connectivity.relayUrl) {
       relay = new HostRelaySupervisor({
         ...options.relayOptions,
+        ...(options.snapshotLane ? { withSnapshot: options.snapshotLane } : {}),
+        identity: options.relayOptions?.identity ?? { expected: { hostId: identity.hostId, fingerprint: identity.fingerprint }, readCurrent: () => { assertIdentity(); const mirror = store.getHostIdentityMirror()!; return { hostId: mirror.hostId, fingerprint: mirror.fingerprint }; } },
         relayUrl: connectivity.relayUrl,
         registrationPath: resolve(identityDirectory, "relay-registration.json"),
         hostId: identity.hostId,
@@ -252,7 +271,7 @@ export function createHostServer(options: HostServerOptions): HostServer {
     clearInterval(identityPoll);
     gateway?.close();
     await relay?.stop();
-    devices?.close();
+    if (!options.devices) devices?.close();
   });
   app.addHook("onRequest", async (request, reply) => {
     const requestOrigin = validatedRequestOrigin(request, connectivity.publicBaseUrl);
@@ -279,7 +298,14 @@ export function createHostServer(options: HostServerOptions): HostServer {
     const id = auth.sessionSubject(request.cookies[SESSION_COOKIE]);
     const device = id ? devices.getDeviceForAuthSession(id) : undefined;
     if (!id || !device) { noStore(reply).code(401).send({ error: { code: "UNAUTHENTICATED", message: "Pair this browser first", retryable: false } }); return undefined; }
-    try { assertMethodScope({ scopes: new Set(device.scopes) }, method); }
+    try {
+      assertMethodScope({ scopes: new Set(device.scopes) }, method);
+      if (["host.getSnapshot", "host.getStatus", "session.getEvents", "session.getDiff"].includes(method)) {
+        const guard = options.assertSessionScope ?? options.catalogPort?.assertActorSession?.bind(options.catalogPort);
+        if (guard) assertSynchronousAuthorization(guard(device.id, options.orchestrator.sessionId, "session:read") as unknown);
+        else if (options.catalogPort) throw new OrchestratorError("SESSION_SCOPE_REQUIRED", "Session authorization is unavailable");
+      }
+    }
     catch { noStore(reply).code(403).send({ error: { code: "FORBIDDEN", message: "Device permission denied", retryable: false } }); return undefined; }
     return id;
   };
@@ -313,7 +339,9 @@ export function createHostServer(options: HostServerOptions): HostServer {
     } catch (error) { return reply.code(403).send({ error: toRpcError(error, "PAIRING_INVALID") }); }
   });
   app.post("/api/auth/logout", async (request, reply) => {
-    noStore(reply); auth.revokeBrowserSession(request.cookies[SESSION_COOKIE]);
+    noStore(reply);
+    try { auth.revokeBrowserSession(request.cookies[SESSION_COOKIE]); }
+    catch (error) { return reply.code(500).send({ error: toRpcError(error) }); }
     reply.clearCookie(SESSION_COOKIE, { httpOnly: true, secure: !connectivity.allowInsecureHttp, sameSite: "strict", path: "/" }); return { ok: true };
   });
   app.post("/api/auth/websocket-ticket", async (request, reply) => {
@@ -387,13 +415,16 @@ export function createHostServer(options: HostServerOptions): HostServer {
   }));
 
   let stopPromise: Promise<void> | undefined;
-  options.orchestrator.registerTransportShutdown(() => app.close());
+  const closeTransports = () => app.close();
+  const registerClose = options.lifecycle?.registerTransportShutdown?.bind(options.lifecycle) ?? options.orchestrator.registerTransportShutdown?.bind(options.orchestrator);
+  const unregisterClose = registerClose?.(closeTransports);
+  app.addHook("onClose", async () => { unregisterClose?.(); });
   return {
     app, auth,
     get identity() { if (!identity) throw new Error("Host is not ready"); return identity; },
     get devices() { return devices; },
     get relay() { return relay; },
-    getPairingUrl, getRelayPairingUrl,
+    getPairingUrl, getRelayPairingUrl, closeTransports,
     async start() {
       const host = options.host ?? "127.0.0.1";
       if (!isLoopbackHost(host)) throw new OrchestratorError("HOST_BIND_FORBIDDEN", "Flyx Host must bind to loopback; expose it with Tailscale Serve");
@@ -404,9 +435,17 @@ export function createHostServer(options: HostServerOptions): HostServer {
       return address;
     },
     stop() {
-      stopPromise ??= options.orchestrator.closeAndWait().then((result) => {
-        if (!result.clean) throw new OrchestratorError("SHUTDOWN_RECOVERY_REQUIRED", "Host stopped with retained unverified execution ownership");
-      });
+      stopPromise ??= (async () => {
+        try {
+          if (options.lifecycle?.shutdown) {
+            const result = await options.lifecycle.shutdown();
+            if (!result.stopped || result.recoveryRequired) throw new OrchestratorError("SHUTDOWN_RECOVERY_REQUIRED", "Host shutdown requires recovery");
+          } else {
+            const closeHost = options.lifecycle?.closeAndWait?.bind(options.lifecycle) ?? options.orchestrator.closeAndWait?.bind(options.orchestrator);
+            if (closeHost && !(await closeHost()).clean) throw new OrchestratorError("SHUTDOWN_RECOVERY_REQUIRED", "Host stopped with retained unverified execution ownership");
+          }
+        } finally { await closeTransports(); }
+      })();
       return stopPromise;
     },
   };

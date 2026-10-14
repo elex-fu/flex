@@ -76,7 +76,8 @@ function fixture(options: {
   const second = devices.createBrowserDevice({ scopes: ["session:read", "approval:write"] });
   const reader = devices.createBrowserDevice({ scopes: ["session:read"] });
   const gateway = new ConnectionGateway({ hostId: "interaction-host", fingerprint: "sha256:" + "a".repeat(64), orchestrator: host, devices,
-    bootstrap: () => host.bootstrap(), descriptor: () => ({ hostId: "interaction-host" }), confirmPairing: () => true, maxFrameBytes: 64 * 1024 });
+    bootstrap: () => host.bootstrap(), descriptor: () => ({ hostId: "interaction-host" }), confirmPairing: () => true, maxFrameBytes: 64 * 1024,
+    interactions: (id) => id === host.sessionId ? bindings.interactions() : undefined, interactionCapabilities: bindings.capabilities });
   const start = async () => { const accepted = await host.startTurn(starter.id, "start", "fixture task"); await host.worker.drainDispatch(); return accepted.turnId; };
   const approval = async (id = "approval") => {
     host.ingestAdapterEvent(fenceAdapterEvent(context!, { kind: "approval_requested", request: {
@@ -136,10 +137,16 @@ class Transport implements DuplexTransport {
     }
     throw new Error("Expected Gateway response");
   }
-  hello(deviceId: string) { this.emit({ type: "client.hello", hostId: "interaction-host", deviceId, clientId: "interaction-test", protocol: { min: 2, max: 2 }, capabilities: [BOUNDED_CONTENT_CAPABILITY, TIMELINE_PROJECTION_CAPABILITY], transportGeneration: this.generation }); return this.wait((frame) => frame.type === "server.hello"); }
+  hello(deviceId: string) { this.emit({ type: "client.hello", hostId: "interaction-host", deviceId, clientId: "interaction-test", protocol: { min: 2, max: 2 }, capabilities: [BOUNDED_CONTENT_CAPABILITY, TIMELINE_PROJECTION_CAPABILITY, INTERACTION_CAPABILITY], transportGeneration: this.generation }); return this.wait((frame) => frame.type === "server.hello"); }
   request(method: string, payload: unknown, commandId?: string) { const id = `rpc-${++this.sequence}`; this.emit({ type: "request", id, method, payload, ...(commandId ? { commandId } : {}), transportGeneration: this.generation }); return this.wait((frame) => frame.type === "response" && frame.id === id); }
 }
 async function connect(f: ReturnType<typeof fixture>, id: string, kind: "direct" | "relay" = "direct") { const transport = new Transport(kind); f.gateway.attach(transport, { deviceId: id }); await transport.hello(id); return transport; }
+// Fixture answer fault tests use the trusted verification seam. They never negotiate or advertise a native contract.
+function verificationAnswer(f: ReturnType<typeof fixture>, payload: unknown, commandId: string): Sent {
+  const interactions = f.bindings.interactions()!;
+  expect(interactions.service.questionCapability(f.host.sessionId)).toBe(false);
+  return { ok: true, payload: interactions.rpc("question.respond", payload, { authSubjectId: f.responder.id, commandId }) };
+}
 describe("bounded Host interaction production connection", () => {
   for (const kind of ["direct", "relay"] as const)
     it(`keeps Access receipts outside the session:read business receipt namespace through ${kind} RPC`, async () => {
@@ -280,8 +287,10 @@ describe("bounded Host interaction production connection", () => {
       expect((await reader.request(method, {}, `denied-${method}`)).error.code).toBe("FORBIDDEN");
     const head = f.host.snapshot().session.headSequence;
     expect((await writer.request("interaction.respondApproval", { sessionId: f.host.sessionId, interactionId: "approval", expectedVersion: 99, action: "deny" }, "stale")).error.code).toBe("INTERACTION_VERSION_CONFLICT");
-    expect((await writer.request("question.respond", { sessionId: f.host.sessionId, interactionId: "question", expectedVersion: 0, answers: [{ questionId: "host-q-question", optionIds: ["One"] }] }, "bad-answer")).error.code).toBe("QUESTION_ANSWER_INVALID");
-    expect((await writer.request("interaction.get", { sessionId: "foreign", interactionId: "approval" })).error.code).toBe("SESSION_SCOPE_REQUIRED");
+    const badAnswer = { sessionId: f.host.sessionId, interactionId: "question", expectedVersion: 0, answers: [{ questionId: "host-q-question", optionIds: ["One"] }] };
+    expect((await writer.request("question.respond", badAnswer, "bad-answer")).error.code).toBe("CAPABILITY_REQUIRED");
+    expect(() => verificationAnswer(f, badAnswer, "bad-answer")).toThrow("QUESTION_ANSWER_INVALID");
+    expect((await writer.request("interaction.get", { sessionId: "foreign", interactionId: "approval" })).error.code).toBe("SESSION_NOT_FOUND");
     expect((await writer.request("interaction.get", { sessionId: f.host.sessionId, interactionId: "approval", extra: true })).error.code).toBe("INVALID_PARAMS");
     expect(f.host.snapshot().session.headSequence).toBe(head);
     expect(f.approvalDelivery).not.toHaveBeenCalled();
@@ -345,7 +354,10 @@ describe("bounded Host interaction production connection", () => {
     await f.question();
     delete f.adapter.respondQuestion;
     const transport = await connect(f, f.responder.id);
-    expect((await transport.request("question.respond", { sessionId: f.host.sessionId, interactionId: "question", expectedVersion: 0, answers: [{ questionId: "host-q-question", optionIds: ["host-option"] }] }, "answer")).ok).toBe(true);
+    const payload = { sessionId: f.host.sessionId, interactionId: "question", expectedVersion: 0, answers: [{ questionId: "host-q-question", optionIds: ["host-option"] }] };
+    expect((await transport.request("question.respond", payload, "answer")).error.code).toBe("CAPABILITY_REQUIRED");
+    expect(f.store.getCommandReceipt(f.responder.id, "answer")).toBeUndefined();
+    expect(verificationAnswer(f, payload, "answer").ok).toBe(true);
     await f.host.worker.drainDispatch();
     expect(f.questionDelivery).not.toHaveBeenCalled();
     expect(f.store.getCommandReceipt(f.responder.id, "answer")).toMatchObject({ state: "failed", response: { status: "superseded", deliveryState: "none" } });
@@ -358,10 +370,12 @@ describe("bounded Host interaction production connection", () => {
     f.questionDelivery.mockImplementation(() => { throw new Error("stdin closed after partial write"); });
     const transport = await connect(f, f.responder.id);
     const payload = { sessionId: f.host.sessionId, interactionId: "question", expectedVersion: 0, answers: [{ questionId: "host-q-question", optionIds: ["host-option"] }] };
-    expect((await transport.request("question.respond", payload, "answer")).ok).toBe(true);
+    expect((await transport.request("question.respond", payload, "answer")).error.code).toBe("CAPABILITY_REQUIRED");
+    expect(f.store.getCommandReceipt(f.responder.id, "answer")).toBeUndefined();
+    expect(verificationAnswer(f, payload, "answer").ok).toBe(true);
     await f.host.worker.drainDispatch();
     expect(f.store.getCommandReceipt(f.responder.id, "answer")).toMatchObject({ state: "outcome_unknown", response: { status: "outcome_unknown", deliveryState: "unconfirmed" } });
-    expect((await transport.request("question.respond", payload, "answer")).payload.status).toBe("outcome_unknown");
+    expect(verificationAnswer(f, payload, "answer").payload.status).toBe("outcome_unknown");
     await f.host.worker.drainDispatch();
     expect(f.questionDelivery).toHaveBeenCalledOnce();
   });
@@ -388,7 +402,10 @@ describe("bounded Host interaction production connection", () => {
     const transport = await connect(f, f.responder.id);
     const current = InteractionSchema.parse((await transport.request("interaction.get", { sessionId: f.host.sessionId, interactionId: "question" })).payload);
     expect(current.responseAvailable).toBe(false);
-    const result = await transport.request("question.respond", { sessionId: f.host.sessionId, interactionId: "question", expectedVersion: 0, answers: [{ questionId: "host-q-question", optionIds: ["host-option"] }] }, "answer");
+    const payload = { sessionId: f.host.sessionId, interactionId: "question", expectedVersion: 0, answers: [{ questionId: "host-q-question", optionIds: ["host-option"] }] };
+    expect((await transport.request("question.respond", payload, "answer")).error.code).toBe("CAPABILITY_REQUIRED");
+    expect(f.store.getCommandReceipt(f.responder.id, "answer")).toBeUndefined();
+    const result = verificationAnswer(f, payload, "answer");
     expect(result.ok).toBe(true);
     await f.host.worker.drainDispatch();
     expect(f.questionDelivery).toHaveBeenCalledOnce();

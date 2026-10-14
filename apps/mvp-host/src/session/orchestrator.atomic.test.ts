@@ -95,7 +95,7 @@ describe("Orchestrator atomic dispatch", () => {
     expect(adapter.respondApproval).toHaveBeenCalledOnce();
   });
 
-  it("keeps unconfirmed approval delivery unknown rather than completed", async () => {
+  it("supersedes an unconfirmed approval while preserving unknown delivery", async () => {
     const { orchestrator, adapter } = fixture(); await seedApproval(orchestrator);
     adapter.respondApproval = vi.fn(() => false);
     expect(await orchestrator.respondApproval("device-1", "respond-1", "approval-1", "deny")).toEqual({ status: "accepted", approvalId: "approval-1" });
@@ -103,7 +103,7 @@ describe("Orchestrator atomic dispatch", () => {
     expect(orchestrator.store.getCommandReceipt("device-1", "respond-1")?.state).toBe("outcome_unknown");
     expect(orchestrator.execution.reservation("approval-1")?.state).toBe("outcome_unknown");
     expect(orchestrator.execution.forCommand("device-1", "respond-1")[0]?.state).toBe("outcome_unknown");
-    expect(orchestrator.store.getApproval("approval-1")?.status).toBe("pending");
+    expect(orchestrator.store.getApproval("approval-1")?.status).toBe("superseded");
     expect(orchestrator.snapshot().session.activityState).toBe("outcome_unknown");
   });
 

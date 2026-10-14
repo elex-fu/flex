@@ -2,7 +2,7 @@ import { randomBytes } from "node:crypto";
 import { buildRelaySocketUrl, parseRelayControlMessage, MAX_RELAY_CONTROL_FRAME_BYTES, MAX_RELAY_CIPHERTEXT_FRAME_BYTES } from "@flyx/mvp-protocol";
 import { HostRelayTransport, type SecureRelayConnection } from "./relay-transport.js";
 import { createNodeRelaySocket, sendRelaySocket, type RelaySocket, type RelaySocketFactory } from "./relay-socket.js";
-import { loadOrRegisterRelayRoute, reserveRelayGeneration, RelayRegistrationError, type RelayRegistration, type RelayRegistrationOptions } from "./relay-registration.js";
+import { loadOrRegisterRelayRoute, reserveRelayGeneration, RelayRegistrationError, type RelayRegistration, type RelayRegistrationOptions, type RelayLocalSnapshotOptions } from "./relay-registration.js";
 
 export type HostRelayState = "stopped" | "connecting" | "registering" | "online" | "backoff" | "draining";
 
@@ -38,6 +38,8 @@ export class HostRelaySupervisor {
   private running = false;
   private epoch = 0;
   private registrationAbort: AbortController | undefined;
+  private stopping: Promise<void> | undefined;
+  private readonly localOperations = new Set<Promise<unknown>>();
   private control: ControlAttempt | undefined;
   private retryTimer: ReturnType<typeof setTimeout> | undefined;
   private heartbeatTimer: ReturnType<typeof setInterval> | undefined;
@@ -51,6 +53,11 @@ export class HostRelaySupervisor {
   private readonly random: () => number;
 
   constructor(private readonly options: HostRelaySupervisorOptions) {
+    if (options.identity) {
+      const expected = { ...options.identity.expected };
+      if (expected.hostId !== options.hostId) throw new RelayRegistrationError("RELAY_IDENTITY_CHANGED");
+      this.options = { ...options, identity: { expected, readCurrent: options.identity.readCurrent.bind(options.identity) } };
+    }
     this.socketFactory = options.socketFactory ?? createNodeRelaySocket;
     this.now = options.now ?? Date.now;
     this.random = options.random ?? Math.random;
@@ -62,6 +69,7 @@ export class HostRelaySupervisor {
   get dataConnectionCount(): number { return this.data.size; }
 
   async start(): Promise<void> {
+    if (this.stopping) await this.stopping;
     if (this.running) return;
     this.running = true;
     const epoch = ++this.epoch;
@@ -74,26 +82,50 @@ export class HostRelaySupervisor {
     if (!this.running || this.epoch !== epoch) return;
     this.transition("connecting");
     try {
-      const route = await loadOrRegisterRelayRoute({ ...this.options, ...(this.registrationAbort ? { signal: this.registrationAbort.signal } : {}) });
+      const route = await loadOrRegisterRelayRoute({ ...this.options, ...this.localOptions(epoch) });
       if (!this.running || this.epoch !== epoch) return;
       this.route = route;
       await this.connectControl(epoch);
-    } catch (error) {
-      if (!this.running || this.epoch !== epoch) return;
-      if (error instanceof RelayRegistrationError && ["RELAY_REGISTRATION_UNREACHABLE", "RELAY_REGISTRATION_FAILED"].includes(error.code)) {
-        this.scheduleReconnect(error.code);
-        return;
-      }
-      this.running = false;
-      this.transition("stopped", "RELAY_START_FAILED");
-      if (initial) throw error;
+    } catch (error) { await this.handleStartFailure(epoch, error, initial); }
+  }
+
+  private async handleStartFailure(epoch: number, error: unknown, initial = false): Promise<void> {
+    if (!this.running || this.epoch !== epoch) return;
+    if (error instanceof RelayRegistrationError && ["RELAY_REGISTRATION_UNREACHABLE", "RELAY_REGISTRATION_FAILED"].includes(error.code)) {
+      this.scheduleReconnect(error.code);
+      return;
     }
+    const stopping = this.stop(), stoppedEpoch = this.epoch;
+    await stopping;
+    if (this.epoch === stoppedEpoch && !this.running) this.transition("stopped", "RELAY_START_FAILED");
+    if (initial) throw error;
+  }
+
+  private localOptions(epoch: number): RelayLocalSnapshotOptions {
+    const lifecycleSignal = this.registrationAbort!.signal;
+    const signal = this.options.signal ? AbortSignal.any([lifecycleSignal, this.options.signal]) : lifecycleSignal;
+    const withSnapshot = <T>(work: () => Promise<T>): Promise<T> => {
+      const run = async () => {
+        // Queued callbacks do no identity/Store work once this lifecycle is sealed.
+        if (!this.running || this.epoch !== epoch || signal.aborted) throw new RelayRegistrationError("RELAY_OPERATION_ABORTED");
+        const pending = work();
+        this.localOperations.add(pending);
+        try { return await pending; }
+        finally { this.localOperations.delete(pending); }
+      };
+      return this.options.withSnapshot ? this.options.withSnapshot(run) : run();
+    };
+    return { withSnapshot, signal, ...(this.options.identity ? { identity: this.options.identity } : {}) };
   }
 
   async stop(): Promise<void> {
-    if (!this.running && this.status === "stopped") return;
+    if (this.stopping) return this.stopping;
+    if (!this.running && this.status === "stopped" && !this.localOperations.size) return;
     this.running = false;
     this.epoch += 1;
+    // Install the stop barrier before notifying any lifecycle observer.
+    const pending = Promise.resolve().then(() => this.drainLocalOperations());
+    this.stopping = pending;
     this.transition("draining");
     this.registrationAbort?.abort();
     this.registrationAbort = undefined;
@@ -107,6 +139,14 @@ export class HostRelaySupervisor {
     this.data.clear();
     this.dataAttempts.clear();
     this.attempts = 0;
+    try { await pending; }
+    finally { if (this.stopping === pending) this.stopping = undefined; }
+  }
+
+  private async drainLocalOperations(): Promise<void> {
+    // Do not wait for an unrelated backup holding the lane or an uncooperative HTTP request.
+    // Work already inside the lane includes temporary-file cleanup and directory fsync.
+    while (this.localOperations.size) await Promise.allSettled([...this.localOperations]);
     this.transition("stopped");
   }
 
@@ -119,7 +159,7 @@ export class HostRelaySupervisor {
     if (!this.running || this.epoch !== epoch || !this.route) return;
     this.transition("connecting");
     try {
-      const registration = await reserveRelayGeneration(this.options.registrationPath, this.route, this.now());
+      const registration = await reserveRelayGeneration(this.options.registrationPath, this.route, this.now(), this.localOptions(epoch));
       if (!this.running || this.epoch !== epoch) return;
       this.route = registration;
       const socket = this.socketFactory(this.socketUrl("control", registration.generation), {
@@ -137,7 +177,11 @@ export class HostRelaySupervisor {
         socket.onClose(() => this.failControl(control, "RELAY_CONTROL_CLOSED")),
         socket.onError(() => this.failControl(control, "RELAY_CONTROL_FAILED")),
       );
-    } catch { if (this.running && this.epoch === epoch) this.scheduleReconnect("RELAY_CONTROL_CONNECT_FAILED"); }
+    } catch (error) {
+      if (!this.running || this.epoch !== epoch) return;
+      if (error instanceof RelayRegistrationError) throw error;
+      this.scheduleReconnect("RELAY_CONTROL_CONNECT_FAILED");
+    }
   }
 
   private socketUrl(role: "control" | "data", generation: number, connectionId?: string): string {
@@ -301,8 +345,9 @@ export class HostRelaySupervisor {
     this.transition("backoff", reason);
     this.retryTimer = setTimeout(() => {
       this.retryTimer = undefined;
-      if (this.route) void this.connectControl(this.epoch);
-      else void this.registerAndConnect(this.epoch);
+      const epoch = this.epoch;
+      if (this.route) void this.connectControl(epoch).catch((error) => this.handleStartFailure(epoch, error));
+      else void this.registerAndConnect(epoch);
     }, this.jitter(this.attempts++));
     this.retryTimer.unref?.();
   }

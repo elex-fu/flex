@@ -1,12 +1,21 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { randomBytes } from "node:crypto";
 import { createNoiseInitiator, noiseKeyPairFromSecretKey } from "@flyx/secure-channel";
-import { HostRelaySupervisor } from "./relay-supervisor.js";
+import { HostRelaySupervisor, type HostRelaySupervisorOptions } from "./relay-supervisor.js";
 import { fakeRelaySocketFactory, settlePromises } from "./relay-test-support.js";
 
+import { OperationSnapshotLane } from "../operations/host-operations.js";
+import { readRelayRegistration } from "./relay-registration.js";
+
+function deferred<T = void>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((done) => { resolve = done; });
+  return { promise, resolve };
+}
+const pin = { hostId: "host-identity-1234", fingerprint: "original-fingerprint" };
 const directories: string[] = [];
 const supervisors: HostRelaySupervisor[] = [];
 afterEach(async () => {
@@ -15,7 +24,7 @@ afterEach(async () => {
   for (const directory of directories.splice(0)) await rm(directory, { recursive: true, force: true });
 });
 
-async function setup(fetchOverride?: typeof globalThis.fetch) {
+async function setup(fetchOverride?: typeof globalThis.fetch, options: Partial<HostRelaySupervisorOptions> = {}, start = true) {
   const directory = await mkdtemp(join(tmpdir(), "flyx-relay-supervisor-"));
   directories.push(directory);
   const route = { v: 1, routeId: randomBytes(24).toString("base64url"), relayCredential: randomBytes(32).toString("base64url") };
@@ -27,11 +36,11 @@ async function setup(fetchOverride?: typeof globalThis.fetch) {
     relayUrl: "wss://relay.example", registrationPath: join(directory, "relay.json"),
     hostId: "host-identity-1234", hostStaticKey, protocol: { min: 2, max: 2 },
     socketFactory: fake.factory, fetch: fetchOverride ?? vi.fn<typeof globalThis.fetch>().mockResolvedValue(new Response(JSON.stringify(route))),
-    random: () => 0.5, now: () => Date.now(), onConnection, onState,
+    random: () => 0.5, now: () => Date.now(), onConnection, onState, ...options,
   });
   supervisors.push(supervisor);
-  await supervisor.start();
-  return { ...fake, supervisor, route, hostStaticKey, onConnection, onState };
+  if (start) await supervisor.start();
+  return { ...fake, supervisor, route, hostStaticKey, onConnection, onState, directory, registrationPath: join(directory, "relay.json") };
 }
 
 function registration(socket: { receive(frame: string): void; url: string }, connectionIds: string[] = []) {
@@ -65,6 +74,133 @@ describe("Host outbound Relay supervisor", () => {
     expect(fetch).toHaveBeenCalledTimes(1);
     expect(sockets).toHaveLength(0);
     expect(supervisor.state).toBe("stopped");
+  });
+
+  it("fences queued lane callbacks before the Store closes without waiting for an unrelated backup", async () => {
+    const lane = new OperationSnapshotLane(() => {}), release = deferred(), entered = deferred();
+    const occupied = lane.withSnapshot(async () => { entered.resolve(); await release.promise; });
+    await entered.promise;
+    let closed = false;
+    const readCurrent = vi.fn(() => { if (closed) throw new Error("STORE_ALREADY_CLOSED"); return pin; });
+    const fetch = vi.fn<typeof globalThis.fetch>();
+    const { supervisor, sockets, directory } = await setup(fetch, { withSnapshot: lane.withSnapshot, identity: { expected: pin, readCurrent } }, false);
+    const starting = supervisor.start(); await settlePromises();
+    await supervisor.stop(); closed = true;
+    release.resolve(); await occupied; await starting; await lane.withSnapshot(async () => {});
+    expect(readCurrent).not.toHaveBeenCalled();
+    expect(fetch).not.toHaveBeenCalled();
+    expect(sockets).toHaveLength(0);
+    expect(await readdir(directory)).toEqual([]);
+    expect(supervisor.state).toBe("stopped");
+  });
+
+  it("waits for active local identity work before stop releases the Store", async () => {
+    const lane = new OperationSnapshotLane(() => {}), entered = deferred(), release = deferred();
+    let closed = false;
+    const readCurrent = vi.fn(async () => { entered.resolve(); await release.promise; if (closed) throw new Error("STORE_ALREADY_CLOSED"); return pin; });
+    const fetch = vi.fn<typeof globalThis.fetch>();
+    const { supervisor, sockets, directory } = await setup(fetch, { withSnapshot: lane.withSnapshot, identity: { expected: pin, readCurrent } }, false);
+    const starting = supervisor.start(); await entered.promise;
+    let stopped = false;
+    const stopping = supervisor.stop().then(() => { stopped = true; });
+    await settlePromises(); expect(stopped).toBe(false);
+    release.resolve(); await stopping; closed = true; await starting;
+    expect(readCurrent).toHaveBeenCalledTimes(1);
+    expect(fetch).not.toHaveBeenCalled();
+    expect(sockets).toHaveLength(0);
+    expect(await readdir(directory)).toEqual([]);
+  });
+
+  it("cleans a written temporary route before stop returns and never publishes its aborted rename", async () => {
+    const lane = new OperationSnapshotLane(() => {}), entered = deferred(), release = deferred();
+    let reads = 0;
+    const readCurrent = vi.fn(async () => { reads += 1; if (reads === 3) { entered.resolve(); await release.promise; } return pin; });
+    const { supervisor, sockets, directory } = await setup(undefined, { withSnapshot: lane.withSnapshot, identity: { expected: pin, readCurrent } }, false);
+    const starting = supervisor.start(); await entered.promise;
+    expect(await readdir(directory)).toEqual([expect.stringMatching(/^relay\.json\..*\.tmp$/)]);
+    let stopped = false;
+    const stopping = supervisor.stop().then(() => { stopped = true; });
+    await settlePromises(); expect(stopped).toBe(false);
+    release.resolve(); await stopping; await starting;
+    expect(await readdir(directory)).toEqual([]);
+    expect(sockets).toHaveLength(0);
+    expect(supervisor.state).toBe("stopped");
+  });
+
+  it("stops during uncooperative HTTP and a late response cannot overwrite a restarted route", async () => {
+    const entered = deferred(), reply = deferred<Response>();
+    const newer = { v: 1, routeId: randomBytes(24).toString("base64url"), relayCredential: randomBytes(32).toString("base64url") };
+    const fetch = vi.fn<typeof globalThis.fetch>()
+      .mockImplementationOnce(async () => { entered.resolve(); return reply.promise; })
+      .mockResolvedValueOnce(new Response(JSON.stringify(newer)));
+    const { supervisor, sockets, directory, registrationPath, route } = await setup(fetch, {}, false);
+    const starting = supervisor.start(); await entered.promise;
+    await supervisor.stop(); await starting;
+    expect(await readdir(directory)).toEqual([]);
+    await supervisor.start();
+    expect(fetch).toHaveBeenCalledTimes(2);
+    expect(sockets).toHaveLength(1);
+    const generation = supervisor.registration!.generation;
+    const late = new Response(JSON.stringify(route)), cancel = vi.spyOn(late.body!, "cancel");
+    reply.resolve(late); await settlePromises();
+    expect(cancel).toHaveBeenCalledTimes(1);
+    expect(await readRelayRegistration(registrationPath, "wss://relay.example")).toMatchObject({ ...newer, generation });
+    expect(sockets).toHaveLength(1);
+  });
+
+  it("fences a generation reservation queued behind the shared lane on stop", async () => {
+    const lane = new OperationSnapshotLane(() => {}), entered = deferred(), release = deferred();
+    let entries = 0, occupied: Promise<void> | undefined;
+    const readCurrent = vi.fn(() => pin);
+    const { supervisor, sockets, registrationPath } = await setup(undefined, {
+      identity: { expected: pin, readCurrent },
+      withSnapshot: <T>(work: () => Promise<T>) => {
+        entries += 1;
+        if (entries === 3) occupied = lane.withSnapshot(async () => { entered.resolve(); await release.promise; });
+        return lane.withSnapshot(work);
+      },
+    }, false);
+    const starting = supervisor.start(); await entered.promise;
+    const before = await readFile(registrationPath, "utf8");
+    expect(JSON.parse(before).generation).toBe(0);
+    await supervisor.stop(); await starting;
+    release.resolve(); await occupied; await lane.withSnapshot(async () => {});
+    expect(await readFile(registrationPath, "utf8")).toBe(before);
+    expect(readCurrent).toHaveBeenCalledTimes(3);
+    expect(sockets).toHaveLength(0);
+  });
+
+  it("fails closed when identity rotates while the route registration HTTP request is pending", async () => {
+    const lane = new OperationSnapshotLane(() => {}), entered = deferred(), reply = deferred<Response>();
+    let current = pin;
+    const fetch = vi.fn<typeof globalThis.fetch>().mockImplementation(async () => { entered.resolve(); return reply.promise; });
+    const { supervisor, sockets, route, directory, onState } = await setup(fetch,
+      { withSnapshot: lane.withSnapshot, identity: { expected: pin, readCurrent: () => current } }, false);
+    const starting = supervisor.start();
+    await entered.promise;
+    await lane.withSnapshot(async () => { current = { hostId: "rotated-host", fingerprint: "rotated-fingerprint" }; });
+    reply.resolve(new Response(JSON.stringify(route)));
+    await expect(starting).rejects.toMatchObject({ code: "RELAY_IDENTITY_CHANGED" });
+    expect(supervisor.state).toBe("stopped");
+    expect(sockets).toHaveLength(0);
+    expect(await readdir(directory)).toEqual([]);
+    expect(onState.mock.calls.flat().join(" ")).not.toMatch(/rotated|original-fingerprint|STORE_ALREADY_CLOSED/);
+  });
+
+  it("stops a reconnect on identity drift without reserving a new generation or retrying", async () => {
+    vi.useFakeTimers();
+    const lane = new OperationSnapshotLane(() => {});
+    let current = pin;
+    const { supervisor, sockets, registrationPath } = await setup(undefined,
+      { withSnapshot: lane.withSnapshot, identity: { expected: pin, readCurrent: () => current } });
+    const control = sockets[0]!; control.open(); registration(control);
+    const before = await readFile(registrationPath, "utf8");
+    await lane.withSnapshot(async () => { current = { ...pin, fingerprint: "rotated-fingerprint" }; });
+    control.serverClose(); await vi.advanceTimersByTimeAsync(500);
+    await vi.waitFor(() => expect(supervisor.state).toBe("stopped"));
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(await readFile(registrationPath, "utf8")).toBe(before);
+    expect(sockets).toHaveLength(1);
   });
 
   it("authenticates control/data via headers, deduplicates control events, and drains all sockets on stop", async () => {

@@ -12,7 +12,7 @@ import { runOfflineRecovery } from "./connectivity/recovery-cli.js";
 import { HOST_OPERATIONS_CLI_USAGE, runHostOperationsCommand } from "./connectivity/operations-cli.js";
 import { verifyOfflineHostQuiescence } from "./connectivity/offline-quiescence.js";
 import { CATALOG_IMPORT_CLI_USAGE, runCatalogImportCli } from "./catalog/catalog-import-cli.js";
-import { OperationSnapshotLane } from "./operations/host-operations.js";
+import { createHostOperations, hostDiagnosticsRpc, HOST_DIAGNOSTICS_RPC_SCOPES, OperationSnapshotLane } from "./operations/host-operations.js";
 import { SqliteStore } from "./storage/db.js";
 import { HostOwnerLock, assertWorkspacePrivacy, canonicalPath } from "./lifecycle/host-owner.js";
 import { openForMaintenance, openForManagement, openOwned, openReadOnly } from "./storage/open-store.js";
@@ -122,6 +122,7 @@ async function main(): Promise<void> {
 
   // Acquisition precedes schema, identity, recovery and provider preflight.
   const owner = HostOwnerLock.acquire({ databasePath, identityDirectory });
+  const snapshotLane = new OperationSnapshotLane(() => owner.assertActive()).withSnapshot;
   let store: SqliteStore | undefined;
   let orchestrator: SessionOrchestrator | undefined;
   let pairingConfirmation: ReturnType<typeof createPairingConfirmation> | undefined;
@@ -134,11 +135,16 @@ async function main(): Promise<void> {
     const identity = await loadOrCreateHostIdentity({ directory: owner.identityDirectory!, expectedMirror: store.getHostIdentityMirror() ?? null });
     store.setHostIdentityMirror(getHostIdentityMirror(identity));
     const connectivity = await resolveConnectivityConfig(parseConnectivityConfig());
-    orchestrator = new SessionOrchestrator({ workspace, databasePath: owner.databasePath, provider, owner, store });
+    const operations = createHostOperations({ store, owner }, { identityDirectory: owner.identityDirectory!, applicationVersion: "0.0.1", withSnapshot: snapshotLane,
+      doctorFacts: () => ({ readiness: { status: orchestrator?.lifecycle.readiness === "ready" ? "ready" : "read_only", reasonCodes: owner.retainedReason ? ["OWNER_RECOVERY_REQUIRED"] : [] } }),
+    });
+    orchestrator = new SessionOrchestrator({ workspace, databasePath: owner.databasePath, provider, owner, store, assertWriteReady: operations.assertWriteReady });
     pairingConfirmation = createPairingConfirmation();
-    const boundary = await orchestrator.prepareNativeRuntime();
+    const restored = Boolean(store.db.prepare("SELECT 1 FROM host_state WHERE key='restore_readiness'").get());
+    if (restored) orchestrator.markProviderUnavailable();
+    const boundary = restored ? undefined : await orchestrator.prepareNativeRuntime();
     if (boundary && !boundary.ready) console.error(`Native execution unavailable (${boundary.code}); Host remains available for read-only history and recovery.`);
-    if ((!boundary || boundary.ready) && process.env.FLYX_SKIP_PREFLIGHT !== "1" && process.env.NODE_ENV !== "test") {
+    if (!restored && (!boundary || boundary.ready) && process.env.FLYX_SKIP_PREFLIGHT !== "1" && process.env.NODE_ENV !== "test") {
       try {
         const status = await orchestrator.adapter.preflight();
         console.log(`${providerName(status.provider)} preflight passed: ${status.transport} ${status.adapterVersion}, runtime ${status.runtimeVersion}`);
@@ -147,7 +153,16 @@ async function main(): Promise<void> {
         console.error(`Provider unavailable; Host remains read-only: ${error instanceof Error ? error.message : "Preflight failed"}`);
       }
     }
-    server = createHostServer({ orchestrator, pairingConfirmation, identity, identityDirectory: owner.identityDirectory!, connectivity,
+    server = createHostServer({ orchestrator, pairingConfirmation, identity, identityDirectory: owner.identityDirectory!, connectivity, snapshotLane,
+      domainPorts: [{ methodScopes: HOST_DIAGNOSTICS_RPC_SCOPES, ready: () => Boolean(store?.db.open), capabilities: () => [],
+        dispatch: async (frame, context) => {
+          if (!Object.hasOwn(HOST_DIAGNOSTICS_RPC_SCOPES, frame.method)) return { handled: false };
+          if (!server || !context.leaseId || context.transportGeneration === undefined) throw new Error("AUTH_REQUIRED");
+          const current = server.devices.assertLease(context.leaseId, context.transportGeneration);
+          if (current.deviceId !== context.subjectId) throw new Error("DEVICE_REVOKED");
+          return { handled: true, payload: hostDiagnosticsRpc(operations, frame.method, frame.payload, current.scopes) };
+        },
+      }],
       ...(process.env.FLYX_WEB_ROOT ? { webRoot: process.env.FLYX_WEB_ROOT } : {}) });
     const address = await server.start();
     console.log(`Flyx MVP Host listening at ${address}`);

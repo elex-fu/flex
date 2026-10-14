@@ -1,5 +1,6 @@
-import { execFileSync, spawnSync } from "node:child_process";
-import { mkdtempSync, realpathSync, rmSync } from "node:fs";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
+import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -13,7 +14,8 @@ const roots: string[] = [];
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
 async function fixture() {
   const root = realpathSync(mkdtempSync(join(tmpdir(), "flyx-main-operations-"))); roots.push(root);
-  const databasePath = join(root, "host.sqlite"), identityDirectory = join(root, "identity");
+  const data = join(root, "data"); mkdirSync(data, { mode: 0o700 });
+  const databasePath = join(data, "host.sqlite"), identityDirectory = join(data, "identity");
   const owner = HostOwnerLock.acquire({ databasePath, identityDirectory });
   const store = openOwned({ databasePath, owner });
   const identity = await loadOrCreateHostIdentity({ directory: identityDirectory });
@@ -70,5 +72,35 @@ describe("actual main operations routing", { timeout: 30000 }, () => {
     const child = spawnSync(process.execPath, ["--import", "tsx", resolve("src/main.ts"), "restore", directory, join(f.root, "rollback-refused")], { env: f.env, encoding: "utf8", timeout: 20000 });
     expect(child.status).toBe(1); expect(child.stderr).toContain("RESTORE_PRODUCERS_UNVERIFIED");
     expect(f.note().value_json).toBe(JSON.stringify("preserve"));
+  });
+
+  it("starts restored history without preparing or preflighting a Native Provider", async () => {
+    const f = await fixture(), workspace = join(f.root, "workspace"); mkdirSync(workspace);
+    execFileSync("git", ["init", "--quiet", workspace]);
+    const owner = HostOwnerLock.acquire({ databasePath: f.databasePath, identityDirectory: f.identityDirectory, mode: "maintenance" });
+    const store = openForMaintenance({ databasePath: f.databasePath, owner });
+    const timestamp = new Date().toISOString();
+    store.db.prepare("INSERT INTO host_state VALUES('restore_readiness',?,?)").run(JSON.stringify({ v: 1, status: "external_state_unverified", restoredAt: timestamp, backupCreatedAt: timestamp,
+      possibleDispatchIntents: 0, reasonCodes: ["RESTORE_GIT_STATE_UNVERIFIED", "RESTORE_PROVIDER_HISTORY_UNVERIFIED"], relayRegistrationInvalidated: false }), timestamp);
+    store.close(); owner.release();
+    const reserve = createServer();
+    await new Promise<void>((yes) => reserve.listen(0, "127.0.0.1", yes));
+    const port = (reserve.address() as { port: number }).port;
+    await new Promise<void>((yes, no) => reserve.close((error) => error ? no(error) : yes()));
+    const child = spawn(process.execPath, ["--import", "tsx", resolve("src/main.ts"), "start"], { env: { ...f.env, NODE_ENV: "production", FLYX_PROVIDER: "codex", FLYX_WORKSPACE: workspace, FLYX_SKIP_PREFLIGHT: "0", PORT: String(port) }, stdio: ["ignore", "pipe", "pipe"] });
+    const ended = new Promise<number | null>((yes, no) => { child.once("exit", yes); child.once("error", no); });
+    void ended.catch(() => undefined);
+    let output = "", errors = "";
+    child.stdout!.on("data", (chunk) => { output += String(chunk); }); child.stderr!.on("data", (chunk) => { errors += String(chunk); });
+    try {
+      const deadline = Date.now() + 15000;
+      while (!output.includes("Flyx MVP Host listening") && child.exitCode === null && Date.now() < deadline) await new Promise<void>((yes) => setTimeout(yes, 20));
+      expect(output, errors).toContain("Flyx MVP Host listening");
+      expect(errors).not.toContain("preflight"); expect(errors).not.toContain("Native execution unavailable");
+      child.kill("SIGTERM"); expect(await ended).toBe(0);
+      const readonly = openReadOnly(f.databasePath);
+      try { expect(readonly.db.prepare("SELECT COUNT(*) AS count FROM managed_processes").get()).toEqual({ count: 0 }); }
+      finally { readonly.close(); }
+    } finally { if (child.exitCode === null) { child.kill("SIGKILL"); await ended; } }
   });
 });

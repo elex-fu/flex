@@ -56,10 +56,19 @@ export type HostRecoveryOptions = {
   companionEvents?: (sessionId: string, turnId: string, reason: string) => PlannedEvent[];
 };
 
+export type HostRecoveryRequestLifecycle = {
+  assertAdmission(): void;
+  assertOpen(): void;
+  track<T>(work: () => Promise<T>): Promise<T>;
+};
+
 /** One factory for live RPC and restricted offline recovery, using the same durable Store. */
 export class HostRecovery {
   readonly service: RecoveryService;
   private readonly resolver: RecoveryResourceResolver;
+  private accepting = true;
+  private sealed = false;
+  private requestLifecycle: HostRecoveryRequestLifecycle | undefined;
   constructor(private readonly options: HostRecoveryOptions) {
     this.resolver = options.resolveResource ?? (() => ({ provider: options.provider, providerInstanceId: `legacy:${options.provider}`,
       workspacePath: options.workspace, configurationFingerprint: "unknown",
@@ -70,6 +79,26 @@ export class HostRecovery {
       ...(options.companionEvents ? { companionEvents: options.companionEvents } : {}) });
   }
   get recovery() { return this.service.recovery; }
+
+  /** Bind an existing loaded service into the same global recovery lane. */
+  bindRequestLifecycle(lifecycle: HostRecoveryRequestLifecycle): void {
+    if (this.requestLifecycle && this.requestLifecycle !== lifecycle) throw new RecoveryError("RECOVERY_LIFECYCLE_ALREADY_BOUND");
+    this.requestLifecycle = lifecycle;
+  }
+  beginDrain(): void { this.accepting = false; this.service.beginDrain(); }
+  seal(): void { this.accepting = false; this.sealed = true; this.service.seal(); }
+  private assertOpen(): void {
+    if (this.sealed || !this.options.store.db.open) throw new RecoveryError("RECOVERY_CLOSED");
+    this.requestLifecycle?.assertOpen();
+  }
+  private request<T>(work: () => Promise<T>): Promise<T> {
+    try {
+      this.assertOpen();
+      if (!this.accepting) throw new RecoveryError("RECOVERY_DRAINING");
+      this.requestLifecycle?.assertAdmission();
+      return this.requestLifecycle ? this.requestLifecycle.track(work) : work();
+    } catch (error) { return Promise.reject(error); }
+  }
 
   assertAdmission(sessionId = this.options.sessionId): void {
     this.options.owner.assertActive();
@@ -110,21 +139,30 @@ export class HostRecovery {
     this.options.onBlocked?.(context, "producer_stop_unverified");
     this.options.supersedeInteractions?.(context.sessionId, { attemptId: context.attemptId, runtimeGeneration: context.runtimeGeneration }, "recovery_blocked");
   }
-  inspect(input: RecoveryInspectPayload): Promise<RecoveryEvidence> { this.assertTargetSession(input.sessionId); return this.service.inspect(input); }
-  async reconcile(input: RecoveryCommandInput): Promise<RecoveryOperation> {
-    this.assertTargetSession(input.sessionId);
-    const operation = await this.service.reconcile(input);
-    this.afterCommitted(operation, input.evidenceId);
-    return operation;
+  inspect(input: RecoveryInspectPayload): Promise<RecoveryEvidence> {
+    return this.request(() => { this.assertTargetSession(input.sessionId); return this.service.inspect(input); });
   }
-  async acknowledge(input: RecoveryCommandInput & { acknowledgeUnknown: true }): Promise<RecoveryOperation> {
-    this.assertTargetSession(input.sessionId);
-    const operation = await this.service.acknowledge(input);
-    this.afterCommitted(operation, input.evidenceId);
-    return operation;
+  reconcile(input: RecoveryCommandInput): Promise<RecoveryOperation> {
+    return this.request(async () => {
+      this.assertTargetSession(input.sessionId);
+      const operation = await this.service.reconcile(input);
+      this.assertOpen();
+      this.afterCommitted(operation, input.evidenceId);
+      return operation;
+    });
+  }
+  acknowledge(input: RecoveryCommandInput & { acknowledgeUnknown: true }): Promise<RecoveryOperation> {
+    return this.request(async () => {
+      this.assertTargetSession(input.sessionId);
+      const operation = await this.service.acknowledge(input);
+      this.assertOpen();
+      this.afterCommitted(operation, input.evidenceId);
+      return operation;
+    });
   }
 
   private authorizeCommand(input: RecoveryCommandInput): void {
+    this.assertOpen();
     this.options.owner.assertActive();
     if (this.options.assertCommandAuthorized) { this.options.assertCommandAuthorized(input); return; }
     if (this.options.owner.recoveryOnly && input.authSubjectId === `local-recovery:${this.options.owner.ownerId}`) return;
@@ -134,6 +172,7 @@ export class HostRecovery {
   }
 
   private afterCommitted(operation: RecoveryOperation, evidenceId: string): void {
+    this.assertOpen();
     if (operation.state !== "completed") return;
     const target = this.recovery.target(operation.sessionId, operation.turnId, operation.attemptId);
     const evidence = this.recovery.evidence(evidenceId);
@@ -142,8 +181,10 @@ export class HostRecovery {
       || operation.gate === "blocked" && target.session.activeTurnId !== operation.turnId) return;
     if (target.context) {
       this.options.supersedeInteractions?.(target.session.id, { attemptId: target.context.attemptId, runtimeGeneration: target.context.runtimeGeneration }, "recovery_settled");
+      this.assertOpen();
       if (evidence?.native.state === "terminal" && operation.gate === "released") this.options.reconcileRuntime?.(target.context, evidence.native);
       else if (evidence?.committedOutcome && operation.gate === "released") this.options.reconcileRuntime?.(target.context, { ...evidence.committedOutcome, state: "not_dispatched" });
+      this.assertOpen();
       const journal = this.recovery.operation(operation.operationId);
       const stopped = evidence?.execution.evidence;
       if (operation.gate === "released" && journal?.phase === "completed" && journal.action === "acknowledge"
@@ -151,8 +192,10 @@ export class HostRecovery {
         this.options.reconcileStoppedRuntime?.(target.context, Object.freeze({ kind: "execution-stopped", sourceId: stopped.sourceId,
           evidenceId, operationId: operation.operationId }));
       }
+      this.assertOpen();
       if (operation.gate === "blocked") this.options.onBlocked?.(target.context, "producer_stop_unverified");
     }
+    this.assertOpen();
     this.options.afterRecovery?.(operation, evidenceId);
   }
 
@@ -172,18 +215,22 @@ export class HostRecovery {
       || target.context && digest(target.context) !== digest(context)) throw new RecoveryError("RECOVERY_CONTEXT_MISMATCH");
   }
   private assertTargetSession(sessionId: string): void {
+    this.assertOpen();
     this.options.owner.assertActive();
     if (sessionId !== this.options.sessionId) throw new RecoveryError("SESSION_NOT_FOUND");
   }
 
   private async inspectNative(handle: NativeHandle): Promise<NativeTurnObservation> {
+    this.assertOpen();
     const resource = this.resource(handle.context, handle.provider);
     if (resource.providerInstanceId !== handle.providerInstanceId || resource.configurationFingerprint !== handle.configurationFingerprint
       || !resource.verifiedVersions.includes(handle.verifiedVersion)) return { state: "unknown", reason: "native_history_configuration_unverified" };
     if (handle.provider === "codex") {
       const client = this.options.codexReader?.(handle);
       if (!client || !resource.readerVersion) return { state: "unknown", reason: "native_history_reader_unavailable" };
-      return inspectCodexNativeTurn(handle, { client, verifiedVersions: resource.verifiedVersions, readerVersion: resource.readerVersion });
+      const observed = await inspectCodexNativeTurn(handle, { client, verifiedVersions: resource.verifiedVersions, readerVersion: resource.readerVersion });
+      this.assertOpen();
+      return observed;
     }
     // These are original captured SDK result events, not user/assistant transcript endings.
     const events = this.options.store.db.prepare(`SELECT id,type,payload_json FROM session_events WHERE session_id = ?
@@ -204,6 +251,7 @@ export class HostRecovery {
   }
 
   private async inspectExecution(target: RecoveryTarget): Promise<ExecutionRecoveryObservation> {
+    this.assertOpen();
     if (!target.context || !target.turn.attemptId || !target.processes.length) return { state: "unknown", workspaceState: "unknown", reason: "original_process_identity_missing" };
     const inspector = this.options.processInspector ?? new SystemProcessInspector();
     const proofs: Array<{ id: string; sourceId: string; contractId: string; identityDigest?: string }> = [];
@@ -224,12 +272,14 @@ export class HostRecovery {
             && saved.boundary.launchDigest === record.boundary.launchDigest && digest(saved.processIdentity) === digest(original)
             && !!current.context && digest(current.context) === digest(target.context);
         });
+      this.assertOpen();
       if (boundary.state !== "stopped" || !boundary.sourceId || !boundary.contractId || boundary.identityDigest !== processIdentityDigest(identity)) {
         return { state: boundary.state === "running" ? "running" : "unknown", workspaceState: boundary.state === "running" ? "held" : "unknown", reason: "original_tree_boundary_unverified" };
       }
       proofs.push({ id: record.id, sourceId: boundary.sourceId, contractId: boundary.contractId, identityDigest: boundary.identityDigest });
     }
     const workspaceState = await this.options.inspectWorkspace?.(target) ?? "unknown";
+    this.assertOpen();
     return { state: "stopped", workspaceState, evidence: { kind: "process-tree-stopped", sourceId: digest(proofs), ownerId: target.context.hostOwnerId,
       ownerGeneration: target.context.hostOwnerGeneration, resourceKeys: [...this.options.owner.resourceKeys, `workspace:${this.options.checkoutRoot ?? this.options.workspace}`],
       processRecordIds: proofs.map((proof) => proof.id) } };

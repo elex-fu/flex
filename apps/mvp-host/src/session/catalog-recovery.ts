@@ -2,6 +2,8 @@ import type { SessionEvent } from "@flyx/mvp-protocol";
 import { RecoveryCapability } from "@flyx/mvp-protocol";
 import type { HostCatalog, CatalogExecutionRuntime } from "../catalog/host-catalog.js";
 import type { AppServerClient } from "../codex/app-server-client.js";
+import type { CatalogGlobalService } from "../lifecycle/catalog-host-lifecycle.js";
+import type { HostRecoveryRequestLifecycle } from "./host-recovery.js";
 import type { DispatchContext, ProviderId } from "../provider/types.js";
 import type { ResolvedSession, SessionRuntimeContext } from "./session-registry.js";
 import { inspectSchema } from "../storage/migrations/schema-version.js";
@@ -41,6 +43,10 @@ export type CatalogRuntimeRecoveryOptions = Pick<HostRecoveryOptions,
   "resolveResource" | "checkoutRoot" | "assertCommandAuthorized" | "processInspector" | "inspectBoundary" | "inspectWorkspace" | "codexReader" | "supersedeInteractions" | "companionEvents">;
 export type CatalogRecoveryOptions = {
   catalog: HostCatalog;
+  /** Global admission permits original retained recovery, but rejects Host drain. */
+  assertRecoveryAdmission?: () => void;
+  /** Track the whole RPC, including committed runtime/resource reconciliation. */
+  trackRecovery?: <T>(work: () => Promise<T>) => Promise<T>;
   /** Read an already verified local cache; do not probe or construct a Provider here. */
   verifiedManifestForInstance?: (identity: CatalogRecoveryIdentity) => CachedCatalogRecoveryManifest | undefined;
   /** Select an actual existing connection. Absence stays unknown; no reconnect/resume/start. */
@@ -68,6 +74,17 @@ export function catalogRecoveryConfigurationFingerprint(target: ResolvedSession)
 /** Recovery is available for persisted Sessions independently of runtime residency. */
 export class CatalogRecoveryBindings {
   private readonly unloaded = new Map<string, { identity: CatalogRecoveryIdentity; recovery: HostRecovery }>();
+  private readonly services = new Set<HostRecovery>();
+  private readonly pending = new Set<Promise<unknown>>();
+  private accepting = true;
+  private sealed = false;
+  private readonly requestLifecycle: HostRecoveryRequestLifecycle = {
+    assertAdmission: () => this.assertAdmission(), assertOpen: () => this.assertOpen(),
+    track: (work) => this.track(work),
+  };
+  readonly shutdownService: CatalogGlobalService = {
+    drain: (deadlineAt) => this.drain(deadlineAt), seal: () => this.seal(), close: () => this.seal(),
+  };
   constructor(private readonly options: CatalogRecoveryOptions) {
     this.options.catalog.owner.assertStorePath(this.options.catalog.store.db.name);
     inspectSchema(this.options.catalog.store.db);
@@ -76,7 +93,7 @@ export class CatalogRecoveryBindings {
   readonly recoveryCapabilities = (): readonly string[] => {
     try {
       const host = this.options.catalog;
-      if (!host.store.db.open || !host.ready) return [];
+      if (!this.accepting || this.sealed || !host.store.db.open || !host.ready) return [];
       host.owner.assertActive();
       if (inspectSchema(host.store.db).version < 7) return [];
       return [RecoveryCapability];
@@ -90,7 +107,7 @@ export class CatalogRecoveryBindings {
     if (runtime) {
       if (!runtime.recovery || runtime.sessionId !== sessionId || runtime.store !== this.options.catalog.store
         || runtime.owner !== this.options.catalog.owner || runtime.recovery.recovery.store !== runtime.store) throw new RecoveryError("RECOVERY_RUNTIME_BINDING_INVALID");
-      return runtime.recovery;
+      return this.bind(runtime.recovery);
     }
     const existing = this.unloaded.get(sessionId);
     if (existing?.identity.configurationFingerprint === identity.configurationFingerprint) return existing.recovery;
@@ -101,11 +118,12 @@ export class CatalogRecoveryBindings {
       onBlocked: (context, reason) => { this.options.catalog.owner.retain(reason); this.options.onBlocked?.(context, reason); },
       afterRecovery: (operation, evidenceId) => this.afterRecovery(identity, recovery, operation, evidenceId) });
     this.unloaded.set(sessionId, { identity, recovery });
-    return recovery;
+    return this.bind(recovery);
   };
 
   /** Pass into the lazy runtime's Orchestrator options before its native bindings can be captured. */
   readonly runtimeRecoveryOptions = (context: SessionRuntimeContext): CatalogRuntimeRecoveryOptions => {
+    this.assertOpen();
     const host = this.options.catalog;
     host.owner.assertActive();
     if (context.store !== host.store || context.owner !== host.owner || context.ownsStore !== false || context.recoverOnStart !== false
@@ -117,8 +135,55 @@ export class CatalogRecoveryBindings {
     return this.hooks(identity, false);
   };
 
+  private bind(recovery: HostRecovery): HostRecovery {
+    recovery.bindRequestLifecycle(this.requestLifecycle);
+    this.services.add(recovery);
+    return recovery;
+  }
+  private assertOpen(): void {
+    if (this.sealed || !this.options.catalog.store.db.open) throw new RecoveryError("RECOVERY_CLOSED");
+  }
+  private assertAdmission(): void {
+    this.assertOpen();
+    if (!this.accepting) throw new RecoveryError("RECOVERY_DRAINING");
+    this.options.assertRecoveryAdmission?.();
+  }
+  private track<T>(work: () => Promise<T>): Promise<T> {
+    this.assertAdmission();
+    let resolve!: (value: T | PromiseLike<T>) => void;
+    let reject!: (reason: unknown) => void;
+    const result = new Promise<T>((yes, no) => { resolve = yes; reject = no; });
+    // Register first: a synchronous accepted-marker callback can start shutdown.
+    this.pending.add(result);
+    void result.finally(() => this.pending.delete(result)).catch(() => {});
+    const execute = () => { this.assertOpen(); return work(); };
+    try { (this.options.trackRecovery ? this.options.trackRecovery(execute) : execute()).then(resolve, reject); }
+    catch (error) { reject(error); }
+    return result;
+  }
+  private async drain(deadlineAt: number): Promise<boolean> {
+    this.accepting = false;
+    for (const service of this.services) service.beginDrain();
+    if (!this.pending.size) return true;
+    const remaining = Number.isFinite(deadlineAt) ? Math.max(0, deadlineAt - Date.now()) : 0;
+    if (!remaining) { this.seal(); return false; }
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const complete = await Promise.race([
+      Promise.allSettled([...this.pending]).then(() => true),
+      new Promise<false>((resolve) => { timer = setTimeout(() => resolve(false), remaining); }),
+    ]);
+    if (timer) clearTimeout(timer);
+    if (!complete) this.seal();
+    return complete;
+  }
+  private seal(): void {
+    this.accepting = false; this.sealed = true;
+    for (const service of this.services) service.seal();
+  }
+
   private afterRecovery(identity: CatalogRecoveryIdentity, recovery: HostRecovery,
     operation: Parameters<NonNullable<HostRecoveryOptions["afterRecovery"]>>[0], evidenceId: string): void {
+    this.assertOpen();
     if (operation.gate !== "released") return;
     const host = this.options.catalog;
     try {
@@ -142,6 +207,7 @@ export class CatalogRecoveryBindings {
       })();
       if (event) this.publish([event]);
     } catch (error) {
+      this.assertOpen();
       let marker: SessionEvent | undefined;
       host.store.db.transaction(() => {
         const changed = host.store.db.prepare(`UPDATE sessions SET recovery_state='blocked',activity_state='outcome_unknown',active_turn_id=?,
@@ -159,7 +225,9 @@ export class CatalogRecoveryBindings {
   }
 
   private publish(events: readonly SessionEvent[]): void {
+    this.assertOpen();
     this.options.catalog.registry.publishCommittedEvents(events);
+    this.assertOpen();
     this.options.onCommit?.(events);
   }
 
@@ -177,7 +245,8 @@ export class CatalogRecoveryBindings {
   }
 
   private assertIdentity(identity: CatalogRecoveryIdentity): void {
-    if (!this.options.catalog.ready || digest(this.capture(identity.sessionId)) !== digest(identity)) throw new RecoveryError("RECOVERY_RESOURCE_MISMATCH");
+    this.assertOpen();
+    if (digest(this.capture(identity.sessionId)) !== digest(identity)) throw new RecoveryError("RECOVERY_RESOURCE_MISMATCH");
   }
 
   private versions(identity: CatalogRecoveryIdentity): readonly string[] {

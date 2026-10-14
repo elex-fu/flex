@@ -28,6 +28,8 @@ export class RecoveryService {
   private readonly id: () => string;
   private readonly evidenceTtlMs: number;
   private readonly running = new Map<string, { hash: string; result: Promise<RecoveryOperation> }>();
+  private accepting = true;
+  private sealed = false;
   constructor(private readonly options: RecoveryServiceOptions) {
     this.recovery = new RecoveryStore(options.store, { ...(options.companionEvents ? { companionEvents: options.companionEvents } : {}) });
     this.now = options.now ?? (() => new Date().toISOString());
@@ -35,9 +37,27 @@ export class RecoveryService {
     this.evidenceTtlMs = Math.max(1, Math.min(60_000, options.evidenceTtlMs ?? 30_000));
   }
 
+  /** Stop new requests while admitted work can still finish on the open Store. */
+  beginDrain(): void { this.accepting = false; }
+  /** In-flight observations may finish, but can no longer reach SQL or publication. */
+  seal(): void { this.accepting = false; this.sealed = true; }
+  private assertOpen(): void {
+    if (this.sealed || !this.options.store.db.open) throw new RecoveryError("RECOVERY_CLOSED");
+  }
+  private assertRequestAdmission(): void {
+    this.assertOpen();
+    if (!this.accepting) throw new RecoveryError("RECOVERY_DRAINING");
+  }
+  private publish(events: readonly SessionEvent[]): void {
+    this.assertOpen();
+    this.options.onCommit?.(events);
+  }
+
   async inspect(input: RecoveryInspectPayload): Promise<RecoveryEvidence> {
+    this.assertRequestAdmission();
     const target = this.recovery.target(input.sessionId, input.turnId, input.attemptId);
     const observed = await this.observe(target);
+    this.assertOpen();
     const observedAt = this.now();
     const view: RecoveryEvidence = {
       evidenceId: this.id(), sessionId: target.session.id, turnId: target.turn.id,
@@ -54,6 +74,7 @@ export class RecoveryService {
     const stop = observed.execution.evidence;
     const evidence: StoredRecoveryEvidence = { view, factsFingerprint: target.factsFingerprint, ...observed,
       ...(stop ? { ownerJournalFingerprint: this.recovery.ownerJournalFingerprint(stop.ownerId, stop.ownerGeneration) } : {}) };
+    this.assertOpen();
     this.recovery.saveEvidence(target, evidence);
     return view;
   }
@@ -62,6 +83,7 @@ export class RecoveryService {
   acknowledge(input: RecoveryCommandInput & { acknowledgeUnknown: true }): Promise<RecoveryOperation> { return this.run(input, "acknowledge"); }
 
   private run(input: RecoveryCommandInput, action: "reconcile" | "acknowledge"): Promise<RecoveryOperation> {
+    try { this.assertRequestAdmission(); } catch (error) { return Promise.reject(error); }
     if (!input.commandId || !input.authSubjectId) return Promise.reject(new RecoveryError("COMMAND_ID_REQUIRED"));
     if (action === "acknowledge" && input.acknowledgeUnknown !== true) return Promise.reject(new RecoveryError("RECOVERY_ACKNOWLEDGEMENT_REQUIRED"));
     const hash = digest({ action, sessionId: input.sessionId, turnId: input.turnId, attemptId: input.attemptId ?? null,
@@ -76,33 +98,41 @@ export class RecoveryService {
   }
 
   private async perform(input: RecoveryCommandInput, action: "reconcile" | "acknowledge", hash: string): Promise<RecoveryOperation> {
+    this.assertOpen();
     this.options.assertCommandAuthorized?.(input);
+    this.assertOpen();
     const marked = this.recovery.beginOperation(input, action, hash, this.now());
     if (marked.operation.result) return marked.operation.result;
-    this.options.onCommit?.(marked.events);
+    this.publish(marked.events);
+    this.assertOpen();
     const journal = marked.operation;
     this.recovery.markChecking(journal.id, this.now());
     try {
       const { target, evidence } = this.recovery.validateEvidence(input, this.now());
       const observed = await this.observe(target);
+      this.assertOpen();
       if (digest(observed.execution) !== digest(evidence.execution) || digest(observed.native) !== digest(evidence.native) || digest(observed.committedOutcome ?? null) !== digest(evidence.committedOutcome ?? null)) {
         throw new RecoveryError("RECOVERY_EVIDENCE_STALE");
       }
       this.options.assertCommandAuthorized?.(input);
+      this.assertOpen();
       const release = this.canRelease(observed.execution);
       if (action === "reconcile" && observed.native.state !== "terminal" && !(observed.committedOutcome && release)
         || action === "acknowledge" && (!release || observed.native.state === "terminal")) {
         const blocked = this.recovery.failOperation(journal, "RECOVERY_BLOCKED", this.now());
-        this.options.onCommit?.(blocked.events);
+        this.publish(blocked.events);
         return blocked.result;
       }
       const settled = this.recovery.finishOperation(input, journal, evidence, observed.native, release, this.now());
-      this.options.onCommit?.(settled.events);
+      this.publish(settled.events);
       return settled.result;
     } catch (error) {
+      // Sealing leaves the already accepted journal/receipt untouched. A late
+      // observation cannot turn shutdown into a failed-operation SQL callback.
+      this.assertOpen();
       if (error instanceof RecoveryError) {
         const failed = this.recovery.failOperation(journal, error.code, this.now());
-        this.options.onCommit?.(failed.events);
+        this.publish(failed.events);
       }
       // Database failures leave the accepted marker for explicit query/recovery;
       // they never turn a possibly-sent original command into a replay intent.
@@ -111,10 +141,12 @@ export class RecoveryService {
   }
 
   private async observe(target: RecoveryTarget): Promise<{ execution: ExecutionRecoveryObservation; native: NativeTurnObservation; committedOutcome?: NotDispatchedRecoveryOutcome }> {
+    this.assertOpen();
     const [execution, native] = await Promise.allSettled([
       this.options.inspectExecution ? this.options.inspectExecution(target) : Promise.resolve(defaultExecutionObservation(target)),
       target.nativeHandle && this.options.inspectNative ? this.options.inspectNative(target.nativeHandle) : Promise.resolve<NativeTurnObservation>({ state: "unknown", reason: "native_history_inspection_unavailable" }),
     ]);
+    this.assertOpen();
     return {
       execution: this.normalizeExecution(target, execution.status === "fulfilled" ? execution.value : { state: "unknown", workspaceState: "unknown", reason: "process_inspection_failed" }),
       ...(target.committedOutcome ? { committedOutcome: target.committedOutcome } : {}),

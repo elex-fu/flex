@@ -229,3 +229,105 @@ describe("Catalogue recovery without Provider residency", () => {
     expect(release).toHaveBeenCalledTimes(1); expect(f.runtimeFactory).not.toHaveBeenCalled(); expect(f.runTurn).not.toHaveBeenCalled();
   });
 });
+
+
+describe("global recovery admission and shutdown", () => {
+  it("tracks unloaded and existing loaded RPCs through the same global control lane", async () => {
+    const admission = vi.fn(); const tracked = vi.fn();
+    const track = <T>(work: () => Promise<T>): Promise<T> => { tracked(); return work(); };
+    const f = await fixture({ assertRecoveryAdmission: admission, trackRecovery: track }, true);
+    f.host.providers.recordVerification("instance-claude", { state: "verified", runtimeVersion: "fixture-runtime", capabilities: ["workspaceWrite"] });
+    const unloaded = f.unknown(); await f.bindings.recoveryForSession(f.codex)!.inspect(unloaded);
+    const runtime = await f.host.registry.ensureLoaded(f.host.legacySessionId);
+    if (!(runtime instanceof SessionOrchestrator)) throw new Error("Expected live runtime");
+    const loaded = f.unknown(runtime.sessionId);
+    const bound = f.bindings.recoveryForSession(runtime.sessionId)!;
+    expect(bound).toBe(runtime.recovery); await runtime.recovery.inspect(loaded);
+    expect(tracked).toHaveBeenCalledTimes(2); expect(admission).toHaveBeenCalled();
+    expect(await f.bindings.shutdownService.drain(Date.now() + 100)).toBe(true);
+    await expect(bound.inspect(loaded)).rejects.toMatchObject({ code: "RECOVERY_DRAINING" });
+    expect(f.bindings.recoveryCapabilities()).toEqual([]);
+    expect(f.bindings.recoveryForSession(f.codex)).toBeUndefined();
+  });
+
+  it("denies global admission before SQL and before observation starts", async () => {
+    let allowed = true; const admission = vi.fn(() => { if (!allowed) throw new Error("HOST_DRAINING"); });
+    const reader = terminalClient(); const f = await fixture({ assertRecoveryAdmission: admission, verifiedManifestForInstance: manifest,
+      existingCodexReader: (target) => existingReader(target, reader.client) });
+    const original = f.unknown(); const bound = f.bindings.recoveryForSession(f.codex)!; allowed = false;
+    const sql = vi.spyOn(f.store.db, "prepare");
+    await expect(bound.inspect(original)).rejects.toThrow("HOST_DRAINING");
+    expect(sql).not.toHaveBeenCalled(); expect(reader.request).not.toHaveBeenCalled(); sql.mockRestore();
+  });
+
+  it("drains an admitted inspection using the absolute deadline while keeping unknown projection publication open", async () => {
+    let release!: () => void; const barrier = new Promise<void>((yes) => { release = yes; });
+    const request = vi.fn(async () => { await barrier; return { thread: { id: "unmatched", turns: [] } }; });
+    const f = await fixture({ verifiedManifestForInstance: manifest, existingCodexReader: (target) => existingReader(target, { request: request as unknown as AppServerClient["request"] }) });
+    const original = f.unknown(); const bound = f.bindings.recoveryForSession(f.codex)!;
+    const pending = bound.inspect(original); const draining = f.bindings.shutdownService.drain(Date.now() + 500);
+    await expect(bound.inspect(original)).rejects.toMatchObject({ code: "RECOVERY_DRAINING" });
+    const observed: SessionEvent[] = []; f.host.registry.subscribe(f.codex, (event) => observed.push(event));
+    const unknown = f.store.commitEvent(f.codex, "execution.control.unknown", { turnId: original.turnId, reason: "Host shutdown original producer still unknown" });
+    f.host.registry.publishCommittedEvents([unknown]);
+    expect(observed).toContainEqual(unknown); expect(f.host.views?.ready(f.codex)).toBe(true);
+    release(); await expect(pending).resolves.toMatchObject({ nativeState: "unknown" });
+    expect(await draining).toBe(true); expect(f.store.getTurn(original.turnId)?.status).toBe("outcome_unknown");
+  });
+
+  it("registers before accepted publication and seals timed-out reconcile before Store close", async () => {
+    let reads = 0; let release!: () => void; const barrier = new Promise<void>((yes) => { release = yes; });
+    const request = vi.fn(async (_method: string, params: unknown) => { if (++reads === 2) await barrier; const id = (params as { threadId: string }).threadId;
+      return { thread: { id, turns: [{ id: id.replace("native-session:", "native-turn:"), status: "completed" }] } }; });
+    let draining: Promise<void | boolean> | undefined; let bindings!: CatalogRecoveryBindings;
+    const commits = vi.fn((events: readonly SessionEvent[]) => { if (events.some((event) => event.type === "recovery.operation.marked")) draining = bindings.shutdownService.drain(Date.now() - 1); });
+    const supersede = vi.fn(); const after = vi.fn();
+    const f = await fixture({ verifiedManifestForInstance: manifest, existingCodexReader: (target) => existingReader(target, { request: request as unknown as AppServerClient["request"] }),
+      onCommit: commits, supersedeInteractions: supersede, afterRecovery: after }); bindings = f.bindings;
+    const original = f.unknown(); const bound = f.bindings.recoveryForSession(f.codex)!; const evidence = await bound.inspect(original);
+    const pending = bound.reconcile({ ...original, authSubjectId: "writer", commandId: "draining-reconcile", evidenceId: evidence.evidenceId, expectedRecoveryRevision: evidence.recoveryRevision });
+    const rejected = expect(pending).rejects.toMatchObject({ code: "RECOVERY_CLOSED" });
+    expect(await draining).toBe(false);
+    expect(f.store.getCommandReceipt("writer", "draining-reconcile")?.state).toBe("accepted");
+    expect(f.store.getCommandReceipt("writer", original.start)?.state).toBe("outcome_unknown");
+    await f.host.closeAndWait(100); f.bindings.shutdownService.seal?.();
+    const sql = vi.spyOn(f.store.db, "prepare"); f.store.close(); release(); await rejected;
+    expect(sql).not.toHaveBeenCalled(); expect(commits).toHaveBeenCalledTimes(1); expect(after).not.toHaveBeenCalled(); expect(supersede).not.toHaveBeenCalled();
+  });
+});
+
+
+describe("recovery continuation fences", () => {
+  it("seals a deferred RPC at its absolute drain deadline and never resumes SQL/publication after close", async () => {
+    let reads = 0; let release!: () => void; const barrier = new Promise<void>((yes) => { release = yes; });
+    const request = vi.fn(async (_method: string, params: unknown) => { if (++reads === 2) await barrier; const id = (params as { threadId: string }).threadId;
+      return { thread: { id, turns: [{ id: id.replace("native-session:", "native-turn:"), status: "completed" }] } }; });
+    const commits = vi.fn(); const supersede = vi.fn(); const after = vi.fn();
+    const f = await fixture({ verifiedManifestForInstance: manifest, existingCodexReader: (target) => existingReader(target, { request: request as unknown as AppServerClient["request"] }),
+      onCommit: commits, supersedeInteractions: supersede, afterRecovery: after });
+    const original = f.unknown(); const bound = f.bindings.recoveryForSession(f.codex)!; const evidence = await bound.inspect(original);
+    const pending = bound.reconcile({ ...original, authSubjectId: "writer", commandId: "deferred-recovery", evidenceId: evidence.evidenceId, expectedRecoveryRevision: evidence.recoveryRevision });
+    const rejected = expect(pending).rejects.toMatchObject({ code: "RECOVERY_CLOSED" });
+    await new Promise<void>((yes) => setImmediate(yes)); expect(reads).toBe(2);
+    expect(bound.recovery.operationForCommand("writer", "deferred-recovery")?.phase).toBe("checking");
+    expect(await f.bindings.shutdownService.drain(Date.now() - 1)).toBe(false);
+    expect(f.store.getCommandReceipt("writer", "deferred-recovery")?.state).toBe("accepted");
+    await f.host.closeAndWait(100); const sql = vi.spyOn(f.store.db, "prepare"); f.store.close(); release(); await rejected;
+    expect(sql).not.toHaveBeenCalled(); expect(commits).toHaveBeenCalledTimes(1); expect(after).not.toHaveBeenCalled(); expect(supersede).not.toHaveBeenCalled();
+  });
+
+  it("checks its own open guard between service completion and runtime/resource callbacks", async () => {
+    let bindings!: CatalogRecoveryBindings; let clearSql = () => {};
+    const reader = terminalClient(); const supersede = vi.fn(); const after = vi.fn();
+    const f = await fixture({ verifiedManifestForInstance: manifest, existingCodexReader: (target) => existingReader(target, reader.client), supersedeInteractions: supersede, afterRecovery: after,
+      onCommit: (events) => { if (events.some((event) => event.type === "turn.recovery.reconciled")) { bindings.shutdownService.seal?.(); clearSql(); } } }); bindings = f.bindings;
+    const original = f.unknown(); const bound = bindings.recoveryForSession(f.codex)!; const evidence = await bound.inspect(original);
+    const sql = vi.spyOn(f.store.db, "prepare"); clearSql = () => { sql.mockClear(); };
+    await expect(bound.reconcile({ ...original, authSubjectId: "writer", commandId: "sealed-after-commit", evidenceId: evidence.evidenceId, expectedRecoveryRevision: evidence.recoveryRevision }))
+      .rejects.toMatchObject({ code: "RECOVERY_CLOSED" });
+    expect(sql).not.toHaveBeenCalled(); sql.mockRestore();
+    expect(f.store.getCommandReceipt("writer", "sealed-after-commit")?.state).toBe("completed");
+    expect(f.store.getTurn(original.turnId)?.status).toBe("completed"); expect(f.store.getSession(f.codex)?.recoveryState).toBe("blocked");
+    expect(after).not.toHaveBeenCalled(); expect(supersede).not.toHaveBeenCalled();
+  });
+});

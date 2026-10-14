@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { SqliteStore } from "../storage/db.js";
 import { RecoveryService } from "./recovery-service.js";
 import { RecoveryStore } from "../storage/recovery-store.js";
@@ -63,6 +63,39 @@ function addControlIntent(f: ReturnType<typeof fixture>) {
       actorKind: "device", kind: "interrupt_turn", resourceId: "original-turn", payload: { turnId: "original-turn" }, requestHash: "interrupt-hash",
       requestFormatVersion: 2, runtimeGeneration: 1, attemptId: "original-attempt" }] }) });
 }
+
+describe("recovery observation lifecycle", () => {
+  it("seals a deferred inspect before Store close without any late evidence SQL", async () => {
+    const f = fixture(); let release!: () => void;
+    f.holdNative(new Promise<void>((yes) => { release = yes; }));
+    const saved = vi.spyOn(f.service.recovery, "saveEvidence");
+    const pending = f.inspect(); const rejected = expect(pending).rejects.toMatchObject({ code: "RECOVERY_CLOSED" });
+    f.service.seal(); const sql = vi.spyOn(f.store.db, "prepare"); f.store.close(); release();
+    await rejected; expect(sql).not.toHaveBeenCalled(); expect(saved).not.toHaveBeenCalled();
+  });
+
+  it.each(["reconcile", "acknowledge"] as const)("keeps the accepted %s marker when sealed observation completes after Store close", async (action) => {
+    const f = fixture({ native: action === "acknowledge" ? { state: "unknown", reason: "original result unknown" } : terminal() });
+    const view = await f.inspect(); let release!: () => void;
+    f.holdNative(new Promise<void>((yes) => { release = yes; }));
+    const pending = action === "acknowledge" ? f.service.acknowledge({ ...f.input(view), acknowledgeUnknown: true }) : f.service.reconcile(f.input(view));
+    const rejected = expect(pending).rejects.toMatchObject({ code: "RECOVERY_CLOSED" });
+    expect(f.recovery.operationForCommand("device", "recovery-command")?.phase).toBe("checking");
+    const finish = vi.spyOn(f.service.recovery, "finishOperation"); const fail = vi.spyOn(f.service.recovery, "failOperation");
+    f.service.seal(); const sql = vi.spyOn(f.store.db, "prepare"); f.store.close(); release(); await rejected;
+    expect(sql).not.toHaveBeenCalled(); expect(finish).not.toHaveBeenCalled(); expect(fail).not.toHaveBeenCalled();
+  });
+
+  it("rejects new requests during drain while the admitted original recovery can commit", async () => {
+    const f = fixture(); const view = await f.inspect(); let release!: () => void;
+    f.holdNative(new Promise<void>((yes) => { release = yes; }));
+    const pending = f.service.reconcile(f.input(view)); f.service.beginDrain();
+    await expect(f.inspect()).rejects.toMatchObject({ code: "RECOVERY_DRAINING" });
+    await expect(f.service.reconcile(f.input(view, "new-request"))).rejects.toMatchObject({ code: "RECOVERY_DRAINING" });
+    release(); await expect(pending).resolves.toMatchObject({ gate: "released" });
+    expect(f.store.getCommandReceipt("device", "new-request")).toBeUndefined();
+  });
+});
 
 describe("evidence-bound original execution recovery", () => {
   it("settles exact native terminal proof, original/control receipts and intents through one Engine commit", async () => {

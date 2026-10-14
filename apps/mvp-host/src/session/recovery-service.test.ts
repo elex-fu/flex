@@ -1,0 +1,243 @@
+import { afterEach, describe, expect, it } from "vitest";
+import { SqliteStore } from "../storage/db.js";
+import { RecoveryService } from "./recovery-service.js";
+import { RecoveryStore } from "../storage/recovery-store.js";
+import type { ExecutionRecoveryObservation, RecoveryCommandInput } from "../storage/recovery-store.js";
+import type { DispatchContext } from "../provider/types.js";
+import type { NativeTurnObservation } from "../provider/native-history.js";
+
+const stores: SqliteStore[] = [];
+afterEach(() => { for (const store of stores.splice(0)) store.close(); });
+const clockStart = Date.parse("2026-10-15T00:00:00Z");
+function terminal(nativeTurnId = "native-turn"): NativeTurnObservation {
+  return { state: "terminal", nativeSessionId: "native-session", nativeTurnId, status: "completed",
+    evidence: { kind: "native-terminal", sourceId: "native-terminal-source", verifiedVersion: "fixture-verified" } };
+}
+function stopped(): ExecutionRecoveryObservation {
+  return { state: "stopped", workspaceState: "clear", evidence: { kind: "process-tree-stopped", sourceId: "tree-stop-source",
+    ownerId: "original-owner", ownerGeneration: 2, resourceKeys: ["db:key", "identity:key", "workspace:key"] } };
+}
+function fixture(options: { native?: NativeTurnObservation; execution?: ExecutionRecoveryObservation; defaultExecution?: boolean; legacy?: boolean } = {}) {
+  const store = new SqliteStore(); stores.push(store);
+  const session = store.createSession("/fixture/workspace", "codex");
+  const accepted = options.legacy
+    ? { turn: store.createTurn({ sessionId: session.id, turnId: "original-turn", commandId: "original-command", requestHash: "original-hash", prompt: "original", generation: 1 }) }
+    : store.acceptTurn({ authSubjectId: "device", sessionId: session.id, turnId: "original-turn", commandId: "original-command", requestHash: "original-hash", prompt: "original", generation: 1, attemptId: "original-attempt" });
+  const context: DispatchContext = { hostOwnerId: "original-owner", hostOwnerGeneration: 2, sessionId: session.id,
+    flyxTurnId: "original-turn", runtimeId: "original-runtime", runtimeGeneration: 1, attemptId: "original-attempt" };
+  const recovery = new RecoveryStore(store);
+  if (!options.legacy) {
+    recovery.recordNativeBinding({ context, provider: "codex", providerInstanceId: "codex-instance", nativeSessionId: "native-session", nativeTurnId: "native-turn",
+      workspacePath: "/fixture/workspace", configurationFingerprint: "fixture-policy", verifiedVersion: "fixture-verified" });
+    store.db.prepare(`INSERT INTO managed_processes(id,owner_id,owner_generation,runtime_id,runtime_generation,attempt_id,session_id,turn_id,pid,process_group,tree_control,state,updated_at)
+      VALUES('process-original','original-owner',2,'original-runtime',1,'original-attempt',?,'original-turn',123,123,'process_group','root_exited',?)`).run(session.id, new Date(clockStart).toISOString());
+  }
+  store.commitEvent(session.id, "turn.unknown", { turnId: accepted.turn.id }, { turnId: accepted.turn.id, turnStatus: "outcome_unknown", activityState: "outcome_unknown",
+    ...(!options.legacy ? { commandReceipt: { authSubjectId: "device", commandId: "original-command", requestHash: "original-hash", state: "outcome_unknown" as const, response: { turnId: accepted.turn.id, status: "outcome_unknown" }, required: true } } : {}) });
+  let timestamp = clockStart;
+  let native = options.native ?? terminal();
+  let execution = options.execution ?? stopped();
+  let nativeReads = 0;
+  let nativeBarrier: Promise<void> | undefined;
+  const service = new RecoveryService({ store, now: () => new Date(timestamp).toISOString(),
+    ...(!options.defaultExecution ? { inspectExecution: async () => execution } : {}),
+    inspectNative: async () => { nativeReads += 1; if (nativeBarrier) await nativeBarrier; return native; } });
+  const inspect = () => service.inspect({ sessionId: session.id, turnId: accepted.turn.id, ...(accepted.turn.attemptId ? { attemptId: accepted.turn.attemptId } : {}) });
+  const input = (view: Awaited<ReturnType<typeof inspect>>, commandId = "recovery-command"): RecoveryCommandInput => ({ authSubjectId: "device", commandId,
+    sessionId: session.id, turnId: accepted.turn.id, ...(accepted.turn.attemptId ? { attemptId: accepted.turn.attemptId } : {}), evidenceId: view.evidenceId, expectedRecoveryRevision: view.recoveryRevision });
+  return { store, service, recovery, session, context, inspect, input, setNative(value: NativeTurnObservation) { native = value; },
+    setExecution(value: ExecutionRecoveryObservation) { execution = value; }, setTime(value: number) { timestamp = value; },
+    holdNative(value: Promise<void> | undefined) { nativeBarrier = value; }, get nativeReads() { return nativeReads; } };
+}
+function nextTurn(f: ReturnType<typeof fixture>, id = "new-turn") {
+  return f.store.acceptTurn({ authSubjectId: "device", sessionId: f.session.id, turnId: id, commandId: `command-${id}`,
+    requestHash: `hash-${id}`, prompt: "new prompt", generation: 2, attemptId: `attempt-${id}` });
+}
+
+function addControlIntent(f: ReturnType<typeof fixture>) {
+  f.store.commitCommand({ sessionId: f.session.id, build: () => ({ result: undefined,
+    receipts: [{ authSubjectId: "device", commandId: "interrupt-command", method: "session.interrupt", requestHash: "interrupt-hash", targetSessionId: f.session.id,
+      requestFormatVersion: 2, state: "outcome_unknown", response: { turnId: "original-turn", status: "outcome_unknown" } }],
+    events: [{ type: "interrupt.unknown", payload: { turnId: "original-turn" } }],
+    intents: [{ id: "interrupt-intent", sessionId: f.session.id, turnId: "original-turn", authSubjectId: "device", commandId: "interrupt-command", ordinal: 0,
+      actorKind: "device", kind: "interrupt_turn", resourceId: "original-turn", payload: { turnId: "original-turn" }, requestHash: "interrupt-hash",
+      requestFormatVersion: 2, runtimeGeneration: 1, attemptId: "original-attempt" }] }) });
+}
+
+describe("evidence-bound original execution recovery", () => {
+  it("settles exact native terminal proof, original/control receipts and intents through one Engine commit", async () => {
+    const f = fixture(); addControlIntent(f);
+    const view = await f.inspect();
+    expect(view).toMatchObject({ nativeState: "terminal", nativeOutcome: "completed", processState: "stopped", workspaceState: "clear" });
+    const result = await f.service.reconcile(f.input(view));
+    expect(result).toMatchObject({ state: "completed", gate: "released", turnStatus: "completed" });
+    expect(f.store.getTurn("original-turn")?.status).toBe("completed");
+    expect(f.store.getCommandReceipt("device", "original-command")?.state).toBe("completed");
+    expect(f.store.getCommandReceipt("device", "interrupt-command")?.response).toMatchObject({ disposition: "obsolete_after_execution_stopped", deliveryState: "unconfirmed" });
+    expect(f.store.getCommandReceipt("device", "recovery-command")?.state).toBe("completed");
+    expect(f.store.db.prepare("SELECT state FROM execution_intents WHERE turn_id = 'original-turn'").all()).toEqual([expect.objectContaining({ state: "settled" }), expect.objectContaining({ state: "settled" })]);
+    expect(f.store.getActiveTurn(f.session.id)).toBeUndefined();
+    expect(f.store.getSession(f.session.id)).toMatchObject({ activityState: "idle", recoveryState: "idle", recoveryRevision: result.recoveryRevision });
+    const again = await f.service.reconcile(f.input(view));
+    expect(again).toEqual(result);
+    expect(f.nativeReads).toBe(2);
+  });
+
+  it("settles a native result without releasing the gate when process identity/descendants are unknown", async () => {
+    const f = fixture({ defaultExecution: true });
+    const view = await f.inspect();
+    expect(view).toMatchObject({ nativeState: "terminal", processState: "unknown", workspaceState: "unknown" });
+    const result = await f.service.reconcile(f.input(view));
+    expect(result).toMatchObject({ state: "completed", turnStatus: "completed", gate: "blocked" });
+    expect(f.store.getCommandReceipt("device", "original-command")?.state).toBe("completed");
+    expect(f.store.getActiveTurn(f.session.id)?.id).toBe("original-turn");
+    expect(f.store.getSession(f.session.id)?.recoveryState).toBe("blocked");
+    expect(() => nextTurn(f)).toThrow("RECOVERY_BLOCKED");
+    expect(f.recovery.releaseProof(view.evidenceId)).toBeUndefined();
+    f.setExecution(stopped());
+    const service = new RecoveryService({ store: f.store, inspectExecution: async () => stopped(), inspectNative: async () => terminal(), now: () => new Date(clockStart).toISOString() });
+    const fresh = await service.inspect({ sessionId: f.session.id, turnId: "original-turn", attemptId: "original-attempt" });
+    await expect(service.reconcile(f.input(fresh, "release-after-stop"))).resolves.toMatchObject({ gate: "released", turnStatus: "completed" });
+  });
+
+  it("requires explicit acknowledgment after known tree stop and preserves unknown history when a new prompt starts", async () => {
+    const f = fixture({ native: { state: "unknown", reason: "no_native_terminal" } });
+    const view = await f.inspect();
+    expect(view.nextSteps).toContain("acknowledge");
+    await expect(f.service.acknowledge({ ...f.input(view), acknowledgeUnknown: true })).resolves.toMatchObject({ gate: "released", turnStatus: "outcome_unknown" });
+    expect(f.store.getTurn("original-turn")?.status).toBe("outcome_unknown");
+    expect(f.store.getCommandReceipt("device", "original-command")).toMatchObject({ state: "outcome_unknown", response: { acknowledged: true, executionStopped: true } });
+    expect(f.store.db.prepare("SELECT state,result_code FROM execution_intents WHERE kind = 'start_turn'").get()).toMatchObject({ state: "settled", result_code: "outcome_unknown_acknowledged" });
+    const accepted = nextTurn(f);
+    expect(f.store.getSnapshot(f.session.id)?.activeTurn?.id).toBe(accepted.turn.id);
+    expect(f.store.getTurn("original-turn")?.status).toBe("outcome_unknown");
+    expect(f.store.db.prepare("SELECT COUNT(*) AS count FROM turns").get()).toEqual({ count: 2 });
+  });
+
+  it.each(["unknown", "running"] as const)("keeps %s process identity blocked without replaying or inventing an outcome", async (state) => {
+    const f = fixture({ native: { state: "unknown", reason: "unverifiable" }, execution: { state, workspaceState: "held", reason: "identity_unverified" } });
+    const view = await f.inspect();
+    expect(view.nextSteps).not.toContain("acknowledge");
+    await expect(f.service.acknowledge({ ...f.input(view), acknowledgeUnknown: true })).resolves.toMatchObject({ state: "blocked", gate: "blocked" });
+    expect(() => nextTurn(f)).toThrow("RECOVERY_BLOCKED");
+    expect(f.store.getCommandReceipt("device", "original-command")?.state).toBe("outcome_unknown");
+    expect(f.store.db.prepare("SELECT state FROM execution_intents WHERE kind = 'start_turn'").get()).toEqual({ state: "outcome_unknown" });
+  });
+
+  it("does not upgrade SDK/legacy history without a verifiable original attempt", async () => {
+    const f = fixture({ legacy: true });
+    const view = await f.inspect();
+    expect(view).toMatchObject({ nativeState: "unknown", processState: "unknown" });
+    expect(view.attemptId).toBeUndefined();
+    await expect(f.service.acknowledge({ ...f.input(view), acknowledgeUnknown: true })).resolves.toMatchObject({ state: "blocked" });
+    expect(() => nextTurn(f)).toThrow("RECOVERY_BLOCKED");
+    expect(f.store.getTurn("original-turn")?.status).toBe("outcome_unknown");
+  });
+
+  it("rejects a terminal observation for another native Turn", async () => {
+    const f = fixture({ native: terminal("latest-but-wrong-turn") });
+    const view = await f.inspect();
+    expect(view.nativeState).toBe("unknown");
+    await expect(f.service.reconcile(f.input(view))).resolves.toMatchObject({ state: "blocked" });
+    expect(f.store.getTurn("original-turn")?.status).toBe("outcome_unknown");
+  });
+
+  it("reconciles historical unknown evidence without changing a newer active Turn", async () => {
+    const f = fixture({ native: { state: "unknown", reason: "no_terminal_yet" } });
+    const view = await f.inspect();
+    await f.service.acknowledge({ ...f.input(view), acknowledgeUnknown: true });
+    nextTurn(f);
+    f.setNative(terminal());
+    const historical = await f.inspect();
+    await expect(f.service.reconcile(f.input(historical, "historical-reconcile"))).resolves.toMatchObject({ gate: "unchanged", turnStatus: "completed" });
+    expect(f.store.getActiveTurn(f.session.id)?.id).toBe("new-turn");
+    expect(f.store.getSession(f.session.id)?.activityState).toBe("running");
+    expect(f.store.getTurn("new-turn")?.status).toBe("queued");
+    expect(f.store.getCommandReceipt("device", "command-new-turn")?.state).toBe("accepted");
+    expect(f.store.getCommandReceipt("device", "original-command")?.state).toBe("completed");
+  });
+
+  it("exposes an accepted marker while read-only inspection is pending, then updates its receipt", async () => {
+    const f = fixture();
+    const view = await f.inspect();
+    let release!: () => void;
+    const barrier = new Promise<void>((resolve) => { release = resolve; });
+    f.holdNative(barrier);
+    const result = f.service.reconcile(f.input(view));
+    expect(f.recovery.operationForCommand("device", "recovery-command")?.phase).toBe("checking");
+    expect(f.store.getCommandReceipt("device", "recovery-command")?.state).toBe("accepted");
+    expect(f.store.getCommandReceipt("device", "original-command")?.state).toBe("outcome_unknown");
+    release();
+    await result;
+    expect(f.store.getCommandReceipt("device", "recovery-command")?.state).toBe("completed");
+  });
+
+  it.each(["expired", "revision", "changed-inspection"])("rejects %s evidence without releasing the original execution", async (cause) => {
+    const f = fixture();
+    const view = await f.inspect();
+    if (cause === "expired") f.setTime(clockStart + 30_001);
+    if (cause === "revision") f.store.db.prepare("UPDATE sessions SET recovery_revision = recovery_revision + 1 WHERE id = ?").run(f.session.id);
+    if (cause === "changed-inspection") f.setExecution({ state: "unknown", workspaceState: "unknown", reason: "process_identity_changed" });
+    await expect(f.service.reconcile(f.input(view))).rejects.toMatchObject({ code: "RECOVERY_EVIDENCE_STALE" });
+    expect(f.store.getTurn("original-turn")?.status).toBe("outcome_unknown");
+    expect(f.store.getActiveTurn(f.session.id)?.id).toBe("original-turn");
+    if (cause === "changed-inspection") expect(f.store.getCommandReceipt("device", "recovery-command")?.state).toBe("failed");
+    else expect(f.store.getCommandReceipt("device", "recovery-command")).toBeUndefined();
+  });
+
+  it("rolls back marker/receipt/events if the operation journal insert fails before inspection", async () => {
+    const f = fixture();
+    const view = await f.inspect();
+    const before = f.store.getSession(f.session.id)!;
+    f.store.db.exec("CREATE TRIGGER fail_recovery_marker BEFORE INSERT ON recovery_operations BEGIN SELECT RAISE(ABORT,'injected recovery journal failure'); END");
+    await expect(f.service.reconcile(f.input(view))).rejects.toThrow("injected recovery journal failure");
+    expect(f.store.getCommandReceipt("device", "recovery-command")).toBeUndefined();
+    expect(f.store.getSession(f.session.id)).toEqual(before);
+    expect(f.nativeReads).toBe(1);
+  });
+
+  it("rolls back native terminal/gate/receipt/intent settlement if the final journal commit fails", async () => {
+    const f = fixture(); addControlIntent(f);
+    const view = await f.inspect();
+    f.store.db.exec("CREATE TRIGGER fail_recovery_final BEFORE UPDATE ON recovery_operations WHEN NEW.phase = 'completed' BEGIN SELECT RAISE(ABORT,'injected recovery final failure'); END");
+    await expect(f.service.reconcile(f.input(view))).rejects.toThrow("injected recovery final failure");
+    expect(f.store.getTurn("original-turn")?.status).toBe("outcome_unknown");
+    expect(f.store.getSession(f.session.id)?.recoveryState).toBe("blocked");
+    expect(f.store.getActiveTurn(f.session.id)?.id).toBe("original-turn");
+    expect(f.store.getCommandReceipt("device", "original-command")?.state).toBe("outcome_unknown");
+    expect(f.store.getCommandReceipt("device", "interrupt-command")?.state).toBe("outcome_unknown");
+    expect(f.store.getCommandReceipt("device", "recovery-command")?.state).toBe("accepted");
+    expect(f.recovery.operationForCommand("device", "recovery-command")?.phase).toBe("checking");
+    expect(f.store.listEvents(f.session.id).events.some((event) => event.type === "turn.recovery.reconciled")).toBe(false);
+  });
+
+  it("issues resource-specific retained-release proof only after committed gate release and invalidates it on new execution", async () => {
+    const f = fixture({ native: { state: "unknown", reason: "no_terminal" } });
+    const view = await f.inspect();
+    const proof = f.recovery.releaseProof(view.evidenceId, ["workspace:key"])!;
+    const resource = { resourceKey: "workspace:key", ownerId: "original-owner", ownerGeneration: 2, purpose: "workspace:original-turn", retainedReason: "unknown execution" };
+    expect(f.recovery.verifyReleaseProof(proof, resource)).toBe(false);
+    await f.service.acknowledge({ ...f.input(view), acknowledgeUnknown: true });
+    expect(f.recovery.verifyReleaseProof(proof, resource)).toBe(true);
+    let uncommitted = true;
+    f.store.db.transaction(() => { uncommitted = f.recovery.verifyReleaseProof(proof, resource); })();
+    expect(uncommitted).toBe(false);
+    expect(f.recovery.verifyReleaseProof({ ...proof, ownerGeneration: 3 }, resource)).toBe(false);
+    expect(f.recovery.verifyReleaseProof({ ...proof, turnId: "wrong-turn" }, resource)).toBe(false);
+    expect(f.recovery.verifyReleaseProof({ ...proof, resourceKeys: ["wrong-resource"] }, resource)).toBe(false);
+    nextTurn(f);
+    expect(f.recovery.verifyReleaseProof(proof, resource)).toBe(false);
+  });
+  it("keeps Host DB/identity ownership retained when another owned runtime is outside the stop proof", async () => {
+    const f = fixture({ native: { state: "unknown", reason: "no_terminal" } });
+    f.store.db.prepare(`INSERT INTO managed_processes(id,owner_id,owner_generation,runtime_id,runtime_generation,attempt_id,tree_control,state,updated_at)
+      VALUES('process-other','original-owner',2,'other-runtime',1,'other-attempt','process_group','unknown','2026-10-15')`).run();
+    const view = await f.inspect();
+    await f.service.acknowledge({ ...f.input(view), acknowledgeUnknown: true });
+    const workspaceProof = f.recovery.releaseProof(view.evidenceId, ["workspace:key"])!;
+    const hostProof = f.recovery.releaseProof(view.evidenceId, ["db:key", "identity:key"])!;
+    expect(f.recovery.verifyReleaseProof(workspaceProof, { resourceKey: "workspace:key", ownerId: "original-owner", ownerGeneration: 2, purpose: "workspace:original-turn" })).toBe(true);
+    expect(f.recovery.verifyReleaseProof(hostProof, { resourceKey: "db:key", ownerId: "original-owner", ownerGeneration: 2, purpose: "host" })).toBe(false);
+  });
+
+});

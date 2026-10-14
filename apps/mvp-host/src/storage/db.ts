@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import { HostOwnerLock, assertHostOwner, canonicalPath, createTestHostOwner, type HostOwnerHandle } from "../lifecycle/host-owner.js";
 import { inspectSchema, StoreSchemaError, validateV3Schema } from "./migrations/schema-version.js";
 import type { ProviderId, RpcError, Session, SessionEvent, TimelineItem, Turn } from "@flyx/mvp-protocol";
+import { applyRecoveryMigration } from "./migrations/005-recovery.js";
 import { applyCommandExecutionMigration } from "./migrations/004-command-execution.js";
 import { ExecutionStore, toExecutionIntent, type RawExecutionIntent } from "./execution-store.js";
 import { decideAcceptTurn } from "../orchestration/decider.js";
@@ -10,6 +11,9 @@ import type { ApprovalDeliveryUpdate, CommandCommit, CommandFacts, CommandPlan, 
 
 export type SessionRow = Session & {
   revision: number;
+  activeTurnId?: string;
+  recoveryState: "idle" | "blocked";
+  recoveryRevision: number;
   workspacePath: string;
   baselineHead?: string;
   baselineDirty?: boolean;
@@ -510,6 +514,7 @@ export class SqliteStore {
     this.db.prepare("INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (2, ?)").run(now());
     this.db.prepare("INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (3, ?)").run(now());
     applyCommandExecutionMigration(this.db);
+    applyRecoveryMigration(this.db);
   }
 
   private upsertTimelineInternal(sessionId: string, input: TimelineUpsert, updatedAt: string): void {
@@ -591,17 +596,14 @@ export class SqliteStore {
   getSnapshot(sessionId: string): Snapshot | undefined {
     const session = this.getSession(sessionId);
     if (!session) return undefined;
-    const turn = this.db.prepare(`
-      SELECT * FROM turns
-      WHERE session_id = ? AND status IN ('queued', 'running', 'waiting_approval', 'interrupting', 'outcome_unknown')
-      ORDER BY created_at DESC LIMIT 1
-    `).get(sessionId) as RawTurn | undefined;
+    const turn = this.getActiveTurn(sessionId);
+    if (session.activeTurnId && !turn) throw new Error("ACTIVE_TURN_INVALID");
     const approvals = this.db.prepare(`
-      SELECT * FROM approvals WHERE session_id = ? AND status = 'pending' ORDER BY created_at ASC
-    `).all(sessionId) as RawApproval[];
+      SELECT * FROM approvals WHERE session_id = ? AND turn_id = ? AND status = 'pending' ORDER BY created_at ASC
+    `).all(sessionId, session.activeTurnId ?? null) as RawApproval[];
     return {
       session,
-      ...(turn ? { activeTurn: toTurn(turn) } : {}),
+      ...(turn ? { activeTurn: turn } : {}),
       pendingApprovals: approvals.map(toApproval),
     };
   }
@@ -613,9 +615,7 @@ export class SqliteStore {
 
   getActiveTurn(sessionId: string): TurnRow | undefined {
     const row = this.db.prepare(`
-      SELECT * FROM turns
-      WHERE session_id = ? AND status IN ('queued', 'running', 'waiting_approval', 'interrupting', 'outcome_unknown')
-      ORDER BY created_at DESC LIMIT 1
+      SELECT t.* FROM sessions s JOIN turns t ON t.id = s.active_turn_id AND t.session_id = s.id WHERE s.id = ?
     `).get(sessionId) as RawTurn | undefined;
     return row ? toTurn(row) : undefined;
   }
@@ -629,12 +629,10 @@ export class SqliteStore {
     prompt: string;
     generation: number;
   }): TurnRow {
-    const timestamp = now();
-    this.db.prepare(`
-      INSERT INTO turns (id, session_id, auth_subject_id, command_id, request_hash, status, prompt, generation, created_at)
-      VALUES (?, ?, ?, ?, ?, 'queued', ?, ?, ?)
-    `).run(input.turnId, input.sessionId, input.authSubjectId ?? "", input.commandId, input.requestHash, input.prompt, input.generation, timestamp);
-    return this.getTurn(input.turnId)!;
+    return this.db.transaction(() => {
+      this.insertTurnInternal(input, now());
+      return this.getTurn(input.turnId)!;
+    })();
   }
 
   /** Synchronous extensions share this connection and the command rollback boundary. */
@@ -749,9 +747,16 @@ export class SqliteStore {
   }
 
   private insertTurnInternal(input: NewTurn, timestamp: string): void {
+    const session = this.getSession(input.sessionId);
+    if (!session) throw new Error("SESSION_NOT_FOUND");
+    if (session.recoveryState === "blocked") throw new Error("RECOVERY_BLOCKED");
+    if (session.activeTurnId) throw new Error("TURN_BUSY");
     this.db.prepare(`INSERT INTO turns (id, session_id, auth_subject_id, command_id, request_hash, status, prompt, generation, attempt_id, created_at)
       VALUES (?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?)`).run(input.turnId, input.sessionId, input.authSubjectId ?? "",
       input.commandId, input.requestHash, input.prompt, input.generation, input.attemptId ?? null, timestamp);
+    const relation = this.db.prepare("UPDATE sessions SET active_turn_id = ?, recovery_revision = recovery_revision + 1 WHERE id = ? AND active_turn_id IS NULL AND recovery_state = 'idle'")
+      .run(input.turnId, input.sessionId);
+    if (relation.changes !== 1) throw new Error("RECOVERY_BLOCKED");
   }
 
   acceptTurn(input: {
@@ -761,7 +766,10 @@ export class SqliteStore {
     const request = { authSubjectId: input.authSubjectId, commandId: input.commandId, method: "session.startTurn",
       requestHash: input.requestHash, requestFormatVersion: input.requestFormatVersion ?? 1, targetSessionId: input.sessionId };
     const committed = this.commitCommand({ sessionId: input.sessionId,
-      build: (facts) => decideAcceptTurn(facts, request, input, { now, id: randomUUID }) })!;
+      build: (facts) => {
+        if (facts.session?.recoveryState === "blocked") throw new Error("RECOVERY_BLOCKED");
+        return decideAcceptTurn(facts, request, input, { now, id: randomUUID });
+      } })!;
     return { turn: this.getTurn(input.turnId)!, receipt: this.getCommandReceipt(input.authSubjectId, input.commandId)!, events: committed.events };
   }
 
@@ -819,6 +827,13 @@ export class SqliteStore {
           finished_at = COALESCE(?, finished_at), provider_session_id = COALESCE(?, provider_session_id), native_turn_id = COALESCE(?, native_turn_id)
         WHERE id = ? AND session_id = ?
       `).run(options.turnStatus, options.turnStatus, occurredAt, finished, options.providerSessionId ?? null, options.nativeTurnId ?? null, options.turnId, sessionId);
+      if (options.turnStatus === "outcome_unknown") {
+        this.db.prepare("UPDATE sessions SET recovery_state = 'blocked', recovery_revision = recovery_revision + 1 WHERE id = ? AND active_turn_id = ? AND recovery_state <> 'blocked'")
+          .run(sessionId, options.turnId);
+      } else if (["completed", "failed", "cancelled"].includes(options.turnStatus)) {
+        this.db.prepare("UPDATE sessions SET active_turn_id = NULL, recovery_revision = recovery_revision + 1 WHERE id = ? AND active_turn_id = ? AND recovery_state = 'idle'")
+          .run(sessionId, options.turnId);
+      }
     }
     if (options.approval) this.insertApprovalInternal(options.approval);
     if (options.commandReceipt) this.updateCommandReceiptInternal(options.commandReceipt, occurredAt, commitId, sequence);
@@ -958,10 +973,10 @@ export class SqliteStore {
 
   recoverActiveTurns(): Array<{ sessionId: string; turnId: string }> {
     const rows = this.db.prepare(`
-      SELECT session_id, id, auth_subject_id, command_id, request_hash, status
-      FROM turns
-      WHERE status IN ('queued', 'running', 'waiting_approval', 'interrupting')
-      ORDER BY created_at ASC
+      SELECT t.session_id, t.id, t.auth_subject_id, t.command_id, t.request_hash, t.status
+      FROM sessions s JOIN turns t ON t.id = s.active_turn_id AND t.session_id = s.id
+      WHERE t.status IN ('queued', 'running', 'waiting_approval', 'interrupting')
+      ORDER BY t.created_at ASC
     `).all() as Array<{
       session_id: string;
       id: string;
@@ -981,6 +996,7 @@ export class SqliteStore {
         const changed = this.db.prepare(`
           UPDATE turns SET status = 'outcome_unknown', finished_at = ?
           WHERE id = ? AND status IN ('queued', 'running', 'waiting_approval', 'interrupting')
+            AND EXISTS (SELECT 1 FROM sessions WHERE active_turn_id = turns.id)
         `).run(timestamp, row.id);
         if (changed.changes !== 1) continue;
         recovered.push({ sessionId: row.session_id, turnId: row.id });
@@ -1007,9 +1023,9 @@ export class SqliteStore {
           }, timestamp);
         }
         this.db.prepare(`
-          UPDATE sessions SET activity_state = 'outcome_unknown', updated_at = ?
-          WHERE id = ?
-        `).run(timestamp, row.session_id);
+          UPDATE sessions SET activity_state = 'outcome_unknown', recovery_state = 'blocked', recovery_revision = recovery_revision + 1, updated_at = ?
+          WHERE id = ? AND active_turn_id = ?
+        `).run(timestamp, row.session_id, row.id);
 
         const recoveryMessage = "Host restarted while this Turn was executing; result is unknown and it was not replayed.";
         const recoveryPayload = {
@@ -1521,7 +1537,8 @@ export class SqliteStore {
 type RawSession = {
   id: string; workspace_id: "default"; workspace_path: string; provider: ProviderId; provider_session_id: string | null;
   baseline_head: string | null; baseline_dirty: number | null; baseline_status_json: string | null; baseline_captured_at: string | null;
-  status: Session["status"]; activity_state: Session["activityState"]; head_sequence: number; revision: number; created_at: string; updated_at: string;
+  status: Session["status"]; activity_state: Session["activityState"]; head_sequence: number; revision: number;
+  active_turn_id: string | null; recovery_state: "idle" | "blocked"; recovery_revision: number; created_at: string; updated_at: string;
 };
 type RawTurn = {
   id: string; session_id: string; auth_subject_id: string; command_id: string; request_hash: string; status: Turn["status"]; prompt: string;
@@ -1602,6 +1619,9 @@ function toSession(row: RawSession): SessionRow {
     activityState: row.activity_state,
     headSequence: row.head_sequence,
     revision: row.revision,
+    ...(row.active_turn_id ? { activeTurnId: row.active_turn_id } : {}),
+    recoveryState: row.recovery_state,
+    recoveryRevision: row.recovery_revision,
     workspacePath: row.workspace_path,
     createdAt: row.created_at,
     updatedAt: row.updated_at,

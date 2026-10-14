@@ -14,3 +14,6 @@ export * from "./cache-store.js";
 export * from "./draft-store.js";
 export * from "./host-runtime.js";
 export * from "./host-runtime-registry.js";
+
+export * from "./session-replica.js";
+export * from "./timeline-reconciler.js";

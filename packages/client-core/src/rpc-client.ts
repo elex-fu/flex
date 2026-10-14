@@ -1,7 +1,16 @@
-import { MAX_APPLICATION_FRAME_BYTES, parseApplicationFrame } from "@flyx/mvp-protocol";
-import type { SessionEvent } from "@flyx/mvp-protocol";
+import {
+  BOUNDED_CONTENT_CAPABILITY, ContentChunkRequestSchema, ContentChunkSchema, MAX_APPLICATION_FRAME_BYTES,
+  OpenViewRequestSchema, OpenViewResponseSchema, parseApplicationFrame, TIMELINE_PROJECTION_CAPABILITY,
+  TimelinePageRequestSchema, TimelinePageSchema, TimelineSubscribeRequestSchema, TimelineSubscribeResponseSchema, TimelineUnsubscribeRequestSchema, TimelineUnsubscribeResponseSchema,
+} from "@flyx/mvp-protocol";
+import type { ContentChunk, ContentChunkRequest, OpenViewRequest, OpenViewResponse, ServerHelloV2, SessionEvent, TimelinePage, TimelinePageRequest, TimelineSubscribeResponse, TimelineUnsubscribeResponse } from "@flyx/mvp-protocol";
 import { ClientError, isRecord, Signal } from "./common.js";
 import type { ClientTransport, Unsubscribe } from "./types.js";
+
+export const ACCESS_RECEIPTS_CAPABILITY = "access-receipts-v1";
+export type AccessReceipt =
+  | { found: false; commandId: string }
+  | { found: true; commandId: string; method: string; state: "accepted" | "completed" | "failed" | "cancelled" | "outcome_unknown"; response?: unknown; updatedAt?: string };
 
 interface Pending { resolve: (value: unknown) => void; reject: (error: unknown) => void; timer: ReturnType<typeof setTimeout> }
 export class RpcClient {
@@ -12,8 +21,11 @@ export class RpcClient {
   private helloPending: Pending | undefined;
   private pongs = new Signal<string>();
   private errors = new Signal<ClientError>();
+  private negotiated: ServerHelloV2 | undefined;
   constructor(private timeoutMs = 30_000) {}
   get generation(): number { return this.transport?.generation ?? -1; }
+  getNegotiatedHello(): ServerHelloV2 | undefined { return this.negotiated ? structuredClone(this.negotiated) : undefined; }
+  supports(capability: string): boolean { return this.negotiated?.capabilities.includes(capability) ?? false; }
   onEvent(handler: (event: SessionEvent) => void): Unsubscribe { return this.events.subscribe(handler); }
   onPong(handler: (nonce: string) => void): Unsubscribe { return this.pongs.subscribe(handler); }
   onError(handler: (error: ClientError) => void): Unsubscribe { return this.errors.subscribe(handler); }
@@ -24,8 +36,10 @@ export class RpcClient {
     this.off = [transport.onMessage((text) => {
       if (this.transport !== transport) return;
       let frame: unknown;
-      try { frame = parseApplicationFrame(text); }
-      catch (error) { console.error("AUDIT PARSE", error); transport.close(1002, "INVALID_FRAME"); return; }
+      try {
+        if (new TextEncoder().encode(text).byteLength > (this.negotiated?.maxFrameBytes ?? MAX_APPLICATION_FRAME_BYTES)) throw new ClientError("FRAME_TOO_LARGE", "Response exceeds the negotiated frame limit");
+        frame = parseApplicationFrame(text);
+      } catch { transport.close(1002, "INVALID_FRAME"); return; }
       if (!isRecord(frame)) return;
       if (frame.type === "protocol.error" && (frame.transportGeneration === undefined || frame.transportGeneration === transport.generation) && isRecord(frame.error)) {
         const error = new ClientError(String(frame.error.code), String(frame.error.message));
@@ -63,6 +77,7 @@ export class RpcClient {
 
   unbind(error = new ClientError("CONNECTION_REPLACED", "Host connection was replaced")): void {
     this.transport = undefined;
+    this.negotiated = undefined;
     for (const off of this.off) off();
     this.off = [];
     for (const pending of this.pending.values()) { clearTimeout(pending.timer); pending.reject(error); }
@@ -74,24 +89,27 @@ export class RpcClient {
     const transport = this.transport;
     if (!transport) throw new ClientError("NOT_CONNECTED", "Host is not connected");
     const encoded = JSON.stringify({ ...frame, transportGeneration: transport.generation });
-    if (new TextEncoder().encode(encoded).byteLength > MAX_APPLICATION_FRAME_BYTES) throw new ClientError("FRAME_TOO_LARGE", "Request exceeds the application frame limit");
+    if (new TextEncoder().encode(encoded).byteLength > (this.negotiated?.maxFrameBytes ?? MAX_APPLICATION_FRAME_BYTES)) throw new ClientError("FRAME_TOO_LARGE", "Request exceeds the application frame limit");
     await transport.send(encoded);
   }
 
-  async hello(profile: { hostId: string; fingerprint: string }, deviceId?: string): Promise<Record<string, unknown>> {
+  async hello(profile: { hostId: string; fingerprint: string }, deviceId?: string): Promise<ServerHelloV2> {
     const generation = this.generation;
-    const response = new Promise<Record<string, unknown>>((resolve, reject) => {
+    if (this.helloPending) throw new ClientError("HELLO_IN_PROGRESS", "Protocol negotiation is already in progress");
+    this.negotiated = undefined;
+    const response = new Promise<ServerHelloV2>((resolve, reject) => {
       const timer = setTimeout(() => { this.helloPending = undefined; reject(new ClientError("HELLO_TIMEOUT", "Host did not finish protocol negotiation")); }, 10_000);
-      this.helloPending = { resolve: (value) => resolve(value as Record<string, unknown>), reject, timer };
+      this.helloPending = { resolve: (value) => resolve(value as ServerHelloV2), reject, timer };
     });
-    void this.send({ type: "client.hello", hostId: profile.hostId, clientId: "flyx-web", ...(deviceId ? { deviceId } : {}), protocol: { min: 2, max: 2 }, capabilities: ["heartbeat", "transport-neutral-rpc", "durable-outbox", "timeline-watermark"], requiredCapabilities: [] }).catch((error: unknown) => {
+    void this.send({ type: "client.hello", hostId: profile.hostId, clientId: "flyx-web", ...(deviceId ? { deviceId } : {}), protocol: { min: 2, max: 2 }, capabilities: ["heartbeat", "transport-neutral-rpc", "durable-outbox", "timeline-watermark", TIMELINE_PROJECTION_CAPABILITY, BOUNDED_CONTENT_CAPABILITY, ACCESS_RECEIPTS_CAPABILITY], requiredCapabilities: [] }).catch((error: unknown) => {
       if (this.helloPending) { clearTimeout(this.helloPending.timer); this.helloPending.reject(error); this.helloPending = undefined; }
     });
     const hello = await response;
     if (this.generation !== generation) throw new ClientError("CONNECTION_REPLACED", "Host connection changed during negotiation");
     if (hello.hostId !== profile.hostId || hello.hostFingerprint !== profile.fingerprint) throw new ClientError("IDENTITY_MISMATCH", "Endpoint identity differs from the pinned Host");
     if (hello.protocolVersion !== 2) throw new ClientError("PROTOCOL_UNSUPPORTED", "Host does not support protocol version 2");
-    return hello;
+    this.negotiated = structuredClone(hello);
+    return structuredClone(hello);
   }
 
   request<T>(method: string, payload: unknown = {}, commandId?: string): Promise<T> {
@@ -103,6 +121,44 @@ export class RpcClient {
         if (this.pending.delete(id)) { clearTimeout(timer); reject(error); }
       });
     });
+  }
+  private requireCapability(capability: string): void {
+    if (!this.supports(capability)) throw new ClientError("CAPABILITY_UNSUPPORTED", "Host has not negotiated this capability");
+  }
+  private async typedRequest<T>(method: string, payload: unknown, schema: { parse(value: unknown): T }): Promise<T> {
+    const response = await this.request<unknown>(method, payload);
+    try { return schema.parse(response); }
+    catch { throw new ClientError("INVALID_RPC_RESPONSE", "Host returned an invalid domain response", { method }); }
+  }
+  openView(request: OpenViewRequest): Promise<OpenViewResponse> {
+    this.requireCapability(TIMELINE_PROJECTION_CAPABILITY);
+    return this.typedRequest("session.openView", OpenViewRequestSchema.parse(request), OpenViewResponseSchema);
+  }
+  getTimelinePage(request: TimelinePageRequest): Promise<TimelinePage> {
+    this.requireCapability(TIMELINE_PROJECTION_CAPABILITY);
+    return this.typedRequest("timeline.getPage", TimelinePageRequestSchema.parse(request), TimelinePageSchema);
+  }
+  subscribeTimeline(request: { sessionId: string; epoch: string }): Promise<TimelineSubscribeResponse> {
+    this.requireCapability(TIMELINE_PROJECTION_CAPABILITY);
+    return this.typedRequest("timeline.subscribe", TimelineSubscribeRequestSchema.parse(request), TimelineSubscribeResponseSchema);
+  }
+  unsubscribeTimeline(request: { subscriptionId: string }): Promise<TimelineUnsubscribeResponse> {
+    this.requireCapability(TIMELINE_PROJECTION_CAPABILITY);
+    return this.typedRequest("timeline.unsubscribe", TimelineUnsubscribeRequestSchema.parse(request), TimelineUnsubscribeResponseSchema);
+  }
+  getContentChunk(request: ContentChunkRequest): Promise<ContentChunk> {
+    this.requireCapability(BOUNDED_CONTENT_CAPABILITY);
+    return this.typedRequest("content.getChunk", ContentChunkRequestSchema.parse(request), ContentChunkSchema);
+  }
+  getAccessReceipt(request: { commandId: string }): Promise<AccessReceipt> {
+    this.requireCapability(ACCESS_RECEIPTS_CAPABILITY);
+    if (!request.commandId || request.commandId.length > 128) throw new ClientError("INVALID_COMMAND_ID", "Invalid command identity");
+    return this.typedRequest("access.getReceipt", { commandId: request.commandId }, { parse: (value): AccessReceipt => {
+      if (!isRecord(value) || value.commandId !== request.commandId || typeof value.found !== "boolean") throw new Error("Invalid receipt identity");
+      if (!value.found) return { found: false, commandId: request.commandId };
+      if (typeof value.method !== "string" || !value.method.startsWith("access.") || !["accepted", "completed", "failed", "cancelled", "outcome_unknown"].includes(String(value.state)) || value.updatedAt !== undefined && typeof value.updatedAt !== "string") throw new Error("Invalid access receipt");
+      return { found: true, commandId: request.commandId, method: value.method, state: value.state as Extract<AccessReceipt, { found: true }>["state"], ...(Object.hasOwn(value, "response") ? { response: value.response } : {}), ...(typeof value.updatedAt === "string" ? { updatedAt: value.updatedAt } : {}) };
+    } });
   }
   ping(nonce: string): Promise<void> { return this.send({ type: "ping", nonce }); }
 }

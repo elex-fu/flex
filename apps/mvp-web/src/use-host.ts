@@ -1,11 +1,13 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
-  createFlyxClient,
   type ClientState,
   type HostProfile,
   type PendingCommand,
+  type SessionReplicaState,
 } from "@flyx/client-core";
-import type { Bootstrap, SessionEvent, TimelineItem } from "@flyx/mvp-protocol";
+import type { Bootstrap, SessionEvent, TimelineContentReference, TimelineItem } from "@flyx/mvp-protocol";
+import { canonicalTimelineItem } from "./canonical-timeline.js";
+import { getWebHostRuntimes, setDesiredWebHost } from "./host-runtimes.js";
 import { hasTerminalItem, isRecord, projectSnapshot, timelineItemFromEvent, type Snapshot } from "./timeline.js";
 
 export type HostStatus = {
@@ -63,13 +65,7 @@ export function connectionLabel(state: ClientState): string {
 
 /** React projection only. Connection, auth, synchronization and write receipts live in client-core. */
 export function useHost(initialPairing?: string) {
-  const [client] = useState(() => createFlyxClient({
-    directBaseUrl: window.location.origin,
-    // An explicit local page is the development HTTP boundary. Imported
-    // endpoints still undergo the core's HTTPS/WSS and identity validation.
-    allowInsecureLoopback: window.location.protocol === "http:"
-      && ["127.0.0.1", "localhost", "[::1]"].includes(window.location.hostname),
-  }));
+  const [client, setClient] = useState(() => getWebHostRuntimes().getCurrent());
   const [connection, setConnection] = useState<ClientState>(() => client.getState());
   const [bootstrap, setBootstrap] = useState<Bootstrap | null>(null);
   const [snapshot, setSnapshot] = useState<Snapshot | null>(null);
@@ -80,7 +76,10 @@ export function useHost(initialPairing?: string) {
   const [error, setError] = useState("");
   const itemsRef = useRef<TimelineItem[]>([]);
   const sessionIdRef = useRef<string | null>(null);
-  const initializedRef = useRef(false);
+  const [cacheError, setCacheError] = useState<string>("");
+  const replicaGenerationRef = useRef<number | null>(null);
+  const [replicaState, setReplicaState] = useState<SessionReplicaState | null>(null);
+  const resolvedContentRef = useRef(new Map<string, unknown>());
   const lifecycleRef = useRef(0);
   const metadataGenerationRef = useRef<number | null>(null);
 
@@ -91,9 +90,11 @@ export function useHost(initialPairing?: string) {
     setSnapshot(null);
     setBootstrap(null);
     setHostStatus(null);
+    resolvedContentRef.current.clear();
   }, []);
 
   const applyEvent = useCallback((event: SessionEvent) => {
+    if (client.getProjectionMode() !== "legacy") return;
     if (sessionIdRef.current && event.sessionId !== sessionIdRef.current) return;
     const explicitId = isRecord(event.payload) && typeof event.payload.itemId === "string" ? event.payload.itemId : `event-${event.id}`;
     const existing = itemsRef.current.find((item) => item.itemId === explicitId);
@@ -106,7 +107,12 @@ export function useHost(initialPairing?: string) {
       setItems(nextItems);
     }
     setSnapshot((current) => projectSnapshot(current, event, itemsRef.current));
-  }, []);
+  }, [client]);
+
+  useEffect(() => getWebHostRuntimes().observe((runtime) => {
+    setClient(runtime); setConnection(runtime.getState()); setReplicaState(null);
+    metadataGenerationRef.current = null; resetProjection();
+  }), [resetProjection]);
 
   useEffect(() => {
     const lifecycle = ++lifecycleRef.current;
@@ -134,22 +140,35 @@ export function useHost(initialPairing?: string) {
       });
     });
     const offSnapshot = client.onSnapshot((value) => {
+      if (!active() || client.getProjectionMode() !== "legacy") return;
       const next = value as Snapshot;
       if (sessionIdRef.current && sessionIdRef.current !== next.session.id) resetProjection();
       sessionIdRef.current = next.session.id;
       setSnapshot(next);
     });
+    const offReplica = client.onReplica((state) => {
+      if (!active()) return;
+      if (state.mode === "legacy") { if (replicaGenerationRef.current !== null) { resetProjection(); replicaGenerationRef.current = null; } return; }
+      if (client.getProjectionMode() !== "canonical" && !(state.stale && state.epoch)) return;
+      if (replicaGenerationRef.current !== state.replicaGeneration) { resolvedContentRef.current.clear(); replicaGenerationRef.current = state.replicaGeneration; }
+      setReplicaState(state);
+      if (sessionIdRef.current && sessionIdRef.current !== state.sessionId) resetProjection();
+      sessionIdRef.current = state.sessionId ?? null;
+      const nextItems = state.items.map((item) => canonicalTimelineItem(item, resolvedContentRef.current.get(`${state.replicaGeneration}:${item.itemId}:${item.revision}`)));
+      itemsRef.current = nextItems; setItems(nextItems);
+      if (isRecord(state.snapshot) && isRecord(state.snapshot.session)) {
+        const next = state.snapshot as unknown as Snapshot;
+        setSnapshot({ ...next, pendingApprovals: state.interactionsAuthoritative ? (state.interactions?.items ?? []) as Snapshot["pendingApprovals"] : [] });
+      }
+    });
     const offEvent = client.onEvent(applyEvent);
     const offReset = client.onReset(resetProjection);
     const offOutbox = client.onOutbox(setPendingCommands);
-    if (!initializedRef.current) {
-      initializedRef.current = true;
-      void (initialPairing ? client.pair(initialPairing) : client.start()).catch((cause) => setError(errorMessage(cause)));
-    }
+    const offCache = client.onCacheError((cause) => setCacheError(cause?.message ?? ""));
+    void getWebHostRuntimes().initialize(initialPairing).catch((cause) => { if (active()) setError(errorMessage(cause)); });
     return () => {
-      offState(); offSnapshot(); offEvent(); offReset(); offOutbox();
-      // StrictMode's synthetic cleanup must not cancel a pairing exchange.
-      window.setTimeout(() => { if (active()) client.stop(); }, 0);
+      lifecycleRef.current++;
+      offState(); offSnapshot(); offReplica(); offEvent(); offReset(); offOutbox(); offCache();
     };
   }, [applyEvent, client, initialPairing, resetProjection]);
 
@@ -162,14 +181,14 @@ export function useHost(initialPairing?: string) {
   const pair = useCallback(async (input: string, deviceName: string) => {
     await run(async () => {
       metadataGenerationRef.current = null;
-      await client.pair(input.trim(), deviceName.trim() || "Flyx 浏览器");
+      await getWebHostRuntimes().pair(input.trim(), deviceName.trim() || "Flyx 浏览器");
     });
   }, [client, run]);
 
   const sendPrompt = useCallback(async (prompt: string) => {
     return run(async () => {
       const response = await client.command<{ turnId?: string }>("session.startTurn", { prompt });
-      if (response.turnId && !hasTerminalItem(itemsRef.current, response.turnId)) {
+      if (client.getProjectionMode() === "legacy" && response.turnId && !hasTerminalItem(itemsRef.current, response.turnId)) {
         setSnapshot((current) => current ? {
           ...current,
           session: { ...current.session, activityState: "running" },
@@ -194,7 +213,7 @@ export function useHost(initialPairing?: string) {
     await run(async () => {
       resetProjection();
       metadataGenerationRef.current = null;
-      await client.selectHost(hostId);
+      await setDesiredWebHost(hostId);
     });
   }, [client, resetProjection, run]);
 
@@ -202,10 +221,24 @@ export function useHost(initialPairing?: string) {
     await run(() => client.retryCommand(commandId));
   }, [client, run]);
 
+  const queryCommandReceipt = useCallback(async (commandId: string) => run(() => client.queryCommandReceipt(commandId)), [client, run]);
+
+  const loadContent = useCallback(async (reference: TimelineContentReference, sessionId?: string) => run(async () => new TextDecoder("utf-8", { fatal: true }).decode(await client.readContent(reference, sessionId ?? sessionIdRef.current ?? undefined))), [client, run]);
+  const loadItemContent = useCallback(async (itemId: string) => run(async () => {
+    const state = client.replica.getState();
+    const item = state.items.find((entry) => entry.itemId === itemId);
+    if (!item) throw new Error("Timeline item is outside the loaded window");
+    const content = await client.resolveItemContent(itemId);
+    if (client.replica.getState().replicaGeneration !== state.replicaGeneration) return;
+    resolvedContentRef.current.set(`${state.replicaGeneration}:${itemId}:${item.revision}`, content);
+    const nextItems = itemsRef.current.map((entry) => entry.itemId === itemId && entry.revision === item.revision ? canonicalTimelineItem(item, content) : entry);
+    itemsRef.current = nextItems; setItems(nextItems); return content;
+  }), [client, run]);
+
   return {
     client, connection, bootstrap, snapshot, items, hostStatus, profiles, pendingCommands, error,
     status: connectionLabel(connection),
-    ready: connection.connection === "online" && connection.sync === "synced",
-    pair, sendPrompt, logout, selectHost, retryCommand, run, setError,
+    ready: connection.connection === "online" && connection.sync === "synced" && (client.getProjectionMode() === "legacy" || replicaState?.interactionsAuthoritative === true && !replicaState.stale),
+    pair, sendPrompt, logout, selectHost, retryCommand, queryCommandReceipt, loadContent, loadItemContent, replicaState, cacheError, run, setError,
   };
 }

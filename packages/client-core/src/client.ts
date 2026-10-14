@@ -1,14 +1,17 @@
-import { decodeConnectionFragment, verifyHostDescriptor } from "@flyx/mvp-protocol";
-import type { HostDescriptorV1, SessionEvent } from "@flyx/mvp-protocol";
+import { BOUNDED_CONTENT_CAPABILITY, decodeConnectionFragment, TIMELINE_PROJECTION_CAPABILITY, verifyHostDescriptor } from "@flyx/mvp-protocol";
+import type { HostDescriptorV1, ServerHelloV2, SessionEvent, TimelineContentReference } from "@flyx/mvp-protocol";
 import { generateNoiseKeyPair } from "@flyx/secure-channel";
 import { abortError, assertNotAborted, ClientError, errorInfo, isRecord, payloadHash, Signal, toBase64Url, validateDirectUrl } from "./common.js";
 import { CommandOutbox } from "./command-outbox.js";
 import { ConnectionSupervisor } from "./connection-supervisor.js";
 import { IndexedDbClientStore } from "./host-profile-store.js";
-import { RpcClient } from "./rpc-client.js";
+import { ReplicaCache, type CacheSelection, type ReplicaCacheOptions } from "./cache-store.js";
+import { ACCESS_RECEIPTS_CAPABILITY, RpcClient } from "./rpc-client.js";
 import { systemMonotonicClock } from "./platform.js";
 import type { MonotonicClock, PlatformSignals } from "./platform.js";
 import { SyncEngine } from "./sync-engine.js";
+import { SessionReplica, type ReplicaFence, type ReplicaMode, type SessionReplicaState } from "./session-replica.js";
+import { TimelineReconciler } from "./timeline-reconciler.js";
 import { connectDirectWeb, directJson, fetchDirectDescriptor, pairDirectWeb } from "./transports/direct-web.js";
 import type { DirectWebOptions } from "./transports/direct-web.js";
 import { connectRelayE2ee } from "./transports/relay-e2ee.js";
@@ -20,6 +23,8 @@ export interface FlyxClientOptions extends DirectWebOptions {
   /** Fixed owner for a registry runtime, independent of the selected UI Host. */
   hostId?: string;
   store?: ClientStore;
+  sessionId?: string;
+  replicaCache?: ReplicaCacheOptions;
   directBaseUrl?: string;
   onlineTarget?: Pick<EventTarget, "addEventListener" | "removeEventListener">;
   platformSignals?: PlatformSignals;
@@ -65,6 +70,8 @@ function sameIdentity(a: HostProfile, b: Pick<HostProfile, "hostId" | "hostPubli
 }
 function endpointAddress(endpoint: ConnectionEndpoint): string { return endpoint.kind === "direct-https" ? endpoint.baseUrl : `${endpoint.relayUrl}/${endpoint.routeId}`; }
 
+export type CachedSessionReplica = Pick<SessionReplicaState, "epoch" | "projectorVersion" | "sourceCursor" | "items" | "loadedWindow">;
+
 export class FlyxClient {
   readonly store: ClientStore;
   private state: ClientState = { connection: "idle", sync: "unknown", transportGeneration: 0, pairingRequired: false };
@@ -72,12 +79,28 @@ export class FlyxClient {
   private outboxChanges = new Signal<PendingCommand[]>();
   private rpc = new RpcClient();
   private sync: SyncEngine;
+  readonly replica = new SessionReplica();
+  private reconciler: TimelineReconciler;
+  private snapshots = new Signal<unknown>();
+  private selectedSessionId: string | undefined;
+  private domainRevision = 0;
+  private domainWork: Promise<void> | undefined;
+  private replicaCache: ReplicaCache<CachedSessionReplica>;
+  private cacheSelection: CacheSelection | undefined;
+  private cacheReplicaGeneration: number | undefined;
+  private cacheError: { code: string; message: string } | undefined;
+  private cacheErrors = new Signal<{ code: string; message: string } | undefined>();
   private supervisor: ConnectionSupervisor | undefined;
   private profile: HostProfile | undefined;
   private outbox: CommandOutbox | undefined;
   private memoryKeys = new Map<string, MemoryDeviceKey>();
   private pendingPair: { grant: string; deviceName: string } | undefined;
   private unresolvedWrites = false;
+  private authoritativeReceiptSignature: string | undefined;
+  private receiptChecks = new Map<string, string>();
+  private receiptReviewRunning = false;
+  private receiptReviewRequested = false;
+  private receiptReviewScheduledSignature: string | undefined;
   private lifecycle = 0;
   private started = false;
   private locallyRevoked = false;
@@ -86,10 +109,34 @@ export class FlyxClient {
   constructor(private options: FlyxClientOptions = {}) {
     this.store = options.store ?? new IndexedDbClientStore();
     this.profile = options.profile;
+    this.selectedSessionId = options.sessionId;
+    this.replicaCache = new ReplicaCache(this.store, { ...options.replicaCache, onError: (error) => {
+      options.replicaCache?.onError?.(error);
+      this.cacheError = errorInfo(error); this.cacheErrors.emit(this.cacheError);
+    } });
     if (options.hostId && options.profile && options.hostId !== options.profile.hostId) throw new ClientError("HOST_RUNTIME_BOUND", "Runtime profile belongs to a different Host");
     this.sync = new SyncEngine({ request: (method, payload) => this.rpc.request(method, payload), isCurrent: (generation) => this.supervisor?.generation === generation, recover: () => this.reconnect() });
-    this.sync.onState((sync) => this.update({ sync }));
-    this.rpc.onEvent((event) => this.sync.receive(event, this.rpc.generation));
+    this.reconciler = new TimelineReconciler(this.replica, { api: this.rpc, onBegin: (fence) => this.loadCachedReplica(fence), isCurrentTransport: (generation) => this.supervisor?.generation === generation && this.rpc.generation === generation });
+    this.sync.onState((sync) => { if (this.getProjectionMode() === "legacy") { if (sync === "synced") delete this.state.error; this.update({ sync }); } });
+    this.sync.onSnapshot((snapshot) => {
+      if (this.getProjectionMode() === "legacy" && isRecord(snapshot) && isRecord(snapshot.session) && typeof snapshot.session.id === "string") this.reconciler.selectLegacy(snapshot.session.id, this.rpc.generation);
+      this.noteReceiptAuthority(snapshot, isRecord(snapshot) && Array.isArray(snapshot.pendingApprovals) ? snapshot.pendingApprovals : []);
+      this.snapshots.emit(snapshot);
+    });
+    this.replica.onChange((state) => {
+      this.persistReplicaCache(state);
+      if (this.getProjectionMode() !== "canonical" || state.mode !== "canonical") return;
+      if (state.sync === "synced" && !state.error) delete this.state.error;
+      this.update({ sync: state.sync, ...(state.error ? { error: state.error } : {}) });
+      if (state.interactionsAuthoritative && state.snapshot !== undefined) {
+        this.noteReceiptAuthority(state.snapshot, state.interactions?.items ?? []);
+        this.snapshots.emit(state.snapshot);
+      }
+    });
+    this.rpc.onEvent((event) => {
+      if (this.getProjectionMode() === "canonical") this.reconciler.receive(event, this.rpc.generation);
+      else this.sync.receive(event, this.rpc.generation);
+    });
     this.rpc.onPong((nonce) => this.supervisor?.receivedPong(nonce));
     this.rpc.onError((error) => {
       if (!["DEVICE_REVOKED", "AUTHENTICATION_REQUIRED", "PAIRING_REQUIRED", "CREDENTIAL_EXPIRED"].includes(error.code)) return;
@@ -109,10 +156,70 @@ export class FlyxClient {
   getState(): ClientState { return structuredClone(this.state); }
   onState(handler: (state: ClientState) => void): Unsubscribe { handler(this.getState()); return this.states.subscribe(handler); }
   onEvent(handler: (event: SessionEvent) => void): Unsubscribe { return this.sync.onEvent(handler); }
-  onSnapshot(handler: (snapshot: unknown) => void): Unsubscribe { return this.sync.onSnapshot(handler); }
+  onSnapshot(handler: (snapshot: unknown) => void): Unsubscribe { return this.snapshots.subscribe(handler); }
+  onReplica(handler: (state: SessionReplicaState) => void): Unsubscribe { return this.replica.onChange(handler); }
+  getCacheError(): { code: string; message: string } | undefined { return this.cacheError ? { ...this.cacheError } : undefined; }
+  onCacheError(handler: (error: { code: string; message: string } | undefined) => void): Unsubscribe { handler(this.getCacheError()); return this.cacheErrors.subscribe(handler); }
+  getNegotiatedHello(): ServerHelloV2 | undefined { return this.rpc.getNegotiatedHello(); }
+  getProjectionMode(): ReplicaMode { return this.rpc.supports(TIMELINE_PROJECTION_CAPABILITY) && this.rpc.supports(BOUNDED_CONTENT_CAPABILITY) ? "canonical" : "legacy"; }
+  async selectSession(sessionId: string): Promise<void> {
+    if (!sessionId || this.getProjectionMode() !== "canonical") throw new ClientError("CAPABILITY_UNSUPPORTED", "Host does not support session view selection");
+    this.selectedSessionId = sessionId;
+    await this.retrySynchronization();
+  }
+  retrySynchronization(): Promise<void> {
+    if (!this.supervisor || !this.rpc.getNegotiatedHello()) return Promise.reject(new ClientError("NOT_CONNECTED", "Host has not finished secure negotiation"));
+    const generation = this.rpc.generation;
+    const work = this.synchronizeDomain(generation).catch((error: unknown) => {
+      if (this.rpc.generation === generation) this.update({ sync: "resync_required", error: errorInfo(error) });
+      throw error;
+    });
+    this.domainWork = work;
+    return work;
+  }
+  loadOlderTimeline(limit = 50): Promise<void> { return this.reconciler.loadOlder(limit); }
+  readContent(reference: TimelineContentReference, sessionId?: string): Promise<Uint8Array> { return this.reconciler.readContent(reference, sessionId); }
+  resolveItemContent(itemId: string): Promise<unknown> { return this.reconciler.resolveItemContent(itemId); }
   onReset(handler: () => void): Unsubscribe { return this.sync.onReset(handler); }
   onOutbox(handler: (commands: PendingCommand[]) => void): Unsubscribe { return this.outboxChanges.subscribe(handler); }
-  private update(patch: Partial<ClientState>): void { this.state = { ...this.state, ...patch }; this.states.emit(this.getState()); }
+  private update(patch: Partial<ClientState>): void { this.state = { ...this.state, ...patch }; this.states.emit(this.getState()); this.scheduleReceiptReview(); }
+  private noteReceiptAuthority(snapshot: unknown, interactions: unknown[]): void {
+    if (!isRecord(snapshot) || !isRecord(snapshot.session) || typeof snapshot.session.id !== "string") return;
+    const turn = isRecord(snapshot.activeTurn) ? snapshot.activeTurn : undefined;
+    // Sequence counters and body deltas do not change an operation's outcome.
+    const directory = interactions.filter(isRecord).map((item) => [item.id ?? item.interactionId ?? item.approvalId, item.version ?? item.revision, item.status, item.deliveryState]).map((item) => JSON.stringify(item)).sort();
+    this.authoritativeReceiptSignature = JSON.stringify([snapshot.session.id, snapshot.session.activityState, turn?.id, turn?.status, directory]);
+    this.scheduleReceiptReview();
+  }
+  private scheduleReceiptReview(force = false): void {
+    if (!this.outbox || this.state.connection !== "online" || this.state.sync !== "synced" || !this.authoritativeReceiptSignature) return;
+    if (!force && this.receiptReviewScheduledSignature === this.authoritativeReceiptSignature) return;
+    this.receiptReviewScheduledSignature = this.authoritativeReceiptSignature;
+    this.receiptReviewRequested = true;
+    if (this.receiptReviewRunning) return;
+    const outbox = this.outbox; const lifecycle = this.lifecycle; const generation = this.rpc.generation;
+    const current = () => this.outbox === outbox && lifecycle === this.lifecycle && generation === this.rpc.generation && this.state.connection === "online" && this.state.sync === "synced";
+    this.receiptReviewRunning = true;
+    void (async () => {
+      while (this.receiptReviewRequested && current()) {
+        this.receiptReviewRequested = false;
+        const signature = this.authoritativeReceiptSignature!;
+        for (const command of await outbox.list()) {
+          if (!current()) return;
+          if (command.state !== "accepted" || this.receiptChecks.get(command.commandId) === signature) continue;
+          this.receiptChecks.set(command.commandId, signature);
+          // Receipt responses may remain accepted. Mark before querying so the
+          // resulting store notification cannot turn into a polling loop.
+          try { await outbox.queryReceipt(command.commandId); }
+          catch (error) { if (current()) this.update({ error: errorInfo(error) }); }
+        }
+      }
+    })().catch((error: unknown) => { if (current()) this.update({ error: errorInfo(error) }); }).finally(() => {
+      if (this.outbox !== outbox || lifecycle !== this.lifecycle) return;
+      this.receiptReviewRunning = false;
+      if (this.receiptReviewRequested) this.scheduleReceiptReview(true);
+    });
+  }
   listProfiles(): Promise<HostProfile[]> { return this.store.listProfiles(); }
   async listPendingCommands(): Promise<PendingCommand[]> { return this.outbox?.list() ?? []; }
   request<T = unknown>(method: string, payload: unknown = {}): Promise<T> { return this.rpc.request<T>(method, payload); }
@@ -136,6 +243,11 @@ export class FlyxClient {
     if (lifecycle !== this.lifecycle) throw abortError();
     options.onPersisted?.(structuredClone(command));
     return this.command<T>(method, payload, commandId);
+  }
+  /** Read-only outcome review remains available while domain catch-up is unavailable. */
+  queryCommandReceipt(commandId: string): Promise<PendingCommand> {
+    if (!this.outbox || this.state.connection !== "online") return Promise.reject(new ClientError("NOT_CONNECTED", "Host is not connected"));
+    return this.outbox.queryReceipt(commandId);
   }
   retryCommand<T = unknown>(commandId: string): Promise<T> {
     if (!this.outbox || this.state.connection !== "online" || this.state.sync !== "synced") return Promise.reject(new ClientError("NOT_CONNECTED", "Wait until the Host is connected and synchronized"));
@@ -170,8 +282,13 @@ export class FlyxClient {
       this.addEndpoint({ id: "direct-current-origin", kind: "direct-https", source: "manual", baseUrl: validateDirectUrl(baseUrl, this.options.allowInsecureLoopback).origin, availability: "unknown" });
     }
     if (lifecycle !== this.lifecycle) return;
+    if (this.selectedSessionId) {
+      const fence = this.replica.begin(this.selectedSessionId, this.state.transportGeneration);
+      void this.loadCachedReplica(fence);
+    }
     this.configure();
     await this.supervisor!.start();
+    await this.domainWork;
   }
   private profileFromDescriptor(descriptor: HostDescriptorV1): HostProfile {
     return { hostId: descriptor.hostId, label: "Flyx Host", hostPublicKey: descriptor.hostPublicKey, signingPublicKey: descriptor.signingPublicKey, fingerprint: descriptor.fingerprint, endpoints: descriptor.endpoints.map((endpoint) => ({ ...endpoint, availability: "unknown" })) };
@@ -212,11 +329,19 @@ export class FlyxClient {
         return typeof value === "function" ? value.bind(target) : value;
       },
     });
-    this.outbox = new CommandOutbox(commandStore, profile.hostId, (method, payload, commandId) => {
+    this.receiptChecks.clear(); this.authoritativeReceiptSignature = undefined; this.receiptReviewScheduledSignature = undefined;
+    this.receiptReviewRunning = false; this.receiptReviewRequested = false;
+    this.outbox = new CommandOutbox(commandStore, profile.hostId, async (method, payload, commandId) => {
       if (lifecycle !== this.lifecycle || this.profile !== profile) return Promise.reject(abortError());
+      if (method === "access.getReceipt" && isRecord(payload) && typeof payload.commandId === "string") return this.rpc.getAccessReceipt({ commandId: payload.commandId });
+      if (method === "command.getReceipt" && isRecord(payload) && typeof payload.commandId === "string" && this.rpc.supports(ACCESS_RECEIPTS_CAPABILITY)) {
+        const stored = await commandStore.getCommand(payload.commandId);
+        if (lifecycle !== this.lifecycle || this.profile !== profile) throw abortError();
+        if (stored?.hostId === profile.hostId && stored.method.startsWith("access.")) return this.rpc.getAccessReceipt({ commandId: payload.commandId });
+      }
       return this.rpc.request(method, payload, commandId);
-    });
-    this.outbox.onChange((commands) => { this.unresolvedWrites = commands.some((command) => ["sent", "receipt_unknown"].includes(command.state)); this.outboxChanges.emit(commands); });
+    }, { supportsAccessReceipts: () => this.rpc.supports(ACCESS_RECEIPTS_CAPABILITY) });
+    this.outbox.onChange((commands) => { this.unresolvedWrites = commands.some((command) => ["sent", "receipt_unknown"].includes(command.state)); this.outboxChanges.emit(commands); if (commands.some((command) => command.state === "accepted" && this.receiptChecks.get(command.commandId) !== this.authoritativeReceiptSignature)) this.scheduleReceiptReview(true); });
     this.supervisor = new ConnectionSupervisor({
       endpoints: () => profile.endpoints,
       preferredEndpointId: () => profile.preferredEndpointId,
@@ -259,7 +384,7 @@ export class FlyxClient {
       ...(this.options.probeDeadlineMs !== undefined ? { probeDeadlineMs: this.options.probeDeadlineMs } : {}),
     });
     this.supervisor.onState((state) => {
-      if (state.transportGeneration !== this.state.transportGeneration) { this.rpc.unbind(); this.sync.invalidate(); }
+      if (state.transportGeneration !== this.state.transportGeneration) { this.rpc.unbind(); this.sync.invalidate(); this.reconciler.invalidate(); }
       if (!state.error) delete this.state.error;
       this.update({ ...state, profile, pairingRequired: state.error !== undefined && ["PAIRING_REQUIRED", "AUTHENTICATION_REQUIRED", "DEVICE_REVOKED", "CREDENTIAL_EXPIRED"].includes(state.error.code) });
     });
@@ -267,6 +392,8 @@ export class FlyxClient {
   private async activate(transport: ClientTransport, endpoint: ConnectionEndpoint, signal: AbortSignal): Promise<void> {
     const profile = this.requireProfile();
     if (this.credentialTransition && this.credentialTransition.generation !== transport.generation) this.credentialTransition = undefined;
+    this.sync.invalidate();
+    this.reconciler.invalidate();
     this.rpc.bind(transport);
     await this.rpc.hello(profile, transport.deviceId);
     assertNotAborted(signal);
@@ -309,11 +436,70 @@ export class FlyxClient {
     await this.persistProfile();
     this.locallyRevoked = false;
     assertNotAborted(signal);
-    await this.sync.synchronize(transport.generation);
-    assertNotAborted(signal);
-    await this.outbox!.reconcile();
-    this.outboxChanges.emit(await this.outbox!.list());
     this.update({ securityLevel });
+    // Security activation owns the socket. Domain catch-up/outbox failures are
+    // recoverable on this authenticated lease and do not reject activation.
+    this.domainWork = this.synchronizeDomain(transport.generation).catch((error: unknown) => {
+      if (this.rpc.generation === transport.generation) this.update({ sync: "resync_required", error: errorInfo(error) });
+    });
+  }
+  private async loadCachedReplica(fence: ReplicaFence): Promise<void> {
+    if (this.replica.cursor) return;
+    const profile = this.profile; if (!profile) return;
+    try {
+      const candidates = await this.store.listReplicaCaches(profile.hostId);
+      if (!this.replica.isCurrent(fence) || this.profile?.fingerprint !== profile.fingerprint) return;
+      const record = candidates.filter((entry) => entry.hostId === profile.hostId && entry.fingerprint === profile.fingerprint && entry.sessionId === fence.sessionId && typeof entry.projectorVersion === "number").sort((a, b) => b.cachedAt - a.cachedAt)[0];
+      if (!record) return;
+      const selection = this.replicaCache.select({ hostId: record.hostId, fingerprint: record.fingerprint, sessionId: record.sessionId, epoch: record.epoch, projectorVersion: record.projectorVersion });
+      this.cacheSelection = selection; this.cacheReplicaGeneration = fence.replicaGeneration;
+      const cached = await this.replicaCache.load(selection);
+      if (!cached || !this.replicaCache.isCurrent(selection) || !this.replica.isCurrent(fence)) return;
+      const value = cached.value;
+      if (!isRecord(value) || value.epoch !== record.epoch || value.projectorVersion !== record.projectorVersion || !Array.isArray(value.items) || !isRecord(value.loadedWindow) || typeof value.loadedWindow.hasOlder !== "boolean") throw new ClientError("CACHE_UNAVAILABLE", "Cached conversation has an invalid projection shape");
+      this.replica.restoreCache(fence, value as CachedSessionReplica);
+    } catch (error) {
+      if (!this.replica.isCurrent(fence)) return;
+      this.cacheError = { code: "CACHE_UNAVAILABLE", message: "Local conversation cache is unavailable" }; this.cacheErrors.emit(this.cacheError);
+    }
+  }
+  private persistReplicaCache(state: SessionReplicaState): void {
+    const profile = this.profile;
+    if (!profile || state.mode !== "canonical" || !state.interactionsAuthoritative || !state.sourceCursor || !state.sessionId || !state.epoch || state.projectorVersion === undefined) return;
+    const key = { hostId: profile.hostId, fingerprint: profile.fingerprint, sessionId: state.sessionId, epoch: state.epoch, projectorVersion: state.projectorVersion };
+    let selection = this.cacheSelection;
+    if (!selection || this.cacheReplicaGeneration !== state.replicaGeneration || Object.entries(key).some(([name, value]) => selection!.key[name as keyof typeof key] !== value)) {
+      selection = this.replicaCache.select(key); this.cacheSelection = selection; this.cacheReplicaGeneration = state.replicaGeneration;
+    }
+    this.replicaCache.acceptLive(selection, state.sourceCursor.sequence);
+    const value: CachedSessionReplica = { epoch: state.epoch, projectorVersion: state.projectorVersion, sourceCursor: state.sourceCursor, items: state.items, loadedWindow: state.loadedWindow };
+    const active = selection;
+    void this.replicaCache.save(active, state.sourceCursor.sequence, value).then((saved) => {
+      if (saved && this.replicaCache.isCurrent(active) && this.cacheError) { this.cacheError = undefined; this.cacheErrors.emit(undefined); }
+    });
+  }
+  private async synchronizeDomain(generation: number): Promise<void> {
+    const revision = ++this.domainRevision;
+    const hostId = this.requireProfile().hostId;
+    const current = () => revision === this.domainRevision && this.rpc.generation === generation && this.supervisor?.generation === generation && this.profile?.hostId === hostId;
+    if (this.getProjectionMode() === "canonical") {
+      let sessionId = this.selectedSessionId;
+      if (!sessionId) {
+        const discovery = await this.rpc.request<unknown>("host.getSnapshot");
+        if (!current()) return;
+        if (!isRecord(discovery) || !isRecord(discovery.session) || typeof discovery.session.id !== "string") throw new ClientError("INVALID_SNAPSHOT", "Host did not return its default session identity");
+        sessionId = discovery.session.id;
+        this.selectedSessionId = sessionId;
+      }
+      await this.reconciler.synchronize(sessionId, generation);
+    } else {
+      await this.sync.synchronize(generation);
+    }
+    if (!current()) return;
+    try {
+      await this.outbox!.reconcile();
+      if (current()) this.outboxChanges.emit(await this.outbox!.list());
+    } catch (error) { if (current()) this.update({ error: errorInfo(error) }); }
   }
   private async rotateCredential(generation: number, method: "access.pair" | "access.refresh", payload: unknown, key: MemoryDeviceKey): Promise<CredentialResponse> {
     const transition = { generation, accepted: false } as { generation: number; accepted: boolean; deferred?: ClientError };
@@ -347,14 +533,21 @@ export class FlyxClient {
   stop(): void {
     this.started = false;
     this.lifecycle++;
+    this.domainRevision++;
+    this.domainWork = undefined;
+    this.replicaCache.invalidate();
+    this.cacheSelection = undefined; this.cacheReplicaGeneration = undefined;
     this.initializing = undefined;
     this.supervisor?.stop();
     this.supervisor = undefined;
     this.outbox = undefined;
     this.credentialTransition = undefined;
     this.unresolvedWrites = false;
+    this.authoritativeReceiptSignature = undefined; this.receiptChecks.clear(); this.receiptReviewScheduledSignature = undefined;
+    this.receiptReviewRequested = false; this.receiptReviewRunning = false;
     this.rpc.unbind();
     this.sync.invalidate();
+    this.reconciler.invalidate();
     this.update({ connection: "closed" });
   }
   reconnect(): void { if (this.supervisor) void this.supervisor.reconnect(); else { this.started = false; void this.start(); } }
@@ -366,6 +559,8 @@ export class FlyxClient {
     if (!profile) throw new ClientError("HOST_NOT_FOUND", "Saved Host does not exist");
     this.stop();
     this.sync.reset();
+    this.reconciler.reset();
+    this.selectedSessionId = undefined;
     this.profile = profile;
     const lifecycle = this.lifecycle;
     await this.store.setSelectedHost(hostId);
@@ -383,6 +578,8 @@ export class FlyxClient {
     this.stop();
     const lifecycle = this.lifecycle;
     this.sync.reset();
+    this.reconciler.reset();
+    this.selectedSessionId = undefined;
     this.update({ connection: "authenticating", pairingRequired: true });
     try {
       let value = input.trim();
@@ -440,7 +637,7 @@ export class FlyxClient {
   /** Local deletion is available offline and does not claim remote revocation. */
   async forgetLocalHost(hostId: string = this.requireProfile().hostId): Promise<void> {
     const current = this.profile?.hostId === hostId || this.options.hostId === hostId;
-    if (current) { this.stop(); this.sync.reset(); this.pendingPair = undefined; }
+    if (current) { this.stop(); this.sync.reset(); this.reconciler.reset(); this.selectedSessionId = undefined; this.pendingPair = undefined; }
     const lifecycle = this.lifecycle;
     const key = this.memoryKeys.get(hostId);
     key?.secretKey.fill(0);
@@ -471,6 +668,8 @@ export class FlyxClient {
     if (endpoint?.kind === "direct-https") await directJson(endpoint.baseUrl, "/api/auth/logout", this.options, { method: "POST" }).catch(() => undefined);
     this.stop();
     this.sync.reset();
+    this.reconciler.reset();
+    this.selectedSessionId = undefined;
     this.update({ pairingRequired: true, connection: "closed" });
   }
   private async clearCurrentCredential(): Promise<void> {

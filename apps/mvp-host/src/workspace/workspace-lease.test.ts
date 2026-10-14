@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, realpathSync, renameSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { HostOwnerLock, type HostOwnerHandle } from "../lifecycle/host-owner.js";
@@ -43,6 +43,18 @@ describe("checkout leases", () => {
     const next = WorkspaceLease.acquire({ workspace: f.workspace, owner: f.second });
     leases.push(next);
     next.assertActive();
+  });
+
+  it("keeps the original managed key after quarantine/removal and rejects aliases",()=>{
+    const f=fixture();const original=realpathSync(f.workspace);
+    const held=WorkspaceLease.acquire({workspace:original,owner:f.first,operationId:"archive"});leases.push(held);
+    renameSync(f.workspace,join(f.root,"quarantine"));
+    expect(()=>WorkspaceLease.acquireReserved({canonicalWorkspace:original,owner:f.second})).toThrow("Another Host");
+    held.release();
+    const reserved=WorkspaceLease.acquireReserved({canonicalWorkspace:original,owner:f.second});leases.push(reserved);
+    expect(reserved.resourceKey).toBe(`workspace:${original}`);
+    expect(()=>WorkspaceLease.acquireReserved({canonicalWorkspace:join(f.root,"checkout-alias"),owner:f.first})).toThrow();
+    rmSync(join(f.root,"quarantine"),{recursive:true});reserved.assertActive();
   });
 
   it("retains a checkout gate after an unknown execution outcome", () => {

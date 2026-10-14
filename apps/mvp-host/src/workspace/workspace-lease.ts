@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { realpathSync } from "node:fs";
-import { ExclusiveFileLock, HostOwnershipError, assertHostOwner, defaultCoordinationDirectory, type HostOwnerHandle, type OwnershipRecoveryAuthorization, type OwnershipRecoveryProof, type OwnershipRecoveryVerifier } from "../lifecycle/host-owner.js";
+import { ExclusiveFileLock, HostOwnershipError, assertHostOwner, canonicalPath, defaultCoordinationDirectory, type HostOwnerHandle, type OwnershipRecoveryAuthorization, type OwnershipRecoveryProof, type OwnershipRecoveryVerifier } from "../lifecycle/host-owner.js";
 import { SystemProcessInspector, type ProcessInspector } from "../lifecycle/process-inspector.js";
 
 export type WorkspaceLeaseOptions = {
@@ -25,6 +25,18 @@ export class WorkspaceLease {
   static acquire(options: WorkspaceLeaseOptions): WorkspaceLease {
     assertHostOwner(options.owner);
     const workspace = realpathSync(options.workspace);
+    return this.acquireAt(options,workspace);
+  }
+
+  /** Trusted local managed-record seam; RPC callers must never supply this path. */
+  static acquireReserved(options: Omit<WorkspaceLeaseOptions,"workspace"> & {canonicalWorkspace:string}): WorkspaceLease {
+    assertHostOwner(options.owner);
+    const workspace=canonicalPath(options.canonicalWorkspace);
+    if(workspace!==options.canonicalWorkspace)throw new HostOwnershipError("OWNER_RECOVERY_EVIDENCE_INVALID","Reserved checkout must use its exact original canonical managed path.");
+    return this.acquireAt({...options,workspace},workspace);
+  }
+
+  private static acquireAt(options:WorkspaceLeaseOptions,workspace:string):WorkspaceLease {
     const operationId = options.operationId ?? randomUUID();
     if (options.recovery && (options.recovery.proof.resourceKeys.length !== 1 || options.recovery.proof.resourceKeys[0] !== `workspace:${workspace}`)) {
       throw new HostOwnershipError("OWNER_RECOVERY_EVIDENCE_INVALID", "Recovery evidence belongs to a different checkout.");

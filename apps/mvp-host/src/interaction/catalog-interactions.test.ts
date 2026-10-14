@@ -9,6 +9,8 @@ import { AccessError } from "../auth/connection-authorizer.js";
 import { createHostAttentionBindings } from "../attention/host-attention.js";
 import { createHostCatalogBindings } from "../catalog/host-catalog.js";
 import { createTestHostOwner } from "../lifecycle/host-owner.js";
+import { ExecutionWorker } from "../orchestration/execution-worker.js";
+import { InteractionStore } from "./interaction-store.js";
 import { fenceAdapterEvent, type DispatchContext, type ProviderAdapter, type ProviderOutcome } from "../provider/types.js";
 import { SessionOrchestrator } from "../session/orchestrator.js";
 import type { SessionRuntimeContext } from "../session/session-registry.js";
@@ -84,10 +86,10 @@ async function fixture(change: {
     runtime.host.ingestAdapterEvent(fenceAdapterEvent(runtime.native, { kind: "turn_completed", result: "done", costUsd: 0, numTurns: 1 }));
     await runtime.host.ingestion.drain();
   } runtime.outcome.release(terminal); await runtime.host.worker.drainOperations(); };
-  cleanup.push(async () => { change.block?.release(); for (const runtime of runtimes) {
+  cleanup.push(async () => { change.block?.release(); if (store.db.open) for (const runtime of runtimes) {
     await finish(runtime);
     await runtime.host.closeAndWait();
-  } await bindings.shutdownService.drain(Date.now() + 1000); bindings.shutdownService.close(); await catalog.closeAndWait(); });
+  } await bindings.shutdownService.drain(Date.now() + 1000); bindings.shutdownService.close(); if (store.db.open) await catalog.closeAndWait(); });
   return { root, workspace, store, owner, devices, starter, approver, reader, catalog, first, second, bindings, active, hook, runtimeFactory, denied, runtimes, start, approval, finish };
 }
 function response(id: string, sessionId: string) { return { sessionId, interactionId: id, expectedVersion: 0, action: "deny" as const }; }
@@ -252,6 +254,63 @@ describe("Catalog interaction bindings", () => {
     expect(f.store.db.open).toBe(true);
     expect(f.bindings.interactionCapabilities()).toEqual([]);
     expect(() => f.bindings.readInteraction(f.first, "approval")).toThrow("INTERACTIONS_UNAVAILABLE");
+  });
+  it("force-seals an unsealed held runtime and fences retained settlement and source hooks across Store closure", async () => {
+    const registered = vi.spyOn(ExecutionWorker.prototype, "registerControl"), entered = barrier(), block = barrier();
+    const f = await fixture({ entered, block }), a = await f.start();
+    await f.approval(a, "approval");
+    const port = a.host.interactionRpcPort!, hooks = f.bindings.runtimeOptions(a.context), control = registered.mock.calls.find(([kind]) => kind === "respond_approval");
+    if (!control?.[2]) throw new Error("Fixture control settlement missing");
+    const [_, deliver, settle] = control;
+    port.rpc("interaction.respondApproval", response("approval", f.first), { authSubjectId: f.approver.id, commandId: "held-answer" });
+    await entered.promise;
+    const intent = a.host.execution.forCommand(f.approver.id, "held-answer").find((value) => value.kind === "respond_approval")!;
+    const before = { receipt: f.store.getCommandReceipt(f.approver.id, "held-answer"), intent: a.host.execution.get(intent.id), row: f.bindings.service.interactions.get("approval") };
+    expect(before.row).toMatchObject({ status: "responding", version: 1, deliveryState: "accepted" });
+    expect(a.host.worker.isSealed).toBe(false);
+    const source = fenceAdapterEvent(a.native!, { kind: "approval_resolved", approvalId: "approval", toolUseId: "native-approval", action: "deny" });
+    const sql = vi.spyOn(f.store.db, "prepare"), transaction = vi.spyOn(f.store.db, "transaction"), publication = vi.spyOn(a.host, "publishCommittedEvent"), catalogPublication = vi.spyOn(f.catalog.registry, "publishCommittedEvents");
+    const projection = vi.spyOn(InteractionStore.prototype, "projectCommittedBatch");
+    f.bindings.shutdownService.seal();
+    f.bindings.shutdownService.seal();
+    expect(a.host.worker.isSealed).toBe(false);
+    expect(a.host.interactionRpcPort).toBeUndefined();
+    const late = () => {
+      expect(f.bindings.interactionCapabilities()).toEqual([]);
+      expect(hooks.interactionEvents!.handle(source)).toBe(true);
+      expect(hooks.interactionEvents!.handle(fenceAdapterEvent(a.native!, { kind: "turn_completed", result: "late", costUsd: 0, numTurns: 1 }))).toBe(true);
+      expect(hooks.interactionEvents!.companionEvents(f.first, a.turnId, "late")).toEqual([]);
+      expect(f.bindings.supersedeInteractions(f.first, { attemptId: a.native!.attemptId, runtimeGeneration: a.native!.runtimeGeneration }, "late")).toBe(0);
+      expect(deliver(intent, a.native!)).toMatchObject({ status: "not_dispatched" });
+      expect(settle(intent, { status: "delivered", evidence: { kind: "local-delivery" } })).toBeUndefined();
+      expect(f.bindings.service.recordDelivery(intent.id, { kind: "native-ack", sourceId: "late-proof", nativeRequestId: "native-approval" })).toBe(false);
+      expect(f.bindings.service.planSupersessionEvents(f.first, { turnId: a.turnId })).toEqual([]);
+      expect(f.bindings.service.expireDue(f.first)).toBe(0);
+      expect(() => f.bindings.service.get(f.first, "approval")).toThrow("INTERACTIONS_UNAVAILABLE");
+      expect(() => f.bindings.service.list(f.first)).toThrow("INTERACTIONS_UNAVAILABLE");
+      expect(() => f.bindings.readInteraction(f.first, "approval")).toThrow("INTERACTIONS_UNAVAILABLE");
+      expect(() => f.bindings.readViewInteractions(f.first)).toThrow("INTERACTIONS_UNAVAILABLE");
+      expect(() => port.rpc("interaction.get", { sessionId: f.first, interactionId: "approval" }, { authSubjectId: f.reader.id })).toThrow("INTERACTIONS_UNAVAILABLE");
+      expect(() => port.rpc("interaction.respondApproval", response("approval", f.first), { authSubjectId: f.approver.id, commandId: "late-answer" })).toThrow("INTERACTIONS_UNAVAILABLE");
+      expect(() => hooks.revalidateDevice!(intent)).toThrow("INTERACTIONS_UNAVAILABLE");
+      f.bindings.shutdownService.close();
+    };
+    late();
+    expect(sql).not.toHaveBeenCalled(); expect(transaction).not.toHaveBeenCalled(); expect(publication).not.toHaveBeenCalled(); expect(catalogPublication).not.toHaveBeenCalled(); expect(a.deliver).not.toHaveBeenCalled();
+    sql.mockRestore(); transaction.mockRestore();
+    expect({ receipt: f.store.getCommandReceipt(f.approver.id, "held-answer"), intent: a.host.execution.get(intent.id), row: f.bindings.service.interactions.get("approval") }).toEqual(before);
+    // Runtime fencing is a separate lifecycle action; the interaction seal claimed no stop proof.
+    const closing = a.host.closeAndWait(10);
+    block.release();
+    a.outcome.release({ status: "outcome_unknown", error: "fixture_stop_unproven", evidence: { kind: "unknown", reason: "fixture_stop_unproven" } });
+    await closing; await f.catalog.closeAndWait(10);
+    expect(projection).not.toHaveBeenCalled();
+    publication.mockClear(); catalogPublication.mockClear();
+    const closedSql = vi.spyOn(f.store.db, "prepare"), closedTransaction = vi.spyOn(f.store.db, "transaction");
+    f.store.close();
+    expect(f.store.db.open).toBe(false);
+    late();
+    expect(closedSql).not.toHaveBeenCalled(); expect(closedTransaction).not.toHaveBeenCalled(); expect(publication).not.toHaveBeenCalled(); expect(catalogPublication).not.toHaveBeenCalled(); expect(a.deliver).not.toHaveBeenCalled();
   });
   it("rejects forged runtime ownership/target contexts and future schema without preparing a Native runtime", async () => {
     const f = await fixture(), resource = f.catalog.registry.resolve(f.first), context: SessionRuntimeContext = { ...resource, store: f.store, owner: f.owner, runtimeId: "runtime", ownsStore: false, recoverOnStart: false };

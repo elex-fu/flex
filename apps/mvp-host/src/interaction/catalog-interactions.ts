@@ -66,11 +66,18 @@ export class CatalogInteractionBindings {
         return;
       if (this.state !== "draining" || [...this.runtimes.values()].some((entry) => entry.host && !entry.host.worker.isSealed))
         throw new InteractionRpcError("INTERACTION_RUNTIME_NOT_DRAINED");
-      for (const entry of this.runtimes.values())
-        entry.bindings.close();
-      this.runtimes.clear();
-      this.service.close();
+      this.shutdownService.seal();
+    },
+    /** Fence callbacks and release projection leases; this makes no worker or producer stop claim. */
+    seal: (): void => {
+      if (this.state === "closed") return;
       this.state = "closed";
+      for (const entry of this.runtimes.values()) {
+        entry.closed = true;
+        entry.bindings.close();
+      }
+      this.runtimes.clear();
+      this.service.seal();
     },
   };
   constructor(private readonly options: CatalogInteractionsOptions) {
@@ -78,10 +85,10 @@ export class CatalogInteractionBindings {
     this.service = new InteractionService(new CommandEngine(options.catalog.store, {
       admission: () => { throw new InteractionRpcError("INTERACTION_METADATA_ONLY"); },
     }), {
-      resolveSession: (id) => { const target = this.resource(id); return { provider: target.session.provider, workspaceId: target.workspace.workspaceId }; },
+      resolveSession: (id) => { this.assertSource(); const target = this.resource(id); return { provider: target.session.provider, workspaceId: target.workspace.workspaceId }; },
       questionCapability: () => false,
       hashRequest: (method, payload, id) => options.catalog.registry.hashRequest(method, payload, id),
-      publish: (event) => options.catalog.registry.publishCommittedEvents([event]),
+      publish: (event) => { if (this.state !== "closed") options.catalog.registry.publishCommittedEvents([event]); },
     });
   }
   readonly readInteraction = (sessionId: string, interactionId: string): Interaction => {
@@ -104,6 +111,7 @@ export class CatalogInteractionBindings {
     return { interactions: parsed.interactions, hasMore: parsed.hasMore, ...(parsed.nextAfterInteractionId !== undefined ? { nextAfterInteractionId: parsed.nextAfterInteractionId } : {}) };
   };
   readonly companionEvents = (sessionId: string, turnId: string, reason: string): PlannedEvent[] => {
+    if (this.state === "closed") return [];
     this.assertSource();
     this.resource(sessionId);
     const turn = this.options.catalog.store.getTurn(turnId);
@@ -115,6 +123,7 @@ export class CatalogInteractionBindings {
     attemptId: string;
     runtimeGeneration: number;
   }, reason: string): number => {
+    if (this.state === "closed") return 0;
     this.assertSource();
     this.resource(sessionId);
     if (!old.attemptId || !Number.isSafeInteger(old.runtimeGeneration) || old.runtimeGeneration < 1)
@@ -148,6 +157,7 @@ export class CatalogInteractionBindings {
         throw new InteractionRpcError("SESSION_NOT_FOUND"); return { provider: identity.provider, workspaceId: identity.workspaceId, runtimeId: identity.runtimeId }; },
       adapterForSession: (id) => id === identity.sessionId && this.questionReady(entry) ? entry.host?.adapter : undefined,
       resolveAdapter: (original) => this.adapter(entry, original),
+      publish: (event) => { if (this.state !== "closed" && !entry.closed) entry.host?.publishCommittedEvent(event); },
       hashRequest: (method, payload, id) => { this.assertEntry(entry); if (id !== identity.sessionId)
         throw new InteractionRpcError("SESSION_NOT_FOUND"); return this.options.catalog.registry.hashRequest(method, payload, id); },
     });
@@ -167,7 +177,12 @@ export class CatalogInteractionBindings {
       } };
     const hooks: HostInteractionHooks = {
       rpcPort: () => entry.closed || !bindings.interactions() ? undefined : port,
-      handle: (event) => { this.assertEntry(entry); this.assertOriginal(entry, event.dispatchContext, true); return bindings.interactionEvents.handle(event); },
+      handle: (event) => {
+        // Consume late callbacks so ingestion cannot fall through to a legacy SQL writer.
+        if (this.state === "closed" || entry.closed) return true;
+        this.assertEntry(entry); this.assertOriginal(entry, event.dispatchContext, true);
+        return bindings.interactionEvents.handle(event);
+      },
       companionEvents: this.companionEvents,
       respondLegacyApproval: (actor, command, approval, action, request) => {
         this.authorizeAnswer(entry, "interaction.respondApproval", actor);

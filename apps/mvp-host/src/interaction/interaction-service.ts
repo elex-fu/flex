@@ -30,15 +30,19 @@ export class InteractionService {
   readonly interactions: InteractionStore;
   readonly execution: ExecutionStore;
   private readonly detach: () => void;
+  private sealed = false;
   constructor(readonly engine: CommandEngine, private readonly options: InteractionServiceOptions) {
     this.interactions = new InteractionStore(engine.store.db);
     this.execution = new ExecutionStore(engine.store);
     this.detach = this.interactions.attach(engine.store);
   }
-  close(): void { this.detach(); }
+  /** Detach this lease and fence retained callbacks without settling any durable outcome. */
+  seal(): void { if (this.sealed) return; this.sealed = true; this.detach(); }
+  close(): void { this.seal(); }
   get store(): SqliteStore { return this.engine.store; }
-  questionCapability(sessionId: string): boolean { return this.options.evidenceSource !== "fixture" && this.options.questionCapability?.(sessionId) === true; }
+  questionCapability(sessionId: string): boolean { return !this.sealed && this.options.evidenceSource !== "fixture" && this.options.questionCapability?.(sessionId) === true; }
   get(sessionId: string, interactionId: string): Interaction {
+    this.assertOpen();
     const route = this.options.resolveSession(sessionId);
     const row = this.interactions.get(interactionId);
     if (!row || row.sessionId !== sessionId)
@@ -52,6 +56,7 @@ export class InteractionService {
     hasMore: boolean;
     nextAfterInteractionId?: string;
   } {
+    this.assertOpen();
     const route = this.options.resolveSession(sessionId);
     const rows = this.interactions.list(sessionId, { ...(afterInteractionId ? { afterInteractionId } : {}), limit: 51 });
     const interactions: Interaction[] = [];
@@ -67,6 +72,7 @@ export class InteractionService {
     return { interactions, hasMore, ...(hasMore && last ? { nextAfterInteractionId: last.interactionId } : {}) };
   }
   ingestQuestion(binding: InteractionFence, native: NativeQuestionRequest): InteractionRow {
+    this.assertOpen();
     if (!this.questionCapability(binding.sessionId) && !this.options.allowVerificationFlow)
       throw new Error("QUESTION_CONTRACT_UNVERIFIED");
     return this.ingest(binding, {
@@ -97,6 +103,7 @@ export class InteractionService {
     expiresAt: string;
     approval?: ApprovalRow;
   }): InteractionRow {
+    this.assertOpen();
     const existing = this.interactions.get(input.interactionId);
     this.assertCurrentFence(binding);
     if (existing?.nativeRequestId) {
@@ -134,8 +141,8 @@ export class InteractionService {
         });
       }
     })!;
-    this.publish(committed.events);
     const row = this.interactions.get(value.interactionId)!;
+    this.publish(committed.events);
     this.emitEvidence(row, "request");
     return row;
   }
@@ -149,12 +156,14 @@ export class InteractionService {
   }
   /** Old omitted-version requests may read current pending state only before any reservation. */
   respondLegacyApproval(authSubjectId: string, commandId: string, approvalId: string, action: "allow_once" | "deny", targetRequest?: CommandRequest): InteractionResponse {
+    this.assertOpen();
     const row = this.interactions.get(approvalId);
     if (!row || row.kind !== "approval")
       throw new Error("APPROVAL_NOT_FOUND");
     return this.respond(authSubjectId, commandId, { sessionId: row.sessionId, interactionId: row.interactionId, expectedVersion: row.version, action }, "approval.respond", targetRequest);
   }
   private respond(authSubjectId: string, commandId: string, input: InteractionRespondApprovalRequest | QuestionRespondRequest, method: string, targetRequest?: CommandRequest): InteractionResponse {
+    this.assertOpen();
     const route = this.options.resolveSession(input.sessionId);
     this.requireActor(authSubjectId, this.now());
     const payload = method === "approval.respond" && "action" in input ? { approvalId: input.interactionId, action: input.action } : input;
@@ -210,6 +219,7 @@ export class InteractionService {
   }
   /** Called by the short control lane after its durable dispatch marker, before native delivery. */
   validateDelivery(intent: ExecutionIntentRow, context: InteractionFence): InteractionRow {
+    this.assertOpen();
     const row = this.interactions.forIntent(intent.id);
     if (!row || row.status !== "responding" || row.sessionId !== intent.sessionId || row.interactionId !== intent.resourceId
       || row.nativeRequestId !== intent.nativeRequestId || row.attemptId !== intent.attemptId || row.runtimeGeneration !== intent.runtimeGeneration)
@@ -224,6 +234,7 @@ export class InteractionService {
   }
   /** Delivery completion is a control fact, never a Turn terminal fact. */
   recordDelivery(intentId: string, evidence: NativeInteractionEvidence, context?: InteractionFence): boolean {
+    if (this.sealed) return false;
     const initial = this.interactions.forIntent(intentId);
     if (!initial)
       return false;
@@ -287,11 +298,12 @@ export class InteractionService {
     });
     if (committed) {
       this.publish(committed.events);
-      this.emitEvidence(this.interactions.forIntent(intentId)!, evidence.kind === "native-ack" ? "native-confirmation" : evidence.kind === "local-delivery" ? "local-delivery" : "superseded");
+      if (!this.sealed) this.emitEvidence(this.interactions.forIntent(intentId)!, evidence.kind === "native-ack" ? "native-confirmation" : evidence.kind === "local-delivery" ? "local-delivery" : "superseded");
     }
     return true;
   }
   resolveNative(interactionId: string, status: "expired" | "superseded" | "confirmed", binding: InteractionFence, evidence?: NativeInteractionEvidence): void {
+    if (this.sealed) return;
     const row = this.interactions.get(interactionId);
     if (!row)
       throw new Error("INTERACTION_NOT_FOUND");
@@ -306,8 +318,10 @@ export class InteractionService {
       this.obsolete([row], status === "expired" ? "interaction.expired" : "interaction.superseded", status === "expired" ? "request_expired" : "native_request_gone");
   }
   expireDue(sessionId: string): number {
+    if (this.sealed) return 0;
     let count = 0;
     for (;;) {
+      if (this.sealed) return count;
       const rows = this.interactions.matchingOpen(sessionId, { expiresBefore: this.now() });
       if (!rows.length)
         return count;
@@ -315,8 +329,10 @@ export class InteractionService {
     }
   }
   supersedeForRuntime(sessionId: string, old: Pick<InteractionFence, "attemptId" | "runtimeGeneration">, reason = "runtime_replaced"): number {
+    if (this.sealed) return 0;
     let count = 0;
     for (;;) {
+      if (this.sealed) return count;
       const rows = this.interactions.matchingOpen(sessionId, old);
       if (!rows.length)
         return count;
@@ -329,6 +345,7 @@ export class InteractionService {
     attemptId?: string;
     runtimeGeneration?: number;
   }, reason = "turn_no_longer_accepts_input"): PlannedEvent[] {
+    if (this.sealed) return [];
     const rows = this.interactions.matchingOpen(sessionId, filter, 257);
     if (rows.length > 256)
       throw new Error("INTERACTION_BATCH_TOO_LARGE");
@@ -381,6 +398,7 @@ export class InteractionService {
       throw new Error("SCOPE_REQUIRED");
   }
   private assertCurrentFence(binding: InteractionFence): void {
+    this.assertOpen();
     const turn = this.store.getActiveTurn(binding.sessionId);
     const route = this.options.resolveSession(binding.sessionId);
     if (!turn || turn.id !== binding.turnId || turn.attemptId !== binding.attemptId || turn.generation !== binding.runtimeGeneration || route.runtimeId !== binding.runtimeId)
@@ -394,7 +412,9 @@ export class InteractionService {
     if (!row.dispatchContext || (["hostOwnerId", "hostOwnerGeneration", "sessionId", "flyxTurnId", "runtimeId", "runtimeGeneration", "attemptId"] as const).some((key) => row.dispatchContext![key] !== binding.dispatchContext[key]) || row.sessionId !== binding.sessionId || row.turnId !== binding.turnId || row.attemptId !== binding.attemptId || row.runtimeGeneration !== binding.runtimeGeneration || row.runtimeId !== binding.runtimeId)
       throw new Error("INTERACTION_DELIVERY_STALE");
   }
+  private assertOpen(): void { if (this.sealed) throw new Error("INTERACTIONS_UNAVAILABLE"); }
   private publish(events: SessionEvent[]): void { for (const event of events) {
+    if (this.sealed) return;
     try {
       this.options.publish?.(event);
     }
@@ -402,7 +422,7 @@ export class InteractionService {
   } }
   private now(): string { return this.options.now?.() ?? new Date().toISOString(); }
   private emitEvidence(row: InteractionRow, phase: InteractionEvidenceSample["phase"]): void {
-    if (!row.nativeRequestId || !row.nativeMethod)
+    if (this.sealed || !row.nativeRequestId || !row.nativeMethod)
       return;
     const route = this.options.resolveSession(row.sessionId);
     const answer = this.interactions.reservation(row.interactionId)?.answer;

@@ -1,0 +1,50 @@
+{
+  "expo": {
+    "name": "Flyx",
+    "slug": "flyx-mobile",
+    "version": "0.0.1",
+    "scheme": "flyx",
+    "platforms": [
+      "ios",
+      "android"
+    ],
+    "jsEngine": "hermes",
+    "newArchEnabled": true,
+    "ios": {
+      "bundleIdentifier": "dev.flyx.mobile",
+      "supportsTablet": true,
+      "infoPlist": {
+        "NSCameraUsageDescription": "Scan a Flyx Host pairing offer.",
+        "NSLocalNetworkUsageDescription": "Connect to your paired Flyx Host over HTTPS."
+      }
+    },
+    "android": {
+      "package": "dev.flyx.mobile",
+      "permissions": [
+        "CAMERA"
+      ],
+      "usesCleartextTraffic": false
+    },
+    "plugins": [
+      [
+        "expo-camera",
+        {
+          "cameraPermission": "Scan a Flyx Host pairing offer.",
+          "microphonePermission": false,
+          "recordAudioAndroid": false
+        }
+      ],
+      [
+        "expo-secure-store",
+        {
+          "configureAndroidBackup": true
+        }
+      ],
+      "expo-sqlite",
+      "expo-notifications"
+    ],
+    "extra": {
+      "pushProjectId": null
+    }
+  }
+}

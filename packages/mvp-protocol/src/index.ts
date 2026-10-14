@@ -142,3 +142,4 @@ export * from "./diagnostics.js";
 export * from "./interaction-api.js";
 
 export * from "./attention-api.js";
+export * from "./session-api.js";

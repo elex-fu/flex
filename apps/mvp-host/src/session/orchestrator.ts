@@ -3,7 +3,8 @@ import { realpathSync } from "node:fs";
 import type { Bootstrap, SessionEvent, TimelineItem } from "@flyx/mvp-protocol";
 import { ProtocolVersion } from "@flyx/mvp-protocol";
 import { ClaudeAdapter } from "../claude/adapter.js";
-import type { AdapterEvent } from "../claude/types.js";
+import { CodexAdapter } from "../codex/adapter.js";
+import type { AdapterEvent, ProviderAdapter, ProviderId } from "../provider/types.js";
 import { GitService, type GitDiff, type GitStatus } from "../git/git-service.js";
 import {
   SqliteStore,
@@ -37,7 +38,8 @@ export type ControlResponse = {
 export type OrchestratorOptions = {
   workspace: string;
   databasePath?: string;
-  adapter?: ClaudeAdapter;
+  provider?: ProviderId;
+  adapter?: ProviderAdapter;
 };
 
 const MAX_PROMPT_BYTES = 16 * 1024;
@@ -46,7 +48,7 @@ export class SessionOrchestrator {
   readonly store: SqliteStore;
   readonly workspace: string;
   readonly git: GitService;
-  readonly adapter: ClaudeAdapter;
+  readonly adapter: ProviderAdapter;
   private readonly listeners = new Set<SessionEventListener>();
   private commandTail: Promise<unknown> = Promise.resolve();
   private eventTail: Promise<void> = Promise.resolve();
@@ -57,23 +59,36 @@ export class SessionOrchestrator {
 
   constructor(options: OrchestratorOptions) {
     const canonicalWorkspace = realpathSync(options.workspace);
+    const provider = options.adapter?.provider ?? options.provider ?? "claude";
     this.store = new SqliteStore(options.databasePath ?? ":memory:");
     const existingSession = this.store.getCurrentSession();
     if (existingSession && existingSession.workspacePath !== canonicalWorkspace) {
       this.store.close();
       throw new OrchestratorError("WORKSPACE_MISMATCH", "Persisted session belongs to a different configured workspace");
     }
+    if (existingSession && existingSession.provider !== provider) {
+      this.store.close();
+      throw new OrchestratorError(
+        "PROVIDER_MISMATCH",
+        `Persisted session uses ${existingSession.provider}; configure a separate FLYX_DB before switching to ${provider}`,
+      );
+    }
     this.workspace = canonicalWorkspace;
-    this.session = existingSession ?? this.store.createSession(canonicalWorkspace);
+    this.session = existingSession ?? this.store.createSession(canonicalWorkspace, provider);
     this.store.recoverActiveTurns();
     this.git = new GitService(canonicalWorkspace);
-    this.adapter = options.adapter ?? new ClaudeAdapter({
-      workspace: canonicalWorkspace,
-      onEvent: (event) => this.enqueueAdapterEvent(event),
-    });
+    try {
+      this.adapter = options.adapter ?? (provider === "codex"
+        ? new CodexAdapter({ workspace: canonicalWorkspace, onEvent: (event) => this.enqueueAdapterEvent(event) })
+        : new ClaudeAdapter({ workspace: canonicalWorkspace, onEvent: (event) => this.enqueueAdapterEvent(event) }));
+    } catch (error) {
+      this.store.close();
+      throw error;
+    }
   }
 
   close(): void {
+    this.adapter.close?.();
     this.store.close();
   }
 
@@ -89,7 +104,7 @@ export class SessionOrchestrator {
   bootstrap(): Bootstrap {
     return {
       protocolVersion: ProtocolVersion,
-      provider: "claude",
+      provider: this.session.provider,
       capabilities: {
         streamingText: true,
         structuredToolCalls: true,
@@ -154,7 +169,7 @@ export class SessionOrchestrator {
     };
   }
 
-  async providerStatus(): Promise<Awaited<ReturnType<ClaudeAdapter["status"]>>> {
+  async providerStatus(): Promise<Awaited<ReturnType<ProviderAdapter["status"]>>> {
     return this.adapter.status();
   }
 
@@ -235,7 +250,7 @@ export class SessionOrchestrator {
           turnStatus: "outcome_unknown",
           commandReceipt: { authSubjectId, commandId, state: "outcome_unknown", response: failed, requestHash, required: true },
           ...(turnReceipt ? { commandReceipts: [turnReceipt] } : {}),
-          timeline: { itemId: `error-${randomUUID()}`, kind: "error", status: "error", content: { message: "Claude interrupt could not be confirmed" } },
+          timeline: { itemId: `error-${randomUUID()}`, kind: "error", status: "error", content: { message: `${providerDisplayName(this.session.provider)} interrupt could not be confirmed` } },
         });
         return failed;
       }
@@ -301,9 +316,9 @@ export class SessionOrchestrator {
           turnStatus: "outcome_unknown",
           commandReceipt: { authSubjectId, commandId, state: "outcome_unknown", response: unavailable, requestHash, required: true },
           ...(turnReceipt ? { commandReceipts: [turnReceipt] } : {}),
-          timeline: { itemId: `error-${randomUUID()}`, kind: "error", status: "error", content: { message: "Claude approval request is no longer active" } },
+          timeline: { itemId: `error-${randomUUID()}`, kind: "error", status: "error", content: { message: `${providerDisplayName(this.session.provider)} approval request is no longer active` } },
         });
-        throw new OrchestratorError("APPROVAL_NOT_ACTIVE", "Claude approval request is no longer active");
+        throw new OrchestratorError("APPROVAL_NOT_ACTIVE", `${providerDisplayName(this.session.provider)} approval request is no longer active`);
       }
       return response;
     });
@@ -312,7 +327,7 @@ export class SessionOrchestrator {
   private async executeTurn(turn: TurnRow, authSubjectId: string): Promise<void> {
     this.commit("turn.started", { turnId: turn.id }, { activityState: "running", turnId: turn.id, turnStatus: "running" });
     const session = this.store.getSession(this.session.id);
-    let outcome: Awaited<ReturnType<ClaudeAdapter["runTurn"]>>;
+    let outcome: Awaited<ReturnType<ProviderAdapter["runTurn"]>>;
     try {
       outcome = await this.adapter.runTurn(turn.id, turn.prompt, session?.providerSessionId);
     } catch (error) {
@@ -351,7 +366,7 @@ export class SessionOrchestrator {
   /**
    * Public entry point for an injected adapter (e.g. the deterministic test
    * adapter) to feed provider events through the same durable pipeline the
-   * built-in ClaudeAdapter uses.
+   * built-in provider adapters use.
    */
   ingestAdapterEvent(event: AdapterEvent): void {
     this.enqueueAdapterEvent(event);
@@ -370,7 +385,7 @@ export class SessionOrchestrator {
             ...(this.receiptUpdateForTurn(active.id, "outcome_unknown", { turnId: active.id, status: "outcome_unknown", reason: "event_persist_failed" })
               ? { commandReceipt: this.receiptUpdateForTurn(active.id, "outcome_unknown", { turnId: active.id, status: "outcome_unknown", reason: "event_persist_failed" }) }
               : {}),
-            timeline: { itemId: `error-${randomUUID()}`, kind: "error", status: "fatal", content: { message: "Flyx could not persist a Claude event" } },
+            timeline: { itemId: `error-${randomUUID()}`, kind: "error", status: "fatal", content: { message: `Flyx could not persist a ${this.session.provider} event` } },
           });
         }
       } catch {
@@ -401,7 +416,7 @@ export class SessionOrchestrator {
     const resolvedTurnId = turnId ?? "";
     switch (event.kind) {
       case "session_init":
-        this.commit("provider.session.init", event, { providerSessionId: event.providerSessionId, timeline: { itemId: `system-session-${event.providerSessionId}`, kind: "system", status: "info", content: { message: "Claude session initialized", providerSessionId: event.providerSessionId, model: event.model } } });
+        this.commit("provider.session.init", event, { providerSessionId: event.providerSessionId, timeline: { itemId: `system-session-${event.providerSessionId}`, kind: "system", status: "info", content: { message: `${providerDisplayName(event.provider)} session initialized`, provider: event.provider, providerSessionId: event.providerSessionId, model: event.model, runtimeVersion: event.runtimeVersion } } });
         return;
       case "assistant_delta": {
         const text = this.mergeText(resolvedTurnId, event.itemId, event.text);
@@ -662,4 +677,8 @@ function outcomeToReceiptState(status: string): "completed" | "failed" | "cancel
   if (status === "cancelled") return "cancelled";
   if (status === "outcome_unknown") return "outcome_unknown";
   return "failed";
+}
+
+function providerDisplayName(provider: ProviderId): string {
+  return provider === "codex" ? "Codex" : "Claude";
 }

@@ -17,7 +17,7 @@
  * .flyx-evidence/<combo>/turns.jsonl。绝不写入 prompt 原文、token、明文成本。
  *
  * 降级规则（不能装作验证过）：
- *   - claude CLI 不存在或版本不匹配 → real 层记 skipped（含原因），退出码 0；
+ *   - 所选 Claude runtime 不存在或版本不匹配 → real 层记 skipped（含原因），退出码 0；
  *   - Host 无法启动（依赖缺失、preflight 失败等环境问题）→ 该层记 blocked，
  *     组合状态保持不变；
  *   - 只有 Turn 真正执行且出现非 completed 终态/超时，才把组合标记 broken。
@@ -128,7 +128,7 @@ const USAGE = `用法: node scripts/compatibility/run-matrix.mjs [选项]
   --config <path>        矩阵配置文件路径（默认 config/claude-compatibility.json）
   --evidence-root <path> 证据输出根目录（默认 .flyx-evidence/）
 
-前置条件（真实层）: pnpm install 已执行、本机 claude CLI 版本与组合锁定版本一致且已登录。
+前置条件（真实层）: pnpm install 已执行、所选 system/bundled Claude runtime 与组合锁定版本一致且已登录。
 `;
 
 // ---------------------------------------------------------------------------
@@ -166,6 +166,24 @@ async function detectClaudeCli() {
       ? "claude CLI 不在 PATH 上（未安装或未暴露给当前 shell）"
       : `claude --version 执行失败（${typeof code === "string" ? code : "unknown"}）`;
     return { available: false, version: null, raw: null, reason };
+  }
+}
+
+async function detectBundledClaude() {
+  try {
+    const manifest = await readJson(resolve(REPO_ROOT, "apps/mvp-host/node_modules/@anthropic-ai/claude-agent-sdk/package.json"));
+    const sdkVersion = typeof manifest.version === "string" ? manifest.version : null;
+    const version = typeof manifest.claudeCodeVersion === "string" ? manifest.claudeCodeVersion : null;
+    if (!sdkVersion || !version) throw new Error("SDK manifest lacks version metadata");
+    return { available: true, version, sdkVersion, raw: `SDK ${sdkVersion}, bundled Claude Code ${version}` };
+  } catch (error) {
+    return {
+      available: false,
+      version: null,
+      sdkVersion: null,
+      raw: null,
+      reason: `无法读取 Claude Agent SDK bundled runtime（${error instanceof Error ? error.message : "unknown"}）`,
+    };
   }
 }
 
@@ -477,13 +495,16 @@ async function runRealLayer(combo, { pnpm, evidenceDir, turns, prompt, promptId,
       // 矩阵脚本没有 TTY 也没有人工确认配对的场景，仅 loopback 本机测试。
       FLYX_ALLOW_INSECURE_HTTP: "1",
       FLYX_REQUIRE_PAIRING_CONFIRM: "0",
+      // The compatibility row decides the runtime source. An empty value is
+      // intentionally falsy in ClaudeAdapter and selects the SDK bundle.
+      FLYX_CLAUDE_EXECUTABLE: combo.executableSource === "sdk-bundled" ? "" : "claude",
     },
     timeoutMs: HOST_READY_TIMEOUT_MS.real,
     ready: (line) => {
       const readyState = readyCapture;
       const listening = /^Flyx MVP Host listening at (\S+)/.exec(line);
       const token = /^Pairing token: (\S+)/.exec(line);
-      const preflight = /^Claude preflight passed: SDK (\S+), CLI (\S+)/.exec(line);
+      const preflight = /^Claude preflight passed: claude-agent-sdk (\S+), runtime (\S+)/.exec(line);
       readyState.listening = listening?.[1] ?? readyState.listening;
       readyState.token = token?.[1] ?? readyState.token;
       if (preflight) readyState.preflight = { sdkVersion: preflight[1], claudeVersion: preflight[2] };
@@ -555,14 +576,18 @@ async function main() {
   const promptId = config.matrixPrompt.id ?? "matrix-prompt";
   const promptHash = sha256(promptText);
 
-  const claude = await detectClaudeCli();
+  const systemClaude = await detectClaudeCli();
+  const bundledClaude = await detectBundledClaude();
   const pnpm = await detectPnpm();
-  if (claude.available) log(`本机 claude CLI: ${claude.raw}（解析版本 ${claude.version ?? "unknown"}）`);
-  else log(`本机 claude CLI 不可用：${claude.reason} → real 层将记 skipped`);
+  if (systemClaude.available) log(`系统 claude CLI: ${systemClaude.raw}（解析版本 ${systemClaude.version ?? "unknown"}）`);
+  else log(`系统 claude CLI 不可用：${systemClaude.reason}`);
+  if (bundledClaude.available) log(`SDK bundled runtime: ${bundledClaude.raw}`);
+  else log(`SDK bundled runtime 不可用：${bundledClaude.reason}`);
   if (!pnpm) { fail("找不到 pnpm 或 corepack，无法启动 Host；矩阵保持 pending 未验证"); return 0; }
 
   let exitCode = 0;
   for (const combo of selected) {
+    const claude = combo.executableSource === "sdk-bundled" ? bundledClaude : systemClaude;
     log(`=== 组合 ${combo.id}（当前状态 ${combo.status}）===`);
     const evidenceDir = resolve(REPO_ROOT, options.evidenceRoot, combo.id);
     await mkdir(evidenceDir, { recursive: true });
@@ -591,6 +616,9 @@ async function main() {
       log(`real 层跳过（skipped）: ${real.reason}`);
     } else if (claude.version !== combo.claudeCliVersion) {
       real = { status: "skipped", reason: `本机 claude CLI ${claude.version ?? "unknown"} 与锁定版本 ${combo.claudeCliVersion} 不一致` };
+      log(`real 层跳过（skipped）: ${real.reason}`);
+    } else if (combo.executableSource === "sdk-bundled" && claude.sdkVersion !== combo.sdkVersion) {
+      real = { status: "skipped", reason: `SDK ${claude.sdkVersion ?? "unknown"} 与锁定版本 ${combo.sdkVersion} 不一致` };
       log(`real 层跳过（skipped）: ${real.reason}`);
     } else if (deterministic.status !== "passed") {
       real = { status: "skipped", reason: `deterministic 层未通过（${deterministic.status}），按矩阵规则不进入真实 Turn` };
@@ -634,6 +662,7 @@ async function main() {
     combo.status = newStatus;
     combo.observed = {
       nodeVersion: process.versions.node,
+      ...(claude.sdkVersion ? { sdkVersion: claude.sdkVersion } : {}),
       claudeCliVersion: claude.version,
       ...(claude.available ? { claudeCliRaw: claude.raw } : {}),
     };

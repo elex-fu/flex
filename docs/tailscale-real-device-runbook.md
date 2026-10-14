@@ -1,229 +1,177 @@
 # Tailscale 真机验收 Runbook
 
-> 本 runbook 对应《移动远程多 Agent 产品技术设计》接收标准（Phase 1B 退回 + §2548 Tailscale HTTPS/WSS）。
-> 目标：**在本机 Host  Tailscale tailnet 可达后，用真实手机构端到端验证 "Claude-only MVP 通过 Tailscale HTTPS 受控访问" 的闭环可用性**，并把每项验收的证据归档到 `.flyx-evidence/tailscale/`，作为 Phase 1 Go 门槛的可审计输入。
+本 runbook 覆盖[网络连通与 E2EE Relay 技术方案](network-connectivity-and-e2ee-relay-technical-design.md) Gate A，记录真实手机上的配对、Turn、审批、中断及断网补同步证据。Claude Code 与 Codex 使用同一网络检查。Provider 认证和兼容版本参照[双 Provider 技术方案](dual-provider-remote-control-technical-design.md)。自动化通过不能代替真机结果。
 
-本 runbook 是 **人工测试 guiding 文档**——Playwright 无法覆盖真机 / 真实移动网络 / 真实 Tailscale 隧道。所有命令都在本机 Host 上执行，除非特别说明。
+## 1. 准备与启动
 
----
+- Host：Node.js 22+、仓库指定的 pnpm 版本、已安装并认证的 Provider、已有 Git 工作区。
+- Host 与手机加入同一 tailnet；在 Tailscale 管理端启用 MagicDNS 和 HTTPS。手机保持 Tailscale VPN 已连接。
+- 手机：iOS Safari 或 Android Chrome，记录系统、浏览器版本和是否使用 PWA。
+- Host 始终监听 `127.0.0.1`，外部 HTTPS/WSS 由 Tailscale Serve 提供，TLS 在本机 Tailscale daemon 终止。此路径不需要公网入站端口。
 
-## 1. 前提与工具
-
-| 项目 | 版本/要求 | 用途 |
-|---|---|---|
-| 本机 Host | macOS / Linux，Node 24，pnpm 10 | 运行 Flyx Host |
-| `tailscale` CLI | 已登录 tailnet，且 tailnet 权限允许手机加入 | 提供稳定 FQDN 与 HTTPS 隧道 |
-| 手机浏览器 | iOS Safari 17+ / Android Chrome 120+（推荐安装为 PWA 后再验收） | 被验收端 |
-| 同一 tailnet 中的手机 | 加入同一 tailnet | 提供“远程 / 第二条网络路径”视角 |
-| `flyctl`（可选） | 仅在需要 MagicDNS / HTTPS 证书未自动签发时使用 | 启用 MagicDNS + HTTPS |
-
-**证据目录**：测试前创建 `./.flyx-evidence/tailscale/`，并在每项验收后以 `<项编号>-<slug>/` 形式归档日志、截图与 Host/Client header 捕获。该目录已在 `.gitignore`，不会进源码。
-
----
-
-## 2. 环境准备
-
-### 2.1 Tailscale 基础就绪
-
-在 Host 执行：
-
-```sh
-tailscale status              # 确认已登录同一 tailnet，手机也在其中
-tailscale ip -4               # 记录 Host 的 Tailscale IPv4（下文写作 <ts-ip>）
-tailscale status --self --json | jq .Self.DNSName   # 记录 MagicDNS 名称（下文写作 <ts-dns>，不含尾随 "."）
-```
-
-**验收前提 A（先决）**：
-
-- [ ] `tailscale status` 输出中本机的 `Self.Online == true`
-- [ ] `tailscale ping <手机 tailscale IP>` 双向可达，RTT < 100ms
-- [ ] MagicDNS 已在 tailnet 开启（`tailscale status` 中 DNSName 非空）；否则 `flyctl tailscale set --magic-dns=true` 或 admin console 开启
-
-### 2.2 在 Tailscale interface 上启动 Host
-
-Flyx Host 默认只监听 loopback；**真机验收必须绑定 tailnet 接口**。MVP Host 当前通过 `FLYX_BIND` 控制监听地址（默认 `127.0.0.1`）；真机验收切换到 `<ts-ip>` 或 `0.0.0.0`。
-
-记录并执行：
-
-```sh
-cd /Users/lex/play/flyx
-pnpm -r install
-pnpm --filter @flyx/mvp-host run build
-pnpm --filter @flyx/mvp-web run build
-
-# 选择其一：
-#  - 仅 tailnet 接口
-FLYX_BIND="<ts-ip>" pnpm --filter @flyx/mvp-host run start
-#  - 全部接口（loopback 也保留，便于本机自检）
-FLYX_BIND="0.0.0.0" pnpm --filter @flyx/mvp-host run start
-```
-
-> 若当前 MVP 实现尚未暴露 `FLYX_BIND`，先用 "保留 loopback + 反向代理到 tailnet" 过渡——附录 A 给出一份最小 `caddy` / `tailscale serve` 反代配置。Host 启动后日志中应出现 `FLYX_READY base=http://<ts-ip|localhost>:<port>/ pairing=http://.../pair?grant=...` 配对 URL。
-
-### 2.3 HTTPS 通道
-
-设计 §1429 指定 Phase 1 内测默认采用 **Tailscale HTTPS + 稳定 MagicDNS**。达成路径按优先级：
-
-1. **首选：Tailscale Serve**——将 Host 作为 plaintext HTTP service 在 tailnet 内通过 `tailscale serve` 暴露为 `https://<ts-dns>`，由 Tailscale 自动签发 tailnet-scoped 证书。
-2. **次选：MagicDNS 自签FQDN**——通过 `tailscale cert <ts-dns>` 取 cert/key，Host 用它们启动 HTTPS listener。
-
-无论哪条路径：
-
-- [ ] 浏览器访问 `https://<ts-dns>:<port>/` 应看到 Flyx Host 首页，证书为 Tailscale 签发的有效证书
-- [ ] 检查证书 SAN 包含 `<ts-dns>` 或 `<ts-ip>`，过期时间 > 30 天
-- [ ] 归档：`openssl s_client -connect <ts-dns>:<port> -servername <ts-dns> </dev/null 2>/dev/null | openssl x509 -noout -issuer -dates -ext subjectAltName` 的完整输出 → `.flyx-evidence/tailscale/01-https-channel/cert.txt`
-
-> iOS Safari 只信任系统根证书；Tailscale 根在加入 tailnet 时通过配置描述文件安装（iOS）或在设备上信任（Android）。若手机未主动信任 tailnet 根，会产生证书错误——这种错误记录在案并在报告中标注 tailnet 信任状态。
-
-### 2.4 证据占位
-
-```sh
-mkdir -p .flyx-evidence/tailscale/{01-https-channel,02-pairing,03-timeline-e2e,04-network-resilience,05-prod-gap}
-```
-
----
-
-## 3. 验收项
-
-### E1. Tailscale HTTPS 可达 + 前端资源加载（phase-gate）
-
-**条目**：手机（同 tailnet、另一子网段）通过 `https://<ts-dns>:<port>/` 能完整加载 Flyx Web UI，无混合内容 / CORS / WSS 证书错误。
-
-**步骤**：
-
-1. 手机开启飞行蜂窝、关闭 Wi-Fi，**仅靠 tailnet** 连接；若 tailnet 隧道需要上游，改用 Wi-Fi + 退出企业 VPN 的真实远端网络。
-2. 打开 `https://<ts-dns>:<port>/`。
-3. 在 Host 抓包确认服务收到请求：`tcpdump -i tailscale0 -n port <port>` 或观察 Host 日志 `access` 行。
-
-**PASS 条件**：
-
-- [ ] 屏幕显示 "连接电脑 Host" 配对页面（未配对前 landing）
-- [ ] 浏览器开发者工具 console 无 TLS / 混合内容报错
-- [ ] 归档：手机截图 + Host 访问日志行 + TCPDUMP 时间戳 → `01-https-channel/`
-
-### E2. 真实扫码配对（scenario 9 核心）
-
-**条目**：手机上通过 `https://<ts-dns>:<port>/pair?grant=<token>` 的一次性扫码配对，30 秒内完成配对并进入 "执行 Timeline" 页面，且可验证 host key pinning 显示。
-
-**步骤**：
-
-1. 手机摄像头扫描 Host 日志输出的配对 QR（或在浏览器中打开配对 URL）。
-2. 配对完成后，用不同的 origin/host 再次打开同一会话，确认 cookie 作用域被限制在 tailnet origin。
-
-**PASS 条件**：
-
-- [ ] 30 秒内进入 "执行 Timeline"
-- [ ] Host 日志显示 `pairing.exchange.*subject=phone-<id>` 与 `auth.session.*created`
-- [ ] 归档：视频/GIF 配对手册 + Host access log → `02-pairing/`
-
-### E3. Tailnet 中的完整 Turn 闭环
-
-**条目**：在手机端输入任一 prompt（如"列出当前目录"），从发起请求到看到完整 Timeline 项（包括 `user.message.created` / `turn.started` / `provider.session.init` / `assistant.message.delta` / `turn.completed`）。
-
-**步骤**：
-
-1. 使用本机自检的 deterministic 场景或真实 Claude 会话均可；若用真实 Claude 需要 CLAUDE_API_KEY。
-2. 输入 `scenario:text`（deterministic）或自然语言。
-3. 记录事件序列，与 E2E 套件 `mvp.spec.ts` 的断言序列对比。
-
-**PASS 条件**：
-
-- [ ] 输入后 3 秒内 `turn.started` 在 timeline 可见
-- [ ] `assistant.message.delta` 流式增量渲染（tailnet RTT 下不超过 200ms 一颗事件）
-- [ ] `turn.completed` 在 5 秒内盖落
-- [ ] 归档：timeline 截图 + `/api/session/:id/timeline` 响应体 → `03-timeline-e2e/`
-
-### E4. Tailnet 网络韧性（scenario 13/14 的远程版本）
-
-**条目**：当手机与 Host 之间网络抖动/断开，重新连回同一 tailnet 后 Timeline 同步恢复无重复/无间隙 (sequence contiguous)。**注意：此处的 "断网" 是手机端飞行模式 / 路由器重启，而不是 Host SIGKILL。**
-
-1. 手机端关闭飞行蜂窝（断开与 tailnet 的路由），保持 Host 活跃。在 Host 端发起一个 `scenario:slow`（deterministic 8s 长 Turn）。
-2. 在 Turn 执行期间手机飞行 30 秒以上；Turn 完成后再关闭飞行。
-3. 等待 Flyx Web 自动重连（retry 退避），检查 timeline 序列。
-
-**PASS 条件**：
-
-- [ ] 重连后 timeline 事件序列号连续（连续整数）——这是 Flyx 的核心不变量
-- [ ] 没有重复的 `assistant.message.delta` 事件
-- [ ] 最终 `turn.completed` 正常落盘
-- [ ] 对比 Host 端 SQLite 的 `events` 表 sequence 与前端渲染 IDs 一致
-- [ ] 归档：手机飞行/恢复的时间轴截图 + Host `events` 表导出 → `04-network-resilience/`
-
-### E5. 产品 Gap 验证（明确失败路径）
-
-**条目**：验证 scenario 13/14 中暴露的 "terminal outcome_unknown 锁住 session 无法发新 Turn" 的 Product Gap，在 Tailscale 路径下行为与 loopback 一致（两者都应锁住）。
-
-1. Host SIGKILL 一个 running turn 后重启并保持 DB（参考 resilience.spec.ts）。
-2. 手机重新打开 UI，确认：
-   - [ ] timeline 出现 "Host restarted while this Turn was executing; result is unknown and it was not replayed."
-   - [ ] 输入框 disabled
-   - [ ] `/api/snapshot` `activeTurn.status == outcome_unknown`
-3. **关键观察项（Gap 描述）**：通过 tailscale HTTPS 路径重连的 "产品 gap" 是否与 loopback 一致——如果远程路径有显著差异（如 session cookie 丢失需要重配对），则是 Phase 1B 的真实产品 Gap，需在 §5 报告。
-
-**归档**：截图 + apiSnapshot 调用 log → `05-prod-gap/`
-
----
-
-## 4. 报告模板
-
-> 执行完本章所有项后，把证据拷贝到 `.flyx-evidence/tailscale/<日期>/REPORT.md`，填写以下模板。
-
-```markdown
-# Tailscale 真机验收报告 - <YYYY-MM-DD>
-
-- Host 机器: <主机名 / OS>
-- Host tailscale IP: <ts-ip>
-- Host MagicDNS: <ts-dns>
-- Host Flyx 绑定: FLYX_BIND=<...>
-- 手机设备: <机型 / iOS|Android 版本 / WebView>
-- 网络路径: 同 tailnet / 跨 subnet / 公网
-- tailnet 根证书信任: 已描述文件 / 已手动 / N/A
-
-## 结果矩阵
-
-| 编号 | 条目 | 结果 | 备注 |
-|---|---|---|---|
-| E1 | Tailscale HTTPS 可达 | PASS / FAIL / PARTIAL | |
-| E2 | 真实扫码配对 | PASS / FAIL | |
-| E3 | 完整 Turn 闭环 | PASS / FAIL | |
-| E4 | 网络韧性（重连） | PASS / FAIL | |
-| E5 | 产品 Gap 行为 | PASS / FAIL | |
-
-## 中断条件
-
-- 任何 E1/E2 FAIL 直接阻塞后续项；E1/E2 是 phase-gate。
-
-## 阻塞 / 风险
-
-- ...
-
-## 结论
-
-- [ ] Phase 1 Go 门槛达成（E1/E2/E3 PASS）
-- [ ] E4/E5 通过，可用于生产化验收
-- [ ] 存在产品 Gap，需要 ... 修复
-```
-
----
-
-## 5. 附录 A：Tailscale Serve 反代配置（仅 FLYX_BIND 未暴露时使用）
+在仓库根目录执行：
 
 ```bash
-# 启用 MagicDNS
-tailscale set --magic-dns
+tailscale status
+tailscale status --json
+tailscale serve --bg --https=443 http://127.0.0.1:4173
+tailscale serve status --json
 
-# 将本机 <port> 作为 http 服务 serve 到 tailnet https
-tailscale serve --bg --https=443 http://127.0.0.1:<web-port>
-
-# 查看分配给的 FQDN
-tailscale status --self --json | jq '.Self.DNSName'
+# 默认 Claude；如需 Codex，增加 FLYX_PROVIDER=codex。
+FLYX_CONNECTIVITY_MODE=tailscale pnpm start:host
 ```
 
-此时 Host 仍然只监听 loopback，但浏览器使用 `https://<ts-dns>` 可达；所有 tailnet 内设备共享同一 MagicDNS，无需额外界该 Host。该路径与 §1429 直接吻合。
+启动时只读检查 Serve JSON 的 `TCP`、`Web`、`Handlers`、`AllowFunnel` 和 `Foreground`。合格配置必须具有 HTTPS listener、完整的 `device.tailnet.ts.net` FQDN、根路径代理 `http://127.0.0.1:4173`，并关闭该 Host 的 Funnel 暴露。非 loopback、错误端口、明文 HTTP、覆盖 API 的其它路径代理、无法确定的 schema 均拒绝启动。
 
-## 附录 B：调试清单
+Host 使用其它 `PORT` 时，Serve target 必须同步修改，例如：
 
-- 手机 telnet 验证连通：`nc -vz <ts-ip> <port>`（iOS 用 Network Utility / Android 用 Termux）。
-- Host 侧抓包：`tcpdump -i tailscale0 -w .flyx-evidence/tailscale/capture.pcap port <port>`。
-- Host 日志增加请求 id：在 Host 启动前 `FLYX_LOG=request`（若支持）以关联手机与 Host。
-- Tailscale 诊断：`tailscale bugreport` 若需要上报 tailnet admin 协助，勿直接贴公共 git log。
+```bash
+tailscale serve --bg --https=443 http://127.0.0.1:4174
+PORT=4174 FLYX_CONNECTIVITY_MODE=tailscale pnpm start:host
+```
+
+Host 从唯一合格 listener 发现 public origin。如果存在多个合格 origin，明确选择实际 Serve 输出的域名：
+
+```bash
+FLYX_CONNECTIVITY_MODE=tailscale \
+FLYX_PUBLIC_BASE_URL=https://workstation.example-tailnet.ts.net \
+pnpm start:host
+```
+
+Public URL 仅接受 HTTPS origin，可省略或保留末尾 `/`，不允许用户名、密码、路径、query 或 fragment；显式配置同样必须通过 Serve 校验。兼容入口 `FLYX_REQUIRE_TAILSCALE_SERVE=1` 也会启用必需的 Serve 检查。
+
+Serve CLI 和证书行为以 [Tailscale Serve 文档](https://tailscale.com/docs/reference/tailscale-cli/serve)为准。有效 HTTPS 证书由 Serve 自动配置；不要安装未知根证书或忽略浏览器 TLS 错误来通过验收。
+
+## 2. 配置与本机管理
+
+| 配置 | 行为 |
+| --- | --- |
+| `FLYX_CONNECTIVITY_MODE=local` | 默认；不查询 Tailscale，可使用显式 HTTPS origin。无远程 endpoint 时只适用于本机。 |
+| `FLYX_CONNECTIVITY_MODE=tailscale` | Serve 必须有效，发现或校验 HTTPS origin。 |
+| `FLYX_CONNECTIVITY_MODE=relay` | 必须显式开启 Relay feature flag，并配置 Relay 与 Hosted App。 |
+| `FLYX_CONNECTIVITY_MODE=auto` | 尝试唯一 Serve discovery；未配置或 CLI 不可用时保留本机/已启用的 Relay。已发现的不安全或歧义配置仍阻止启动。 |
+| `FLYX_IDENTITY_DIR` | 默认是数据库所在目录下的 `identity`，存放独立于 SQLite 的 Host 身份。 |
+| `FLYX_ALLOW_INSECURE_HTTP=1` | 仅允许 `local` 模式的 loopback 调试，不能与远程 endpoint 或 Relay 同用。 |
+
+不要在真机验收时开启不安全 HTTP。本机调试的显式命令是：
+
+```bash
+FLYX_CONNECTIVITY_MODE=local FLYX_ALLOW_INSECURE_HTTP=1 pnpm start:host
+```
+
+身份目录权限为 `0700`，文件为 `0600`，私钥不进入 SQLite、日志或 QR。持久数据库已有身份镜像时，身份丢失或 fingerprint 不匹配会阻止启动；不要删除身份文件绕过错误。数据库与对应身份应分别安全备份，恢复时成对核对。
+
+管理命令使用现有 `FLYX_DB` 和 `FLYX_IDENTITY_DIR`，不会启动 Provider、监听网络或恢复运行中的 Turn：
+
+```bash
+pnpm start:host identity show
+pnpm start:host devices list
+pnpm start:host devices revoke <deviceId>
+pnpm start:host devices revoke-all
+pnpm start:host identity rotate
+```
+
+`identity rotate` 必须在本机终端输入 `rotate` 确认，保持 `hostId`、替换密钥并撤销旧设备；之后重启 Host 并重新配对。撤销设备会关闭活动连接，跨进程关闭检查周期为 1 秒。同一身份目录若用于多个数据库，轮换后其它数据库的旧 fingerprint 会触发 mismatch；需要核对并明确处理对应镜像，不能静默接受新密钥。
+
+## 3. 验收与证据
+
+在 `.flyx-evidence/tailscale/<日期>/` 保存已脱敏的 Serve 配置、设备版本、截图、时间线和报告。配对 fragment/grant、cookie、刷新凭证、身份私钥和完整 Provider 提示内容不要进入可共享日志。
+
+### E1. HTTPS 页面与 WebSocket
+
+手机关闭 Wi-Fi，启用蜂窝数据并保持 Tailscale VPN。访问 Host 输出的 `https://<FQDN>/`，不要把 HTTP 端口 `4173` 加到此 URL。
+
+- 页面和静态资源完整加载，证书有效且域名匹配，无混合内容或 CORS 错误。
+- WebSocket 使用相同 public origin 的 WSS，连接后没有重连循环。
+- 另一设备不能直接访问 Host 的 LAN 地址和 `4173` 端口，Host listener 仍是 loopback。
+
+证据：手机截图、Serve JSON（脱敏）、浏览器 Network 中的 HTTPS/WSS origin 和连接状态。本机查询 Host listener，不把 tailnet IP 的明文 HTTP 可达当作通过条件。
+
+### E2. 扫码、单次 grant 与身份固定
+
+Host 在交互终端本地生成 QR，内容为 `https://<FQDN>/#pair=<payload>`，不调用外部 QR 服务；非交互日志不打印链接。Payload 包含 Host ID、公钥与 fingerprint、endpoint、五分钟有效的单次 grant，不含私钥。
+
+1. 手机扫描 QR（或打开终端链接），在 Host 终端 60 秒内输入 `y` 确认。
+2. 确认进入会话，客户端显示/保存的 Host 身份与本机 `identity show` 一致。
+3. 导入 fragment 后立即清理地址栏；静态页面 GET、访问日志和 Referer 不含 grant。
+4. 在另一浏览器重用已消费链接必须失败；过期链接必须失败。拒绝 Host 提示不得颁发凭证。
+5. 使用错误 Host key 或变更 fingerprint 的配置，确认客户端拒绝并要求人工重新配对。
+
+证据：已遮挡 QR/grant 的配对截图、清理后的地址栏、单次/过期/拒绝结果，以及匹配的公开 fingerprint。
+
+### E3. Turn、审批与中断
+
+使用已认证的真实 Claude 或 Codex，记录 Provider/版本。依赖各自官方 CLI 认证，不用任意环境变量代替 preflight。
+
+1. 发送简单只读任务，观察流式 Timeline 和最终状态。
+2. 发起需要命令或文件写入的任务，分别验证一次性允许与拒绝；未批准前不能执行操作。
+3. 发起持续任务并从手机中断，确认进入终态，之后能发送新任务。
+
+证据：操作时间戳、会话与 Turn ID、审批结果、最终 Timeline。实际 Provider 时延单独记录，不把固定几秒完成作为网络正确性的替代证据。
+
+### E4. 断网、后台与路径恢复
+
+1. 持续 Turn 期间让手机飞行 30 秒，Host 保持运行；再恢复蜂窝数据和 Tailscale。
+2. 运行 Turn 时从 Wi-Fi 切蜂窝，再切回 Wi-Fi。
+3. 页面置于后台后返回；另空闲 30 分钟，再发起一次只读操作。
+
+- 手机断连不取消 Host 上正在运行的 Turn。
+- 自动重连先恢复快照/watermark，再补同步；Timeline sequence 无间隙、无重复项，命令不重复执行。
+- 记录恢复耗时（目标 10 秒）；若系统冻结后台计时器，单独记录页面可见性时间。
+- 空闲首次操作成功，或经一次自动重连后恢复；无需重新配对。
+
+证据：网络切换时间、重连状态、相关 sequence 与 Host 持久化记录。手机断网与 Host 崩溃分开测试；Host 崩溃时不可自动重放结果未知的写命令。
+
+### E5. 登出、撤销与故障关闭
+
+1. 同一设备开两个页面，登出后确认该设备所有活动连接关闭。
+2. 重新配对，本机执行 `devices revoke <deviceId>`；旧 cookie/凭证与活动 WebSocket 失效，其它设备仍可用。
+3. 在独立测试环境验证错误端口、明文 listener、Funnel 配置阻止启动；不要为测试将真实 Host 暴露到公网。
+4. 使用测试副本验证身份缺失/不匹配时 fail closed，不修改正式身份。
+
+证据：设备 ID、撤销提交与关闭时间、失败码和其它设备可用性。
+
+## 4. Relay Alpha 与回滚
+
+Relay 默认关闭。有可用的 Hosted App 与 Relay 部署后显式启用：
+
+```bash
+FLYX_CONNECTIVITY_MODE=auto \
+FLYX_RELAY_ENABLED=1 \
+FLYX_RELAY_URL=wss://relay.example.com \
+FLYX_HOSTED_APP_URL=https://app.example.com \
+pnpm start:host
+```
+
+托管 Relay 如需注册凭证，设置 `FLYX_RELAY_REGISTRATION_TOKEN`，不要写入配对链接或仓库。Relay URL 为 WSS origin，Hosted App 为 HTTPS origin。Host 出站注册路由，Relay offer 以 Hosted App fragment 展示；另行执行技术方案的蜂窝网络、E2EE、重放、配额和 Direct/Relay 切换验收。
+
+回滚时关闭 `FLYX_RELAY_ENABLED`，保留身份和设备数据库，用 `FLYX_CONNECTIVITY_MODE=tailscale` 重启。不要删除身份或 SQLite 新表来回滚网络路径。不再使用 Serve 时按实际配置关闭：
+
+```bash
+tailscale serve --https=443 off
+```
+
+## 5. 报告模板
+
+```markdown
+# Tailscale 真机结果 — <日期>
+
+- Host OS / Node / Tailscale / Provider 版本：
+- 手机系统 / 浏览器 / PWA：
+- Host ID / 公开 fingerprint：
+- 网络：Wi-Fi / 蜂窝 + Tailscale
+- Host loopback 端口 / HTTPS origin（脱敏）：
+
+| 项目 | PASS / FAIL / 未执行 | 证据与观察 |
+| --- | --- | --- |
+| E1 HTTPS/WSS | | |
+| E2 配对/身份固定 | | |
+| E3 Turn/审批/中断 | | |
+| E4 断网/后台/空闲 | | |
+| E5 登出/撤销/故障关闭 | | |
+
+- 恢复耗时：
+- Timeline 与命令幂等核对：
+- 尚未验证的设备或路径：
+- Gate A 结论（全部 E1–E5 通过才填写通过）：
+```

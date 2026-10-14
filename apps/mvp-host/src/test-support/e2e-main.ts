@@ -73,8 +73,8 @@ const address = await server.start();
 // out. The primary server token stays first for backwards compatibility.
 const mintedTokens = [server.auth.pairingUrlToken];
 const grantExpiry = new Date(Date.now() + 30 * 60_000).toISOString();
-for (let index = 0; index < 24; index += 1) {
-  const token = randomBytes(24).toString("base64url");
+for (let index = 0; index < 63; index += 1) {
+  const token = randomBytes(32).toString("base64url");
   orchestrator.store.createPairingGrant(createHash("sha256").update(token).digest("hex"), grantExpiry);
   mintedTokens.push(token);
 }

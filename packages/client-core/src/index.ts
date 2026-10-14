@@ -1,0 +1,11 @@
+export * from "./types.js";
+export { ClientError } from "./common.js";
+export * from "./client.js";
+export * from "./command-outbox.js";
+export * from "./connection-supervisor.js";
+export * from "./host-profile-store.js";
+export * from "./rpc-client.js";
+export * from "./sync-engine.js";
+export * from "./transports/direct-web.js";
+export * from "./transports/relay-e2ee.js";
+export type { SocketFactory } from "./transports/websocket.js";

@@ -1,0 +1,10 @@
+{
+  "name": "@flyx/claude-fixtures",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test test/retry.test.js",
+    "reset": "node scripts/reset.mjs"
+  }
+}

@@ -2,6 +2,7 @@ import { appendFileSync, readFileSync } from "node:fs";
 import { expect, type Page } from "@playwright/test";
 
 const PAIRING_TOKEN = () => process.env.FLYX_E2E_PAIRING_TOKEN!;
+let nextPairingClient = 1;
 
 /**
  * Current Host base URL.  Read from the environment on every call because
@@ -20,7 +21,7 @@ export function baseUrl(): string {
  * The token pool is re-read from the environment on every call so specs that
  * restart the Host (which mints a fresh pool) keep handing out valid grants.
  */
-function claimToken(): string {
+export function claimToken(): string {
   const availableTokens: string[] = JSON.parse(process.env.FLYX_E2E_PAIRING_TOKENS ?? "[]");
   const claimFile = process.env.FLYX_E2E_CLAIM_FILE;
   if (!claimFile) return availableTokens.shift() ?? PAIRING_TOKEN();
@@ -32,6 +33,10 @@ function claimToken(): string {
 /** Pair a fresh browser context like a phone entering the one-time token. */
 export async function pair(page: Page): Promise<string> {
   const token = claimToken();
+  // The Host intentionally enforces a per-IP pairing-attempt budget.  Each
+  // browser test models a separate phone, so give it a deterministic fixture
+  // address to keep the suite from tripping the production guardrail.
+  await page.setExtraHTTPHeaders({ "x-forwarded-for": `198.18.0.${nextPairingClient++}` });
   await page.goto(baseUrl());
   await expect(page.getByRole("heading", { name: "连接电脑 Host" })).toBeVisible();
   await page.getByPlaceholder("配对 Token").fill(token);

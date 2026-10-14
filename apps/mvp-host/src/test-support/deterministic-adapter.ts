@@ -4,8 +4,10 @@ import type {
   AdapterStatus,
   ApprovalAction,
   ApprovalRequest,
+  ProviderAdapter,
+  ProviderId,
   TurnOutcome,
-} from "../claude/types.js";
+} from "../provider/types.js";
 
 /**
  * Deterministic replacement for `ClaudeAdapter` used by browser E2E runs and
@@ -109,15 +111,17 @@ type ActiveDeterministicTurn = {
   wake: (() => void) | undefined;
 };
 
-export class DeterministicAdapter {
+export class DeterministicAdapter implements ProviderAdapter {
+  readonly provider: ProviderId;
   readonly workspace: string;
   private readonly onEvent: AdapterEventHandler | undefined;
   private readonly scenarios = new Map<string, DeterministicScenario>();
   private active: ActiveDeterministicTurn | undefined;
   private generation = 0;
 
-  constructor(options: { workspace: string; onEvent?: AdapterEventHandler; scenarios?: DeterministicScenario[] }) {
+  constructor(options: { workspace: string; provider?: ProviderId; onEvent?: AdapterEventHandler; scenarios?: DeterministicScenario[] }) {
     this.workspace = options.workspace;
+    this.provider = options.provider ?? "claude";
     this.onEvent = options.onEvent;
     for (const scenario of [...DEFAULT_SCENARIOS, ...(options.scenarios ?? [])]) {
       this.scenarios.set(scenario.id, scenario);
@@ -141,9 +145,11 @@ export class DeterministicAdapter {
 
   async status(): Promise<AdapterStatus> {
     return {
-      sdkVersion: "deterministic",
-      claudeExecutable: "deterministic",
-      claudeVersion: "deterministic",
+      provider: this.provider,
+      transport: "deterministic",
+      adapterVersion: "deterministic",
+      executable: "deterministic",
+      runtimeVersion: "deterministic",
       workspace: this.workspace,
       sandboxRequired: true,
     };
@@ -162,7 +168,7 @@ export class DeterministicAdapter {
     this.active = active;
     const scenario = this.selectScenario(prompt);
 
-    this.emit({ kind: "session_init", providerSessionId: PROVIDER_SESSION_ID, claudeCodeVersion: "deterministic", model: "deterministic", tools: ["Read", "Bash"] });
+    this.emit({ kind: "session_init", provider: this.provider, providerSessionId: PROVIDER_SESSION_ID, runtimeVersion: "deterministic", model: "deterministic", tools: ["Read", "Bash"] });
 
     let index = 0;
     for (const step of scenario.steps) {

@@ -9,8 +9,11 @@
     "dev:web": "pnpm --filter @flyx/mvp-web dev",
     "build": "pnpm -r build",
     "typecheck": "pnpm -r typecheck",
-    "test": "pnpm --filter @flyx/mvp-protocol test && pnpm --filter @flyx/mvp-host test && pnpm --filter @flyx/mvp-web test",
+    "test": "pnpm --filter '@flyx/*' -r --if-present test",
+    "dev:relay": "pnpm --filter @flyx/mvp-relay dev",
+    "start:relay": "pnpm --filter @flyx/mvp-relay start",
     "test:spike": "pnpm --filter @flyx/mvp-host test:spike",
+    "test:codex-spike": "pnpm --filter @flyx/mvp-host test:codex-spike",
     "test:e2e": "pnpm --filter @flyx/mvp-web test:e2e"
   },
   "devDependencies": {

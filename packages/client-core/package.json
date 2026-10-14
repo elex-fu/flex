@@ -1,0 +1,17 @@
+{
+  "name": "@flyx/client-core",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "exports": { ".": { "types": "./dist/index.d.ts", "import": "./dist/index.js" } },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@flyx/mvp-protocol": "workspace:*",
+    "@flyx/secure-channel": "workspace:*"
+  },
+  "devDependencies": { "@types/node": "^24.0.0", "fake-indexeddb": "^6.2.4", "vitest": "^4.1.6" }
+}

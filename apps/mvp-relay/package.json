@@ -1,0 +1,29 @@
+{
+  "name": "@flyx/mvp-relay",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": { "types": "./dist/index.d.ts", "import": "./dist/index.js" }
+  },
+  "scripts": {
+    "dev": "tsx watch src/main.ts",
+    "start": "tsx src/main.ts",
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "test:cloudflare:smoke": "tsx src/cloudflare/smoke.ts",
+    "deploy:cloudflare": "wrangler deploy",
+    "dev:cloudflare": "wrangler dev"
+  },
+  "dependencies": {
+    "@flyx/mvp-protocol": "workspace:*",
+    "ws": "^8.18.3"
+  },
+  "devDependencies": {
+    "wrangler": "^4.0.0",
+    "@types/node": "^24.0.0",
+    "@types/ws": "^8.18.1",
+    "vitest": "^4.1.6"
+  }
+}

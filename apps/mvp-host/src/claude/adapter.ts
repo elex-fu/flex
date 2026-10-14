@@ -19,13 +19,16 @@ import type {
   AdapterStatus,
   ApprovalAction,
   ApprovalRequest,
+  ProviderAdapter,
   TurnOutcome,
 } from "./types.js";
 
 const execFile = promisify(execFileCallback);
 const require = createRequire(import.meta.url);
 const sdkEntry = require.resolve("@anthropic-ai/claude-agent-sdk");
-const SDK_VERSION = readPackageVersion(sdkEntry);
+const SDK_PACKAGE = readPackageMetadata(sdkEntry);
+const SDK_VERSION = SDK_PACKAGE.version;
+const BUNDLED_CLAUDE_VERSION = SDK_PACKAGE.claudeCodeVersion;
 const SAFE_TOOLS = ["Read", "Glob", "Grep", "Edit", "Write", "Bash"] as const;
 const MAX_APPROVAL_INPUT_BYTES = 128 * 1024;
 const MAX_TOOL_OUTPUT_BYTES = 64 * 1024;
@@ -66,7 +69,8 @@ export type ClaudeAdapterOptions = {
   maxBudgetUsd?: number;
 };
 
-export class ClaudeAdapter {
+export class ClaudeAdapter implements ProviderAdapter {
+  readonly provider = "claude" as const;
   readonly workspace: string;
   private readonly onEvent: AdapterEventHandler | undefined;
   private readonly maxBudgetUsd: number;
@@ -84,23 +88,28 @@ export class ClaudeAdapter {
   async status(): Promise<AdapterStatus> {
     const workspace = await this.workspaceRealpathPromise;
     await stat(workspace);
-    let claudeVersion = "unknown";
-    const executable = process.env.FLYX_CLAUDE_EXECUTABLE ?? "claude";
-    try {
-      const result = await execFile(executable, ["--version"], { timeout: 5_000 });
-      claudeVersion = result.stdout.trim() || result.stderr.trim() || "unknown";
-    } catch (error) {
-      this.emit({
-        kind: "diagnostic",
-        code: "CLAUDE_EXECUTABLE_UNAVAILABLE",
-        message: "The system claude executable could not be inspected; the SDK bundled executable may still be used.",
-        details: error instanceof Error ? error.message : String(error),
-      });
+    const pathOverride = process.env.FLYX_CLAUDE_EXECUTABLE;
+    const executable = pathOverride ?? "sdk-bundled";
+    let runtimeVersion = BUNDLED_CLAUDE_VERSION;
+    if (pathOverride) {
+      try {
+        const result = await execFile(pathOverride, ["--version"], { timeout: 5_000 });
+        runtimeVersion = result.stdout.trim() || result.stderr.trim() || "unknown";
+      } catch (error) {
+        this.emit({
+          kind: "diagnostic",
+          code: "CLAUDE_EXECUTABLE_UNAVAILABLE",
+          message: "The configured Claude executable could not be inspected.",
+          details: error instanceof Error ? error.message : String(error),
+        });
+      }
     }
     return {
-      sdkVersion: SDK_VERSION,
-      claudeExecutable: process.env.FLYX_CLAUDE_EXECUTABLE ?? "sdk-bundled",
-      claudeVersion,
+      provider: this.provider,
+      transport: "claude-agent-sdk",
+      adapterVersion: SDK_VERSION,
+      executable,
+      runtimeVersion,
       workspace,
       sandboxRequired: true,
     };
@@ -500,8 +509,9 @@ export class ClaudeAdapter {
     if (message.type === "system" && message.subtype === "init") {
       this.emit({
         kind: "session_init",
+        provider: this.provider,
         providerSessionId: message.session_id,
-        claudeCodeVersion: message.claude_code_version,
+        runtimeVersion: message.claude_code_version,
         model: message.model,
         tools: message.tools,
       });
@@ -728,17 +738,23 @@ function truncateRecord(value: Record<string, unknown>): Record<string, unknown>
   return JSON.parse(truncate(JSON.stringify(value), MAX_APPROVAL_INPUT_BYTES)) as Record<string, unknown>;
 }
 
-function readPackageVersion(entry: string): string {
+function readPackageMetadata(entry: string): { version: string; claudeCodeVersion: string } {
   let directory = dirname(entry);
   for (let attempt = 0; attempt < 5; attempt += 1) {
     try {
-      const packageJson = JSON.parse(readFileSync(join(directory, "package.json"), "utf8")) as { version?: string };
-      return String(packageJson.version ?? "unknown");
+      const packageJson = JSON.parse(readFileSync(join(directory, "package.json"), "utf8")) as {
+        version?: string;
+        claudeCodeVersion?: string;
+      };
+      return {
+        version: String(packageJson.version ?? "unknown"),
+        claudeCodeVersion: String(packageJson.claudeCodeVersion ?? "unknown"),
+      };
     } catch {
       directory = dirname(directory);
     }
   }
-  return "unknown";
+  return { version: "unknown", claudeCodeVersion: "unknown" };
 }
 
 function restrictedEnvironment(): NodeJS.ProcessEnv {

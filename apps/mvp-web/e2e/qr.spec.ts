@@ -9,6 +9,7 @@ const PAIRING_TOKEN = () => process.env.FLYX_E2E_PAIRING_TOKEN!;
 // Minted by the deterministic Host in global setup and handed to every worker
 // through the environment; each token is a one-time pairing grant.
 const availableTokens: string[] = JSON.parse(process.env.FLYX_E2E_PAIRING_TOKENS ?? "[]");
+let nextPairingClient = 1;
 
 /**
  * Claim a dedicated one-time pairing token.  Duplicates the file-counter
@@ -30,11 +31,14 @@ test.describe("QR pairing (design doc 5.7)", () => {
   test("pairing screen renders the scannable QR SVG", async ({ page }) => {
     await page.goto(BASE_URL());
     await expect(page.getByRole("heading", { name: "连接电脑 Host" })).toBeVisible();
-    await expect(page.getByTestId("pairing-qr").locator("svg")).toBeVisible({ timeout: 10_000 });
+    const image = page.getByTestId("pairing-qr").locator("img");
+    await expect(image).toBeVisible({ timeout: 10_000 });
+    await expect.poll(() => image.evaluate((element: HTMLImageElement) => element.naturalWidth)).toBeGreaterThan(0);
   });
 
   test("?pair=<token> auto-pairs straight into the Timeline", async ({ page }) => {
     const token = claimToken();
+    await page.setExtraHTTPHeaders({ "x-forwarded-for": `198.18.1.${nextPairingClient++}` });
     // This is exactly the URL a phone camera opens after scanning the QR.
     await page.goto(`${BASE_URL()}/?pair=${encodeURIComponent(token)}`);
     await expect(page.getByRole("heading", { name: "执行 Timeline" })).toBeVisible({ timeout: 15_000 });

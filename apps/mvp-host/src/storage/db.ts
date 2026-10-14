@@ -1,6 +1,6 @@
 import Database from "better-sqlite3";
 import { randomUUID } from "node:crypto";
-import type { RpcError, Session, SessionEvent, TimelineItem, Turn } from "@flyx/mvp-protocol";
+import type { ProviderId, RpcError, Session, SessionEvent, TimelineItem, Turn } from "@flyx/mvp-protocol";
 
 export type SessionRow = Session & {
   workspacePath: string;
@@ -113,6 +113,66 @@ export type Snapshot = {
   pendingApprovals: ApprovalRow[];
 };
 
+export type HostIdentityMirror = { hostId: string; fingerprint: string };
+
+export type DeviceRecord = {
+  id: string;
+  hostId: string;
+  displayName?: string;
+  platform: string;
+  credentialKind: "noise-static-key" | "browser-session";
+  publicKey?: string;
+  scopes: string[];
+  /** Monotonic fence for refresh credentials and tickets derived from them. */
+  credentialRevision: number;
+  createdAt: string;
+  lastSeenAt?: string;
+  expiresAt?: string;
+  revokedAt?: string;
+};
+
+export type AuthSessionRecord = {
+  id: string;
+  expiresAt: string;
+  deviceId?: string;
+  revokedAt?: string;
+};
+
+export type PairingGrantRecord = {
+  id: string;
+  hostId?: string;
+  requestedScopes?: string[];
+  expiresAt: string;
+  approvedAt?: string;
+  consumedAt?: string;
+  deviceId?: string;
+};
+
+export type ProtocolSessionRecord = {
+  id: string;
+  deviceId: string;
+  protocolVersion: number;
+  transportKind: string;
+  transportGeneration: number;
+  capabilities: string[];
+  connectedAt: string;
+  expiresAt: string;
+  authSessionId?: string;
+  disconnectedAt?: string;
+  closeCode?: string;
+};
+
+export type AccessAuditEvent = {
+  id: string;
+  deviceId?: string;
+  action: string;
+  targetType?: string;
+  targetId?: string;
+  transportKind?: string;
+  occurredAt: string;
+  resultCode: string;
+};
+
 const SCHEMA = `
 PRAGMA journal_mode = WAL;
 PRAGMA synchronous = FULL;
@@ -147,6 +207,58 @@ CREATE TABLE IF NOT EXISTS pairing_grants (
   confirmed_at TEXT,
   consumed_at TEXT
 );
+
+CREATE TABLE IF NOT EXISTS devices (
+  id TEXT PRIMARY KEY,
+  host_id TEXT NOT NULL,
+  display_name TEXT,
+  platform TEXT NOT NULL,
+  credential_kind TEXT NOT NULL CHECK (credential_kind IN ('noise-static-key', 'browser-session')),
+  public_key TEXT,
+  credential_hash TEXT,
+  credential_revision INTEGER NOT NULL DEFAULT 0,
+  scopes_json TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  last_seen_at TEXT,
+  expires_at TEXT,
+  revoked_at TEXT
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS device_host_public_key
+  ON devices(host_id, public_key) WHERE public_key IS NOT NULL;
+
+CREATE UNIQUE INDEX IF NOT EXISTS device_refresh_credential
+  ON devices(credential_hash) WHERE credential_hash IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS protocol_sessions (
+  id TEXT PRIMARY KEY,
+  device_id TEXT NOT NULL REFERENCES devices(id),
+  protocol_version INTEGER NOT NULL,
+  transport_kind TEXT NOT NULL,
+  transport_generation INTEGER NOT NULL,
+  capability_json TEXT NOT NULL,
+  connected_at TEXT NOT NULL,
+  expires_at TEXT NOT NULL,
+  auth_session_id TEXT REFERENCES auth_sessions(id),
+  disconnected_at TEXT,
+  close_code TEXT
+);
+
+CREATE INDEX IF NOT EXISTS active_device_protocol_sessions
+  ON protocol_sessions(device_id) WHERE disconnected_at IS NULL;
+
+CREATE TABLE IF NOT EXISTS access_audit_events (
+  id TEXT PRIMARY KEY,
+  device_id TEXT,
+  action TEXT NOT NULL,
+  target_type TEXT,
+  target_id TEXT,
+  transport_kind TEXT,
+  occurred_at TEXT NOT NULL,
+  result_code TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS access_audit_by_time ON access_audit_events(occurred_at);
 
 CREATE TABLE IF NOT EXISTS sessions (
   id TEXT PRIMARY KEY,
@@ -281,6 +393,25 @@ export class SqliteStore {
     if (!sessionColumns.some((column) => column.name === "baseline_status_json")) this.db.exec("ALTER TABLE sessions ADD COLUMN baseline_status_json TEXT");
     if (!sessionColumns.some((column) => column.name === "baseline_captured_at")) this.db.exec("ALTER TABLE sessions ADD COLUMN baseline_captured_at TEXT");
     this.db.exec("CREATE INDEX IF NOT EXISTS turns_receipt_lookup ON turns(auth_subject_id, command_id)");
+    const authColumns = this.db.prepare("PRAGMA table_info(auth_sessions)").all() as Array<{ name: string }>;
+    if (!authColumns.some((column) => column.name === "device_id")) this.db.exec("ALTER TABLE auth_sessions ADD COLUMN device_id TEXT REFERENCES devices(id)");
+    const deviceColumns = this.db.prepare("PRAGMA table_info(devices)").all() as Array<{ name: string }>;
+    if (!deviceColumns.some((column) => column.name === "credential_revision")) {
+      this.db.exec("ALTER TABLE devices ADD COLUMN credential_revision INTEGER NOT NULL DEFAULT 0");
+    }
+    const grantColumns = this.db.prepare("PRAGMA table_info(pairing_grants)").all() as Array<{ name: string }>;
+    const grantAdditions = [
+      ["host_id", "TEXT"],
+      ["requested_scopes", "TEXT"],
+      ["approved_at", "TEXT"],
+      ["device_id", "TEXT REFERENCES devices(id)"],
+    ] as const;
+    for (const [name, type] of grantAdditions) {
+      if (!grantColumns.some((column) => column.name === name)) this.db.exec(`ALTER TABLE pairing_grants ADD COLUMN ${name} ${type}`);
+    }
+    this.db.exec("CREATE INDEX IF NOT EXISTS auth_sessions_device ON auth_sessions(device_id)");
+    this.db.prepare("INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (2, ?)").run(now());
+    this.db.prepare("INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (3, ?)").run(now());
   }
 
   private upsertTimelineInternal(sessionId: string, input: TimelineUpsert, updatedAt: string): void {
@@ -319,12 +450,12 @@ export class SqliteStore {
     );
   }
 
-  createSession(workspacePath: string, id = randomUUID()): SessionRow {
+  createSession(workspacePath: string, provider: ProviderId = "claude", id = randomUUID()): SessionRow {
     const timestamp = now();
     this.db.prepare(`
       INSERT INTO sessions (id, workspace_id, workspace_path, provider, status, activity_state, head_sequence, created_at, updated_at)
-      VALUES (?, 'default', ?, 'claude', 'active', 'idle', 0, ?, ?)
-    `).run(id, workspacePath, timestamp, timestamp);
+      VALUES (?, 'default', ?, ?, 'active', 'idle', 0, ?, ?)
+    `).run(id, workspacePath, provider, timestamp, timestamp);
     return this.getSession(id)!;
   }
 
@@ -878,7 +1009,7 @@ export class SqliteStore {
     return this.getCommandReceipt(authSubjectId, commandId)!;
   }
 
-  createAuthSession(tokenHash: string, expiresAt: string, id = randomUUID()): void {
+  createAuthSession(tokenHash: string, expiresAt: string, id: string = randomUUID()): void {
     const timestamp = now();
     this.db.prepare(`
       INSERT INTO auth_sessions (id, token_hash, created_at, expires_at, last_seen_at)
@@ -886,11 +1017,16 @@ export class SqliteStore {
     `).run(id, tokenHash, timestamp, expiresAt, timestamp);
   }
 
-  findAuthSession(tokenHash: string): { id: string; expiresAt: string; revokedAt?: string } | undefined {
-    const row = this.db.prepare("SELECT id, expires_at, revoked_at FROM auth_sessions WHERE token_hash = ?")
-      .get(tokenHash) as { id: string; expires_at: string; revoked_at: string | null } | undefined;
-    if (!row) return undefined;
-    return { id: row.id, expiresAt: row.expires_at, ...(row.revoked_at ? { revokedAt: row.revoked_at } : {}) };
+  findAuthSession(tokenHash: string): AuthSessionRecord | undefined {
+    const row = this.db.prepare("SELECT id, expires_at, revoked_at, device_id FROM auth_sessions WHERE token_hash = ?")
+      .get(tokenHash) as RawAuthSession | undefined;
+    return row ? toAuthSession(row) : undefined;
+  }
+
+  getAuthSession(id: string): AuthSessionRecord | undefined {
+    const row = this.db.prepare("SELECT id, expires_at, revoked_at, device_id FROM auth_sessions WHERE id = ?")
+      .get(id) as RawAuthSession | undefined;
+    return row ? toAuthSession(row) : undefined;
   }
 
   revokeAuthSession(id: string): void {
@@ -901,12 +1037,13 @@ export class SqliteStore {
     this.db.prepare("UPDATE auth_sessions SET last_seen_at = ? WHERE id = ?").run(now(), id);
   }
 
-  createPairingGrant(tokenHash: string, expiresAt: string, id = randomUUID()): void {
+  createPairingGrant(tokenHash: string, expiresAt: string, id: string = randomUUID(), metadata: { hostId?: string; scopes?: string[] } = {}): void {
     const timestamp = now();
     this.db.prepare(`
-      INSERT OR REPLACE INTO pairing_grants (id, token_hash, created_at, expires_at, consumed_at)
-      VALUES (?, ?, ?, ?, NULL)
-    `).run(id, tokenHash, timestamp, expiresAt);
+      INSERT INTO pairing_grants (id, token_hash, created_at, expires_at, consumed_at, host_id, requested_scopes)
+      VALUES (?, ?, ?, ?, NULL, ?, ?)
+      ON CONFLICT(token_hash) DO NOTHING
+    `).run(id, tokenHash, timestamp, expiresAt, metadata.hostId ?? null, metadata.scopes ? json(metadata.scopes) : null);
   }
 
   hasActivePairingGrant(tokenHash: string): boolean {
@@ -921,10 +1058,204 @@ export class SqliteStore {
   consumePairingGrant(tokenHash: string): boolean {
     const timestamp = now();
     const result = this.db.prepare(`
-      UPDATE pairing_grants SET consumed_at = ?
+      UPDATE pairing_grants SET consumed_at = ?, confirmed_at = ?, approved_at = ?
       WHERE token_hash = ? AND consumed_at IS NULL AND expires_at > ?
-    `).run(timestamp, tokenHash, timestamp);
+    `).run(timestamp, timestamp, timestamp, tokenHash, timestamp);
     return result.changes === 1;
+  }
+
+  getPairingGrant(tokenHash: string): PairingGrantRecord | undefined {
+    const row = this.db.prepare(`
+      SELECT id, host_id, requested_scopes, expires_at, approved_at, consumed_at, device_id
+      FROM pairing_grants WHERE token_hash = ?
+    `).get(tokenHash) as RawPairingGrant | undefined;
+    if (!row) return undefined;
+    return {
+      id: row.id,
+      ...(row.host_id ? { hostId: row.host_id } : {}),
+      ...(row.requested_scopes ? { requestedScopes: parse<string[]>(row.requested_scopes) } : {}),
+      expiresAt: row.expires_at,
+      ...(row.approved_at ? { approvedAt: row.approved_at } : {}),
+      ...(row.consumed_at ? { consumedAt: row.consumed_at } : {}),
+      ...(row.device_id ? { deviceId: row.device_id } : {}),
+    };
+  }
+
+  /** The caller invokes this only after local confirmation; approval, consume
+   * and registration share one transaction so a failed insert never burns a grant. */
+  createDeviceFromPairingGrant(tokenHash: string, device: DeviceRecord): boolean {
+    return this.db.transaction(() => {
+      const grant = this.getPairingGrant(tokenHash);
+      if (grant?.requestedScopes && device.scopes.some((scope) => !grant.requestedScopes!.includes(scope))) throw new Error("PAIRING_SCOPE_INVALID");
+      const result = this.db.prepare(`
+        UPDATE pairing_grants SET confirmed_at = ?, approved_at = ?, consumed_at = ?, host_id = ?
+        WHERE token_hash = ? AND consumed_at IS NULL AND expires_at > ?
+          AND (host_id IS NULL OR host_id = ?)
+      `).run(device.createdAt, device.createdAt, device.createdAt, device.hostId, tokenHash, device.createdAt, device.hostId);
+      if (result.changes !== 1) return false;
+      this.createDevice(device);
+      this.db.prepare("UPDATE pairing_grants SET device_id = ? WHERE token_hash = ?").run(device.id, tokenHash);
+      return true;
+    })();
+  }
+
+  getHostIdentityMirror(): HostIdentityMirror | undefined {
+    const row = this.db.prepare("SELECT value_json FROM host_state WHERE key = 'host_identity'").get() as { value_json: string } | undefined;
+    if (!row) return undefined;
+    const value = parse<unknown>(row.value_json);
+    if (!isRecord(value) || typeof value.hostId !== "string" || !value.hostId || typeof value.fingerprint !== "string" || !value.fingerprint) {
+      throw new Error("HOST_IDENTITY_MISMATCH");
+    }
+    return { hostId: value.hostId, fingerprint: value.fingerprint };
+  }
+
+  setHostIdentityMirror(value: HostIdentityMirror): void {
+    if (!value.hostId || !value.fingerprint) throw new Error("HOST_IDENTITY_MISMATCH");
+    this.db.transaction(() => {
+      const previous = this.getHostIdentityMirror();
+      if (previous && (previous.hostId !== value.hostId || previous.fingerprint !== value.fingerprint)) throw new Error("HOST_IDENTITY_MISMATCH");
+      this.db.prepare("INSERT OR IGNORE INTO host_state (key, value_json, updated_at) VALUES ('host_identity', ?, ?)").run(json(value), now());
+      const persisted = this.getHostIdentityMirror();
+      if (!persisted || persisted.hostId !== value.hostId || persisted.fingerprint !== value.fingerprint) {
+        throw new Error("HOST_IDENTITY_MISMATCH");
+      }
+    })();
+  }
+
+  /** Explicit local key rotation. The expected mirror fences concurrent rotations. */
+  rotateHostIdentityMirror(value: HostIdentityMirror, expectedPrevious?: HostIdentityMirror): void {
+    if (!value.hostId || !value.fingerprint || (expectedPrevious && (
+      !expectedPrevious.hostId || !expectedPrevious.fingerprint || value.hostId !== expectedPrevious.hostId
+    ))) {
+      throw new Error("HOST_IDENTITY_MISMATCH");
+    }
+    this.db.transaction(() => {
+      const previous = this.getHostIdentityMirror();
+      if (expectedPrevious && (!previous || previous.hostId !== expectedPrevious.hostId || previous.fingerprint !== expectedPrevious.fingerprint)) {
+        throw new Error("HOST_IDENTITY_MISMATCH");
+      }
+      this.db.prepare(`
+        INSERT INTO host_state (key, value_json, updated_at) VALUES ('host_identity', ?, ?)
+        ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json, updated_at = excluded.updated_at
+      `).run(json(value), now());
+    })();
+  }
+
+  createDevice(device: DeviceRecord): void {
+    this.db.prepare(`
+      INSERT INTO devices (id, host_id, display_name, platform, credential_kind, public_key, scopes_json, credential_revision, created_at, last_seen_at, expires_at, revoked_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(device.id, device.hostId, device.displayName ?? null, device.platform, device.credentialKind, device.publicKey ?? null,
+      json(device.scopes), device.credentialRevision, device.createdAt, device.lastSeenAt ?? null, device.expiresAt ?? null, device.revokedAt ?? null);
+  }
+
+  getDevice(id: string): DeviceRecord | undefined {
+    const row = this.db.prepare("SELECT * FROM devices WHERE id = ?").get(id) as RawDevice | undefined;
+    return row ? toDevice(row) : undefined;
+  }
+
+  listDevices(hostId: string): DeviceRecord[] {
+    return (this.db.prepare("SELECT * FROM devices WHERE host_id = ? ORDER BY created_at, id").all(hostId) as RawDevice[]).map(toDevice);
+  }
+
+  findDeviceByPublicKey(hostId: string, publicKey: string): DeviceRecord | undefined {
+    const row = this.db.prepare("SELECT * FROM devices WHERE host_id = ? AND public_key = ?").get(hostId, publicKey) as RawDevice | undefined;
+    return row ? toDevice(row) : undefined;
+  }
+
+  findDeviceByCredentialHash(hostId: string, credentialHash: string): DeviceRecord | undefined {
+    const row = this.db.prepare("SELECT * FROM devices WHERE host_id = ? AND credential_hash = ?").get(hostId, credentialHash) as RawDevice | undefined;
+    return row ? toDevice(row) : undefined;
+  }
+
+  bindAuthSession(id: string, deviceId: string, timestamp = now()): boolean {
+    return this.db.transaction(() => {
+      const result = this.db.prepare(`
+        UPDATE auth_sessions SET device_id = ?
+        WHERE id = ? AND revoked_at IS NULL AND expires_at > ?
+          AND (device_id IS NULL OR device_id = ?)
+          AND EXISTS (SELECT 1 FROM devices WHERE id = ? AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at > ?))
+      `).run(deviceId, id, timestamp, deviceId, deviceId, timestamp);
+      if (result.changes !== 1) return false;
+      this.migrateAuthSubject(id, deviceId);
+      return true;
+    })();
+  }
+
+  /**
+   * Re-key v1 command ownership from a browser auth-session id to its stable
+   * device id. This runs with auth-session binding so retries cannot observe a
+   * mapped device while its durable receipt still lives in the old namespace.
+   */
+  private migrateAuthSubject(authSessionId: string, deviceId: string): void {
+    if (authSessionId === deviceId) return;
+    const legacy = this.db.prepare(`
+      SELECT * FROM command_receipts WHERE auth_subject_id = ? ORDER BY created_at, command_id
+    `).all(authSessionId) as RawReceipt[];
+    for (const row of legacy) {
+      const current = this.db.prepare(`
+        SELECT method, request_hash FROM command_receipts WHERE auth_subject_id = ? AND command_id = ?
+      `).get(deviceId, row.command_id) as { method: string; request_hash: string } | undefined;
+      if (current && (current.method !== row.method || current.request_hash !== row.request_hash)) {
+        throw new Error("COMMAND_ID_REUSED");
+      }
+      if (current) {
+        this.db.prepare("DELETE FROM command_receipts WHERE auth_subject_id = ? AND command_id = ?")
+          .run(authSessionId, row.command_id);
+      } else {
+        this.db.prepare(`
+          UPDATE command_receipts SET auth_subject_id = ? WHERE auth_subject_id = ? AND command_id = ?
+        `).run(deviceId, authSessionId, row.command_id);
+      }
+    }
+    this.db.prepare("UPDATE turns SET auth_subject_id = ? WHERE auth_subject_id = ?").run(deviceId, authSessionId);
+  }
+
+  createProtocolSession(record: ProtocolSessionRecord): void {
+    this.db.prepare(`
+      INSERT INTO protocol_sessions (id, device_id, protocol_version, transport_kind, transport_generation, capability_json, connected_at, expires_at, auth_session_id)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(record.id, record.deviceId, record.protocolVersion, record.transportKind, record.transportGeneration,
+      json(record.capabilities), record.connectedAt, record.expiresAt, record.authSessionId ?? null);
+  }
+
+  getProtocolSession(id: string): ProtocolSessionRecord | undefined {
+    const row = this.db.prepare("SELECT * FROM protocol_sessions WHERE id = ?").get(id) as RawProtocolSession | undefined;
+    return row ? toProtocolSession(row) : undefined;
+  }
+
+  listActiveProtocolSessions(hostId: string): ProtocolSessionRecord[] {
+    return (this.db.prepare(`
+      SELECT protocol_sessions.* FROM protocol_sessions JOIN devices ON devices.id = protocol_sessions.device_id
+      WHERE devices.host_id = ? AND disconnected_at IS NULL ORDER BY connected_at
+    `).all(hostId) as RawProtocolSession[]).map(toProtocolSession);
+  }
+
+  disconnectProtocolSession(id: string, closeCode: string, timestamp = now()): boolean {
+    return this.db.prepare("UPDATE protocol_sessions SET disconnected_at = ?, close_code = ? WHERE id = ? AND disconnected_at IS NULL")
+      .run(timestamp, closeCode, id).changes === 1;
+  }
+
+  recordAccessAudit(event: Omit<AccessAuditEvent, "id"> & { id?: string }): void {
+    this.db.prepare(`
+      INSERT INTO access_audit_events (id, device_id, action, target_type, target_id, transport_kind, occurred_at, result_code)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(event.id ?? randomUUID(), event.deviceId ?? null, event.action, event.targetType ?? null, event.targetId ?? null,
+      event.transportKind ?? null, event.occurredAt, event.resultCode);
+  }
+
+  listAccessAudit(limit = 100): AccessAuditEvent[] {
+    return (this.db.prepare("SELECT * FROM access_audit_events ORDER BY occurred_at DESC, rowid DESC LIMIT ?")
+      .all(Math.max(1, Math.min(10_000, limit))) as RawAccessAudit[]).map((row) => ({
+        id: row.id,
+        ...(row.device_id ? { deviceId: row.device_id } : {}),
+        action: row.action,
+        ...(row.target_type ? { targetType: row.target_type } : {}),
+        ...(row.target_id ? { targetId: row.target_id } : {}),
+        ...(row.transport_kind ? { transportKind: row.transport_kind } : {}),
+        occurredAt: row.occurred_at,
+        resultCode: row.result_code,
+      }));
   }
 
   private appendEventInternal(sessionId: string, type: string, payload: unknown, occurredAt: string): SessionEvent {
@@ -974,7 +1305,7 @@ export class SqliteStore {
 }
 
 type RawSession = {
-  id: string; workspace_id: "default"; workspace_path: string; provider: "claude"; provider_session_id: string | null;
+  id: string; workspace_id: "default"; workspace_path: string; provider: ProviderId; provider_session_id: string | null;
   baseline_head: string | null; baseline_dirty: number | null; baseline_status_json: string | null; baseline_captured_at: string | null;
   status: Session["status"]; activity_state: Session["activityState"]; head_sequence: number; created_at: string; updated_at: string;
 };
@@ -986,6 +1317,62 @@ type RawEvent = { id: string; session_id: string; sequence: number; type: string
 type RawTimeline = { session_id: string; item_id: string; kind: TimelineItem["kind"]; status: string; revision: number; content_json: string; updated_at: string };
 type RawApproval = { approval_id: string; session_id: string; turn_id: string; tool_use_id: string; version: number; status: ApprovalStatus; action: string | null; request_json: string; created_at: string; resolved_at: string | null };
 type RawReceipt = { auth_subject_id: string; command_id: string; method: string; request_hash: string; state: CommandReceiptState; response_json: string; created_at: string; updated_at: string };
+type RawAuthSession = { id: string; expires_at: string; revoked_at: string | null; device_id: string | null };
+type RawPairingGrant = { id: string; host_id: string | null; requested_scopes: string | null; expires_at: string; approved_at: string | null; consumed_at: string | null; device_id: string | null };
+type RawDevice = {
+  id: string; host_id: string; display_name: string | null; platform: string; credential_kind: DeviceRecord["credentialKind"];
+  public_key: string | null; scopes_json: string; credential_revision: number; created_at: string; last_seen_at: string | null; expires_at: string | null; revoked_at: string | null;
+};
+type RawProtocolSession = {
+  id: string; device_id: string; protocol_version: number; transport_kind: string; transport_generation: number;
+  capability_json: string; connected_at: string; expires_at: string; auth_session_id: string | null; disconnected_at: string | null; close_code: string | null;
+};
+type RawAccessAudit = {
+  id: string; device_id: string | null; action: string; target_type: string | null; target_id: string | null;
+  transport_kind: string | null; occurred_at: string; result_code: string;
+};
+
+function toAuthSession(row: RawAuthSession): AuthSessionRecord {
+  return {
+    id: row.id,
+    expiresAt: row.expires_at,
+    ...(row.revoked_at ? { revokedAt: row.revoked_at } : {}),
+    ...(row.device_id ? { deviceId: row.device_id } : {}),
+  };
+}
+
+function toDevice(row: RawDevice): DeviceRecord {
+  return {
+    id: row.id,
+    hostId: row.host_id,
+    ...(row.display_name ? { displayName: row.display_name } : {}),
+    platform: row.platform,
+    credentialKind: row.credential_kind,
+    ...(row.public_key ? { publicKey: row.public_key } : {}),
+    scopes: parse<string[]>(row.scopes_json),
+    credentialRevision: row.credential_revision,
+    createdAt: row.created_at,
+    ...(row.last_seen_at ? { lastSeenAt: row.last_seen_at } : {}),
+    ...(row.expires_at ? { expiresAt: row.expires_at } : {}),
+    ...(row.revoked_at ? { revokedAt: row.revoked_at } : {}),
+  };
+}
+
+function toProtocolSession(row: RawProtocolSession): ProtocolSessionRecord {
+  return {
+    id: row.id,
+    deviceId: row.device_id,
+    protocolVersion: row.protocol_version,
+    transportKind: row.transport_kind,
+    transportGeneration: row.transport_generation,
+    capabilities: parse<string[]>(row.capability_json),
+    connectedAt: row.connected_at,
+    expiresAt: row.expires_at,
+    ...(row.auth_session_id ? { authSessionId: row.auth_session_id } : {}),
+    ...(row.disconnected_at ? { disconnectedAt: row.disconnected_at } : {}),
+    ...(row.close_code ? { closeCode: row.close_code } : {}),
+  };
+}
 
 function toSession(row: RawSession): SessionRow {
   return {

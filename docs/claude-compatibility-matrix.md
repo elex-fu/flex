@@ -21,12 +21,12 @@
 
 | 组合 id | SDK | Claude CLI | Node | OS | 状态 |
 |---|---|---|---|---|---|
-| `sdk-0.3.220_cli-2.1.216_node-24.18.0` | `@anthropic-ai/claude-agent-sdk@0.3.220` | `2.1.216` | `24.18.0` | macOS 25.5.0 arm64 | `pending` |
+| `sdk-0.3.220_cli-2.1.220_node-24.18.0` | `@anthropic-ai/claude-agent-sdk@0.3.220` | bundled `2.1.220` | `24.18.0` | macOS 25.5.0 arm64 | `pending` |
 
 版本来源：
 
 - `sdkVersion` 取自 `apps/mvp-host/package.json` 中 `@anthropic-ai/claude-agent-sdk` 的精确锁定版本（当前 `0.3.220`）；
-- `claudeCliVersion` 取自设计文档 5.6 节的当前候选（`2.1.216`）；本机 `claude --version` 输出 `2.1.216 (Claude Code)` 时视为匹配；
+- `claudeCliVersion` 取自 SDK manifest 的 `claudeCodeVersion`（当前 `2.1.220`）。`executableSource=sdk-bundled` 时矩阵检查 bundled runtime，而不是 PATH 中可能不同版本的系统 `claude`；
 - `nodeVersion` 为锁定运行时版本。
 
 升级规则（设计文档 5.6 矩阵规则 6/7）：未通过矩阵的 SDK/CLI 不能进入启动脚本默认值；依赖升级必须由单独 PR 完成，并附矩阵差异与真实额度记录。
@@ -57,13 +57,13 @@ deterministic-verified ──(10 次真实 Turn 全部 completed，且
 # 前置：仓库根目录执行过 pnpm install；真实层还需要本机 claude CLI 版本与组合一致且已登录
 node scripts/compatibility/run-matrix.mjs                       # 跑所有 pending 组合（deterministic + real 两层）
 node scripts/compatibility/run-matrix.mjs --deterministic-only  # 只跑 deterministic 层（不需要 claude CLI）
-node scripts/compatibility/run-matrix.mjs --combo sdk-0.3.220_cli-2.1.216_node-24.18.0
+node scripts/compatibility/run-matrix.mjs --combo sdk-0.3.220_cli-2.1.220_node-24.18.0
 node scripts/compatibility/run-matrix.mjs --turns 3             # 冒烟用（默认 10，验证等级判定始终要求 10）
 ```
 
 脚本流程（每个选中组合）：
 
-1. 读取 `config/claude-compatibility.json`；检测本机 `claude --version`（不存在或与 `claudeCliVersion` 不一致 → real 层记 skipped 并写明原因，退出码 0）；
+1. 读取 `config/claude-compatibility.json`；按 `executableSource` 检测 SDK bundled runtime 或系统 `claude --version`（不存在或版本不一致 → real 层记 skipped 并写明原因，退出码 0）；
 2. **deterministic 层**：spawn `pnpm --filter @flyx/mvp-host exec tsx src/test-support/e2e-main.ts`（与 Playwright E2E 相同的入口：真实 Fastify server 栈 + `DeterministicAdapter`），等待 stdout 的 `FLYX_E2E_HOST_READY base=... token=...` 就绪行；
 3. **real 层**：spawn `pnpm --filter @flyx/mvp-host exec tsx src/main.ts`（**真实 `ClaudeAdapter`**，Host 启动时真实执行 Claude preflight），等待 `Flyx MVP Host listening at ...` 与 `Pairing token: ...` 就绪行；
 4. 每层通过 Host 的 HTTP 认证（`/api/pairing/exchange` → `/api/auth/browser-session` → `/api/auth/websocket-ticket`）+ WSS RPC（`/api/ws`）驱动 Turn：`session.subscribe` → N 次 `session.startTurn`（矩阵固定安全 prompt）→ 等待权威终态事件（`turn.completed` / `turn.failed` / `turn.cancelled`）；
@@ -77,7 +77,7 @@ node scripts/compatibility/run-matrix.mjs --turns 3             # 冒烟用（�
 
 ```text
 .flyx-evidence/
-  sdk-0.3.220_cli-2.1.216_node-24.18.0/
+  sdk-0.3.220_cli-2.1.220_node-24.18.0/
     turns.jsonl        # 所有 Turn 的脱敏记录（deterministic 与 real 用 layer 字段区分）
     approvals.jsonl    # 审批证据（由专用审批验证运行产出，本脚本只统计）
     interrupts.jsonl   # 中断证据（由专用中断验证运行产出，本脚本只统计）
@@ -100,7 +100,7 @@ node scripts/compatibility/run-matrix.mjs --turns 3             # 冒烟用（�
 
 ## 当前状态与下一步
 
-- [ ] `sdk-0.3.220_cli-2.1.216_node-24.18.0`：10 次 deterministic Turn（当前 `pending`）
+- [ ] `sdk-0.3.220_cli-2.1.220_node-24.18.0`：10 次 deterministic Turn（当前 `pending`）
 - [ ] 同上组合：10 次真实 Turn
 - [ ] 同上组合：10 次审批（allow/deny 各 ≥ 3）+ 10 次中断证据
 - [ ] 全部通过后将 `decision` 从 `locked-candidate` 改为 `locked`

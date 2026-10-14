@@ -1,0 +1,43 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "flyx-relay",
+  "main": "src/cloudflare/worker.ts",
+  "compatibility_date": "2026-09-01",
+  "send_metrics": false,
+  "workers_dev": false,
+  "preview_urls": false,
+  "limits": { "cpu_ms": 10000 },
+  "durable_objects": {
+    "bindings": [
+      { "name": "RELAY_ROOMS", "class_name": "RelayRouteObject" },
+      { "name": "RELAY_QUOTAS", "class_name": "RelayQuotaObject" }
+    ]
+  },
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["RelayRouteObject", "RelayQuotaObject"] }
+  ],
+  "analytics_engine_datasets": [
+    { "binding": "RELAY_METRICS", "dataset": "flyx_relay" }
+  ],
+  // Invocation logs contain full URLs. Keep logs/traces disabled; use aggregate metrics.
+  "observability": {
+    "enabled": false,
+    "logs": { "enabled": false, "invocation_logs": false },
+    "traces": { "enabled": false }
+  },
+  "vars": {
+    "RELAY_ALLOW_ANONYMOUS_REGISTRATION": "false",
+    "RELAY_ALLOW_INSECURE_LOCAL": "false",
+    "RELAY_ALLOWED_ORIGINS": "",
+    "RELAY_MAX_CREATES_PER_IP_HOUR": "5",
+    "RELAY_MAX_CREATES_PER_DAY": "1000",
+    "RELAY_MAX_CONNECTS_PER_IP_MINUTE": "120",
+    "RELAY_MAX_CLIENTS_PER_ROUTE": "32",
+    "RELAY_MAX_CONNECTS_PER_ROUTE_MINUTE": "120",
+    "RELAY_MAX_FRAMES_PER_SOCKET_SECOND": "128",
+    "RELAY_MAX_BYTES_PER_SOCKET_SECOND": "1048576",
+    "RELAY_MAX_ROUTE_BYTES_PER_SECOND": "8388608",
+    "RELAY_IDLE_TIMEOUT_MS": "90000",
+    "RELAY_PENDING_TIMEOUT_MS": "15000"
+  }
+}

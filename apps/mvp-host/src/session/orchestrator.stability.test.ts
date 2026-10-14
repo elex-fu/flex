@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { resolve } from "node:path";
-import type { ClaudeAdapter } from "../claude/adapter.js";
 import { SessionOrchestrator } from "./orchestrator.js";
+import type { AdapterStatus, ProviderAdapter } from "../provider/types.js";
 
 const openOrchestrators: SessionOrchestrator[] = [];
 
@@ -9,12 +9,29 @@ afterEach(() => {
   while (openOrchestrators.length) openOrchestrators.pop()!.close();
 });
 
-class DeterministicAdapter {
+class DeterministicAdapter implements ProviderAdapter {
+  readonly provider = "claude" as const;
   readonly workspace: string;
   activeTurnId: string | undefined;
 
   constructor(workspace: string) {
     this.workspace = workspace;
+  }
+
+  async status(): Promise<AdapterStatus> {
+    return {
+      provider: this.provider,
+      transport: "deterministic",
+      adapterVersion: "test",
+      executable: "deterministic",
+      runtimeVersion: "test",
+      workspace: this.workspace,
+      sandboxRequired: true,
+    };
+  }
+
+  async preflight(): Promise<AdapterStatus> {
+    return this.status();
   }
 
   async runTurn(turnId: string): Promise<{ status: "completed"; providerSessionId: string }> {
@@ -46,7 +63,7 @@ describe("Session orchestration stability", () => {
     const adapter = new DeterministicAdapter(workspace);
     const orchestrator = new SessionOrchestrator({
       workspace,
-      adapter: adapter as unknown as ClaudeAdapter,
+      adapter,
     });
     openOrchestrators.push(orchestrator);
 

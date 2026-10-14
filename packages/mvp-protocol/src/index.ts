@@ -1,6 +1,9 @@
 import { z } from "zod";
 
-export const ProtocolVersion = 1 as const;
+export const ProtocolVersion = 2 as const;
+
+export const ProviderIdSchema = z.enum(["claude", "codex"]);
+export type ProviderId = z.infer<typeof ProviderIdSchema>;
 
 export const RpcErrorSchema = z.object({
   code: z.string(),
@@ -15,7 +18,7 @@ export type RpcError = z.infer<typeof RpcErrorSchema>;
 export const SessionSchema = z.object({
   id: z.string(),
   workspaceId: z.literal("default"),
-  provider: z.literal("claude"),
+  provider: ProviderIdSchema,
   providerSessionId: z.string().optional(),
   status: z.enum(["active", "archived"]),
   activityState: z.enum([
@@ -82,31 +85,33 @@ export const FrameSchema = z.union([
     method: z.string(),
     commandId: z.string().optional(),
     payload: z.unknown().default({}),
-  }),
+  }).strict(),
   z.object({
     type: z.literal("response"),
     id: z.string(),
     ok: z.literal(true),
     payload: z.unknown(),
-  }),
+  }).strict(),
   z.object({
     type: z.literal("response"),
     id: z.string(),
     ok: z.literal(false),
     error: RpcErrorSchema,
-  }),
+  }).strict(),
   z.object({
     type: z.literal("event"),
     sessionId: z.string(),
     event: SessionEventSchema,
-  }),
+  }).strict(),
 ]);
 
 export type Frame = z.infer<typeof FrameSchema>;
 
 export const BootstrapSchema = z.object({
-  protocolVersion: z.literal(ProtocolVersion),
-  provider: z.literal("claude"),
+  // Legacy Direct clients still receive/parse v1 bootstrap during the
+  // compatibility window; new Hosts advertise ProtocolVersion (v2).
+  protocolVersion: z.union([z.literal(1), z.literal(ProtocolVersion)]),
+  provider: ProviderIdSchema,
   capabilities: z.object({
     streamingText: z.boolean(),
     structuredToolCalls: z.boolean(),
@@ -119,3 +124,9 @@ export const BootstrapSchema = z.object({
 });
 
 export type Bootstrap = z.infer<typeof BootstrapSchema>;
+
+export * from "./handshake.js";
+export * from "./application-frames.js";
+export * from "./host-descriptor.js";
+export * from "./connection-offer.js";
+export * from "./relay-control.js";

@@ -1,6 +1,5 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { resolve } from "node:path";
-import type { ClaudeAdapter } from "../claude/adapter.js";
 import { SessionOrchestrator } from "./orchestrator.js";
 import { DeterministicAdapter } from "../test-support/deterministic-adapter.js";
 
@@ -10,21 +9,30 @@ afterEach(() => {
   while (openOrchestrators.length) openOrchestrators.pop()!.close();
 });
 
-function createOrchestrator(): { orchestrator: SessionOrchestrator; adapter: DeterministicAdapter } {
+function createOrchestrator(provider: "claude" | "codex" = "claude"): { orchestrator: SessionOrchestrator; adapter: DeterministicAdapter } {
   const workspace = resolve(process.cwd(), "../../packages/claude-fixtures");
   let ref: SessionOrchestrator | undefined;
   const adapter = new DeterministicAdapter({
     workspace,
+    provider,
     onEvent: (event) => ref?.ingestAdapterEvent(event),
   });
   const orchestrator = new SessionOrchestrator({
     workspace,
-    adapter: adapter as unknown as ClaudeAdapter,
+    adapter,
   });
   ref = orchestrator;
   openOrchestrators.push(orchestrator);
   return { orchestrator, adapter };
 }
+
+describe("provider binding", () => {
+  it("persists and advertises the selected Codex provider", () => {
+    const { orchestrator } = createOrchestrator("codex");
+    expect(orchestrator.snapshot().session.provider).toBe("codex");
+    expect(orchestrator.bootstrap()).toMatchObject({ provider: "codex", protocolVersion: 2 });
+  });
+});
 
 async function waitForIdle(orchestrator: SessionOrchestrator): Promise<void> {
   for (let attempt = 0; attempt < 200; attempt += 1) {

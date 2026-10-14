@@ -94,6 +94,23 @@ export class RuntimeRegistry {
     runtime.retained = false;
     this.finish(context, outcome);
   }
+  /** Trusted R07 callback only: acknowledgment and gate release must already be committed.
+   * Clears execution retention without creating or changing a Provider terminal fact.
+   */
+  reconcileStopped(context: DispatchContext, evidence: { kind: "execution-stopped"; sourceId: string }): void {
+    if (!evidence || evidence.kind !== "execution-stopped" || typeof evidence.sourceId !== "string" || !evidence.sourceId.trim()) {
+      throw new Error("RUNTIME_STOP_EVIDENCE_REQUIRED");
+    }
+    const runtime = this.runtimes.get(context.runtimeId);
+    if (!runtime || !sameDispatchContext(runtime.context, context)) throw new Error("RUNTIME_RECOVERY_CONTEXT_MISMATCH");
+    if (!runtime.unknown && !runtime.retained) throw new Error("RUNTIME_RETENTION_REQUIRED");
+    runtime.acceptance?.reject(new Error("NATIVE_ACK_UNAVAILABLE"));
+    runtime.unknown = false;
+    runtime.retained = false;
+    runtime.context = undefined;
+    runtime.terminal = undefined;
+    runtime.acceptance = undefined;
+  }
   /** Known business outcome with an independently retained execution gate. */
   retainBinding(context: DispatchContext): void {
     const runtime = this.runtimes.get(context.runtimeId);

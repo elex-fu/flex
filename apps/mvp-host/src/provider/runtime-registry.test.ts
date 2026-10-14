@@ -33,6 +33,49 @@ describe("runtime evidence and ownership", () => {
     expect(() => registry.reconcileVerified(context, { status: "outcome_unknown", error: "unverified", evidence: { kind: "unknown", reason: "unverified" } })).toThrow("RUNTIME_RECOVERY_EVIDENCE_REQUIRED");
     registry.reconcileVerified(context, verified); expect(registry.isBusy("runtime")).toBe(false);
   });
+  it("releases proved stopped execution after acknowledgment while preserving the unknown outcome", async () => {
+    const driver = adapter({ status: "outcome_unknown", error: "possible send", evidence: { kind: "unknown", reason: "possible send" } });
+    const registry = new RuntimeRegistry(); registry.register("runtime", driver);
+    const outcome = await registry.begin(context, { prompt: "actual" }).outcome;
+    Object.freeze(outcome.evidence); Object.freeze(outcome);
+    registry.finish(context, outcome); registry.retainBinding(context);
+    expect(() => registry.reconcileVerified(context, outcome)).toThrow("RUNTIME_RECOVERY_EVIDENCE_REQUIRED");
+    registry.reconcileStopped(context, { kind: "execution-stopped", sourceId: "committed-acknowledgment-stop-proof" });
+    expect(registry.matches(context)).toBe(false); expect(registry.isBusy("runtime")).toBe(false);
+    expect(outcome).toEqual({ status: "outcome_unknown", error: "possible send", evidence: { kind: "unknown", reason: "possible send" } });
+    const next = dispatchContextForTurn("next-turn", { ...context, flyxTurnId: "next-turn", attemptId: "next-attempt", runtimeGeneration: 2 });
+    driver.runTurn = async () => ({ status: "failed", error: "next preparation", evidence: { kind: "not-dispatched" } });
+    const nextOutcome = await registry.begin(next, { prompt: "next" }).outcome;
+    expect(nextOutcome.status).toBe("failed"); registry.finish(next, nextOutcome);
+    expect(registry.isBusy("runtime")).toBe(false);
+  });
+  it.each([
+    { hostOwnerId: "different-owner" }, { hostOwnerGeneration: 2 }, { sessionId: "different-session" },
+    { flyxTurnId: "different-turn" }, { runtimeId: "different-runtime" }, { runtimeGeneration: 2 }, { attemptId: "different-attempt" },
+  ])("rejects stop evidence for a different immutable dispatch fence %j", (different) => {
+    const registry = new RuntimeRegistry(); registry.register("runtime", adapter({ status: "outcome_unknown", error: "possible send" }));
+    registry.retainUnknown(context);
+    expect(() => registry.reconcileStopped({ ...context, ...different }, { kind: "execution-stopped", sourceId: "proof" })).toThrow("RUNTIME_RECOVERY_CONTEXT_MISMATCH");
+    expect(registry.matches(context)).toBe(true); expect(registry.isBusy("runtime")).toBe(true);
+  });
+  it.each([
+    undefined, null, {}, { kind: "native-terminal", sourceId: "native-result" }, { kind: "local-delivery", sourceId: "delivery" },
+    { kind: "execution-stopped" }, { kind: "execution-stopped", sourceId: "" }, { kind: "execution-stopped", sourceId: "  " },
+    { kind: "execution-stopped", sourceId: 1 },
+  ])("rejects missing or unproved stop evidence %j without clearing retention", (evidence) => {
+    const registry = new RuntimeRegistry(); registry.register("runtime", adapter({ status: "outcome_unknown", error: "possible send" }));
+    registry.retainUnknown(context);
+    expect(() => registry.reconcileStopped(context, evidence as Parameters<RuntimeRegistry["reconcileStopped"]>[1])).toThrow("RUNTIME_STOP_EVIDENCE_REQUIRED");
+    expect(registry.matches(context)).toBe(true); expect(registry.isBusy("runtime")).toBe(true);
+  });
+  it("requires an independently retained binding before stopped acknowledgment can clear it", async () => {
+    const known = { status: "completed" as const, providerSessionId: "native", evidence: { kind: "native-terminal" as const, sourceId: "native-result" } };
+    const registry = new RuntimeRegistry(); registry.register("runtime", adapter(known));
+    const run = registry.begin(context, { prompt: "actual" });
+    expect(() => registry.reconcileStopped(context, { kind: "execution-stopped", sourceId: "proof" })).toThrow("RUNTIME_RETENTION_REQUIRED");
+    expect(registry.matches(context)).toBe(true);
+    registry.finish(context, await run.outcome); expect(registry.isBusy("runtime")).toBe(false);
+  });
   it("keeps a known business outcome separate from an independently retained execution binding", async () => {
     const known = { status: "completed" as const, providerSessionId: "native", evidence: { kind: "native-terminal" as const, sourceId: "native-result" } };
     const registry = new RuntimeRegistry(); registry.register("runtime", adapter(known)); registry.begin(context, { prompt: "actual" });
@@ -40,7 +83,7 @@ describe("runtime evidence and ownership", () => {
     registry.finish(context, known); expect(registry.isBusy("runtime")).toBe(true); expect(registry.matches(context)).toBe(true);
     registry.reconcileVerified(context, known); expect(registry.isBusy("runtime")).toBe(false);
   });
-  it("does not let a recovered old outcome reject the next attempt's ACK or retain its binding", async () => {
+  it.each(["native-terminal", "execution-stopped"] as const)("does not let an old outcome recovered with %s reject the next attempt's ACK or retain its binding", async (recovery) => {
     const settlements: Array<(outcome: TurnOutcome) => void> = [];
     const driver: ProviderAdapter = { ...adapter({ status: "failed", error: "unused" }), provider: "codex" };
     driver.runTurn = () => new Promise((resolve) => { settlements.push(resolve); });
@@ -48,7 +91,8 @@ describe("runtime evidence and ownership", () => {
     const oldRun = registry.begin(context, { prompt: "old" }); void oldRun.accepted?.catch(() => undefined);
     registry.retainUnknown(context);
     const known = { status: "completed" as const, providerSessionId: "native", evidence: { kind: "native-terminal" as const, sourceId: "verified-result" } };
-    registry.reconcileVerified(context, known);
+    if (recovery === "native-terminal") registry.reconcileVerified(context, known);
+    else registry.reconcileStopped(context, { kind: "execution-stopped", sourceId: "committed-acknowledgment-stop-proof" });
     const next = dispatchContextForTurn("next-turn", { ...context, flyxTurnId: "next-turn", attemptId: "next-attempt", runtimeGeneration: 2 });
     const nextRun = registry.begin(next, { prompt: "next" });
     const nextAccepted = expect(nextRun.accepted).resolves.toMatchObject({ nativeSessionId: "next-native-session", nativeTurnId: "next-native-turn" });

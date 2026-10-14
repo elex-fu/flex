@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 /** Controlled compatibility evidence. Real calls require --real AND RUN_REAL_<PROVIDER>=1. */
 import { spawn } from "node:child_process";
+import { createRequire } from "node:module";
 import { createHash, randomUUID } from "node:crypto";
 import { appendFile, chmod, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { arch, release } from "node:os";
@@ -105,7 +106,9 @@ export class RpcClient {
   waitTerminal(turnId, timeoutMs) { return this.waitEvent((event) => TERMINALS.has(event?.type) && event?.payload?.turnId === turnId, timeoutMs); }
   close() { this.ws.close(); }
 }
-async function openClient(info) {
+export async function openClient(info) {
+  const require = createRequire(join(ROOT, "apps/mvp-host/package.json"));
+  const WebSocket = require("ws");
   const post = async (path, body, cookie) => {
     const response = await fetch(new URL(path, info.baseUrl), { method: "POST", headers: { "content-type": "application/json", ...(cookie ? { cookie } : {}) }, body: JSON.stringify(body), signal: AbortSignal.timeout(15_000) });
     if (!response.ok) throw coded("AUTH_EXCHANGE_FAILED"); return response;
@@ -115,7 +118,7 @@ async function openClient(info) {
   const cookie = (auth.headers.getSetCookie?.() ?? []).map((value) => value.split(";")[0]).find((value) => value.startsWith("flyx_session="));
   if (!cookie) throw coded("AUTH_COOKIE_MISSING");
   const { ticket } = await (await post("/api/auth/websocket-ticket", {}, cookie)).json();
-  const ws = new WebSocket(info.baseUrl.replace(/^http/, "ws") + "/api/ws?ticket=" + encodeURIComponent(ticket));
+  const ws = new WebSocket(info.baseUrl.replace(/^http/, "ws") + "/api/ws?ticket=" + encodeURIComponent(ticket), { origin: info.baseUrl });
   await new Promise((done, reject) => {
     const timer = setTimeout(() => reject(coded("WS_CONNECT_TIMEOUT")), 15_000);
     ws.onopen = () => { clearTimeout(timer); done(); }; ws.onerror = () => { clearTimeout(timer); reject(coded("WS_CONNECT_FAILED")); };

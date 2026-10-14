@@ -4,7 +4,7 @@ import { chmod, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parseArgs, parseNativeEvidence, parseReadiness, readReadiness, evaluateVerification, nativeCounts } from "./evidence.mjs";
-import { RpcClient } from "./run-matrix.mjs";
+import { openClient, RpcClient } from "./run-matrix.mjs";
 
 const h = (character) => character.repeat(64);
 const combo = { provider: "claude", status: "pending", nodeVersion: "24.18.0", os: "macOS 25.5.0 arm64", sdkVersion: "0.3.220", claudeCliVersion: "2.1.220", capabilities: ["interrupt"] };
@@ -73,4 +73,55 @@ test("terminal events received before start RPC response are retained", async ()
   const client = new RpcClient(ws);
   client.handleFrame({ type: "event", event: { type: "turn.completed", payload: { turnId: "fast" } } });
   assert.equal((await client.waitTerminal("fast", 1)).type, "turn.completed");
+});
+
+test("matrix client sends the exact loopback Origin through real HTTP/WebSocket auth", { timeout: 5_000 }, async () => {
+  const { createServer } = await import("node:http");
+  const { createRequire } = await import("node:module");
+  const require = createRequire(new URL("../../apps/mvp-host/package.json", import.meta.url));
+  const { WebSocketServer } = require("ws");
+  const server = createServer(async (request, response) => {
+    const chunks = [];
+    for await (const chunk of request) chunks.push(chunk);
+    const body = JSON.parse(Buffer.concat(chunks).toString() || "{}");
+    response.setHeader("content-type", "application/json");
+    if (request.url === "/api/pairing/exchange") {
+      assert.equal(body.token, "test-pairing-secret");
+      response.end(JSON.stringify({ credential: "fixture-credential" }));
+    } else if (request.url === "/api/auth/browser-session") {
+      assert.equal(body.credential, "fixture-credential");
+      response.setHeader("set-cookie", "flyx_session=fixture; HttpOnly");
+      response.end("{}");
+    } else if (request.url === "/api/auth/websocket-ticket") {
+      assert.equal(request.headers.cookie, "flyx_session=fixture");
+      response.end(JSON.stringify({ ticket: "fixture-ticket" }));
+    } else { response.statusCode = 404; response.end("{}"); }
+  });
+  const sockets = new WebSocketServer({ noServer: true });
+  let origin;
+  server.on("upgrade", (request, socket, head) => {
+    origin = request.headers.origin;
+    sockets.handleUpgrade(request, socket, head, (ws) => sockets.emit("connection", ws, request));
+  });
+  sockets.on("connection", (ws) => {
+    ws.on("message", (bytes) => {
+      const frame = JSON.parse(bytes.toString());
+      ws.send(JSON.stringify({ type: "response", id: frame.id, ok: true, payload: {} }));
+    });
+  });
+  let client;
+  try {
+    await new Promise((done) => server.listen(0, "127.0.0.1", done));
+    const baseUrl = "http://127.0.0.1:" + server.address().port;
+    client = await openClient({ baseUrl, token: "test-pairing-secret" });
+    assert.equal(origin, baseUrl);
+    const response = await client.call("host.probe", {});
+    assert.equal(response.ok, true);
+  } finally {
+    client?.close();
+    for (const ws of sockets.clients) ws.terminate();
+    await new Promise((done) => sockets.close(done));
+    server.closeIdleConnections();
+    await new Promise((done) => server.close(done));
+  }
 });

@@ -50,6 +50,9 @@ export type ControlResponse = {
 
 export type OrchestratorOptions = {
   workspace: string;
+  sessionId?: string;
+  ownsStore?: boolean;
+  recoverOnStart?: boolean;
   databasePath?: string;
   provider?: ProviderId;
   adapter?: ProviderAdapter;
@@ -57,7 +60,6 @@ export type OrchestratorOptions = {
   revalidateDevice?: (intent: ExecutionIntentRow) => void;
   /** Verified preparer/producer tree exit, independent of business terminal evidence. */
   canReleaseWorkspace?: (context: DispatchContext) => boolean;
-  recoverOnStart?: boolean;
   runtimeId?: string;
   owner?: HostOwnerHandle;
   store?: SqliteStore;
@@ -76,6 +78,8 @@ export class SessionOrchestrator {
   readonly store: SqliteStore;
   readonly views: HostViews | undefined = undefined;
   readonly owner: HostOwnerHandle;
+  readonly ownsStore: boolean;
+  readonly recoverOnStart: boolean;
   private activeWorkspaceLease: WorkspaceLease | undefined;
   private closed = false;
   readonly workspace: string;
@@ -100,6 +104,10 @@ export class SessionOrchestrator {
 
   constructor(options: OrchestratorOptions) {
     this.canReleaseWorkspace = options.canReleaseWorkspace ?? (() => false);
+    this.ownsStore = options.ownsStore ?? true;
+    this.recoverOnStart = options.recoverOnStart ?? true;
+    if (!this.ownsStore && (!options.owner || !options.store || !options.sessionId)) throw new Error("A shared Session runtime requires explicit owner, Store and Session ID");
+    if (!this.ownsStore && this.recoverOnStart) throw new Error("Shared Session runtimes cannot recover the Host on construction");
     const canonicalWorkspace = realpathSync(options.workspace);
     const provider = options.adapter?.provider ?? options.provider ?? "claude";
     const databasePath = options.databasePath ?? options.owner?.databasePath ?? ":memory:";
@@ -123,7 +131,10 @@ export class SessionOrchestrator {
       }
       this.store = openedStore = options.store ?? openOwned({ databasePath, owner: this.owner });
       this.owner.assertStorePath(this.store.db.name);
-      const existingSession = this.store.getCurrentSession();
+      const existingSession = options.sessionId ? this.store.getSession(options.sessionId) : this.store.getCurrentSession();
+      if (options.sessionId && !existingSession) throw new OrchestratorError("SESSION_NOT_FOUND", "Selected Session does not exist");
+      if (existingSession?.status === "archived") throw new OrchestratorError("SESSION_ARCHIVED", "Selected Session is archived");
+      if (!this.recoverOnStart && existingSession?.recoveryState === "blocked") throw new OrchestratorError("RECOVERY_BLOCKED", "Selected Session requires recovery before loading");
       if (existingSession && existingSession.workspacePath !== canonicalWorkspace) {
         throw new OrchestratorError("WORKSPACE_MISMATCH", "Persisted session belongs to a different configured workspace");
       }
@@ -172,8 +183,10 @@ export class SessionOrchestrator {
       // The Store is only assigned after ownership has been proven. A second
       // Host therefore cannot reach migration, recovery, or provider creation.
       this.views?.close();
-      openedStore?.close();
-      this.owner.release();
+      if (this.ownsStore) {
+        openedStore?.close();
+        this.owner.release();
+      }
       throw error;
     }
     this.runtimes = new RuntimeRegistry({ drainIngestion: () => this.ingestion.drain() });
@@ -201,7 +214,7 @@ export class SessionOrchestrator {
       drainIngestion: () => this.ingestion.drain(),
       failed: (error) => { if (error instanceof Error && !/^(DEVICE_|SCOPE_|PRE_DISPATCH_|DISPATCH_)/.test(error.message)) this.degraded = true; },
     });
-    if (options.recoverOnStart !== false) {
+    if (this.recoverOnStart) {
       // Native dispatch phases decide recovery before any pending intent can run.
       this.worker.start();
       const legacy = this.store.getActiveTurn(this.session.id);

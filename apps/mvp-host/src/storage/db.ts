@@ -10,7 +10,8 @@ import { ExecutionStore, toExecutionIntent, type RawExecutionIntent } from "./ex
 import { decideAcceptTurn } from "../orchestration/decider.js";
 import type { ApprovalDeliveryUpdate, CommandCommit, CommandFacts, CommandPlan, EventCommitRow, ExecutionIntentInput, ExecutionIntentRow, ExecutionIntentUpdate, NewTurn, RequestFormatVersion } from "../orchestration/command-contract.js";
 
-export type SessionRow = Session & {
+export type SessionRow = Omit<Session,"workspaceId"> & {
+  workspaceId: string;
   revision: number;
   activeTurnId?: string;
   recoveryState: "idle" | "blocked";

@@ -21,6 +21,7 @@ import type { DispatchContext } from "../provider/types.js";
 import type { ExecutionCheckpointBinding } from "../session/execution-integrations.js";
 import type { SessionRegistry } from "../session/session-registry.js";
 import type { SqliteStore } from "../storage/db.js";
+import type { WorkspaceRecord } from "../storage/catalog-store.js";
 import { validateInteractionSchema } from "../storage/migrations/008-interactions.js";
 import { validateRevertSchema } from "../storage/migrations/009-checkpoints.js";
 import { validateViewsSchema } from "../storage/migrations/006-views-schema.js";
@@ -30,10 +31,10 @@ import type { WorkspaceRegistry } from "../workspace/workspace-registry.js";
 import { CheckpointService } from "./checkpoint-service.js";
 import { CheckpointStore } from "./checkpoint-store.js";
 import { ControlledRestore, type ControlledRestoreOptions } from "./controlled-restore.js";
-import { bindingDigest, CheckpointGitDriver, validateCheckpointPath } from "./git-driver.js";
+import { bindingDigest, CheckpointGitDriver, validateCheckpointPath, type CheckpointGitDriverOptions, type CheckpointGitRunner, type CheckpointGitRunRequest, type CheckpointGitRunResult } from "./git-driver.js";
 import { CheckpointPreviewService, type CheckpointPreviewContext, type LeaseSuccession } from "./preview-service.js";
 import { REVERT_INTENT_KIND, RevertService, type RevertServiceOptions } from "./revert-service.js";
-import { CheckpointError, type CheckpointContext } from "./types.js";
+import { CheckpointError, type CheckpointContext, type CheckpointPhase } from "./types.js";
 import type { NativeRevertPreparation } from "./revert-types.js";
 
 export type CheckpointScope = "session:read" | "session:write";
@@ -49,7 +50,16 @@ export type HostRevertPorts = Pick<RevertServiceOptions,
   /** Reload actual versioned evidence. Absence of this port never enables native rewind. */
   verifiedNativeCapabilities?(sessionId: string): Promise<readonly VerifiedRewindCapability[]>;
 };
+export type HostCheckpointGitBinding = Readonly<{
+  hostOwnerId: string; hostOwnerGeneration: number; workspaceId: string;
+  capture?: Readonly<Omit<CheckpointContext, "nativeHandle"> & { checkpointId: string; phase: CheckpointPhase }>;
+}>;
+export type HostCheckpointGitRunRequest = CheckpointGitRunRequest & Readonly<{ binding: HostCheckpointGitBinding }>;
+export type HostCheckpointGitRunner = (request: HostCheckpointGitRunRequest) => Promise<CheckpointGitRunResult>;
 export type HostCheckpointsOptions = {
+  /** Production supplies a managed runner which journals before launching final Git argv. */
+  runGit?: HostCheckpointGitRunner;
+  driverFactory?(workspace: Readonly<WorkspaceRecord>, options: CheckpointGitDriverOptions): CheckpointGitDriver;
   store: SqliteStore; owner: HostOwnerHandle;
   registry: Pick<SessionRegistry, "store" | "resolve" | "publishCommittedEvents">;
   workspaces: Pick<WorkspaceRegistry, "require">;
@@ -236,7 +246,7 @@ export class HostCheckpoints {
     try { return await Promise.race([wait(), new Promise<boolean>((resolve) => { timer = setTimeout(() => resolve(false), Math.max(0, deadlineMs)); })]); }
     finally { if (timer) clearTimeout(timer); }
   }
-  seal(): void { this.sealed = true; this.checkpoints.seal(); this.revert?.seal(); this.restore.seal(); }
+  seal(): void { this.sealed = true; for (const driver of this.drivers.values()) driver.seal(); this.checkpoints.seal(); this.revert?.seal(); this.restore.seal(); }
   private async drainRequests(): Promise<void> { while (this.requests.size) await Promise.allSettled([...this.requests]); }
   private assertOpen(): void { if (this.sealed) throw new CheckpointError("CHECKPOINT_SEALED", "Host checkpoint boundary is sealed"); this.options.owner.assertActive(); }
   private authorize(sessionId: string, actorId: string, scope: CheckpointScope): void {
@@ -266,7 +276,31 @@ export class HostCheckpoints {
     this.assertOpen(); const workspace = this.options.workspaces.require(workspaceId); const cached = this.drivers.get(workspaceId);
     if (cached && cached.workspace !== workspace.worktreeRoot) throw new CheckpointError("WORKSPACE_BINDING_CHANGED", "Registered Git checkout changed");
     if (cached) return cached;
-    const driver = new CheckpointGitDriver(workspace.worktreeRoot); this.drivers.set(workspaceId, driver); return driver;
+    const runner: CheckpointGitRunner | undefined = this.options.runGit ? async (request) => {
+      this.assertOpen(); const actual = this.options.workspaces.require(workspaceId);
+      if (request.workspace !== actual.worktreeRoot) throw new CheckpointError("WORKSPACE_BINDING_CHANGED", "Git runner belongs to another registered checkout");
+      let capture: HostCheckpointGitBinding["capture"]; let captureContext: CheckpointContext | undefined;
+      if (request.operation.kind === "capture") {
+        const manifest = this.checkpoints.store.get(request.operation.checkpointId);
+        if (!manifest || manifest.workspaceId !== workspaceId || manifest.status !== "capturing") throw new CheckpointError("CHECKPOINT_CONTEXT_INVALID", "Git capture has no original capturing journal");
+        captureContext = { sessionId: manifest.sessionId, workspaceId, lease: { ...manifest.lease }, sessionRevision: manifest.sessionRevision,
+          epoch: manifest.epoch, runtimeGeneration: manifest.runtimeGeneration, nativeHandle: manifest.nativeHandle,
+          ...(manifest.turnId ? { turnId: manifest.turnId } : {}), ...(manifest.attemptId ? { attemptId: manifest.attemptId } : {}) };
+        this.assertLease(captureContext);
+        capture = Object.freeze({ checkpointId: manifest.checkpointId, phase: manifest.phase, sessionId: manifest.sessionId, workspaceId,
+          ...(manifest.turnId ? { turnId: manifest.turnId } : {}), ...(manifest.attemptId ? { attemptId: manifest.attemptId } : {}),
+          lease: Object.freeze({ ...manifest.lease }), sessionRevision: manifest.sessionRevision, epoch: manifest.epoch, runtimeGeneration: manifest.runtimeGeneration });
+      }
+      const binding: HostCheckpointGitBinding = Object.freeze({ hostOwnerId: this.options.owner.ownerId, hostOwnerGeneration: this.options.owner.generation, workspaceId, ...(capture ? { capture } : {}) });
+      const result = await this.options.runGit!(Object.freeze({ ...request, binding })); this.assertOpen();
+      if (captureContext) this.assertLease(captureContext); return result;
+    } : undefined;
+    const driverOptions: CheckpointGitDriverOptions = runner ? { runGit: runner } : {};
+    const record = Object.freeze({ ...workspace, capabilities: [...workspace.capabilities] });
+    const driver = this.options.driverFactory?.(record, driverOptions) ?? new CheckpointGitDriver(workspace.worktreeRoot, driverOptions);
+    if (driver.workspace !== workspace.worktreeRoot) throw new CheckpointError("WORKSPACE_BINDING_CHANGED", "Checkpoint driver factory returned another checkout");
+    if (runner && !driver.usesGitRunner(runner)) throw new CheckpointError("CHECKPOINT_MANAGED_GIT_REQUIRED", "Checkpoint driver factory omitted the managed runner");
+    this.drivers.set(workspaceId, driver); return driver;
   }
   private assertActualLease(lease: WorkspaceLease, workspaceId: string, token: CheckpointContext["lease"]): void {
     this.assertOpen(); lease.assertActive();

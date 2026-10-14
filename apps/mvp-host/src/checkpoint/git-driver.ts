@@ -1,4 +1,5 @@
 import { execFile } from "node:child_process";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash } from "node:crypto";
 import { constants } from "node:fs";
 import type { Stats } from "node:fs";
@@ -20,7 +21,26 @@ export type CheckpointTreeEntry = { path: string; mode: string; oid: string };
 type TreeEntry = { path: string; mode: string; oid: string; stage?: number };
 type Repo = { root: string; gitDirectory: string; indexPath: string };
 type Sample = { fingerprint: CheckpointFingerprint; entries: CheckpointEntry[]; indexEntries: TreeEntry[]; headEntries: TreeEntry[]; unsupported: Array<{ path?: string; reason: string }>; readRaced: boolean };
+export type CheckpointGitOperation = Readonly<
+  { kind: "capture"; checkpointId: string } | { kind: "fingerprint" } |
+  { kind: "verify"; checkpointId: string; layer: "workspace" | "index" } |
+  { kind: "diff"; diffId: string } | { kind: "resolve_commit" } | { kind: "list_tree" } |
+  { kind: "blob" } | { kind: "patch"; fileId: string }
+>;
+export type CheckpointGitRunRequest = Readonly<{
+  command: "git"; args: readonly string[]; cwd: string; workspace: string;
+  /** Final fixed overrides only: an injected runner must not merge arbitrary Host environment. */
+  env: Readonly<Record<string, string>>;
+  /** A frozen value snapshot; raw mutable byte views never cross this boundary. */
+  input?: Readonly<{ encoding: "base64"; data: string; bytes: number }>;
+  maxInputBytes: number; maxBuffer: number; timeoutMs: number; signal: AbortSignal;
+  operation: CheckpointGitOperation;
+}>;
+export type CheckpointGitRunResult = { stdout: Uint8Array; exitCode: number };
+/** Trusted prelaunch runner journals before spawn and proves its own lifecycle/containment contract. */
+export type CheckpointGitRunner = (request: CheckpointGitRunRequest) => Promise<CheckpointGitRunResult>;
 export type CheckpointGitDriverOptions = {
+  runGit?: CheckpointGitRunner;
   maxFileBytes?: number; maxCaptureBytes?: number; maxFiles?: number;
   /** Deterministic fault/barrier seam; production callers normally omit it. */
   onBoundary?: (boundary: "workspace_read" | "refs_written") => Promise<void>;
@@ -89,12 +109,24 @@ export class CheckpointGitDriver {
   private readonly maxFileBytes: number;
   private readonly maxCaptureBytes: number;
   private readonly maxFiles: number;
+  private readonly operations = new AsyncLocalStorage<CheckpointGitOperation>();
+  private readonly lifecycle = new AbortController();
   constructor(readonly workspace: string, private readonly options: CheckpointGitDriverOptions = {}) {
     this.maxFileBytes = options.maxFileBytes ?? 64 * 1024 * 1024;
     this.maxCaptureBytes = options.maxCaptureBytes ?? 512 * 1024 * 1024;
     this.maxFiles = options.maxFiles ?? 100_000;
   }
-  async capture(checkpointId: string, additionalPaths: readonly string[] = []): Promise<GitCapture> {
+  usesGitRunner(runner: CheckpointGitRunner): boolean { return this.options.runGit === runner; }
+  /** Cancellation asks the actual runner to stop; it is not descendant-stop proof. */
+  seal(): void { this.lifecycle.abort(); }
+  private operation<T>(operation: CheckpointGitOperation, work: () => Promise<T>): Promise<T> {
+    if (this.lifecycle.signal.aborted) return Promise.reject(new CheckpointError("CHECKPOINT_GIT_SEALED", "Checkpoint Git execution is sealed"));
+    return this.operations.run(this.operations.getStore() ?? Object.freeze(operation), work);
+  }
+  capture(checkpointId: string, additionalPaths: readonly string[] = []): Promise<GitCapture> {
+    return this.operation({ kind: "capture", checkpointId }, () => this.captureSnapshot(checkpointId, additionalPaths));
+  }
+  private async captureSnapshot(checkpointId: string, additionalPaths: readonly string[]): Promise<GitCapture> {
     if (!ID.test(checkpointId)) throw new CheckpointError("INVALID_CHECKPOINT_ID", "Checkpoint refs must use a generated ID");
     const repo = await this.repo(); const temp = await mkdtemp(join(tmpdir(), "flyx-checkpoint-"));
     const copiedIndex = join(temp, "index"); const workspaceIndex = join(temp, "workspace-index");
@@ -155,7 +187,10 @@ export class CheckpointGitDriver {
     } finally { await rm(temp, { recursive: true, force: true }); }
   }
   /** Revalidation reads real bytes but neither stages files nor writes Git objects/refs. */
-  async fingerprint(additionalPaths: readonly string[] = []): Promise<CheckpointFingerprint> {
+  fingerprint(additionalPaths: readonly string[] = []): Promise<CheckpointFingerprint> {
+    return this.operation({ kind: "fingerprint" }, () => this.sampleFingerprint(additionalPaths));
+  }
+  private async sampleFingerprint(additionalPaths: readonly string[]): Promise<CheckpointFingerprint> {
     const repo = await this.repo(); const temp = await mkdtemp(join(tmpdir(), "flyx-checkpoint-sample-"));
     try {
       const sample = await this.sample(repo, join(temp, "index"), false, additionalPaths);
@@ -167,7 +202,10 @@ export class CheckpointGitDriver {
     if (!ID.test(checkpointId)) throw new CheckpointError("INVALID_CHECKPOINT_ID", "Checkpoint refs must use a generated ID");
     return `refs/flyx/checkpoints/${checkpointId}/${layer}`;
   }
-  async verify(manifest: CheckpointManifest, layer: "workspace" | "index"): Promise<string> {
+  verify(manifest: CheckpointManifest, layer: "workspace" | "index"): Promise<string> {
+    return this.operation({ kind: "verify", checkpointId: manifest.checkpointId, layer }, () => this.verifyTree(manifest, layer));
+  }
+  private async verifyTree(manifest: CheckpointManifest, layer: "workspace" | "index"): Promise<string> {
     const expected = layer === "workspace" ? manifest.workspaceTree : manifest.indexTree;
     const ref = layer === "workspace" ? manifest.workspaceRef : manifest.indexRef;
     if (!expected || ref !== this.ref(manifest.checkpointId, layer)) throw new CheckpointError("CAPTURE_UNAVAILABLE", "Checkpoint has no retained tree for this layer");
@@ -175,27 +213,42 @@ export class CheckpointGitDriver {
     if (!actual || actual.toString("ascii").trim() !== expected) throw new CheckpointError("CAPTURE_UNAVAILABLE", "Checkpoint ref is missing or changed");
     return expected;
   }
-  async diff(beforeTree: string, afterTree: string, diffId: string): Promise<CheckpointDiffEntry[]> {
+  diff(beforeTree: string, afterTree: string, diffId: string): Promise<CheckpointDiffEntry[]> {
+    return this.operation({ kind: "diff", diffId }, () => this.diffTrees(beforeTree, afterTree, diffId));
+  }
+  private async diffTrees(beforeTree: string, afterTree: string, diffId: string): Promise<CheckpointDiffEntry[]> {
     this.assertOid(beforeTree); this.assertOid(afterTree);
     const raw = await this.objectGit(["diff-tree", "--no-commit-id", "-r", "--raw", "-z", "--no-abbrev", "--no-ext-diff", "--no-textconv", "-M", "-C", "--find-copies-harder", beforeTree, afterTree, "--"]);
     return parseCheckpointTreeDiff(raw!).map((entry, position) => ({ ...entry, position, fileId: digest(`${diffId}\0${position}\0${entry.oldPath ?? ""}\0${entry.path}`) }));
   }
-  async resolveCommit(serverValidatedRef: string): Promise<string> {
+  resolveCommit(serverValidatedRef: string): Promise<string> {
+    return this.operation({ kind: "resolve_commit" }, () => this.resolveCommitOid(serverValidatedRef));
+  }
+  private async resolveCommitOid(serverValidatedRef: string): Promise<string> {
     if (!(OID.test(serverValidatedRef) || serverValidatedRef === "HEAD" || /^refs\/(?:heads|tags|remotes|flyx)\/[a-zA-Z0-9._/-]+$/.test(serverValidatedRef)) || serverValidatedRef.includes("..") || serverValidatedRef.includes("//")) {
       throw new CheckpointError("INVALID_GIT_REF", "Commit resolution requires a server-validated ref");
     }
     return this.oid(await this.git(["rev-parse", "--verify", "--end-of-options", `${serverValidatedRef}^{commit}`]));
   }
-  async listTree(treeOrCommitOid: string): Promise<CheckpointTreeEntry[]> {
+  listTree(treeOrCommitOid: string): Promise<CheckpointTreeEntry[]> {
+    return this.operation({ kind: "list_tree" }, () => this.readTreeEntries(treeOrCommitOid));
+  }
+  private async readTreeEntries(treeOrCommitOid: string): Promise<CheckpointTreeEntry[]> {
     this.assertOid(treeOrCommitOid);
     return treeEntries((await this.git(["ls-tree", "-r", "-z", treeOrCommitOid]))!);
   }
-  async blob(oid: string): Promise<Buffer | undefined> {
+  blob(oid: string): Promise<Buffer | undefined> {
+    return this.operation({ kind: "blob" }, () => this.readBlob(oid));
+  }
+  private async readBlob(oid: string): Promise<Buffer | undefined> {
     if (ZERO_OID.test(oid)) return undefined;
     this.assertOid(oid);
     return await this.git(["cat-file", "blob", oid], { maxBytes: this.maxFileBytes });
   }
-  async patch(beforeTree: string, afterTree: string, entry: CheckpointDiffEntry): Promise<Buffer> {
+  patch(beforeTree: string, afterTree: string, entry: CheckpointDiffEntry): Promise<Buffer> {
+    return this.operation({ kind: "patch", fileId: entry.fileId }, () => this.readPatch(beforeTree, afterTree, entry));
+  }
+  private async readPatch(beforeTree: string, afterTree: string, entry: CheckpointDiffEntry): Promise<Buffer> {
     this.assertOid(beforeTree); this.assertOid(afterTree); validateCheckpointPath(entry.path);
     if (entry.oldPath) validateCheckpointPath(entry.oldPath);
     return (await this.objectGit(["diff", "--no-ext-diff", "--no-textconv", "--no-color", "--unified=3", "-M", beforeTree, afterTree, "--", ...(entry.oldPath ? [entry.oldPath] : []), entry.path], { maxBytes: Math.min(this.maxCaptureBytes, 64 * 1024 * 1024) }))!;
@@ -350,25 +403,44 @@ export class CheckpointGitDriver {
     try { return (await this.git(args, { ...options, gitDirectory, worktree: temp, index: options.index ?? join(temp, "empty-index") }))!; }
     finally { await rm(temp, { recursive: true, force: true }); }
   }
-  private git(args: string[], options: { gitDirectory?: string; worktree?: string; index?: string; input?: Buffer; maxBytes?: number; allowFailure?: boolean; commitIdentity?: boolean } = {}): Promise<Buffer | undefined> {
-    const env: NodeJS.ProcessEnv = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith("GIT_")));
-    Object.assign(env, { GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null", GIT_OPTIONAL_LOCKS: "0", GIT_TERMINAL_PROMPT: "0", GIT_PAGER: "cat", GIT_NO_REPLACE_OBJECTS: "1", GIT_NO_LAZY_FETCH: "1" });
+  private async git(args: string[], options: { gitDirectory?: string; worktree?: string; index?: string; input?: Buffer; maxBytes?: number; allowFailure?: boolean; commitIdentity?: boolean } = {}): Promise<Buffer | undefined> {
+    if (this.lifecycle.signal.aborted) throw new CheckpointError("CHECKPOINT_GIT_SEALED", "Checkpoint Git execution is sealed");
+    const env: Record<string, string> = { GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null", GIT_OPTIONAL_LOCKS: "0", GIT_TERMINAL_PROMPT: "0", GIT_PAGER: "cat", GIT_NO_REPLACE_OBJECTS: "1", GIT_NO_LAZY_FETCH: "1" };
     if (options.index) env.GIT_INDEX_FILE = options.index;
     if (options.gitDirectory) env.GIT_DIR = options.gitDirectory;
     if (options.worktree) env.GIT_WORK_TREE = options.worktree;
     if (options.commitIdentity) Object.assign(env, { GIT_AUTHOR_NAME: "Flyx Checkpoint", GIT_AUTHOR_EMAIL: "checkpoint@flyx.invalid", GIT_COMMITTER_NAME: "Flyx Checkpoint", GIT_COMMITTER_EMAIL: "checkpoint@flyx.invalid" });
+    const input = options.input ? Object.freeze({ encoding: "base64" as const, data: options.input.toString("base64"), bytes: options.input.length }) : undefined;
+    const request: CheckpointGitRunRequest = Object.freeze({ command: "git", args: Object.freeze([...CONFIG.flatMap((config) => ["-c", config]), ...args]),
+      cwd: options.worktree ?? this.workspace, workspace: this.workspace, env: Object.freeze(env), ...(input ? { input } : {}), maxInputBytes: input?.bytes ?? 0,
+      maxBuffer: options.maxBytes ?? 32 * 1024 * 1024, timeoutMs: 30_000, signal: this.lifecycle.signal,
+      operation: this.operations.getStore() ?? Object.freeze({ kind: "fingerprint" as const }),
+    });
+    let result: CheckpointGitRunResult;
+    try { result = await (this.options.runGit ?? ((value) => this.legacyRunGit(value)))(request); }
+    catch (error) {
+      if (error instanceof CheckpointError) throw error;
+      throw new CheckpointError("GIT_OPERATION_FAILED", `Checkpoint Git ${args[0] ?? "operation"} failed`);
+    }
+    if (this.lifecycle.signal.aborted) throw new CheckpointError("CHECKPOINT_GIT_SEALED", "Checkpoint Git execution is sealed");
+    if (!result || !Number.isSafeInteger(result.exitCode) || result.exitCode < 0 || result.exitCode > 255 || !(result.stdout instanceof Uint8Array)) throw new CheckpointError("GIT_RUNNER_RESULT_INVALID", "Git runner returned an invalid completion result");
+    if (result.stdout.length > request.maxBuffer) throw new CheckpointError("GIT_OUTPUT_BUDGET_EXCEEDED", "Git runner exceeded its output budget");
+    if (result.exitCode !== 0) {
+      if (options.allowFailure) return undefined;
+      throw new CheckpointError("GIT_OPERATION_FAILED", `Checkpoint Git ${args[0] ?? "operation"} failed`);
+    }
+    return Buffer.from(result.stdout);
+  }
+  /** Compatibility only. Production Host composition supplies the tracked prelaunch runner. */
+  private legacyRunGit(request: CheckpointGitRunRequest): Promise<CheckpointGitRunResult> {
+    const inherited = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith("GIT_") && !/^(?:DYLD_|LD_|GCONV_PATH$|GLIBC_TUNABLES$|LOCPATH$)/.test(key)));
     return new Promise((resolveResult, reject) => {
-      const child = execFile("git", [...CONFIG.flatMap((config) => ["-c", config]), ...args], {
-        cwd: options.worktree ?? this.workspace, env, encoding: "buffer", timeout: 30_000, maxBuffer: options.maxBytes ?? 32 * 1024 * 1024,
-      }, (error, stdout) => {
-        if (error) {
-          if (options.allowFailure && typeof error.code === "number") { resolveResult(undefined); return; }
-          reject(new CheckpointError("GIT_OPERATION_FAILED", `Checkpoint Git ${args[0] ?? "operation"} failed`)); return;
-        }
-        resolveResult(stdout);
+      const child = execFile(request.command, [...request.args], { cwd: request.cwd, env: { ...inherited, ...request.env }, encoding: "buffer", timeout: request.timeoutMs, maxBuffer: request.maxBuffer, signal: request.signal }, (error, stdout) => {
+        if (error && typeof error.code !== "number") { reject(error); return; }
+        resolveResult({ stdout, exitCode: error ? Number(error.code) : 0 });
       });
-      child.stdin?.on("error", () => { /* The exec callback reports a closed/failed command. */ });
-      child.stdin?.end(options.input);
+      child.stdin?.on("error", () => { /* Completion reports a closed/failed command. */ });
+      child.stdin?.end(request.input ? Buffer.from(request.input.data, "base64") : undefined);
     });
   }
 }

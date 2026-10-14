@@ -1,15 +1,76 @@
+import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { chmod, lstat, mkdir, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { CheckpointGitDriver } from "./git-driver.js";
+import { CheckpointGitDriver, type CheckpointGitRunRequest, type CheckpointGitRunResult } from "./git-driver.js";
 import { fixtureGit, removeFixture, temporaryRepository, userGitState } from "./test-support.js";
 
 const roots: string[] = [];
 async function repository(unborn = false): Promise<string> { const root = await temporaryRepository(unborn); roots.push(root); return root; }
 afterEach(async () => { for (const root of roots.splice(0)) await removeFixture(root); });
 
+async function runGitFixture(request: CheckpointGitRunRequest): Promise<CheckpointGitRunResult> {
+  return new Promise((resolve, reject) => {
+    const child = execFile(request.command, [...request.args], { cwd: request.cwd, env: { ...request.env }, encoding: "buffer", timeout: request.timeoutMs, maxBuffer: request.maxBuffer, signal: request.signal }, (error, stdout) => {
+      if (error && typeof error.code !== "number") { reject(error); return; }
+      resolve({ stdout, exitCode: error ? Number(error.code) : 0 });
+    });
+    child.stdin?.on("error", () => {}); child.stdin?.end(request.input ? Buffer.from(request.input.data, "base64") : undefined);
+  });
+}
+function barrier<T = void>() { let resolve!: (value: T) => void; const promise = new Promise<T>((yes) => { resolve = yes; }); return { promise, resolve }; }
+
 describe("controlled checkpoint Git driver", { timeout: 30_000 }, () => {
+  it("registers immutable final Git requests before launch with isolated environment and stdin budgets", async () => {
+    const root = await realpath(await repository()), records: CheckpointGitRunRequest[] = [], boundaries: string[] = [];
+    const originalSecret = process.env.FLYX_CHECKPOINT_GIT_SECRET, originalIndex = process.env.GIT_INDEX_FILE;
+    const user = await userGitState(root);
+    process.env.FLYX_CHECKPOINT_GIT_SECRET = "Host-only-test-value"; process.env.GIT_INDEX_FILE = "/unrelated/client-index";
+    const id = randomUUID();
+    try {
+      const driver = new CheckpointGitDriver(root, { runGit: async (request) => {
+        expect(Object.isFrozen(request)).toBe(true); expect(Object.isFrozen(request.args)).toBe(true); expect(Object.isFrozen(request.env)).toBe(true); expect(Object.isFrozen(request.operation)).toBe(true);
+        expect(request.workspace).toBe(root); expect(request.command).toBe("git"); expect(request.timeoutMs).toBe(30_000); expect(request.maxBuffer).toBeGreaterThan(0);
+        expect(request.env.FLYX_CHECKPOINT_GIT_SECRET).toBeUndefined(); expect(request.env.GIT_INDEX_FILE).not.toBe("/unrelated/client-index"); expect(request.env.GIT_CONFIG_GLOBAL).toBe("/dev/null"); expect(request.env.GIT_CONFIG_NOSYSTEM).toBe("1"); expect(request.env.GIT_OPTIONAL_LOCKS).toBe("0");
+        expect(request.args.slice(0, 4)).toEqual(["-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null"]); expect(request.operation).toEqual({ kind: "capture", checkpointId: id });
+        if (request.input) { expect(Object.isFrozen(request.input)).toBe(true); expect(Buffer.from(request.input.data, "base64").length).toBe(request.input.bytes); expect(request.maxInputBytes).toBe(request.input.bytes); expect(() => Reflect.set(request.input!, "data", "changed")).not.toThrow(); expect(Reflect.set(request.input, "data", "changed")).toBe(false); }
+        records.push(request); boundaries.push("registered");
+        expect(records.at(-1)).toBe(request); boundaries.push("process-boundary"); return runGitFixture(request);
+      } });
+      const capture = await driver.capture(id); expect(capture.status).toBe("complete");
+      expect(records.some((request) => request.args.includes("hash-object") && request.args.includes("--no-filters") && request.input?.bytes)).toBe(true);
+      expect(records.some((request) => request.args.includes("update-index") && request.env.GIT_INDEX_FILE && request.env.GIT_WORK_TREE === request.cwd && request.cwd !== root)).toBe(true);
+      expect(boundaries.every((value, index) => value === (index % 2 ? "process-boundary" : "registered"))).toBe(true);
+    } finally { if (originalSecret === undefined) delete process.env.FLYX_CHECKPOINT_GIT_SECRET; else process.env.FLYX_CHECKPOINT_GIT_SECRET = originalSecret; if (originalIndex === undefined) delete process.env.GIT_INDEX_FILE; else process.env.GIT_INDEX_FILE = originalIndex; }
+    expect(await userGitState(root)).toEqual(user);
+  });
+  it("keeps concurrent historical blob reads separate from a suspended capture context", async () => {
+    const root = await repository(), entered = barrier(), release = barrier(), records: CheckpointGitRunRequest[] = [];
+    const oid = (await fixtureGit(root, ["rev-parse", "HEAD:tracked.txt"])).toString().trim(); let held = false;
+    const driver = new CheckpointGitDriver(root, { runGit: async (request) => {
+      records.push(request); if (request.operation.kind === "capture" && !held) { held = true; entered.resolve(); await release.promise; } return runGitFixture(request);
+    } });
+    const id = randomUUID(), capture = driver.capture(id); await entered.promise;
+    expect((await driver.blob(oid))?.toString()).toBe("committed\n"); expect(records.filter((request) => request.args.includes("cat-file")).map((request) => request.operation)).toEqual([{ kind: "blob" }]);
+    release.resolve(); expect((await capture).status).toBe("complete");
+    expect(records.filter((request) => !request.args.includes("cat-file")).every((request) => request.operation.kind === "capture" && request.operation.checkpointId === id)).toBe(true);
+  });
+  it("does not reinterpret launch rejection as unborn HEAD and rejects output budget violations", async () => {
+    const root = await repository(true);
+    const driver = new CheckpointGitDriver(root, { runGit: async (request) => {
+      if (request.args.includes("--verify") && request.args.at(-1) === "HEAD") throw Object.assign(new Error("prelaunch journal failed"), { code: 128 }); return runGitFixture(request);
+    } });
+    await expect(driver.capture(randomUUID())).rejects.toMatchObject({ code: "GIT_OPERATION_FAILED" });
+    const bounded = new CheckpointGitDriver(root, { maxFileBytes: 3, runGit: async () => ({ stdout: Buffer.alloc(4), exitCode: 0 }) });
+    await expect(bounded.blob("a".repeat(40))).rejects.toMatchObject({ code: "GIT_OUTPUT_BUDGET_EXCEEDED" });
+  });
+  it("cancels a queued managed launch and rejects its late successful result after seal", async () => {
+    const root = await repository(), entered = barrier(), release = barrier(); let launched = 0; let signal: AbortSignal | undefined;
+    const driver = new CheckpointGitDriver(root, { runGit: async (request) => { signal = request.signal; entered.resolve(); await release.promise; if (!request.signal.aborted) launched++; return { stdout: Buffer.from(root), exitCode: 0 }; } });
+    const work = driver.capture(randomUUID()); await entered.promise; driver.seal(); expect(signal?.aborted).toBe(true); release.resolve();
+    await expect(work).rejects.toMatchObject({ code: "CHECKPOINT_GIT_SEALED" }); expect(launched).toBe(0); await expect(driver.fingerprint()).rejects.toMatchObject({ code: "CHECKPOINT_GIT_SEALED" });
+  });
   it("retains workspace/index independently without changing the user's staged index, HEAD or branch", async () => {
     const root = await repository();
     await writeFile(join(root, "tracked.txt"), "staged\n"); await fixtureGit(root, ["add", "--", "tracked.txt"]);

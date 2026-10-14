@@ -26,8 +26,8 @@ import { TimelineBackfill } from "../timeline/backfill.js";
 import { WorkspaceRegistry } from "../workspace/workspace-registry.js";
 import { WorkspaceLease } from "../workspace/workspace-lease.js";
 import { assertRestoreWriteReady } from "../operations/restore-service.js";
-import { bindingDigest } from "./git-driver.js";
-import { createHostCheckpoints, type CheckpointRpcContext, type HostCheckpointsOptions, type HostRevertPorts } from "./host-checkpoints.js";
+import { bindingDigest, CheckpointGitDriver, type CheckpointGitRunResult } from "./git-driver.js";
+import { createHostCheckpoints, type CheckpointRpcContext, type HostCheckpointsOptions, type HostRevertPorts, type HostCheckpointGitRunRequest, type HostCheckpointGitRunner } from "./host-checkpoints.js";
 import type { CheckpointPreviewContext } from "./preview-service.js";
 import type { NativeRevertDriver, NativeRevertProof, NativeRevertRequest, RevertOperation } from "./revert-types.js";
 import { fixtureGit, removeFixture, temporaryRepository, userGitState } from "./test-support.js";
@@ -114,7 +114,59 @@ async function fixture(input: { revert?: boolean; verified?: boolean; helper?: s
     setLease: (value: WorkspaceLease) => { lease = value; }, setActorAllowed: (value: boolean) => { actorAllowed = value; }, setNative: (value: unknown) => { currentNativeHandle = value; }, setRuntimeGeneration: (value: number) => { runtimeGeneration = value; }, setTimeout: (value: boolean) => { timeout = value; } };
 }
 
-describe("owned checkpoint production factory and RPC", () => {
+function managedGitFixture(store: ReturnType<typeof openOwned>, request: HostCheckpointGitRunRequest, registries: ManagedProcessRegistry[]): Promise<CheckpointGitRunResult> {
+  const capture = request.binding.capture;
+  const context: DispatchContext = { hostOwnerId: request.binding.hostOwnerId, hostOwnerGeneration: request.binding.hostOwnerGeneration,
+    runtimeId: "checkpoint-managed-query", runtimeGeneration: capture?.runtimeGeneration ?? 0, attemptId: capture?.attemptId ?? randomUUID(),
+    sessionId: capture?.sessionId ?? "checkpoint-read", flyxTurnId: capture?.turnId ?? capture?.checkpointId ?? "checkpoint-read" };
+  const registry = new ManagedProcessRegistry({ journal: new SqliteProcessJournal(store.db), context: () => context }); registries.push(registry);
+  return new Promise((resolve, reject) => {
+    if (request.signal.aborted) { reject(new Error("Managed Git launch cancelled")); return; }
+    const child = registry.spawn(request.command, request.args, { cwd: request.cwd, env: { ...request.env }, stdio: ["pipe", "pipe", "pipe"] });
+    const stdout: Buffer[] = []; let bytes = 0;
+    const abort = () => { child.kill("SIGKILL"); }; request.signal.addEventListener("abort", abort, { once: true });
+    const timer = setTimeout(abort, request.timeoutMs);
+    child.stderr?.resume(); child.stdin?.on("error", () => {});
+    child.stdout?.on("data", (data: Buffer) => { bytes += data.length; if (bytes > request.maxBuffer) abort(); else stdout.push(data); });
+    child.once("error", reject);
+    child.once("close", (code) => { clearTimeout(timer); request.signal.removeEventListener("abort", abort); if (code === null) reject(new Error("Managed Git outcome unknown")); else resolve({ stdout: Buffer.concat(stdout), exitCode: code }); });
+    child.stdin?.end(request.input ? Buffer.from(request.input.data, "base64") : undefined);
+  });
+}
+
+describe("owned checkpoint production factory and RPC", { timeout: 20_000 }, () => {
+  it("forwards tracked prelaunch Git with actual capture journal/lease binding and serves historical reads without that lease", async () => {
+    const f = await fixture(), requests: HostCheckpointGitRunRequest[] = [], registries: ManagedProcessRegistry[] = [];
+    cleanups.push(() => registries.forEach((registry) => registry.sealJournal()));
+    const runGit: HostCheckpointGitRunner = async (request) => {
+      expect(Object.isFrozen(request)).toBe(true); expect(Object.isFrozen(request.binding)).toBe(true);
+      expect(request.binding.hostOwnerId).toBe(f.owner.ownerId); expect(request.binding.hostOwnerGeneration).toBe(f.owner.generation); expect(request.binding.workspaceId).toBe(f.session.workspaceId);
+      expect(request.workspace).toBe(f.workspaces.require(f.session.workspaceId).worktreeRoot);
+      if (request.operation.kind === "capture") {
+        const manifest = f.host.checkpoints.store.get(request.operation.checkpointId)!;
+        expect(manifest.status).toBe("capturing"); expect(request.binding.capture).toMatchObject({ checkpointId: manifest.checkpointId, sessionId: f.session.sessionId, epoch: manifest.epoch, lease: f.currentContext().lease });
+        expect(Object.isFrozen(request.binding.capture!.lease)).toBe(true); expect(JSON.stringify(request.binding)).not.toContain("private-native-id"); expect(Object.hasOwn(request.binding.capture!, "nativeHandle")).toBe(false);
+      } else expect(request.binding.capture).toBeUndefined();
+      requests.push(request); return managedGitFixture(f.store, request, registries);
+    };
+    const factory = vi.fn((workspace, options) => new CheckpointGitDriver(workspace.worktreeRoot, options));
+    const host = await createHostCheckpoints({ ...f.options, runGit, driverFactory: factory }); cleanups.push(() => host.seal());
+    const state = await userGitState(f.root), before = await host.checkpoints.captureCurrent(f.currentContext(), "preview"); await writeFile(join(f.root, "tracked.txt"), "managed historical after\n"); const after = await host.checkpoints.captureCurrent(f.currentContext(), "preview");
+    expect(before.status).toBe("complete"); expect(after.status).toBe("complete"); expect(await userGitState(f.root)).toEqual(state);
+    const readOptions = { ...f.options, runGit, runtimeState: () => { throw new Error("No runtime for historical reads"); }, leaseForContext: () => { throw new Error("No lease for historical reads"); } };
+    const reader = await createHostCheckpoints(readOptions); cleanups.push(() => reader.seal());
+    const page = await reader.dispatchCheckpoint({ id: "managed-diff", method: "checkpoint.getDiff", payload: { sessionId: f.session.sessionId, beforeCheckpointId: before.checkpointId, afterCheckpointId: after.checkpointId } }, f.rpcContext()); if (!page.handled) throw new Error("NOT_HANDLED"); const diff = CheckpointDiffPageSchema.parse(page.payload);
+    const content = await reader.dispatchCheckpoint({ id: "managed-file", method: "checkpoint.getFile", payload: { sessionId: f.session.sessionId, diffId: diff.diffId, fileId: diff.files[0]!.fileId } }, f.rpcContext()); if (!content.handled) throw new Error("NOT_HANDLED"); expect(CheckpointDiffFileSchema.parse(content.payload).after).toMatchObject({ text: "managed historical after\n" });
+    expect(factory).toHaveBeenCalledTimes(1); expect(requests.some((request) => request.operation.kind === "blob")).toBe(true); expect(requests.some((request) => request.operation.kind === "patch")).toBe(true); expect(requests.some((request) => request.operation.kind === "diff")).toBe(true);
+    expect(f.store.db.prepare("SELECT COUNT(*) AS n FROM managed_processes WHERE owner_id=? AND state='root_exited'").get(f.owner.ownerId)).toEqual({ n: requests.length }); expect(f.runtimeFactory).not.toHaveBeenCalled();
+  });
+  it("fails rejected managed Git before completing a capture and refuses a factory that drops the runner", async () => {
+    const f = await fixture(); const runGit: HostCheckpointGitRunner = async () => { throw new Error("prelaunch journal failure"); };
+    const host = await createHostCheckpoints({ ...f.options, runGit }); cleanups.push(() => host.seal());
+    const before = await userGitState(f.root); const result = await host.checkpoints.captureCurrent(f.currentContext(), "preview"); expect(result.status).toBe("failed"); expect(result.errorCode).toBe("GIT_OPERATION_FAILED"); expect(host.checkpoints.store.get(result.checkpointId)?.status).toBe("failed"); expect(await userGitState(f.root)).toEqual(before);
+    const bad = await createHostCheckpoints({ ...f.options, runGit, driverFactory: (workspace) => new CheckpointGitDriver(workspace.worktreeRoot) }); cleanups.push(() => bad.seal());
+    await expect(bad.capabilitiesForSession(f.session.sessionId, "device-1")).rejects.toMatchObject({ code: "CHECKPOINT_MANAGED_GIT_REQUIRED" });
+  });
   it("uses the owned schema-10 migration path and validates readiness without schema writes", async () => {
     const f = await fixture(); const before = f.store.db.prepare("SELECT sql FROM sqlite_master ORDER BY name").all();
     expect(SUPPORTED_SCHEMA_VERSION).toBe(10); expect(inspectSchema(f.store.db).version).toBe(SUPPORTED_SCHEMA_VERSION);

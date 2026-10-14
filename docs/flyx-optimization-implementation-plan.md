@@ -800,28 +800,30 @@ B01–B05 来自前一轮定向复现，本轮增加 B06–B09。当前已有构
 
 | 批次 | 当前状态 | 已集成提交 / 验证 | 剩余验收 |
 | --- | --- | --- | --- |
-| R01 | 已完成并推送 | `4a46642`：Git 19、Timeline 14；`5eddded`：清洁副本 build、生产/测试类型检查、产品与 fixture 检查通过 | 后续批次继续沿用统一验证入口；浏览器仅发现 24 用例，尚未执行 |
+| R01 | 已完成并推送 | `4a46642`：Git 19、Timeline 14；`5eddded`：清洁副本 build、生产/测试类型检查、产品与 fixture 检查通过 | 后续沿用统一验证入口；本轮真实 Chrome 已通过 29 用例，详见 Web 浏览器验收记录 |
 | R02 | 已完成并推送 | `866e407`：Host 192 通过、5 明确跳过；`49ac8ce`：内部运行绑定脱敏，相关 16 用例与类型检查通过 | R03 接入真实 owner，R05/R06 接入持久 attempt；真实 Provider 契约随 R15 验收 |
 | R03 | 所有权基础已集成并推送 | `bdd21d6`、`ad9b0f0`、`ff5c2dc`、`4ab9e49`、`f67181d`：原 owner、只读打开、显式恢复维护、004→006 迁移/重开检查 | 原 Host 硬崩溃的恢复入口补齐；原路径 lease 后续接 worktree |
 | R04 | 生产生命周期已合入，平台停止证明未完成 | `86febe3`：Adapter 管理进程、原始派发绑定、异步关闭和共享 Store/Views 归属 | macOS 后代停止仍为 unknown；真实 Provider 与整体入口验收 |
 | R05 | 原子引擎已集成并推送 | `5c34c20`、`3e5a4c5`：owner/lease 接入、命令故障矩阵和冻结旧版本迁移 fixture | 其它批次继续使用同一原子提交入口 |
-| R06 | 核心及执行钩子已合入 | `5ec7a3c`、`c2e0bbd`、`8feef42`：Worker、Checkpoint 钩子、明确停止后解除保留运行绑定 | 泛化 operation 工厂、多 Session 和最终关闭合并验收 |
-| R07 | Host/RPC/离线恢复入口已合入 | `7be14c7`：原尝试证据、已知结果与执行 gate 分离、硬崩溃维护和 typed client | 多 Session 路由、可信版本/进程检查与真实 Native 证据 |
+| R06 | 核心、执行钩子和全局关闭边界已合入 | `5ec7a3c`、`c2e0bbd`、`8feef42`、`99801bb`：Worker、Checkpoint 钩子、明确停止后解除保留运行绑定；全局服务在 Store 关闭前排空和封闭 | 泛化 operation、最终入口和多 Session 整体关闭验收 |
+| R07 | Host/RPC/离线恢复及 Catalog 绑定已合入 | `7be14c7`、`b277134`：原尝试证据、已知结果与执行 gate 分离、硬崩溃维护、typed client；未加载 Session 可按原始 Catalog 身份读取恢复事实 | 主入口接通、可信版本/进程检查与真实 Native 证据；默认无可信版本清单 |
 | R08 | 模块已集成并推送，生产链路已接通 | `7e37d45`、`f67181d`、`59d7616`：正文引用、权限、006 SQL 和严格响应预算 | 最终 Web/原生大内容入口与整体回归 |
-| R09 | 生产链路已集成，合并验收中 | `bbf31d8`、`f4bfcf7`、`59d7616`：固定水位、epoch、万级历史、Direct/Relay 与磁盘重开 | 多 Session/Interaction 投影及最终浏览器验收 |
-| R10 | 共享核心及 Web 入口已合入 | `da7f23f`、`eee9af1`、`6222d68`：Replica、能力协商、引用、Session DTO 和只读回执核对 | Host 动态能力启用及真实浏览器闭环 |
-| R11 | Catalog 和协议模块已合入，生产工厂集成中 | `630da94`、`ee882b6`、`f361d9f`：007、离线导入、公开 DTO 与 SessionClient | 多 Session 工厂、legacy 固定路由、共享 Store 与运行时关闭 |
-| R12 | 共享核心及 Web 草稿入口已合入 | `1f26299`、`6222d68`：平台信号、runtime 归属、持久草稿、原子发送、本机清除与启动屏障 | 真实浏览器及手机后台恢复 |
-| R13 | 008 和生产 RPC/控制钩子已合入 | `54e8ae0`、`e132b32`、`f361d9f`：reservation、delivery、Question、审批卡片和原子终态伴随事件 | 多 Session 单投影 hook、Gateway 动态能力与真实答案回传 |
-| R14 | 模块和执行钩子已合入 | `916e3b2`、`c2e0bbd`、`f361d9f`：独立 index/workspace checkpoint、原始文件、终态后捕获、Diff 与预览 | 生产 factory/RPC/UI 接通及真实捕获验收 |
-| R15 | 模块及 owned operations 已合入 | `82096b9`、`3790ecb`、`ac5988b`、`1d47948`：doctor、备份恢复、固定产物、握手、restore 写 gate | 主入口/CLI 组合、双 Provider 与真机 |
+| R09 | 生产链路和共享投影已合入 | `bbf31d8`、`f4bfcf7`、`59d7616`、`eb302e4`：固定水位、epoch、万级历史、Direct/Relay、磁盘重开及共享 Interaction 投影；真实 Chrome 29 用例通过 | 主入口多 Session 组合验收 |
+| R10 | 共享核心、Web 和动态传输端口已合入 | `da7f23f`、`eee9af1`、`6222d68`、`7388cc6`：Replica、能力协商、引用、Session DTO、只读回执核对及当前服务能力协商；真实 Chrome 29 用例通过 | 主入口实际服务启用及真实 Provider 闭环 |
+| R11 | Catalog 生产工厂、协议和传输组合已合入 | `630da94`、`ee882b6`、`a409554`、`fed93dd`、`7388cc6`：007、离线导入、公开 DTO、SessionClient、延迟运行时与固定 legacy 默认；空库原子创建，已有多 Session 要求显式默认 | main 中央组合、只读启动与端到端多 Session 验收 |
+| R12 | 共享核心及 Web 草稿入口已合入并取得浏览器证据 | `1f26299`、`6222d68`、`b480bd5`：平台信号、runtime 归属、持久草稿、原子发送、本机清除与启动屏障；实际 IndexedDB 写失败与刷新恢复通过 | 手机后台与网络切换验收 |
+| R13 | 008、共享投影和生产传输端口已合入 | `54e8ae0`、`e132b32`、`f361d9f`、`eb302e4`、`7388cc6`：reservation、delivery、Question、审批卡片、原子终态伴随事件及当前 lease/Session 权限重查 | main 启用及真实 Native 答案回传 |
+| R14 | 模块、执行钩子、工厂及托管 Git 注入已合入 | `916e3b2`、`c2e0bbd`、`1335a0b`、`aaccfad`、`0e62b9a`：独立 index/workspace checkpoint、原始文件、Diff/预览 RPC、typed client；真实旧 schema fixture、历史只读查询和派发前不可变 Git 请求 | main/UI 接通及实际托管 Git/捕获验收；注入端口本身不构成停止证明 |
+| R15 | operations CLI、诊断主入口和 Relay 快照通道已合入 | `82096b9`、`3790ecb`、`ac5988b`、`1d47948`、`846c31a`、`93a10af`、`57ac6cb`、`04830fa`：doctor、备份恢复、固定产物、握手、restore 写 gate；实际 CLI 及恢复只读启动无需 Provider 预检 | Catalog 全局主入口组合、双 Provider 与真机；离线恢复仍需原始全部生产进程确已停止的独立证据 |
 | R16 | journal、受控恢复及 SQL 已合入 | `56465d0`、`8715b50`、`f361d9f`：分阶段恢复、安全点、恢复证据与 readiness fencing | 生产 factory/RPC/UI、托管 helper 与真实 Provider rewind |
-| R17 | 模块及 009 已合入，生产绑定开发中 | `233c2ac`、`f361d9f`：worktree 持久操作、原路径 lease 与隔离并发 | Catalog/Worker/RPC 接通、托管 Git 与真正停止证明 |
-| R18 | attention SQL 与 Expo 最小平台已合入 | `a27a056`、`de38bc5`、`f361d9f`：提醒事实/队列、010、安全凭据/deep link、共同核心 | Host 提醒工厂与实际推送、真机网络和后台恢复 |
+| R17 | 模块、Host 绑定、传输端口和公开客户端已合入 | `233c2ac`、`33587ee`、`9732372`、`7388cc6`：worktree 持久操作、原路径 lease、原始/恢复派发隔离、typed client 和作用域路由 | main 接通、托管 Git 与真正停止证明；缺少证明时写操作仍不可用 |
+| R18 | Host 提醒工厂、传输端口与 Expo 最小平台已合入 | `a27a056`、`de38bc5`、`52a3812`、`f0ea18a`、`7388cc6`：提醒事实/队列、010、安全凭据/deep link、原生 SessionClient 与共同核心；原子事实和全局提醒生命周期 | main 中央入口、实际推送、真机网络和后台恢复；默认无已配置推送服务 |
 
 当前仍为开发分支，M1/M2/M3 均未宣称发布完成。整套方案完成前，必须逐项核对第 18 节的退出条件，包括确定性故障、真实 Provider 和真机证据。
 
 2026-10-15 已集成基础的合并验证：Host 570 用例通过、5 个真实 Provider 用例明确跳过；client-core 101 用例、Web 26 用例通过，Host/client/Web 严格类型检查及 Host 构建通过。Host 测试使用本机临时监听和测试数据，禁用真实 Provider。后续生产端口、007–010 激活、多 Session 和原生平台提交继续进行独立合并验收，不能据此宣称完整十八批次已交付。
+
+2026-10-15 在 `04830fa` 合并源码上的完整 Host 回归：1,000 用例通过、0 失败、5 个真实 Provider 用例明确跳过；严格生产/测试类型检查与生产构建通过。包含真实 operations CLI、SQL 007–010 统一激活、Catalog/Recovery/Interaction/Attention/Worktree 生产端口、全局关闭及恢复只读启动。完整回归发现并修复了传输关闭重复调用，实际 HTTP 生命周期用例验证只关闭一次。共同核心 142、Web 52、Expo 83 用例通过。Chrome 的 29 用例在已合入新 Gateway 的 `b277134` 上通过，使用 `test-support/e2e-main.ts` 确定性 Host；不能作为产品 main 多 Session 或真实 Native 验收。报告保留于 `/private/tmp/flyx-final-merged-host-confirmed-20261015.json` 与 `/private/tmp/flyx-browser-merged-evidence-20261015/summary.json`。
 
 ## 20 客户端范围与交付优先级
 
@@ -837,6 +839,10 @@ B01–B05 来自前一轮定向复现，本轮增加 B06–B09。当前已有构
 
 开发优先级是共享核心与 Web 端到端闭环，再进行 Expo 最小平台验收。原生代码和模拟平台测试通过仅说明实现可继续集成；真机网络、凭据与后台恢复尚须实际证据。SecureStore 保护短凭据，普通 SQLite 的正文缓存不宣称已经加密。提醒点击后重新读取当前状态，不能直接提交过期动作；未知命令始终核对原回执，不能因为重新连上而自动重发。
 
-2026-10-15 合入最小原生平台及 Web 操作入口后的源码规模约为 5,000 行：共享客户端核心约 3,000 行，Web 约 1,200 行，Expo 约 700 行，不含测试和依赖锁文件。这个数字用于说明代码分布，不能换算为完成比例或剩余工期。当前必要投入主要是共享的可靠发送、草稿、权威状态与查询，以及 Web 的操作闭环；完整原生导航、语音和复杂通知设置仍保持后续范围。
+2026-10-15 在当前合并源码上重新统计，共 5,211 行客户端源码：共享客户端核心 3,259 行（约 63%）、Web 1,214 行（约 23%）、Expo 738 行（约 14%）。统计包含 TS/TSX/CSS，排除测试、依赖、导出产物和平台生成目录。这个数字说明代码分布，不能换算为完成比例或剩余工期。三部分复用同一会话、命令与恢复核心；当前必要投入主要是可靠发送、草稿、权威状态与 Web 操作闭环。完整原生导航、语音和复杂通知设置继续保持后续范围。
 
-本轮已验证共同核心 116 用例、Web 52 用例、Expo/Noise 73 用例，严格客户端类型检查通过；新增 SessionClient 的 15 用例另行通过。Host 全量合并回归仍在修正旧 fixture 和新生命周期/schema 的适配，真实浏览器正在验证。真实双 Provider、手机网络/后台/凭据和推送交付继续保持未验收。
+本轮合并源码已验证共同核心 142 用例、Web 52 用例、Expo/Noise 83 用例，三端严格测试类型检查通过。真实 Chrome 29/29 通过，包含草稿恢复、持久化失败时禁止发送、按需读取大正文及未知命令仅核对；证据与测试范围见 [浏览器验收记录](../apps/mvp-web/BROWSER_ACCEPTANCE.md)。独立原生平台提交上的 Android/iOS Hermes 导出通过，仍没有真机/模拟器验收证据。Host 的新增生产服务继续进行中央接入和合并回归；不能由模块通过推断整个十八批次或双 Provider 产品闭环已完成。
+
+从投入必要性看，共享核心与 Web 优先级最高：它们决定日常会话是否可靠，也为 Host 能力提供实际操作入口。Expo 最小流程适合保留，以便验证手机配对、安全凭据、网络切换和后台恢复；进一步扩展原生界面应等待 Host 接通与真实移动场景验收。若阶段目标只是本机 CLI 开发，完整原生客户端可以后移；若目标是离开电脑仍能接收提醒、审批和继续任务，最小移动端是必要入口。
+
+客户端成熟度的下一步以实际闭环判断：跨 Session 选择使用真实 Catalog；审批和问答取得当前权限并由 Native 确认；历史 Diff 与恢复查询通过实际 Host 路由；手机后台恢复和提醒跳转取得真机证据。当前共同核心和确定性测试已具备基础，但中央入口、真实 Provider、手机网络/后台/凭据和推送交付仍未完成全部验收。

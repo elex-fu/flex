@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { HostOwnerLock, type HostOwnerHandle, type OwnershipRecoveryProof, type RecoveryMaintenanceOwnerHandle } from "./host-owner.js";
 import { SystemProcessInspector, type ProcessInspector } from "./process-inspector.js";
-import { openForMaintenance, openForRecoveryMaintenance, openOwned } from "../storage/open-store.js";
+import { openForMaintenance, openForRecoveryMaintenance, openOwned, upgradeForRecoveryMaintenance } from "../storage/open-store.js";
 import type { SqliteStore } from "../storage/db.js";
 
 const roots:string[]=[];
@@ -117,5 +117,23 @@ describe("retained owner recovery-maintenance bootstrap",()=>{
     const missing=f.acquire();
     expect(()=>openForRecoveryMaintenance({databasePath:f.options.databasePath,owner:missing})).toThrow();
     expect(readdirSync(join(f.root,"data"))).toEqual([]);missing.closeMaintenance();expect(f.files()).toEqual(retained);
+  });
+
+  it("runs explicit installed metadata upgrades only under retained guards and rolls back invalid or async upgrades",()=>{
+    const f=fixture();const scope=f.acquire();const retained=f.files();
+    const store=openForRecoveryMaintenance({databasePath:f.options.databasePath,owner:scope});stores.push(store);
+    expect(store.db.prepare("SELECT 1 FROM sqlite_master WHERE name='recovery_probe'").get()).toBeUndefined();
+    expect(()=>upgradeForRecoveryMaintenance(f.original,store.db,()=>{})).toThrow("held retained recovery-maintenance writer");
+    store.withRecoveryTransaction(()=>upgradeForRecoveryMaintenance(scope,store.db,(db)=>db.exec("CREATE TABLE recovery_probe(evidence_id TEXT PRIMARY KEY)")));
+    expect(store.db.prepare("SELECT 1 FROM sqlite_master WHERE name='recovery_probe'").get()).toBeDefined();
+    expect(f.files()).toEqual(retained);
+    expect(()=>upgradeForRecoveryMaintenance(scope,store.db,(db)=>{
+      db.exec("CREATE TABLE forbidden_future_metadata(id TEXT); INSERT INTO schema_migrations VALUES(99,'future')");
+    })).toThrow("newer than supported");
+    expect(store.db.prepare("SELECT 1 FROM sqlite_master WHERE name='forbidden_future_metadata'").get()).toBeUndefined();
+    expect(store.db.prepare("SELECT MAX(version) AS version FROM schema_migrations").get()).toEqual({version:4});
+    expect(()=>upgradeForRecoveryMaintenance(scope,store.db,async()=>{})).toThrow("SYNCHRONOUS_METADATA_MIGRATION_REQUIRED");
+    expect(()=>store.assertWriterOwner()).toThrow("HOST_RECOVERY_ONLY");
+    expect(f.files()).toEqual(retained);scope.closeMaintenance();
   });
 });

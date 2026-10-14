@@ -1,5 +1,7 @@
+import type Database from "better-sqlite3";
 import { assertHostOwner, type HostOwnerHandle } from "../lifecycle/host-owner.js";
 import { SqliteStore } from "./db.js";
+import { inspectSchema } from "./migrations/schema-version.js";
 
 export type OwnedStoreOptions = { databasePath: string; owner: HostOwnerHandle };
 
@@ -35,4 +37,34 @@ export function openForRecoveryMaintenance(options: OwnedStoreOptions): SqliteSt
   options.owner.assertStorePath(options.databasePath);
   if (options.owner.mode !== "maintenance" || !options.owner.recoveryOnly) throw new Error("A retained recovery-maintenance owner is required");
   return new SqliteStore(options.databasePath, { mode: "recovery-maintenance", owner: options.owner });
+}
+
+/**
+ * Explicit local SQL-only upgrade before an offline Recovery journal exists.
+ * The normal recovery opener does no DDL. This caller-supplied migration must
+ * be trusted code from the installed Host, not an RPC payload or Provider.
+ */
+export function upgradeForRecoveryMaintenance<T>(owner: HostOwnerHandle, db: Database.Database,
+  pureMetadataMigration: (connection: Database.Database) => T): T {
+  assertHostOwner(owner);
+  owner.assertStorePath(db.name);
+  if (!owner.recoveryOnly || owner.mode !== "maintenance" || db.readonly || !owner.retainedReason) {
+    throw new Error("A held retained recovery-maintenance writer is required for metadata upgrade");
+  }
+  const retained = owner.retainedReason;
+  const before = inspectSchema(db);
+  if (before.version < 3) throw new Error("Recovery metadata upgrade requires an existing supported baseline");
+  return db.transaction(() => {
+    owner.assertActive();
+    const result = pureMetadataMigration(db);
+    if (result && typeof result === "object" && "then" in result && typeof result.then === "function") {
+      throw new Error("SYNCHRONOUS_METADATA_MIGRATION_REQUIRED");
+    }
+    // Future markers or corrupt installed-schema declarations roll back the
+    // entire explicit upgrade. Parent adds each installed migration validator.
+    inspectSchema(db);
+    owner.assertActive();
+    if (owner.retainedReason !== retained) throw new Error("Metadata upgrade must preserve retained ownership until committed recovery proof");
+    return result;
+  })();
 }

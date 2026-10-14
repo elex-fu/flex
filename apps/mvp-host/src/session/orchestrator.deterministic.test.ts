@@ -17,7 +17,7 @@ function createOrchestrator(provider: "claude" | "codex" = "claude"): { orchestr
     provider,
     onEvent: (event) => ref?.ingestAdapterEvent(event),
   });
-  const orchestrator = new SessionOrchestrator({
+  const orchestrator = new SessionOrchestrator({ canReleaseWorkspace: () => true,
     workspace,
     adapter,
   });
@@ -35,12 +35,10 @@ describe("provider binding", () => {
 });
 
 async function waitForIdle(orchestrator: SessionOrchestrator): Promise<void> {
-  for (let attempt = 0; attempt < 200; attempt += 1) {
-    const snapshot = orchestrator.snapshot();
-    if (snapshot.session.activityState === "idle" && !snapshot.activeTurn) return;
-    await new Promise<void>((resolvePromise) => setTimeout(resolvePromise, 5));
-  }
-  throw new Error("orchestrator did not become idle");
+  await orchestrator.worker.drainDispatch();
+  expect(await orchestrator.worker.drainOperations()).toBe(true);
+  expect(orchestrator.snapshot().session.activityState).toBe("idle");
+  expect(orchestrator.snapshot().activeTurn).toBeUndefined();
 }
 
 // Scenario 10 of the MVP acceptance matrix: replaying the same commandId must

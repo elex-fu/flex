@@ -43,16 +43,16 @@ class ContextAdapter implements ProviderAdapter {
 
 function setup(options: { databasePath?: string; owner?: HostOwnerHandle } = {}) {
   const adapter = new ContextAdapter();
-  const orchestrator = new SessionOrchestrator({ workspace, adapter, ...options });
+  const orchestrator = new SessionOrchestrator({ canReleaseWorkspace: () => true, workspace, adapter, ...options });
   adapter.orchestrator = orchestrator;
+  if (!orchestrator.store.getDevice("device")) orchestrator.store.createDevice({ id: "device", hostId: "test-host", platform: "test", credentialKind: "browser-session", scopes: ["session:write", "approval:write"], credentialRevision: 0, createdAt: new Date().toISOString() });
   open.push(orchestrator);
   return { adapter, orchestrator };
 }
 
 async function drain(orchestrator: SessionOrchestrator): Promise<void> {
-  await (orchestrator as unknown as { eventTail: Promise<void> }).eventTail;
-  // executeTurn waits on the same event queue before its final reconciliation.
-  await new Promise<void>((resolveDone) => setImmediate(resolveDone));
+  await orchestrator.worker.drainDispatch();
+  await orchestrator.ingestion.drain();
 }
 async function waitForTerminal(orchestrator: SessionOrchestrator, turnId: string): Promise<void> {
   if (!["completed", "failed", "cancelled", "outcome_unknown"].includes(orchestrator.store.getTurn(turnId)?.status ?? "")) {
@@ -66,6 +66,7 @@ async function waitForTerminal(orchestrator: SessionOrchestrator, turnId: string
     });
   }
   await drain(orchestrator);
+  expect(await orchestrator.worker.drainOperations()).toBe(true);
 }
 
 class FailingFirstThreadClient implements AppServerClient {
@@ -98,12 +99,14 @@ describe("authoritative Engine Provider fence", () => {
   it("B07 persists the second streamed Turn after the first thread load fails", async () => {
     let orchestrator!: SessionOrchestrator;
     const adapter = new CodexAdapter({ workspace, onEvent: (event) => orchestrator.ingestAdapterEvent(event), clientFactory: (handlers) => new FailingFirstThreadClient(handlers) });
-    orchestrator = new SessionOrchestrator({ workspace, adapter });
+    orchestrator = new SessionOrchestrator({ canReleaseWorkspace: () => true, workspace, adapter });
     open.push(orchestrator);
     const first = await orchestrator.startTurn("device", "first-command", "first");
+    await orchestrator.worker.drainDispatch();
     await waitForTerminal(orchestrator, first.turnId);
     expect(orchestrator.store.getTurn(first.turnId)).toMatchObject({ generation: 1, status: "failed" });
     const second = await orchestrator.startTurn("device", "second-command", "second");
+    await orchestrator.worker.drainDispatch();
     await waitForTerminal(orchestrator, second.turnId);
     expect(orchestrator.store.getTurn(second.turnId)).toMatchObject({ generation: 2, status: "completed", providerSessionId: "native-session" });
     expect(orchestrator.store.getCommandReceipt("device", "second-command")?.state).toBe("completed");
@@ -119,11 +122,13 @@ describe("authoritative Engine Provider fence", () => {
     const owner = createTestHostOwner();
     const { adapter, orchestrator } = setup({ owner });
     const first = await orchestrator.startTurn("device", "first-command", "first");
+    await orchestrator.worker.drainDispatch();
     adapter.emit(0, { kind: "session_init", provider: "codex", providerSessionId: "native-session", model: "test", runtimeVersion: "test", tools: [] });
     adapter.emit(0, { kind: "assistant_delta", itemId: "shared-item", text: "first" });
     adapter.finish(0);
     await waitForTerminal(orchestrator, first.turnId);
     const second = await orchestrator.startTurn("device", "second-command", "second");
+    await orchestrator.worker.drainDispatch();
     const context = adapter.calls[1]!.context;
     expect(context).toMatchObject({ hostOwnerId: owner.ownerId, hostOwnerGeneration: owner.generation, sessionId: orchestrator.sessionId, flyxTurnId: second.turnId, runtimeGeneration: 2 });
     expect(adapter.calls[1]!.resumeSessionId).toBe("native-session");
@@ -161,6 +166,7 @@ describe("authoritative Engine Provider fence", () => {
     const databasePath = join(directory, "host.sqlite");
     const firstHost = setup({ databasePath });
     const first = await firstHost.orchestrator.startTurn("device", "first-command", "first");
+    await firstHost.orchestrator.worker.drainDispatch();
     firstHost.adapter.emit(0, { kind: "session_init", provider: "codex", providerSessionId: "native-session", model: "test", runtimeVersion: "test", tools: [] });
     firstHost.adapter.finish(0);
     await waitForTerminal(firstHost.orchestrator, first.turnId);
@@ -168,6 +174,7 @@ describe("authoritative Engine Provider fence", () => {
     firstHost.orchestrator.close();
     const secondHost = setup({ databasePath });
     const second = await secondHost.orchestrator.startTurn("device", "second-command", "continue");
+    await secondHost.orchestrator.worker.drainDispatch();
     expect(secondHost.adapter.calls[0]!.context).toMatchObject({ hostOwnerId: secondHost.orchestrator.owner.ownerId, hostOwnerGeneration: secondHost.orchestrator.owner.generation, runtimeGeneration: 2, flyxTurnId: second.turnId });
     expect(secondHost.orchestrator.owner.ownerId).not.toBe(firstHost.orchestrator.owner.ownerId);
     expect(secondHost.adapter.calls[0]!.resumeSessionId).toBe("native-session");

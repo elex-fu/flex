@@ -28,7 +28,7 @@ class HoldingAdapter implements ProviderAdapter {
   }
   async interrupt(): Promise<"unavailable"> { return "unavailable"; }
   respondApproval(): boolean { return false; }
-  complete(): void { this.completeRun?.({ status: "completed", providerSessionId: "test-native" }); }
+  complete(): void { this.completeRun?.({ status: "completed", providerSessionId: "test-native", evidence: { kind: "native-terminal", sourceId: "test-native-terminal" } }); }
 }
 
 function fixture() {
@@ -41,7 +41,8 @@ function fixture() {
   symlinkSync(workspace, join(root, "checkout-alias"));
   const coordinationDirectory = join(root, "coordination");
   const make = (name: string, adapter: HoldingAdapter, configuredWorkspace = workspace) => {
-    const host = new SessionOrchestrator({ workspace: configuredWorkspace, databasePath: join(root, name, "host.sqlite"), adapter, coordinationDirectory });
+    const host = new SessionOrchestrator({ canReleaseWorkspace: () => true, workspace: configuredWorkspace, databasePath: join(root, name, "host.sqlite"), adapter, coordinationDirectory });
+    for (const id of ["device", "first", "second"]) host.store.createDevice({ id, hostId: "test-host", platform: "test", credentialKind: "browser-session", scopes: ["session:write", "approval:write"], credentialRevision: 0, createdAt: new Date().toISOString() });
     hosts.push(host);
     return host;
   };
@@ -49,13 +50,13 @@ function fixture() {
 }
 
 async function complete(host: SessionOrchestrator, adapter: HoldingAdapter): Promise<void> {
+  await host.worker.drainDispatch();
   const terminal = new Promise<void>((resolve) => {
     const unsubscribe = host.subscribe((event) => { if (event.type === "turn.reconciled") { unsubscribe(); resolve(); } });
   });
   adapter.complete();
   await terminal;
-  // Drain the execution Promise's finally callback without timing sleeps.
-  await new Promise<void>((resolve) => setImmediate(resolve));
+  expect(await host.worker.drainOperations()).toBe(true);
 }
 
 describe("ownership at the actual Orchestrator entry point", () => {
@@ -96,9 +97,9 @@ describe("ownership at the actual Orchestrator entry point", () => {
   it("rejects private data inside or surrounding the configured checkout before creating its database", () => {
     const f = fixture();
     const databasePath = join(f.workspace, "private", "host.sqlite");
-    expect(() => new SessionOrchestrator({ workspace: f.workspace, databasePath, adapter: new HoldingAdapter(f.workspace), coordinationDirectory: f.coordinationDirectory })).toThrow("overlaps");
+    expect(() => new SessionOrchestrator({ canReleaseWorkspace: () => true, workspace: f.workspace, databasePath, adapter: new HoldingAdapter(f.workspace), coordinationDirectory: f.coordinationDirectory })).toThrow("overlaps");
     expect(existsSync(databasePath)).toBe(false);
-    expect(() => new SessionOrchestrator({ workspace: f.workspace, databasePath: join(f.root, "host.sqlite"), adapter: new HoldingAdapter(f.workspace), coordinationDirectory: f.coordinationDirectory })).toThrow("overlaps");
+    expect(() => new SessionOrchestrator({ canReleaseWorkspace: () => true, workspace: f.workspace, databasePath: join(f.root, "host.sqlite"), adapter: new HoldingAdapter(f.workspace), coordinationDirectory: f.coordinationDirectory })).toThrow("overlaps");
     expect(existsSync(join(f.root, "host.sqlite"))).toBe(false);
   });
 });

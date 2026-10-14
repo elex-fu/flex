@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { resolve } from "node:path";
 import { SessionOrchestrator } from "./orchestrator.js";
-import type { AdapterStatus, ProviderAdapter } from "../provider/types.js";
+import type { AdapterStatus, ProviderAdapter, ProviderOutcome } from "../provider/types.js";
 
 const openOrchestrators: SessionOrchestrator[] = [];
 
@@ -34,10 +34,10 @@ class DeterministicAdapter implements ProviderAdapter {
     return this.status();
   }
 
-  async runTurn(turnId: string): Promise<{ status: "completed"; providerSessionId: string }> {
+  async runTurn(turnId: string): Promise<ProviderOutcome> {
     this.activeTurnId = turnId;
     this.activeTurnId = undefined;
-    return { status: "completed", providerSessionId: "deterministic-provider-session" };
+    return { status: "completed", providerSessionId: "deterministic-provider-session", evidence: { kind: "native-terminal", sourceId: turnId } };
   }
 
   async interrupt(): Promise<"unavailable"> {
@@ -50,18 +50,17 @@ class DeterministicAdapter implements ProviderAdapter {
 }
 
 async function waitForIdle(orchestrator: SessionOrchestrator): Promise<void> {
-  for (let attempt = 0; attempt < 100; attempt += 1) {
-    if (orchestrator.snapshot().session.activityState === "idle" && !orchestrator.snapshot().activeTurn) return;
-    await new Promise<void>((resolvePromise) => setTimeout(resolvePromise, 1));
-  }
-  throw new Error("orchestrator did not become idle");
+  await orchestrator.worker.drainDispatch();
+  expect(await orchestrator.worker.drainOperations()).toBe(true);
+  expect(orchestrator.snapshot().session.activityState).toBe("idle");
+  expect(orchestrator.snapshot().activeTurn).toBeUndefined();
 }
 
 describe("Session orchestration stability", () => {
   it("completes 30 deterministic Turns without duplicate active state or receipts", async () => {
     const workspace = resolve(process.cwd(), "../../packages/claude-fixtures");
     const adapter = new DeterministicAdapter(workspace);
-    const orchestrator = new SessionOrchestrator({
+    const orchestrator = new SessionOrchestrator({ canReleaseWorkspace: () => true,
       workspace,
       adapter,
     });

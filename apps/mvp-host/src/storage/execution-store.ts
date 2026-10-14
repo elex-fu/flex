@@ -1,3 +1,4 @@
+import type { DispatchContext } from "../provider/types.js";
 import type { SqliteStore } from "./db.js";
 import type { ApprovalReservationRow, ExecutionIntentRow, ExecutionIntentState, ExecutionIntentUpdate } from "../orchestration/command-contract.js";
 
@@ -25,19 +26,26 @@ export class ExecutionStore {
     const row = this.store.db.prepare("SELECT * FROM approval_reservations WHERE approval_id = ?").get(approvalId) as RawReservation | undefined;
     return row ? toReservation(row) : undefined;
   }
-  claim(id: string, owner: { id: string; generation: number }): ExecutionIntentRow {
-    return this.transition({ id, expectedStates: ["pending"], state: "claimed", claimOwnerId: owner.id, claimOwnerGeneration: owner.generation });
+  claim(id: string, owner: { id: string; generation: number }, revalidate?: (intent: ExecutionIntentRow) => void): ExecutionIntentRow {
+    return this.transition({ id, expectedStates: ["pending"], state: "claimed", claimOwnerId: owner.id, claimOwnerGeneration: owner.generation }, revalidate);
   }
-  transition(update: ExecutionIntentUpdate): ExecutionIntentRow {
+  transition(update: ExecutionIntentUpdate, revalidate?: (intent: ExecutionIntentRow) => void): ExecutionIntentRow {
     const current = this.get(update.id);
     if (!current) throw new Error("EXECUTION_INTENT_NOT_FOUND");
-    this.store.commitCommand({ sessionId: current.sessionId, build: () => ({ result: undefined, intentUpdates: [update] }) });
+    this.store.commitCommand({ sessionId: current.sessionId, build: () => {
+      const validation = revalidate?.(this.get(update.id)!) as unknown;
+      if (validation && typeof (validation as { then?: unknown }).then === "function") {
+        void Promise.resolve(validation).catch(() => undefined);
+        throw new Error("DISPATCH_REVALIDATION_MUST_BE_SYNCHRONOUS");
+      }
+      return { result: undefined, intentUpdates: [update] };
+    } });
     return this.get(update.id)!;
   }
 }
 export type RawExecutionIntent = {
   id: string; session_id: string; turn_id: string | null; auth_subject_id: string; command_id: string; ordinal: number;
-  actor_kind: "device" | "host"; kind: string; resource_id: string; payload_json: string; request_hash: string;
+  actor_kind: "device" | "host"; kind: string; resource_id: string; payload_json: string; dispatch_context_json: string | null; request_hash: string;
   request_format_version: 1 | 2; source_sequence: number; commit_id: string | null; runtime_generation: number;
   attempt_id: string; state: ExecutionIntentState; claim_owner_id: string | null; claim_owner_generation: number | null;
   native_request_id: string | null; result_code: string | null; result_json: string | null; created_at: string; updated_at: string;
@@ -46,6 +54,7 @@ export function toExecutionIntent(row: RawExecutionIntent): ExecutionIntentRow {
   return { id: row.id, sessionId: row.session_id, ...(row.turn_id ? { turnId: row.turn_id } : {}),
     authSubjectId: row.auth_subject_id, commandId: row.command_id, ordinal: row.ordinal, actorKind: row.actor_kind,
     kind: row.kind, resourceId: row.resource_id, payload: JSON.parse(row.payload_json) as unknown, requestHash: row.request_hash,
+    ...(row.dispatch_context_json ? { dispatchContext: Object.freeze(JSON.parse(row.dispatch_context_json) as DispatchContext) } : {}),
     requestFormatVersion: row.request_format_version, sourceSequence: row.source_sequence, ...(row.commit_id ? { commitId: row.commit_id } : {}),
     runtimeGeneration: row.runtime_generation, attemptId: row.attempt_id, state: row.state,
     ...(row.claim_owner_id ? { claimOwnerId: row.claim_owner_id } : {}),

@@ -1,3 +1,4 @@
+import type { DispatchContext } from "../provider/types.js";
 import type { SessionEvent } from "@flyx/mvp-protocol";
 import type { ApprovalRow, CommandReceiptRow, CommandReceiptUpdate, EventCommitOptions, SessionRow, TurnRow } from "../storage/db.js";
 
@@ -9,6 +10,8 @@ export type CommandRequest = {
   requestHash: string;
   requestFormatVersion?: RequestFormatVersion;
   targetSessionId?: string;
+  actorKind?: "device" | "host";
+  dispatchBinding?: Pick<DispatchContext, "hostOwnerId" | "hostOwnerGeneration" | "runtimeId">;
 };
 export type CommandReceiptInput = Omit<CommandReceiptRow, "createdAt" | "updatedAt">;
 export type DecisionClock = { now(): string; id(): string };
@@ -30,6 +33,7 @@ export type ExecutionIntentInput = {
   runtimeGeneration: number;
   attemptId: string;
   nativeRequestId?: string;
+  dispatchContext?: DispatchContext;
   /** Zero based event offset within this commit; defaults to its last event. */
   sourceEventOffset?: number;
 };
@@ -47,6 +51,8 @@ export type ExecutionIntentRow = Omit<ExecutionIntentInput, "sourceEventOffset">
 export type ExecutionIntentUpdate = {
   id: string;
   expectedStates: ExecutionIntentState[];
+  expectedClaimOwnerId?: string;
+  expectedClaimOwnerGeneration?: number;
   state: ExecutionIntentState;
   claimOwnerId?: string;
   claimOwnerGeneration?: number;

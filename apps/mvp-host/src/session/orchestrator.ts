@@ -13,6 +13,11 @@ import { dispatchContextForTurn } from "../provider/types.js";
 import { GitService, type GitDiff, type GitStatus } from "../git/git-service.js";
 import { CommandEngine, hashCommandRequest } from "../orchestration/command-engine.js";
 import { decideAcceptTurn, decideApprovalReservation, decideInterrupt } from "../orchestration/decider.js";
+import { ExecutionWorker, type ExecutionWorkerOptions } from "../orchestration/execution-worker.js";
+import { ProviderIngestion } from "../orchestration/provider-ingestion.js";
+import { RuntimeRegistry } from "../provider/runtime-registry.js";
+import type { CommandRequest, ExecutionIntentRow } from "../orchestration/command-contract.js";
+import type { ProviderControlOutcome, ProviderOutcome } from "../provider/types.js";
 import { ExecutionStore } from "../storage/execution-store.js";
 import {
   SqliteStore,
@@ -47,6 +52,11 @@ export type OrchestratorOptions = {
   databasePath?: string;
   provider?: ProviderId;
   adapter?: ProviderAdapter;
+  executionHooks?: Pick<ExecutionWorkerOptions, "beforeDispatch" | "afterTerminal" | "stage" | "track">;
+  revalidateDevice?: (intent: ExecutionIntentRow) => void;
+  /** Verified preparer/producer tree exit, independent of business terminal evidence. */
+  canReleaseWorkspace?: (context: DispatchContext) => boolean;
+  recoverOnStart?: boolean;
   runtimeId?: string;
   owner?: HostOwnerHandle;
   store?: SqliteStore;
@@ -67,6 +77,9 @@ export class SessionOrchestrator {
   readonly adapter: ProviderAdapter;
   readonly commandEngine: CommandEngine;
   readonly execution: ExecutionStore;
+  readonly worker: ExecutionWorker;
+  readonly runtimes: RuntimeRegistry;
+  readonly ingestion: ProviderIngestion;
   private readonly listeners = new Set<SessionEventListener>();
   private commandTail: Promise<unknown> = Promise.resolve();
   private eventTail: Promise<void> = Promise.resolve();
@@ -74,11 +87,13 @@ export class SessionOrchestrator {
   private readonly hostOwnerGeneration: number;
   private readonly runtimeId: string;
   private readonly dispatchContexts = new Map<string, DispatchContext>();
+  private readonly canReleaseWorkspace: (context: DispatchContext) => boolean;
   private degraded = false;
   private baselinePromise: Promise<void> | undefined;
   private readonly session: SessionRow;
 
   constructor(options: OrchestratorOptions) {
+    this.canReleaseWorkspace = options.canReleaseWorkspace ?? (() => false);
     const canonicalWorkspace = realpathSync(options.workspace);
     const provider = options.adapter?.provider ?? options.provider ?? "claude";
     const databasePath = options.databasePath ?? options.owner?.databasePath ?? ":memory:";
@@ -117,13 +132,14 @@ export class SessionOrchestrator {
       this.hostOwnerId = this.owner.ownerId;
       this.hostOwnerGeneration = this.owner.generation;
       this.runtimeId = options.runtimeId ?? `${provider}:${this.session.id}`;
-      this.store.recoverActiveTurns();
       this.execution = new ExecutionStore(this.store);
       this.commandEngine = new CommandEngine(this.store, {
         publish: (event) => this.notify(event),
+        wake: () => this.worker?.wake(),
         admission: (request) => {
           this.owner.assertActive();
           const device = this.store.getDevice(request.authSubjectId);
+          if (!device && this.owner.mode !== "test") throw new OrchestratorError("DEVICE_REVOKED", "Device is no longer authorized");
           if (device?.revokedAt || (device?.expiresAt && device.expiresAt <= new Date().toISOString())) {
             throw new OrchestratorError("DEVICE_REVOKED", "Device is no longer authorized");
           }
@@ -142,6 +158,37 @@ export class SessionOrchestrator {
       this.owner.release();
       throw error;
     }
+    this.runtimes = new RuntimeRegistry({ drainIngestion: () => this.ingestion.drain() });
+    this.runtimes.register(this.runtimeId, this.adapter);
+    this.ingestion = new ProviderIngestion({
+      admit: (event) => this.admitAdapterEvent(event),
+      handle: (event) => this.handleAdapterEvent(event),
+      observed: (event) => this.runtimes.observe(event),
+      failed: (error) => this.recordIngestionFailure(error),
+      track: (run) => this.worker.track("ingestion", run),
+    });
+    this.worker = new ExecutionWorker(this.execution, this.runtimes, {
+      owner: { id: this.hostOwnerId, generation: this.hostOwnerGeneration }, sessionId: this.session.id,
+      ...options.executionHooks,
+      revalidateDevice: (intent) => { this.revalidateIntentDevice(intent); return options.revalidateDevice?.(intent); },
+      onDispatch: (intent, context) => {
+        if (intent.turnId) this.dispatchContexts.set(intent.turnId, context);
+        if (intent.kind === "start_turn") {
+          const state = this.store.getTurn(intent.turnId!)?.status === "interrupting" ? "interrupting" : "running";
+          this.commit("turn.started", { turnId: intent.turnId }, { activityState: state, turnId: intent.turnId!, turnStatus: state });
+        }
+      },
+      onStartOutcome: (intent, outcome) => this.settleTurn(intent, outcome),
+      onControlResult: (intent, outcome) => this.settleControl(intent, outcome),
+      drainIngestion: () => this.ingestion.drain(),
+      failed: (error) => { if (error instanceof Error && !/^(DEVICE_|SCOPE_|PRE_DISPATCH_|DISPATCH_)/.test(error.message)) this.degraded = true; },
+    });
+    if (options.recoverOnStart !== false) {
+      // Native dispatch phases decide recovery before any pending intent can run.
+      this.worker.start();
+      const legacy = this.store.getActiveTurn(this.session.id);
+      if (legacy && this.execution.list({ sessionId: this.session.id }).every((intent) => intent.turnId !== legacy.id)) this.store.recoverActiveTurns();
+    }
   }
 
   get workspaceLease(): WorkspaceLease | undefined { return this.activeWorkspaceLease; }
@@ -149,6 +196,8 @@ export class SessionOrchestrator {
   close(): void {
     if (this.closed) return;
     this.closed = true;
+    this.worker.seal();
+    this.ingestion.seal();
     this.adapter.close?.();
     const active = this.store.getActiveTurn(this.session.id);
     if (active || this.activeWorkspaceLease) {
@@ -249,7 +298,7 @@ export class SessionOrchestrator {
       }
       const method = "session.startTurn";
       const requestHash = hashRequest(method, { prompt });
-      const request = { authSubjectId, commandId, method, requestHash, requestFormatVersion: 1 as const, targetSessionId: this.session.id };
+      const request = this.commandRequest(authSubjectId, commandId, method, { prompt });
       if (this.store.getCommandReceipt(authSubjectId, commandId)) {
         return this.commandEngine.commitRequest<StartTurnResponse>(request, () => { throw new Error("RECEIPT_DISAPPEARED"); }).result;
       }
@@ -258,6 +307,7 @@ export class SessionOrchestrator {
       if (current.session.activityState !== "idle" || current.activeTurn) {
         throw new OrchestratorError("TURN_BUSY", "The current session already has an active turn", true);
       }
+      if (this.activeWorkspaceLease) throw new OrchestratorError("WORKSPACE_BUSY", "Checkout ownership remains retained", true);
       const leaseOperationId = randomUUID();
       let lease: WorkspaceLease;
       try { lease = WorkspaceLease.acquire({ workspace: this.workspace, owner: this.owner, operationId: leaseOperationId }); }
@@ -266,20 +316,10 @@ export class SessionOrchestrator {
       try {
         await this.ensureBaseline();
         const accepted = this.commandEngine.commitRequest(request, (facts, clock) => {
-          this.assertWritable();
+          this.assertWritable(); this.worker.assertAdmission("start_turn");
           return decideAcceptTurn(facts, request, { prompt }, clock);
         });
         if (accepted.reused) { lease.release(); this.activeWorkspaceLease = undefined; return accepted.result; }
-        const turn = this.store.getTurn(accepted.result.turnId)!;
-        void this.executeTurn(turn, authSubjectId, accepted.intents[0]!.id).finally(() => {
-          const latest = this.store.db.open ? this.store.getTurn(turn.id) : undefined;
-          if (!this.degraded && latest && ["completed", "failed", "cancelled"].includes(latest.status)) {
-            lease.release();
-            if (this.activeWorkspaceLease === lease) this.activeWorkspaceLease = undefined;
-          } else {
-            lease.retain("turn_outcome_unverified");
-          }
-        }).catch(() => { this.degraded = true; });
         return accepted.result;
       } catch (error) {
         lease.release();
@@ -291,157 +331,109 @@ export class SessionOrchestrator {
 
   interrupt(authSubjectId: string, commandId: string): Promise<ControlResponse> {
     return this.enqueueCommand(async () => {
-      const method = "session.interrupt";
-      const requestHash = hashRequest(method, {});
-      const committed = this.commandEngine.commitRequest({ authSubjectId, commandId, method, requestHash,
-        requestFormatVersion: 1, targetSessionId: this.session.id }, (facts, clock) => {
-        this.assertWritable();
-        return decideInterrupt(facts, { authSubjectId, commandId, method, requestHash,
-          requestFormatVersion: 1, targetSessionId: this.session.id }, clock);
-      });
-      const response = committed.result;
-      if (committed.reused || response.status !== "accepted" || !response.turnId) return response;
-      const current = this.store.getTurn(response.turnId)!;
-      await this.resolvePendingApprovalsAsAborted(current);
-      if (!this.prepareControlIntent(committed.intents[0]!.id)) {
-        return this.store.getCommandReceipt(authSubjectId, commandId)!.response as ControlResponse;
-      }
-      const result = await this.adapter.interrupt("user_interrupt");
-      if (result === "already_terminal") {
-        const terminal = { status: "already_terminal", turnId: current.id } satisfies ControlResponse;
-        this.commit("turn.interrupt.settled", { turnId: current.id, commandId, status: "already_terminal" }, {
-          commandReceipt: { authSubjectId, commandId, state: "completed", response: terminal, requestHash, required: true },
-        });
-        return terminal;
-      }
-      if (result === "unavailable") {
-        const failed = { status: "outcome_unknown", turnId: current.id } satisfies ControlResponse;
-        const turnReceipt = this.receiptUpdateForTurn(current.id, "outcome_unknown", {
-          turnId: current.id,
-          status: "outcome_unknown",
-          reason: "interrupt_unavailable",
-        });
-        this.commit("turn.interrupt.unavailable", { turnId: current.id }, {
-          activityState: "outcome_unknown",
-          turnId: current.id,
-          turnStatus: "outcome_unknown",
-          commandReceipt: { authSubjectId, commandId, state: "outcome_unknown", response: failed, requestHash, required: true },
-          ...(turnReceipt ? { commandReceipts: [turnReceipt] } : {}),
-          timeline: { itemId: `error-${randomUUID()}`, kind: "error", status: "error", content: { message: `${providerDisplayName(this.session.provider)} interrupt could not be confirmed` } },
-        });
-        return failed;
-      }
-      return response;
+      const request = this.commandRequest(authSubjectId, commandId, "session.interrupt", {});
+      return this.commandEngine.commitRequest(request, (facts, clock) => {
+        this.assertWritable(); this.worker.assertAdmission("control");
+        return decideInterrupt(facts, request, clock);
+      }).result;
     });
   }
 
   respondApproval(authSubjectId: string, commandId: string, approvalId: string, action: "allow_once" | "deny"): Promise<ControlResponse> {
     return this.enqueueCommand(async () => {
-      const method = "approval.respond";
-      const request = { approvalId, action };
-      const requestHash = hashRequest(method, request);
-      const committed = this.commandEngine.commitRequest({ authSubjectId, commandId, method, requestHash,
-        requestFormatVersion: 1, targetSessionId: this.session.id }, (facts, clock) => {
-        this.assertWritable();
-        return decideApprovalReservation(facts, { authSubjectId, commandId, method, requestHash,
-          requestFormatVersion: 1, targetSessionId: this.session.id }, { approvalId, action }, clock);
-      }, { approvalId });
-      if (committed.reused) return committed.result;
-      const approval = this.store.getApproval(approvalId)!;
-      const intentId = committed.intents[0]!.id;
-      if (!this.prepareControlIntent(intentId)) return this.store.getCommandReceipt(authSubjectId, commandId)!.response as ControlResponse;
-      let delivered = false;
-      try { delivered = this.adapter.respondApproval(approvalId, action); } catch { /* Native outcome is unproven. */ }
-      if (!delivered) {
-        const unavailable = { status: "outcome_unknown", approvalId } satisfies ControlResponse;
-        const turnReceipt = this.receiptUpdateForTurn(approval.turnId, "outcome_unknown", {
-          turnId: approval.turnId, status: "outcome_unknown", reason: "approval_not_active",
-        });
-        this.commit("approval.resolve.unavailable", { approvalId }, {
-          activityState: "outcome_unknown", turnId: approval.turnId, turnStatus: "outcome_unknown",
-          commandReceipt: { authSubjectId, commandId, state: "outcome_unknown", response: unavailable, requestHash, required: true },
-          ...(turnReceipt ? { commandReceipts: [turnReceipt] } : {}),
-          approvalDelivery: { approvalId, authSubjectId, commandId, state: "outcome_unknown" },
-          timeline: { itemId: `approval-${approvalId}`, kind: "approval", status: "outcome_unknown",
-            content: { ...approval.request, approvalId, action, status: "outcome_unknown", deliveryState: "outcome_unknown" } },
-        });
-        throw new OrchestratorError("APPROVAL_NOT_ACTIVE", `${providerDisplayName(this.session.provider)} approval request is no longer active`);
-      }
-      // A boolean Adapter result proves local delivery only. The durable
-      // reservation is visible before this call and never claims tool success.
-      const response = { status: "delivered", approvalId, deliveryState: "local_delivery" };
-      const resolution = this.store.resolveApprovalAndCommit({
-        approvalId, expectedVersion: approval.version, action,
-        event: { sessionId: this.session.id, type: "approval.resolved", build: (resolved, pending) => {
-          const stillPending = pending.some((item) => item.turnId === resolved.turnId);
-          const content = { ...resolved.request, approvalId, toolUseId: resolved.toolUseId, action, status: "delivered", deliveryState: "local_delivery" };
-          return { payload: { ...content, itemId: `approval-${approvalId}` }, options: {
-            activityState: stillPending ? "waiting_approval" : "running", turnId: resolved.turnId,
-            turnStatus: stillPending ? "waiting_approval" : "running",
-            commandReceipt: { authSubjectId, commandId, requestHash, state: "completed", response, required: true },
-            approvalDelivery: { approvalId, authSubjectId, commandId, state: "local_delivery" },
-            timeline: { itemId: `approval-${approvalId}`, kind: "approval", status: "delivered", content },
-          } };
-        } },
-      });
-      if (!resolution) throw new OrchestratorError("INTERACTION_DELIVERY_UNSETTLED", "Approval delivery needs reconciliation");
-      this.notify(resolution.event);
-      return response;
-
+      const request = this.commandRequest(authSubjectId, commandId, "approval.respond", { approvalId, action });
+      return this.commandEngine.commitRequest(request, (facts, clock) => {
+        this.assertWritable(); this.worker.assertAdmission("control");
+        return decideApprovalReservation(facts, request, { approvalId, action }, clock);
+      }, { approvalId }).result;
     });
   }
 
-  private async executeTurn(turn: TurnRow, authSubjectId: string, intentId: string): Promise<void> {
-    const context = dispatchContextForTurn(turn.id, {
-      hostOwnerId: this.hostOwnerId,
-      hostOwnerGeneration: this.hostOwnerGeneration,
-      sessionId: turn.sessionId,
-      flyxTurnId: turn.id,
-      runtimeId: this.runtimeId,
-      runtimeGeneration: turn.generation,
-      attemptId: turn.attemptId!,
-    });
-    this.dispatchContexts.set(turn.id, context);
-    this.execution.claim(intentId, { id: "legacy-facade", generation: 0 });
-    this.commit("turn.started", { turnId: turn.id }, { activityState: "running", turnId: turn.id, turnStatus: "running",
-      executionIntentUpdates: [{ id: intentId, expectedStates: ["claimed"], state: "dispatching", attemptId: turn.attemptId!, runtimeGeneration: turn.generation }],
-    });
-    const session = this.store.getSession(this.session.id);
-    let outcome: Awaited<ReturnType<ProviderAdapter["runTurn"]>>;
-    try {
-      outcome = await this.adapter.runTurn(turn.id, turn.prompt, session?.providerSessionId, context);
-    } catch (error) {
-      outcome = { status: "failed", error: error instanceof Error ? error.message : String(error) };
-    }
-    await this.eventTail;
-    this.dispatchContexts.delete(turn.id);
+  private commandRequest(authSubjectId: string, commandId: string, method: string, payload: unknown): CommandRequest {
+    return { authSubjectId, commandId, method, requestHash: hashRequest(method, payload), requestFormatVersion: 1,
+      targetSessionId: this.session.id, actorKind: !this.store.getDevice(authSubjectId) && this.owner.mode === "test" ? "host" : "device",
+      dispatchBinding: { hostOwnerId: this.hostOwnerId, hostOwnerGeneration: this.hostOwnerGeneration, runtimeId: this.runtimeId } };
+  }
+  private revalidateIntentDevice(intent: ExecutionIntentRow): void {
+    this.owner.assertActive();
+    if (intent.actorKind !== "device") return;
+    const device = this.store.getDevice(intent.authSubjectId);
+    if (!device || device.revokedAt || (device.expiresAt && device.expiresAt <= new Date().toISOString())) throw new Error("DEVICE_REVOKED");
+    const scope = intent.kind.startsWith("respond_") ? "approval:write" : "session:write";
+    if (!device.scopes.includes(scope)) throw new Error("SCOPE_REQUIRED");
+  }
+  private settleTurn(intent: ExecutionIntentRow, outcome: ProviderOutcome): void {
+    const turn = intent.turnId ? this.store.getTurn(intent.turnId) : undefined;
+    if (!turn) throw new Error("TURN_NOT_FOUND");
     const latest = this.store.getTurn(turn.id);
     const finalResponse = { turnId: turn.id, ...outcome };
     const receiptUpdate = this.receiptUpdateForTurn(turn.id, outcomeToReceiptState(outcome.status), finalResponse);
     if (latest && ["queued", "running", "waiting_approval", "interrupting"].includes(latest.status)) {
-      const terminal = outcome.status === "cancelled" ? "cancelled" : outcome.status === "outcome_unknown" ? "outcome_unknown" : outcome.status === "completed" ? "completed" : "failed";
-      const controlReceipts = this.controlReceiptUpdatesForTurn(turn.id, terminal);
-      const reconciliationOptions = {
-        activityState: terminal === "outcome_unknown" ? "outcome_unknown" : "idle",
-        turnId: turn.id,
-        turnStatus: terminal,
-        ...(receiptUpdate ? { commandReceipt: receiptUpdate } : {}),
-        ...(controlReceipts.length ? { commandReceipts: controlReceipts } : {}),
-        ...(terminal === "failed" || terminal === "outcome_unknown"
-          ? { timeline: { itemId: `error-${randomUUID()}`, kind: "error" as const, status: terminal, content: { message: "error" in outcome ? outcome.error : "Turn ended without a terminal event" } } }
-          : {}),
-      } as const;
-      this.commit("turn.reconciled", { turnId: turn.id, outcome }, reconciliationOptions);
-      return;
-    }
-    // A terminal provider event should normally have committed the receipt in
-    // the same transaction.  If an older adapter/event path left the receipt
-    // accepted, append a tiny reconciliation event so the repair is still
-    // durable and observable rather than mutating the receipt silently.
-    const receipt = this.store.getCommandReceipt(authSubjectId, turn.commandId);
-    if (receipt && ["accepted"].includes(receipt.state) && receiptUpdate) {
+      const terminal = outcome.status;
+      const controls = this.controlReceiptUpdatesForTurn(turn.id, terminal);
+      this.commit("turn.reconciled", { turnId: turn.id, outcome }, {
+        activityState: terminal === "outcome_unknown" ? "outcome_unknown" : "idle", turnId: turn.id, turnStatus: terminal,
+        ...(receiptUpdate ? { commandReceipt: receiptUpdate } : {}), ...(controls.length ? { commandReceipts: controls } : {}),
+        ...(terminal === "failed" || terminal === "outcome_unknown" ? { timeline: { itemId: `error-${turn.id}`, kind: "error" as const,
+          status: terminal, content: { turnId: turn.id, message: "error" in outcome ? outcome.error : "Provider outcome is unknown" } } } : {}),
+      });
+    } else if (this.store.getCommandReceipt(intent.authSubjectId, intent.commandId)?.state === "accepted" && receiptUpdate) {
       this.commit("turn.receipt.reconciled", { turnId: turn.id, outcome }, { commandReceipt: receiptUpdate });
     }
+    if (outcome.evidence.kind !== "unknown") {
+      this.dispatchContexts.delete(turn.id);
+      let treeExitProved = false;
+      try { treeExitProved = !!intent.dispatchContext && this.canReleaseWorkspace(intent.dispatchContext); } catch { this.degraded = true; }
+      if (this.activeWorkspaceLease && !treeExitProved) {
+        this.activeWorkspaceLease.retain("producer_stop_unverified"); this.owner.retain("producer_stop_unverified");
+      } else if (!this.degraded && ["completed", "failed", "cancelled"].includes(this.store.getTurn(turn.id)?.status ?? "")) {
+        this.activeWorkspaceLease?.release(); this.activeWorkspaceLease = undefined;
+      } else this.activeWorkspaceLease?.retain("terminal_commit_unverified");
+    } else this.activeWorkspaceLease?.retain("turn_outcome_unverified");
+  }
+  private settleControl(intent: ExecutionIntentRow, outcome: ProviderControlOutcome): void {
+    if (this.store.getCommandReceipt(intent.authSubjectId, intent.commandId)?.state !== "accepted") return;
+    const payload = isRecord(intent.payload) ? intent.payload : {};
+    const turn = intent.turnId ? this.store.getTurn(intent.turnId) : undefined;
+    const alreadyTerminal = turn && ["completed", "failed", "cancelled"].includes(turn.status);
+    const unknown = outcome.evidence.kind === "unknown" && !alreadyTerminal;
+    const deliveryState = outcome.evidence.kind === "native-ack" ? "native_confirmation" : "local_delivery";
+    const receipt = { authSubjectId: intent.authSubjectId, commandId: intent.commandId, requestHash: intent.requestHash, required: true };
+    if (unknown) {
+      const response = { status: "outcome_unknown", ...(intent.turnId ? { turnId: intent.turnId } : {}), evidence: outcome.evidence };
+      const start = intent.turnId ? this.receiptUpdateForTurn(intent.turnId, "outcome_unknown", response) : undefined;
+      this.commit("execution.control.unknown", { intentId: intent.id, ...response }, {
+        ...(intent.turnId ? { activityState: "outcome_unknown", turnId: intent.turnId, turnStatus: "outcome_unknown" } : {}),
+        commandReceipt: { ...receipt, state: "outcome_unknown", response }, ...(start ? { commandReceipts: [start] } : {}),
+        ...(intent.kind === "respond_approval" && typeof payload.approvalId === "string" ? { approvalDelivery: {
+          approvalId: payload.approvalId, authSubjectId: intent.authSubjectId, commandId: intent.commandId, state: "outcome_unknown" } } : {}),
+      });
+      if (intent.dispatchContext) this.runtimes.retainUnknown(intent.dispatchContext);
+      return;
+    }
+    if (intent.kind === "respond_approval" && outcome.status === "delivered" && typeof payload.approvalId === "string") {
+      const approval = this.store.getApproval(payload.approvalId);
+      if (!approval) throw new Error("APPROVAL_NOT_FOUND");
+      const response = { status: "delivered", approvalId: approval.approvalId, deliveryState, evidence: outcome.evidence };
+      const content = { ...approval.request, approvalId: approval.approvalId, action: payload.action, status: "delivered", deliveryState };
+      const options = { commandReceipt: { ...receipt, state: "completed" as const, response }, approvalDelivery: {
+        approvalId: approval.approvalId, authSubjectId: intent.authSubjectId, commandId: intent.commandId, state: deliveryState as "native_confirmation" | "local_delivery" },
+        timeline: { itemId: `approval-${approval.approvalId}`, kind: "approval" as const, status: "delivered", content } };
+      if (approval.status === "pending") {
+        const result = this.store.resolveApprovalAndCommit({ approvalId: approval.approvalId, expectedVersion: approval.version, action: String(payload.action),
+          event: { sessionId: this.session.id, type: "approval.resolved", build: (resolved, pending) => ({ payload: { ...content, itemId: `approval-${approval.approvalId}` }, options: {
+            ...options, activityState: pending.some((value) => value.turnId === resolved.turnId) ? "waiting_approval" : "running", turnId: resolved.turnId,
+            turnStatus: pending.some((value) => value.turnId === resolved.turnId) ? "waiting_approval" : "running",
+          } }) } });
+        if (!result) throw new Error("INTERACTION_DELIVERY_UNSETTLED");
+        this.notify(result.event);
+      } else this.commit("approval.delivery.recorded", { ...response, turnId: intent.turnId }, options);
+      return;
+    }
+    const response = { status: alreadyTerminal || outcome.status === "already_terminal" ? "already_terminal"
+      : outcome.status === "not_dispatched" ? "not_dispatched" : "accepted", ...(intent.turnId ? { turnId: intent.turnId } : {}), evidence: outcome.evidence };
+    this.commit("execution.control.delivered", { intentId: intent.id, ...response }, { commandReceipt: { ...receipt,
+      state: outcome.status === "not_dispatched" ? "failed" : alreadyTerminal || outcome.status === "already_terminal" ? "completed" : "accepted", response } });
   }
 
   /**
@@ -453,28 +445,25 @@ export class SessionOrchestrator {
     this.enqueueAdapterEvent(event);
   }
 
-  private enqueueAdapterEvent(event: AdapterEvent): void {
-    this.eventTail = this.eventTail.then(() => this.handleAdapterEvent(event)).catch((error) => {
-      this.degraded = true;
-      const active = this.store.getActiveTurn(this.session.id);
-      try {
-        if (active) {
-          this.commit("host.event_persist_failed", { turnId: active.id, message: error instanceof Error ? error.message : String(error) }, {
-            activityState: "outcome_unknown",
-            turnId: active.id,
-            turnStatus: "outcome_unknown",
-            ...(this.receiptUpdateForTurn(active.id, "outcome_unknown", { turnId: active.id, status: "outcome_unknown", reason: "event_persist_failed" })
-              ? { commandReceipt: this.receiptUpdateForTurn(active.id, "outcome_unknown", { turnId: active.id, status: "outcome_unknown", reason: "event_persist_failed" }) }
-              : {}),
-            timeline: { itemId: `error-${randomUUID()}`, kind: "error", status: "fatal", content: { message: `Flyx could not persist a ${this.session.provider} event` } },
-          });
-        }
-      } catch {
-        // The database may itself be unavailable.  The degraded flag still
-        // prevents new work, and the adapter is interrupted below.
-      }
-      void this.adapter.interrupt("event_persist_failed");
-    });
+  private admitAdapterEvent(event: AdapterEvent): boolean {
+    const context = event.dispatchContext;
+    return !!context && !!this.dispatchContexts.get(context.flyxTurnId)
+      && sameDispatchContext(this.dispatchContexts.get(context.flyxTurnId)!, context)
+      && event.turnId === context.flyxTurnId && event.generation === context.runtimeGeneration;
+  }
+  private enqueueAdapterEvent(event: AdapterEvent): void { this.eventTail = this.ingestion.enqueue(event); }
+  private recordIngestionFailure(error: unknown): void {
+    this.degraded = true;
+    const active = this.store.getActiveTurn(this.session.id);
+    if (active) {
+      const context = this.dispatchContexts.get(active.id);
+      if (context) this.runtimes.retainUnknown(context);
+      const receipt = this.receiptUpdateForTurn(active.id, "outcome_unknown", { turnId: active.id, status: "outcome_unknown", reason: "event_persist_failed" });
+      try { this.commit("host.event_persist_failed", { turnId: active.id }, { activityState: "outcome_unknown", turnId: active.id, turnStatus: "outcome_unknown",
+        ...(receipt ? { commandReceipt: receipt } : {}) }); } catch { /* Ownership gate is retained by the lifecycle when the Store fails. */ }
+    }
+    const stop = this.worker.track("control", async () => { await this.adapter.interrupt("event_persist_failed"); });
+    void stop.catch(() => { this.degraded = true; });
   }
 
   private async handleAdapterEvent(event: AdapterEvent): Promise<void> {
@@ -627,14 +616,6 @@ export class SessionOrchestrator {
     }
   }
 
-  private nextRuntimeGeneration(): number {
-    const row = this.store.db.prepare("SELECT MAX(generation) AS generation FROM turns WHERE session_id = ?")
-      .get(this.session.id) as { generation: number | null };
-    const generation = (row.generation ?? 0) + 1;
-    if (!Number.isSafeInteger(generation)) throw new OrchestratorError("GENERATION_EXHAUSTED", "Provider generation exhausted");
-    return generation;
-  }
-
   private commit(type: string, payload: unknown, options: Parameters<SqliteStore["commitEvent"]>[3] = {}): SessionEvent {
     this.owner.assertActive();
     const event = this.store.commitEvent(this.session.id, type, payload, options);
@@ -692,35 +673,6 @@ export class SessionOrchestrator {
     return current + delta;
   }
 
-  private async resolvePendingApprovalsAsAborted(turn: TurnRow): Promise<void> {
-    const snapshot = this.store.getSnapshot(this.session.id);
-    for (const approval of snapshot?.pendingApprovals ?? []) {
-      if (approval.turnId !== turn.id) continue;
-      const committed = this.store.resolveApprovalAndCommit({
-        approvalId: approval.approvalId,
-        expectedVersion: approval.version,
-        action: "aborted",
-        event: {
-          sessionId: this.session.id,
-          type: "approval.resolved",
-          build: (resolved) => {
-            const content = { ...resolved.request, turnId: turn.id, approvalId: approval.approvalId, toolUseId: resolved.toolUseId, action: "aborted", status: "aborted" };
-            return {
-              payload: { ...content, itemId: `approval-${approval.approvalId}` },
-              options: {
-                activityState: "interrupting",
-                turnId: turn.id,
-                turnStatus: "interrupting",
-                timeline: { itemId: `approval-${approval.approvalId}`, kind: "approval", status: "aborted", content },
-              },
-            };
-          },
-        },
-      });
-      if (committed) this.notify(committed.event);
-    }
-  }
-
   private enqueueCommand<T>(fn: () => Promise<T>): Promise<T> {
     const next = this.commandTail.then(() => {
       if (this.closed) throw new OrchestratorError("HOST_DRAINING", "Host is closed to new commands", true);
@@ -756,14 +708,7 @@ export class SessionOrchestrator {
     if (this.degraded) throw new OrchestratorError("HOST_DEGRADED", "Host event persistence is degraded; restart the Host before accepting commands", true);
   }
 
-  private prepareControlIntent(intentId: string): boolean {
-    const intent = this.execution.get(intentId);
-    if (!intent || intent.state === "settled" || intent.state === "outcome_unknown") return false;
-    this.execution.claim(intentId, { id: "legacy-facade", generation: 0 });
-    this.execution.transition({ id: intentId, expectedStates: ["claimed"], state: "dispatching",
-      attemptId: intent.attemptId, runtimeGeneration: intent.runtimeGeneration });
-    return true;
-  }
+
 }
 
 const hashRequest = hashCommandRequest;

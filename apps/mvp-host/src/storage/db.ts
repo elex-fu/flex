@@ -1452,6 +1452,9 @@ export class SqliteStore {
   }
 
   private insertExecutionIntentInternal(input: ExecutionIntentInput, sourceSequence: number, commitId: string, timestamp: string): void {
+    const context = input.dispatchContext;
+    if (context && (context.sessionId !== input.sessionId || context.flyxTurnId !== (input.turnId ?? input.resourceId)
+      || context.attemptId !== input.attemptId || context.runtimeGeneration !== input.runtimeGeneration)) throw new Error("EXECUTION_INTENT_CONTEXT_MISMATCH");
     const receipt = this.getCommandReceipt(input.authSubjectId, input.commandId);
     if (!receipt || receipt.requestHash !== input.requestHash || receipt.requestFormatVersion !== (input.requestFormatVersion ?? 1)
       || receipt.targetSessionId !== input.sessionId) throw new Error("EXECUTION_INTENT_REQUEST_MISMATCH");
@@ -1461,16 +1464,20 @@ export class SqliteStore {
         || (turn.attemptId && turn.attemptId !== input.attemptId)) throw new Error("EXECUTION_INTENT_FENCE_MISMATCH");
     }
     this.db.prepare(`INSERT INTO execution_intents (id, session_id, turn_id, auth_subject_id, command_id, ordinal, actor_kind, kind,
-      resource_id, payload_json, request_hash, request_format_version, source_sequence, commit_id, runtime_generation, attempt_id, state, native_request_id, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)`).run(input.id, input.sessionId,
+      resource_id, payload_json, dispatch_context_json, request_hash, request_format_version, source_sequence, commit_id, runtime_generation, attempt_id, state, native_request_id, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)`).run(input.id, input.sessionId,
       input.turnId ?? null, input.authSubjectId, input.commandId, input.ordinal, input.actorKind, input.kind, input.resourceId,
-      json(input.payload), input.requestHash, input.requestFormatVersion ?? 1, sourceSequence, commitId, input.runtimeGeneration,
+      json(input.payload), input.dispatchContext ? json(input.dispatchContext) : null, input.requestHash, input.requestFormatVersion ?? 1, sourceSequence, commitId, input.runtimeGeneration,
       input.attemptId, input.nativeRequestId ?? null, timestamp, timestamp);
   }
 
   private updateExecutionIntentInternal(input: ExecutionIntentUpdate, timestamp: string): void {
     const current = new ExecutionStore(this).get(input.id);
     if (!current || !input.expectedStates.includes(current.state)) throw new Error("EXECUTION_INTENT_STATE_CONFLICT");
+    if ((input.expectedClaimOwnerId !== undefined && input.expectedClaimOwnerId !== current.claimOwnerId)
+      || (input.expectedClaimOwnerGeneration !== undefined && input.expectedClaimOwnerGeneration !== current.claimOwnerGeneration)) throw new Error("EXECUTION_INTENT_OWNER_MISMATCH");
+    if (input.state === "claimed" && current.dispatchContext
+      && (input.claimOwnerId !== current.dispatchContext.hostOwnerId || input.claimOwnerGeneration !== current.dispatchContext.hostOwnerGeneration)) throw new Error("EXECUTION_INTENT_OWNER_MISMATCH");
     if ((input.attemptId && input.attemptId !== current.attemptId)
       || (input.runtimeGeneration !== undefined && input.runtimeGeneration !== current.runtimeGeneration)) throw new Error("EXECUTION_INTENT_FENCE_MISMATCH");
     const allowed: Record<string, readonly string[]> = {
@@ -1500,7 +1507,7 @@ export class SqliteStore {
 
   private finalizeTurnIntentsInternal(sessionId: string, turnId: string, status: Turn["status"], timestamp: string): void {
     this.db.prepare(`UPDATE execution_intents SET state = ?, result_code = ?, result_json = ?, updated_at = ?
-      WHERE session_id = ? AND turn_id = ? AND state <> 'settled'`).run(status === "outcome_unknown" ? "outcome_unknown" : "settled", status,
+      WHERE session_id = ? AND turn_id = ? AND kind = 'start_turn' AND state <> 'settled'`).run(status === "outcome_unknown" ? "outcome_unknown" : "settled", status,
       json({ turnId, status }), timestamp, sessionId, turnId);
   }
 

@@ -34,6 +34,7 @@ type AdapterEventEnvelope = {
   generation: number;
   turnId: string;
   nativeItemId?: string;
+  terminalEvidence?: ProviderEvidence;
 };
 
 export type AdapterEvent =
@@ -94,7 +95,7 @@ export type AdapterEvent =
   ) & AdapterEventEnvelope;
 
 type DistributiveOmit<T, K extends PropertyKey> = T extends unknown ? Omit<T, K> : never;
-export type AdapterEventPayload = DistributiveOmit<AdapterEvent, keyof AdapterEventEnvelope>;
+export type AdapterEventPayload = DistributiveOmit<AdapterEvent, Exclude<keyof AdapterEventEnvelope, "terminalEvidence">>;
 
 /** Snapshot caller-owned values so asynchronous callbacks keep their original fence. */
 export function dispatchContextForTurn(turnId: string, context?: DispatchContext): DispatchContext {
@@ -132,11 +133,27 @@ export type AdapterStatus = {
   sandboxRequired: true;
 };
 
-export type TurnOutcome =
+export type ProviderEvidence =
+  | { kind: "native-terminal"; sourceId: string }
+  | { kind: "not-dispatched" }
+  | { kind: "unknown"; reason: string };
+export type ProviderAcceptance = { nativeSessionId: string; nativeTurnId?: string; sourceId: string };
+export type ProviderOutcome = TurnOutcome & { evidence: ProviderEvidence };
+export type ProviderRun = { accepted?: Promise<ProviderAcceptance>; outcome: Promise<ProviderOutcome> };
+export type ProviderDeliveryEvidence =
+  | { kind: "native-ack"; sourceId: string }
+  | { kind: "local-delivery" }
+  | { kind: "native-terminal"; sourceId: string }
+  | { kind: "not-dispatched" }
+  | { kind: "unknown"; reason: string };
+export type ProviderControlOutcome = { status: "delivered" | "already_terminal" | "not_dispatched" | "outcome_unknown"; evidence: ProviderDeliveryEvidence; error?: string };
+
+export type TurnOutcome = (
   | { status: "completed"; providerSessionId: string }
   | { status: "failed"; providerSessionId?: string; error: string }
   | { status: "cancelled"; providerSessionId?: string }
-  | { status: "outcome_unknown"; providerSessionId?: string; error: string };
+  | { status: "outcome_unknown"; providerSessionId?: string; error: string }
+) & { evidence?: ProviderEvidence };
 
 export interface ProviderAdapter {
   readonly provider: ProviderId;
@@ -144,6 +161,8 @@ export interface ProviderAdapter {
   status(): Promise<AdapterStatus>;
   preflight(): Promise<AdapterStatus>;
   runTurn(turnId: string, prompt: string, resumeSessionId?: string, context?: DispatchContext): Promise<TurnOutcome>;
+  beginTurn?(context: DispatchContext, prompt: string, resumeSessionId?: string): ProviderRun;
+  deliverControl?(context: DispatchContext, command: { kind: "interrupt_turn"; reason: string } | { kind: "respond_approval"; approvalId: string; action: ApprovalAction }): Promise<ProviderControlOutcome>;
   interrupt(reason?: string): Promise<"accepted" | "already_terminal" | "unavailable">;
   respondApproval(approvalId: string, action: ApprovalAction): boolean;
   close?(): void;

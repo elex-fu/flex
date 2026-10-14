@@ -8,7 +8,7 @@ export const COMMAND_EXECUTION_REQUIRED_COLUMNS: Record<string, readonly string[
   command_receipts: ["target_session_id", "request_format_version", "commit_id", "source_sequence"],
   session_events: ["commit_id"],
   event_commits: ["id", "session_id", "first_sequence", "last_sequence"],
-  execution_intents: ["id", "session_id", "turn_id", "auth_subject_id", "command_id", "ordinal", "actor_kind", "kind", "resource_id", "payload_json", "request_hash", "request_format_version", "source_sequence", "commit_id", "runtime_generation", "attempt_id", "state", "claim_owner_id", "claim_owner_generation", "native_request_id", "result_code", "result_json", "created_at", "updated_at"],
+  execution_intents: ["id", "session_id", "turn_id", "auth_subject_id", "command_id", "ordinal", "actor_kind", "kind", "resource_id", "payload_json", "dispatch_context_json", "request_hash", "request_format_version", "source_sequence", "commit_id", "runtime_generation", "attempt_id", "state", "claim_owner_id", "claim_owner_generation", "native_request_id", "result_code", "result_json", "created_at", "updated_at"],
   managed_processes: ["id", "owner_id", "owner_generation", "runtime_id", "runtime_generation", "attempt_id", "session_id", "turn_id", "pid", "process_group", "tree_control", "state", "error_code", "updated_at"],
   approval_reservations: ["approval_id", "auth_subject_id", "command_id", "intent_id", "expected_version", "action", "state", "created_at", "updated_at"],
 };
@@ -58,6 +58,7 @@ export function applyCommandExecutionMigration(db: Database.Database, appliedAt 
         kind TEXT NOT NULL,
         resource_id TEXT NOT NULL,
         payload_json TEXT NOT NULL,
+        dispatch_context_json TEXT,
         request_hash TEXT NOT NULL,
         request_format_version INTEGER NOT NULL DEFAULT 1 CHECK (request_format_version IN (1, 2)),
         source_sequence INTEGER NOT NULL,

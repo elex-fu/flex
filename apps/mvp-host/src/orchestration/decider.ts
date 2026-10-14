@@ -1,3 +1,4 @@
+import { dispatchContextForTurn } from "../provider/types.js";
 import type { CommandFacts, CommandPlan, CommandRequest, DecisionClock, ExecutionIntentInput, NewTurn } from "./command-contract.js";
 
 function requireSession(facts: CommandFacts) {
@@ -10,10 +11,15 @@ function receipt(request: CommandRequest, state: "accepted" | "completed", respo
 function intent(request: CommandRequest, turn: { id: string; generation: number; attemptId?: string }, clock: DecisionClock,
   kind: ExecutionIntentInput["kind"], resourceId: string, payload: unknown): ExecutionIntentInput {
   if (!request.targetSessionId) throw new Error("SESSION_NOT_FOUND");
+  const attemptId = turn.attemptId ?? clock.id();
   return { id: clock.id(), sessionId: request.targetSessionId, turnId: turn.id,
-    authSubjectId: request.authSubjectId, commandId: request.commandId, ordinal: 0, actorKind: "device",
+    authSubjectId: request.authSubjectId, commandId: request.commandId, ordinal: 0, actorKind: request.actorKind ?? "device",
     kind, resourceId, payload, requestHash: request.requestHash, requestFormatVersion: request.requestFormatVersion ?? 1,
-    runtimeGeneration: turn.generation, attemptId: turn.attemptId ?? clock.id() };
+    runtimeGeneration: turn.generation, attemptId,
+    ...(request.dispatchBinding ? { dispatchContext: dispatchContextForTurn(turn.id, {
+      ...request.dispatchBinding, sessionId: request.targetSessionId, flyxTurnId: turn.id,
+      runtimeGeneration: turn.generation, attemptId,
+    }) } : {}) };
 }
 
 /** Pure: injected clock/IDs and durable facts are its only inputs. */

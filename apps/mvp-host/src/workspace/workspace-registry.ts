@@ -14,10 +14,12 @@ const LocalWorkspaceConfig = z.strictObject({
 });
 export type LocalWorkspaceConfig = z.input<typeof LocalWorkspaceConfig>;
 export type PreparedWorkspaceRegistration = Omit<WorkspaceRecord,"createdAt"|"updatedAt">;
+export type WorkspaceGitQuery=(input:{argv:readonly string[];cwd:string;maxBufferBytes:number;timeoutMs:number;operationId?:string})=>Promise<{stdout:string}>;
+export type WorkspaceRegistryOptions={owner:HostOwnerHandle;privateDirectories?:readonly string[];readOnlyGit?:WorkspaceGitQuery};
 
 export class WorkspaceRegistry {
   private readonly prepared = new WeakSet<object>();
-  constructor(readonly catalog:CatalogStore,private readonly options:{owner:HostOwnerHandle;privateDirectories?:readonly string[]}) {}
+  constructor(readonly catalog:CatalogStore,private readonly options:WorkspaceRegistryOptions) {}
   get(id:string) { return this.catalog.workspace(id); }
   require(id:string):WorkspaceRecord {
     const workspace=this.get(id); if (!workspace) throw new CatalogError("WORKSPACE_NOT_FOUND");
@@ -33,12 +35,17 @@ export class WorkspaceRegistry {
     assertWorkspacePrivacy(record.worktreeRoot,this.privatePaths());
   }
   private privatePaths():string[] { const owner=this.options.owner;return [...(owner.databasePath!==":memory:"?[dirname(owner.databasePath)]:[]),...(owner.identityDirectory?[owner.identityDirectory]:[]),...(owner.coordinationDirectory?[owner.coordinationDirectory]:[]),...(this.options.privateDirectories??[])]; }
+  private async query(root:string,args:readonly string[],operationId?:string):Promise<string> {
+    const argv=["-c","core.fsmonitor=false","-C",root,...args];
+    const result=this.options.readOnlyGit?await this.options.readOnlyGit({argv:Object.freeze(argv),cwd:root,maxBufferBytes:16*1024,timeoutMs:5000,...(operationId?{operationId}:{})}):await run("git",argv,{cwd:root,encoding:"utf8",maxBuffer:16*1024,timeout:5000});
+    if(typeof result.stdout!=="string"||Buffer.byteLength(result.stdout,"utf8")>16*1024)throw new CatalogError("WORKSPACE_GIT_OUTPUT_INVALID");
+    this.options.owner.assertActive();return result.stdout.trim();
+  }
   private async prepare(input:LocalWorkspaceConfig,kind:"local"|"worktree",operationId?:string):Promise<PreparedWorkspaceRegistration> {
     assertHostOwner(this.options.owner);
     const parsed=LocalWorkspaceConfig.parse(input);
     const canonicalRoot=realpathSync(parsed.root);
-    const result=await run("git",["-c","core.fsmonitor=false","-C",canonicalRoot,"rev-parse","--show-toplevel"],{encoding:"utf8",maxBuffer:16*1024,timeout:5000});
-    const worktreeRoot=realpathSync(result.stdout.trim());
+    const worktreeRoot=realpathSync(await this.query(canonicalRoot,["rev-parse","--show-toplevel"],operationId));
     const record:PreparedWorkspaceRegistration={workspaceId:parsed.workspaceId,canonicalRoot,worktreeRoot,checkoutKey:checkoutKey(worktreeRoot),kind,state:"active",repositoryId:parsed.repositoryId??parsed.workspaceId,capabilities:parsed.capabilities,...(operationId?{registrationOperationId:operationId}:{})};
     this.assertCurrent({...record,createdAt:"",updatedAt:""}); this.options.owner.assertActive();
     Object.freeze(record.capabilities);this.prepared.add(record); return Object.freeze(record);
@@ -55,7 +62,7 @@ export class WorkspaceRegistry {
     if(!operationId) throw new CatalogError("WORKTREE_OPERATION_REQUIRED");
     const record=await this.prepare(config,"worktree",operationId);
     if(record.canonicalRoot!==record.worktreeRoot)throw new CatalogError("WORKTREE_REGISTRATION_CONFLICT","Generated checkout must identify its actual Git worktree root");
-    const common=async(root:string)=>realpathSync((await run("git",["-C",root,"rev-parse","--path-format=absolute","--git-common-dir"],{encoding:"utf8",maxBuffer:16*1024,timeout:5000})).stdout.trim());
+    const common=async(root:string)=>realpathSync(await this.query(root,["rev-parse","--path-format=absolute","--git-common-dir"],operationId));
     if(await common(repository.worktreeRoot)!==await common(record.worktreeRoot))throw new CatalogError("WORKTREE_REGISTRATION_CONFLICT","Generated worktree belongs to a different registered repository");
     return record;
   }

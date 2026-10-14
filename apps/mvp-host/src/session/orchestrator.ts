@@ -98,7 +98,7 @@ export type OrchestratorOptions = {
 };
 
 export type RuntimeCloseReport = { closed: boolean; producerStopped: boolean; clean: boolean; state: "stopped" | "recovery_required"; stopped: boolean; recoveryRequired: boolean };
-export type ShutdownService = { drain(deadlineMs: number): Promise<void | boolean>; close?(): Promise<void> | void };
+export type ShutdownService = { drain(deadlineMs: number): Promise<void | boolean>; seal?(): void; close?(): Promise<void> | void };
 
 const MAX_PROMPT_BYTES = 16 * 1024;
 
@@ -119,6 +119,7 @@ export class SessionOrchestrator {
   private readonly transportClosers = new Set<() => Promise<void>>();
   private activeWorkspaceLease: WorkspaceLease | undefined;
   private closed = false;
+  private callbacksSealed = false;
   readonly workspace: string;
   readonly checkoutRoot: string;
   readonly git: GitService;
@@ -351,7 +352,34 @@ export class SessionOrchestrator {
   }
 
   close(): void { void this.closeAndWait().catch(() => {}); }
+  /** Final shared-Store fence. This does not prove producer stop or release resources. */
+  sealBeforeStoreClose(): void {
+    if (this.callbacksSealed) return;
+    this.callbacksSealed = true;
+    this.closed = true;
+    this.listeners.clear();
+    this.dispatchContexts.clear();
+    let failure: unknown;
+    for (const seal of [
+      () => this.worker.seal(),
+      () => this.ingestion.seal(),
+      () => this.operations.seal(),
+      () => this.recovery.seal(),
+      () => this.adapter.sealCallbacks?.(),
+      () => this.adapter.sealProcessJournal?.(),
+      () => this.nativeRuntime?.sealJournals(),
+      () => this.checkpointBinding?.service.seal?.(),
+      ...[...this.shutdownServices].map((service) => () => service.seal?.()),
+      () => this.activeWorkspaceLease?.retain("RUNTIME_STOP_UNVERIFIED"),
+    ]) {
+      try { seal(); } catch (error) { failure ??= error; }
+    }
+    if (failure) throw failure;
+  }
   closeAndWait(deadlineMs?: number): Promise<RuntimeCloseReport> {
+    if (this.callbacksSealed && !this.closePromise) return this.closePromise = Promise.resolve({
+      closed: true, producerStopped: false, clean: false, stopped: false, recoveryRequired: true, state: "recovery_required",
+    });
     this.closePromise ??= this.lifecycle.shutdown(deadlineMs).then((result) => ({ ...result, closed: true, producerStopped: !!this.producerStop?.treeStopped, clean: result.stopped && !result.recoveryRequired && (!this.ownsStore || !this.owner.retainedReason),
       state: result.stopped && !result.recoveryRequired && (!this.ownsStore || !this.owner.retainedReason) ? "stopped" as const : "recovery_required" as const }));
     return this.closePromise;
@@ -364,8 +392,10 @@ export class SessionOrchestrator {
   }
   markProviderUnavailable(): void { this.lifecycle.markReady(false); }
   async prepareNativeRuntime(): Promise<NativeBoundaryAssessment | undefined> {
+    if (this.callbacksSealed) throw new OrchestratorError("HOST_DRAINING", "Host callbacks are sealed");
     if (!this.nativeRuntime) return undefined;
     const assessment = await this.nativeRuntime.prepare();
+    if (this.callbacksSealed) throw new OrchestratorError("HOST_DRAINING", "Host callbacks are sealed");
     this.lifecycle.markReady(assessment.ready);
     return assessment;
   }
@@ -404,12 +434,14 @@ export class SessionOrchestrator {
   }
 
   subscribe(listener: SessionEventListener): () => void {
+    if (this.callbacksSealed) return () => {};
     this.listeners.add(listener);
     return () => this.listeners.delete(listener);
   }
 
   /** Internal publication of facts already committed by shared feature services. */
   publishCommittedEvent(event: SessionEvent): void {
+    if (this.callbacksSealed) return;
     this.owner.assertActive();
     if (event.sessionId !== this.session.id) throw new OrchestratorError("RESOURCE_SCOPE_MISMATCH", "Committed event belongs to another Session");
     this.notify(event);
@@ -723,6 +755,7 @@ export class SessionOrchestrator {
   }
   private enqueueAdapterEvent(event: AdapterEvent): void { this.eventTail = this.ingestion.enqueue(event); }
   private recordIngestionFailure(error: unknown): void {
+    if (this.callbacksSealed || !this.store.db.open) return;
     this.degraded = true;
     const active = this.store.getActiveTurn(this.session.id);
     if (active) {
@@ -737,6 +770,7 @@ export class SessionOrchestrator {
   }
 
   private async handleAdapterEvent(event: AdapterEvent): Promise<void> {
+    if (this.callbacksSealed || !this.store.db.open) return;
     const context = event.dispatchContext;
     if (!context || event.turnId !== context.flyxTurnId || event.generation !== context.runtimeGeneration) return;
     const expected = this.dispatchContexts.get(context.flyxTurnId);
@@ -1063,6 +1097,7 @@ export class SessionOrchestrator {
     if (this.store.getSessionBaseline(this.session.id)) return Promise.resolve();
     if (!this.baselinePromise) {
       this.baselinePromise = this.git.status().then((status) => {
+        if (this.callbacksSealed || !this.store.db.open) throw new OrchestratorError("HOST_DRAINING", "Host callbacks are sealed");
         this.owner.assertActive();
         this.store.setSessionBaseline(this.session.id, { ...(status.head ? { head: status.head } : {}), dirty: status.dirty, files: status.files });
       }).catch((error) => {

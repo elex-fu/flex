@@ -14,7 +14,7 @@ const terminal: ProviderOutcome = { status: "completed", providerSessionId: "nat
 class ControlledAdapter implements ProviderAdapter {
   readonly provider = "claude" as const; readonly workspace = workspace;
   readonly started = barrier(); readonly stopping = barrier(); readonly stopAllowed = barrier<ProcessStopResult>(); readonly outcome = barrier<ProviderOutcome>();
-  context: DispatchContext | undefined; onEvent: AdapterEventHandler | undefined; sealed = false; closeCalls = 0; stopped = false;
+  context: DispatchContext | undefined; onEvent: AdapterEventHandler | undefined; sealed = false; journalSealed = false; closeCalls = 0; stopped = false;
   async status(): Promise<AdapterStatus> { return { provider: this.provider, transport: "deterministic", adapterVersion: "fixture", executable: "fixture", runtimeVersion: "fixture", workspace, sandboxRequired: true }; }
   preflight(): Promise<AdapterStatus> { throw new Error("Real Provider preflight forbidden"); }
   async runTurn(_id: string, _prompt: string, _resume?: string, context?: DispatchContext) { this.context = context; this.started.resolve(); return this.outcome.promise; }
@@ -22,6 +22,7 @@ class ControlledAdapter implements ProviderAdapter {
   respondApproval() { return true; }
   async closeAndWait() { this.closeCalls++; this.stopping.resolve(); const result = await this.stopAllowed.promise; this.stopped = result.treeStopped; return result; }
   sealCallbacks() { this.sealed = true; }
+  sealProcessJournal() { this.journalSealed = true; }
   finish() { if (!this.sealed && this.context) this.onEvent?.(fenceAdapterEvent(this.context, { kind: "turn_completed", result: "done", costUsd: 0, numTurns: 1, terminalEvidence: terminal.evidence })); this.outcome.resolve(terminal); }
 }
 const opened: Array<{ host: SessionOrchestrator; adapter: ControlledAdapter; store: SqliteStore }> = [];
@@ -81,6 +82,41 @@ describe("actual Host lifecycle integration", () => {
     const otherStore = new SqliteStore(); const other = otherStore.createSession(workspace, "claude");
     expect(() => new SessionOrchestrator({ workspace, owner, store: otherStore, sessionId: other.id, ownsStore: false, recoverOnStart: false, adapter: new ControlledAdapter(), hostViews: views })).toThrow("Shared Host views require the same Store and owner");
     expect(closeViews).not.toHaveBeenCalled(); expect(otherStore.db.open).toBe(true); expect(views.ready(selected.id)).toBe(true); otherStore.close(); views.close();
+  });
+  it("hard-seals all shared runtime callbacks without SQL even when one fence fails", async () => {
+    const f = fixture(undefined, true), serviceSeal = vi.fn(), listener = vi.fn();
+    const event = f.store.commitEvent(f.host.sessionId, "diagnostic.saved", {});
+    f.host.subscribe(listener);
+    f.host.registerShutdownService({ drain: async () => {}, seal: serviceSeal });
+    const sealAdapter = f.adapter.sealCallbacks.bind(f.adapter);
+    vi.spyOn(f.adapter, "sealCallbacks").mockImplementation(() => { sealAdapter(); throw new Error("adapter fence failed"); });
+    const prepare = vi.spyOn(f.store.db, "prepare");
+    try {
+      expect(() => f.host.sealBeforeStoreClose()).toThrow("adapter fence failed");
+      expect(() => f.host.sealBeforeStoreClose()).not.toThrow();
+      expect(f.host.worker.isSealed).toBe(true); expect(f.adapter.sealed).toBe(true); expect(f.adapter.journalSealed).toBe(true);
+      expect(serviceSeal).toHaveBeenCalledOnce(); expect(prepare).not.toHaveBeenCalled();
+      f.store.close();
+      f.host.publishCommittedEvent(event); f.host.subscribe(listener); f.host.publishCommittedEvent(event);
+      await expect(f.host.startTurn("actor", "late-start", "late")).rejects.toMatchObject({ code: "HOST_DRAINING" });
+      expect(await f.host.closeAndWait()).toMatchObject({ clean: false, producerStopped: false, recoveryRequired: true });
+      expect(f.adapter.closeCalls).toBe(0); expect(listener).not.toHaveBeenCalled(); expect(prepare).not.toHaveBeenCalled();
+      f.host.owner.assertActive();
+    } finally { prepare.mockRestore(); }
+  });
+  it("rejects late preparation after the shared Store fence without revisiting SQL or reporting a stopped producer", async () => {
+    const started = barrier(), assessment = barrier<NativeBoundaryAssessment>();
+    const owner = createTestHostOwner(), store = new SqliteStore();
+    const host = new SessionOrchestrator({ workspace, owner, store, nativeBoundaryFactory: async () => { started.resolve(); return assessment.promise; } });
+    const preparing = host.prepareNativeRuntime(), rejected = expect(preparing).rejects.toMatchObject({ code: "HOST_DRAINING" });
+    await started.promise; host.sealBeforeStoreClose(); store.close();
+    const prepare = vi.spyOn(store.db, "prepare");
+    try {
+      assessment.resolve({ ready: false, code: "NATIVE_BOUNDARY_BACKEND_UNAVAILABLE", summary: { ready: false, code: "NATIVE_BOUNDARY_BACKEND_UNAVAILABLE", platform: process.platform } });
+      await rejected;
+      expect(await host.closeAndWait()).toMatchObject({ clean: false, producerStopped: false, recoveryRequired: true });
+      expect(prepare).not.toHaveBeenCalled(); owner.assertActive();
+    } finally { prepare.mockRestore(); owner.release(); }
   });
   it("shares Store close failure and retains ownership instead of reporting a clean stop", async () => {
     const f = fixture(); f.adapter.stopAllowed.resolve({ stopped: true, treeStopped: true, records: [] }); f.store.close = () => { throw new Error("Store close failed"); };

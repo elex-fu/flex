@@ -7,6 +7,12 @@ const ENVIRONMENT_KEYS=new Set(["PATH","LANG","LC_ALL","LC_CTYPE","TERM","NO_COL
 const Config=z.strictObject({model:z.string().min(1).max(256).optional(),environment:z.record(z.string(),z.string()).default({}),sandboxRequired:z.literal(true).default(true)});
 export const LocalProviderInstanceConfig=z.strictObject({providerInstanceId:z.string().min(1).max(256),provider:z.enum(["claude","codex"]),executable:z.string().min(1),config:Config.default({environment:{},sandboxRequired:true}),policyVersion:z.number().int().positive().default(1),policyCapabilities:z.array(z.string().min(1).max(128)).max(64).default([])});
 export type LocalProviderInstanceConfig=z.input<typeof LocalProviderInstanceConfig>;
+export function parseLocalProviderInstance(input:LocalProviderInstanceConfig) {
+  const config=LocalProviderInstanceConfig.parse(input);
+  if(config.executable.includes("\0"))throw new CatalogError("PROVIDER_ENVIRONMENT_REJECTED");
+  for(const [key,value] of Object.entries(config.config.environment))if(!ENVIRONMENT_KEYS.has(key)||value.includes("\0"))throw new CatalogError("PROVIDER_ENVIRONMENT_REJECTED","Provider configuration may not persist secrets or inherit arbitrary Host environment");
+  return config;
+}
 
 function resolveExecutable(executable:string):string {
   const candidates=isAbsolute(executable)?[executable]:(process.env.PATH??"").split(delimiter).filter(Boolean).map((directory)=>join(directory,executable));
@@ -19,11 +25,18 @@ export class ProviderInstanceRegistry {
   constructor(readonly catalog:CatalogStore) {}
   get(id:string) {return this.catalog.provider(id);}
   require(id:string):ProviderInstanceRecord {const provider=this.get(id);if(!provider)throw new CatalogError("PROVIDER_INSTANCE_NOT_FOUND");if(provider.state!=="configured")throw new CatalogError("PROVIDER_INSTANCE_UNAVAILABLE");return provider;}
+  /** Current local executable plus trusted verification, before Native preparation. */
+  requireExecution(id:string):ProviderInstanceRecord {
+    const provider=this.require(id);
+    if(provider.verification.state!=="verified"||!provider.verification.runtimeVersion)throw new CatalogError("PROVIDER_CAPABILITY_UNVERIFIED");
+    try {if(!isAbsolute(provider.executable)||realpathSync(provider.executable)!==provider.executable)throw new Error("changed");accessSync(provider.executable,constants.X_OK);}
+    catch {throw new CatalogError("PROVIDER_EXECUTABLE_CHANGED","Configured Provider executable must be revalidated locally");}
+    return provider;
+  }
   list() {return this.catalog.providers();}
-  listPublic() {return this.list().map((provider)=>({providerInstanceId:provider.providerInstanceId,provider:provider.provider,state:provider.state,verification:{state:provider.verification.state,...(provider.verification.runtimeVersion?{runtimeVersion:provider.verification.runtimeVersion}:{})}}));}
+  listPublic() {return this.list().map((provider)=>({providerInstanceId:provider.providerInstanceId,provider:provider.provider,state:provider.state,verification:{state:provider.verification.state,...(provider.verification.state==="verified"&&provider.verification.runtimeVersion?{runtimeVersion:provider.verification.runtimeVersion}:{})}}));}
   registerLocal(input:LocalProviderInstanceConfig):ProviderInstanceRecord {
-    const config=LocalProviderInstanceConfig.parse(input);
-    for(const key of Object.keys(config.config.environment)) if(!ENVIRONMENT_KEYS.has(key)) throw new CatalogError("PROVIDER_ENVIRONMENT_REJECTED","Provider configuration may not persist secrets or inherit arbitrary Host environment");
+    const config=parseLocalProviderInstance(input);
     const executable=resolveExecutable(config.executable);
     const previous=this.get(config.providerInstanceId);
     if(previous&&(previous.executable!==executable||JSON.stringify(previous.config)!==JSON.stringify(config.config)||previous.policyVersion!==config.policyVersion)) {

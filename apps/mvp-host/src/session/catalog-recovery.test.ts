@@ -49,11 +49,12 @@ async function fixture(extra: Omit<CatalogRecoveryOptions, "catalog"> = {}, live
       checkoutRoot: context.workspace.worktreeRoot, adapter, recovery: bindings.runtimeRecoveryOptions(context) });
   });
   const host = await createHostCatalogBindings({ store, owner,
-    configuration: { workspaces: [{ workspaceId: "workspace", root: workspace }], providerInstances: (["claude", "codex"] as const).map((provider) => ({ providerInstanceId: `instance-${provider}`, provider, executable: process.execPath })) },
+    configuration: { workspaces: [{ workspaceId: "workspace", root: workspace }], providerInstances: (["claude", "codex"] as const).map((provider) => ({ providerInstanceId: `instance-${provider}`, provider, executable: process.execPath, policyCapabilities: live ? ["workspaceWrite"] : [] })) },
     initialLegacySession: { workspaceId: "workspace", providerInstanceId: "instance-claude" }, runtimeFactory,
     assertSessionAccess: (actor, target) => { if (denied.has(`${actor}:${target.session.sessionId}`)) throw Object.assign(new Error("Session grant revoked"), { code: "FORBIDDEN" }); } });
   bindings = createCatalogRecoveryBindings({ catalog: host, ...extra });
-  const codex = host.registry.createNew({ authSubjectId: "writer", commandId: "create-codex" }, { workspaceId: "workspace", providerInstanceId: "instance-codex", title: "Recovery target" }).summary.sessionId;
+  // Seed owned historical facts without claiming current Provider verification.
+  const codex = host.catalog.create({ authSubjectId: "writer", commandId: "create-codex" }, { workspaceId: "workspace", providerInstanceId: "instance-codex", title: "Recovery target" }, { workspace: host.workspaces.require("workspace"), provider: host.providers.require("instance-codex") }).summary.sessionId;
   const unknown = (sessionId = codex, fingerprint?: string) => {
     const start = `start:${sessionId}`; const turnId = `turn:${sessionId}`; const attemptId = `attempt:${sessionId}`;
     store.acceptTurn({ authSubjectId: "writer", sessionId, turnId, commandId: start, requestHash: `hash:${sessionId}`, prompt: "original prompt", generation: 1, attemptId });
@@ -106,7 +107,7 @@ describe("Catalogue recovery without Provider residency", () => {
   it("binds live capture and recovery fingerprints while excluding mutable observed verification and residency", async () => {
     const f = await fixture({}, true);
     const before = catalogRecoveryConfigurationFingerprint(f.host.registry.resolve(f.host.legacySessionId));
-    f.host.providers.recordVerification("instance-claude", { state: "verified", runtimeVersion: "version-probe", capabilities: [] });
+    f.host.providers.recordVerification("instance-claude", { state: "verified", runtimeVersion: "version-probe", capabilities: ["workspaceWrite"] });
     const runtime = await f.host.registry.ensureLoaded(f.host.legacySessionId);
     if (!(runtime instanceof SessionOrchestrator)) throw new Error("Expected the supplied live recovery runtime");
     expect(catalogRecoveryConfigurationFingerprint(f.host.registry.resolve(f.host.legacySessionId))).toBe(before);

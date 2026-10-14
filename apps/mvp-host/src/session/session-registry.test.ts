@@ -38,7 +38,7 @@ async function fixture(factory?:(context:SessionRuntimeContext)=>Promise<FakeRun
   const catalog=new CatalogStore(store);cleanups.push(()=>catalog.dispose());
   const workspaces=new WorkspaceRegistry(catalog,{owner});await workspaces.registerLocal({workspaceId:"workspace-one",root:checkout});
   const providers=new ProviderInstanceRegistry(catalog);
-  for(const provider of ["claude","codex"] as const)providers.registerLocal({providerInstanceId:`instance-${provider}`,provider,executable:process.execPath,policyCapabilities:["streamingText","workspaceWrite"]});
+  for(const provider of ["claude","codex"] as const){providers.registerLocal({providerInstanceId:`instance-${provider}`,provider,executable:process.execPath,policyCapabilities:["streamingText","workspaceWrite"]});providers.recordVerification(`instance-${provider}`,{state:"verified",runtimeVersion:"fixture-version",capabilities:["streamingText","workspaceWrite"]});}
   const runtimeFactory=vi.fn(factory??((context)=>{const runtime=new FakeRuntime(context.session.sessionId,context.runtimeId);runtime.closeGate.resolve(clean);return runtime;}));
   const registry=new SessionRegistry(catalog,workspaces,providers,{owner,runtimeFactory});
   const create=(commandId:string,provider="claude")=>registry.createNew({authSubjectId:"primary-device",commandId},{workspaceId:"workspace-one",providerInstanceId:`instance-${provider}`,title:commandId}).summary;
@@ -165,6 +165,7 @@ describe("Session catalog and lazy runtime routing",()=>{
   });
   it("intersects verified capabilities with adapter, policy, workspace and device scopes and rejects secret env",async()=>{
     const f=await fixture();expect(()=>f.providers.registerLocal({providerInstanceId:"unsafe",provider:"codex",executable:process.execPath,config:{environment:{API_KEY:"secret"}}})).toThrow("may not persist secrets");
+    f.providers.recordVerification("instance-claude",{state:"unverified",capabilities:[]});
     expect(f.providers.effectiveCapabilities("instance-claude",{adapter:["streamingText","workspaceWrite"],workspace:["streamingText","workspaceWrite"],deviceScopes:["session:read","session:write"]})).toEqual([]);
     f.providers.recordVerification("instance-claude",{state:"verified",runtimeVersion:"test-version",capabilities:["streamingText","workspaceWrite"]});
     expect(f.providers.effectiveCapabilities("instance-claude",{adapter:["streamingText","workspaceWrite"],workspace:["streamingText","workspaceWrite"],deviceScopes:["session:read"]})).toEqual(["streamingText"]);

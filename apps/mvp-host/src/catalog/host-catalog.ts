@@ -3,7 +3,7 @@ import { ProtocolVersion, SESSION_CATALOG_CAPABILITY, TIMELINE_PROJECTION_CAPABI
 import type { HostOwnerHandle } from "../lifecycle/host-owner.js";
 import { assertHostOwner } from "../lifecycle/host-owner.js";
 import type { SqliteStore, CommandReceiptRow } from "../storage/db.js";
-import { CatalogError, CatalogStore, publicSessionSummary, type CatalogCommit, type CatalogSession, type ProviderVerification } from "../storage/catalog-store.js";
+import { CatalogError, CatalogStore, publicSessionSummary, type CatalogCommit, type CatalogSession, type ProviderVerification, type ProviderInstanceRecord } from "../storage/catalog-store.js";
 import { validateCatalogSchema } from "../storage/migrations/007-catalog.js";
 import { registerConfiguredCatalog, LocalCatalogConfigurationSchema, type LocalCatalogConfiguration } from "../session/configured-catalog.js";
 import { SessionRegistry, type SessionRuntimeContext, type RuntimeCloseReport, type ResolvedSession } from "../session/session-registry.js";
@@ -19,6 +19,7 @@ import type { ProviderInstanceRegistry } from "../provider/provider-instance-reg
 import type { InteractionRpcPort } from "../interaction/host-interactions.js";
 import { CatalogInteractionReader } from "./catalog-interaction-reader.js";
 import { CatalogLegacyHost } from "./catalog-legacy-host.js";
+import { invalidateCatalogResourceReadiness, registerCatalogReadMetadata } from "./catalog-read-bootstrap.js";
 export type CatalogAccessScope = "session:read" | "session:write" | "approval:write";
 export interface CatalogExecutionRuntime {
     readonly sessionId: string;
@@ -70,6 +71,11 @@ export type HostCatalogOptions = {
         close?(): Promise<void> | void;
     }[];
     runtimeCloseDeadlineMs?: number;
+};
+export type CatalogConfigurationRevalidationOptions = {
+    readOnlyGit?: WorkspaceGitQuery;
+    /** Trusted installed-contract evidence; a Native boundary assessment is insufficient. */
+    verifyProviderConfiguration?: (provider: ProviderInstanceRecord) => ProviderVerification | Promise<ProviderVerification>;
 };
 export interface CatalogRpcContext extends RpcContext {
     assertSessionScope?(sessionId: string, scope: CatalogAccessScope): void;
@@ -124,6 +130,29 @@ export class HostCatalog {
     get store() { return this.options.store; }
     get owner() { return this.options.owner; }
     get legacySessionId() { return this.legacy.sessionId; }
+    assertExecutionResources(sessionId: string): ResolvedSession { return this.registry.assertExecutionResources(sessionId); }
+    /** Explicit local configuration step; SQL/history startup never calls it. */
+    async revalidateConfiguration(configuration: LocalCatalogConfiguration, options: CatalogConfigurationRevalidationOptions = {}): Promise<void> {
+        this.owner.assertActive();
+        if (this.closed) throw new CatalogError("HOST_CLOSING");
+        const parsed = LocalCatalogConfigurationSchema.parse(configuration);
+        if (parsed.legacyDefaultSessionId && parsed.legacyDefaultSessionId !== this.legacySessionId) throw new CatalogError("LEGACY_DEFAULT_CONFLICT");
+        for (const session of this.catalog.allSessions()) {
+            this.catalog.assertIdle(session.sessionId);
+            if (session.residency !== "unloaded") throw new CatalogError("CATALOG_RESOURCES_BUSY");
+        }
+        this.store.db.transaction(() => invalidateCatalogResourceReadiness(this.catalog, this.owner))();
+        const readOnlyGit = options.readOnlyGit ?? this.options.readOnlyGit;
+        await registerConfiguredCatalog(this.catalog, this.owner, parsed, { ...(this.options.privateDirectories ? { privateDirectories: this.options.privateDirectories } : {}), ...(readOnlyGit ? { readOnlyGit } : {}) });
+        if (this.closed) throw new CatalogError("HOST_CLOSING");
+        for (const input of parsed.providerInstances) {
+            if (!options.verifyProviderConfiguration) continue;
+            const verification = await options.verifyProviderConfiguration(this.providers.require(input.providerInstanceId));
+            this.owner.assertActive();
+            if (this.closed) throw new CatalogError("HOST_CLOSING");
+            this.providers.recordVerification(input.providerInstanceId, verification);
+        }
+    }
     capabilities(): readonly string[] { try {
         this.owner.assertActive();
         return this.closed ? [] : [SESSION_CATALOG_CAPABILITY];
@@ -221,7 +250,7 @@ export class HostCatalog {
         throw new CatalogError("CAPABILITY_REQUIRED", "Session catalog capability is required"); }
     private commandFor(frame: RpcRequest, context: RpcContext) { if (!frame.commandId || frame.commandId.length > 128)
         throw new CatalogError("COMMAND_ID_REQUIRED"); return { authSubjectId: context.subjectId, commandId: frame.commandId }; }
-    private publicForSession(value: unknown, sessionId: string): unknown { const target = this.registry.resolve(sessionId); return publicValue(publicValue(value, target.workspace.canonicalRoot), target.workspace.worktreeRoot); }
+    private publicForSession(value: unknown, sessionId: string): unknown { const target = this.registry.resolve(sessionId); const projected = publicValue(value, target.workspace.canonicalRoot); return target.workspace.worktreeRoot ? publicValue(projected, target.workspace.worktreeRoot) : projected; }
     private summary(session: CatalogSession): SessionSummaryV2 {
         const raw = this.store.getSession(session.sessionId);
         const blocked = raw?.recoveryState === "blocked" || this.catalog.runtimeCloseForSession(session.sessionId)?.state === "outcome_unknown" || Boolean(this.store.db.prepare("SELECT 1 FROM host_state WHERE key='restore_readiness'").get());
@@ -281,7 +310,7 @@ export class HostCatalog {
     }
     bootstrap(): Bootstrap {
         const target = this.registry.resolve(this.legacySessionId);
-        const capabilities = this.providers.effectiveCapabilities(target.providerInstance.providerInstanceId, { adapter: target.providerInstance.verification.capabilities, workspace: target.workspace.capabilities, deviceScopes: ["session:read", "session:write", "approval:write"] });
+        const capabilities = target.workspace.state === "active" && target.providerInstance.state === "configured" && target.providerInstance.verification.state === "verified" ? this.providers.effectiveCapabilities(target.providerInstance.providerInstanceId, { adapter: target.providerInstance.verification.capabilities, workspace: target.workspace.capabilities, deviceScopes: ["session:read", "session:write", "approval:write"] }) : [];
         return { protocolVersion: ProtocolVersion, provider: target.session.provider, capabilities: { streamingText: capabilities.includes("streamingText"), structuredToolCalls: capabilities.includes("structuredToolCalls"), interactiveApprovals: capabilities.includes("interactiveApprovals"), resumeConversation: capabilities.includes("resumeConversation"), interrupt: capabilities.includes("interrupt"), gitDiff: capabilities.includes("gitDiff"), sandboxRequired: true } };
     }
     async dispatchCatalog(frame: RpcRequest, context: CatalogRpcContext): Promise<CatalogDispatchResult> {
@@ -426,6 +455,11 @@ export class HostCatalog {
         const scope = frame.method === "approval.respond" ? "approval:write" : "session:write";
         this.target(context, sessionId, scope);
         this.assertRestoreReady();
+        const resolved = this.registry.assertExecutionResources(sessionId);
+        const required = frame.method === "session.startTurn" ? "workspaceWrite" : frame.method === "session.interrupt" ? "interrupt" : "interactiveApprovals";
+        const device = this.store.getDevice(context.subjectId)!;
+        if (!this.providers.effectiveCapabilities(resolved.providerInstance.providerInstanceId, { adapter: resolved.providerInstance.verification.capabilities, workspace: resolved.workspace.capabilities, deviceScopes: device.scopes }).includes(required))
+            throw new CatalogError("PROVIDER_CAPABILITY_UNVERIFIED");
         const command = this.commandFor(frame, context);
         const legacyPayload = frame.method === "session.startTurn" ? { prompt: (input as {
                 prompt: string;
@@ -452,10 +486,9 @@ export class HostCatalog {
             throw new CatalogError("SESSION_REVISION_CONFLICT");
         const runtime = await this.registry.ensureLoaded(sessionId);
         this.target(context, sessionId, scope);
-        const resolved = this.registry.resolve(sessionId);
-        const required = frame.method === "session.startTurn" ? "workspaceWrite" : frame.method === "session.interrupt" ? "interrupt" : "interactiveApprovals";
-        const device = this.store.getDevice(context.subjectId)!;
-        if (!this.providers.effectiveCapabilities(resolved.providerInstance.providerInstanceId, { adapter: resolved.providerInstance.verification.capabilities, workspace: resolved.workspace.capabilities, deviceScopes: device.scopes }).includes(required))
+        const current = this.registry.assertExecutionResources(sessionId);
+        const currentDevice = this.store.getDevice(context.subjectId)!;
+        if (!this.providers.effectiveCapabilities(current.providerInstance.providerInstanceId, { adapter: current.providerInstance.verification.capabilities, workspace: current.workspace.capabilities, deviceScopes: currentDevice.scopes }).includes(required))
             throw new CatalogError("PROVIDER_CAPABILITY_UNVERIFIED");
         const result = frame.method === "session.startTurn" ? await runtime.startTurn(command.authSubjectId, command.commandId, (input as {
             prompt: string;
@@ -557,6 +590,13 @@ export class HostCatalog {
     }
 }
 export async function createHostCatalogBindings(options: HostCatalogOptions): Promise<HostCatalog> {
+    return openHostCatalog(options, false);
+}
+/** Trusted owner-only SQL bootstrap, with no local Git or Provider admission. */
+export async function createHostCatalogReadBindings(options: HostCatalogOptions): Promise<HostCatalog> {
+    return openHostCatalog(options, true);
+}
+async function openHostCatalog(options: HostCatalogOptions, metadataOnly: boolean): Promise<HostCatalog> {
     assertHostOwner(options.owner);
     options.owner.assertStorePath(options.store.db.name);
     if (options.owner.recoveryOnly || options.owner.mode === "maintenance")
@@ -581,9 +621,9 @@ export async function createHostCatalogBindings(options: HostCatalogOptions): Pr
             throw new CatalogError("LEGACY_DEFAULT_REQUIRED", "Choose the existing default Session in local Host configuration");
         if (legacyDefault && configuration.legacyDefaultSessionId && legacyDefault !== configuration.legacyDefaultSessionId)
             throw new CatalogError("LEGACY_DEFAULT_CONFLICT");
-        const configured = await registerConfiguredCatalog(catalog, options.owner, configuration, { ...(options.privateDirectories ? { privateDirectories: options.privateDirectories } : {}), ...(options.readOnlyGit ? { readOnlyGit: options.readOnlyGit } : {}) });
+        const configured = metadataOnly ? registerCatalogReadMetadata(catalog, options.owner, configuration, { ...(options.privateDirectories ? { privateDirectories: options.privateDirectories } : {}), ...(options.readOnlyGit ? { readOnlyGit: options.readOnlyGit } : {}), ...(options.initialLegacySession ? { initialLegacySession: options.initialLegacySession } : {}), ...(options.restoreWriteReady ? { restoreWriteReady: options.restoreWriteReady } : {}) }) : await registerConfiguredCatalog(catalog, options.owner, configuration, { ...(options.privateDirectories ? { privateDirectories: options.privateDirectories } : {}), ...(options.readOnlyGit ? { readOnlyGit: options.readOnlyGit } : {}) });
         const initial = options.initialLegacySession;
-        if (!catalog.legacyDefaultSessionId() && !hasSessions && initial)
+        if (!metadataOnly && !catalog.legacyDefaultSessionId() && !hasSessions && initial)
             options.store.db.transaction(() => { const input = { ...initial, title: initial.title ?? "Untitled session" }; const created = catalog.create({ authSubjectId: "host-bootstrap", commandId: "catalog-legacy-default" }, input, { workspace: configured.workspaces.require(input.workspaceId), provider: configured.providers.require(input.providerInstanceId) }); catalog.setLegacyDefaultOnce(created.summary.sessionId); })();
         if (!catalog.legacyDefaultSessionId())
             throw new CatalogError("LEGACY_DEFAULT_REQUIRED");

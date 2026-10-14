@@ -200,6 +200,22 @@ describe("production Host catalog binding", () => {
         await expect(fresh.rpc("session.startTurn", { sessionId: fresh.host.legacySessionId, prompt: "hello", cwd: "/arbitrary-client" }, "path")).rejects.toMatchObject({ code: "INVALID_PARAMS" });
         expect(fresh.runtimeFactory).not.toHaveBeenCalled();
     });
+    it("rechecks the requested execution capability after an awaited load before accepting or dispatching a Turn", async () => {
+        const gate = barrier<CatalogExecutionRuntime>();
+        let captured!: SessionRuntimeContext;
+        const f = await fixture({ runtimeFactory: (context) => { captured = context; return gate.promise; } });
+        const id = f.host.legacySessionId;
+        const pending = f.rpc("session.startTurn", { sessionId: id, prompt: "revoked capability" }, "revoked-capability");
+        const denied = expect(pending).rejects.toMatchObject({ code: "PROVIDER_CAPABILITY_UNVERIFIED" });
+        await tick();
+        f.host.providers.recordVerification("instance-claude", { state: "verified", runtimeVersion: "fixture", capabilities: ["interrupt"] });
+        const runtime = new EngineRuntime(captured);
+        gate.resolve(runtime);
+        await denied;
+        expect(runtime.startTurn).not.toHaveBeenCalled();
+        expect(f.store.getCommandReceipt("writer", "revoked-capability")).toBeUndefined();
+        expect(f.store.getActiveTurn(id)).toBeUndefined();
+    });
     it("journals accepted runtime-close before its effect, reports unknown stop, and never replays it", async () => {
         const f = await fixture();
         const id = f.host.legacySessionId;

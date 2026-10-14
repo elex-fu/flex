@@ -27,7 +27,7 @@ export class CatalogLegacyHost {
             throw new OrchestratorError("SESSION_NOT_FOUND", "Default Session does not exist");
         return snapshot;
     }
-    private public<T>(value: T): T { return publicValue(publicValue(value, this.workspace), this.checkoutRoot) as T; }
+    private public<T>(value: T): T { const projected = publicValue(value, this.workspace); return (this.checkoutRoot ? publicValue(projected, this.checkoutRoot) : projected) as T; }
     publicSnapshot(): ReturnType<SessionOrchestrator["publicSnapshot"]> { return this.public(this.catalog.legacy.publicSnapshot()); }
     timeline(after = 0, limit = 200, upTo?: number): ReturnType<SessionOrchestrator["timeline"]> {
         const page = this.catalog.registry.readEvents(this.sessionId, after, Math.max(1, Math.min(limit, 200)), upTo);
@@ -39,12 +39,12 @@ export class CatalogLegacyHost {
     }
     timelineItems() { return this.public(this.catalog.legacy.timelineItems()); }
     subscribe(listener: (event: SessionEvent) => void): () => void { return this.catalog.registry.subscribe(this.sessionId, (event) => listener(this.public(publicEvent(event, this.workspace)))); }
-    async gitStatus() { return this.public(publicGitStatus(await this.catalog.registry.gitStatus(this.sessionId), this.workspace)); }
-    async gitDiff() { return this.public(publicGitDiff(await this.catalog.registry.gitDiff(this.sessionId), this.workspace)); }
+    async gitStatus() { if (this.catalog.registry.resolve(this.sessionId).workspace.state !== "active") return { available: false, dirty: false, files: [], error: "Git status unavailable" }; return this.public(publicGitStatus(await this.catalog.registry.gitStatus(this.sessionId), this.workspace)); }
+    async gitDiff() { if (this.catalog.registry.resolve(this.sessionId).workspace.state !== "active") return { available: false, dirty: false, files: [], diff: "", truncated: false, error: "Git diff unavailable" }; return this.public(publicGitDiff(await this.catalog.registry.gitDiff(this.sessionId), this.workspace)); }
     /** Configured and already-verified metadata only; status does not run --version or a preflight. */
     async providerStatus(): Promise<AdapterStatus> {
         const provider = this.catalog.registry.resolve(this.sessionId).providerInstance;
-        return { provider: provider.provider, transport: provider.provider === "claude" ? "claude-agent-sdk" : "codex-app-server", adapterVersion: "unloaded", executable: provider.executable, runtimeVersion: provider.verification.runtimeVersion ?? "unverified", workspace: this.workspace, sandboxRequired: true };
+        return { provider: provider.provider, transport: provider.provider === "claude" ? "claude-agent-sdk" : "codex-app-server", adapterVersion: "unloaded", executable: provider.executable, runtimeVersion: provider.verification.state === "verified" ? provider.verification.runtimeVersion ?? "unverified" : "unverified", workspace: this.workspace, sandboxRequired: true };
     }
     // Authenticated writes are handled by CatalogRpcPort, carrying its concrete lease/target scope.
     async startTurn(_actor: string, _commandId: string, _prompt: string): Promise<StartTurnResponse> { throw new OrchestratorError("SESSION_ROUTING_REQUIRED", "Writes require authenticated Session routing"); }

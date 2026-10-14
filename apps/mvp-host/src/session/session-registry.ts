@@ -39,6 +39,13 @@ export class SessionRegistry<R extends SessionRuntime=SessionRuntime> {
     if(!workspace||!providerInstance||providerInstance.provider!==session.provider)throw new CatalogError("SESSION_BINDING_INVALID");
     return {session,workspace,providerInstance};
   }
+  /** Business/FS admission is distinct from the pure persisted read relation. */
+  assertExecutionResources(sessionId:string):ResolvedSession {
+    this.store.assertWriterOwner();this.options.owner.assertActive();
+    if(this.options.owner.mode==="maintenance")throw new CatalogError("HOST_MAINTENANCE_ONLY");
+    const resolved=this.resolve(sessionId);
+    return {...resolved,workspace:this.workspaces.require(resolved.workspace.workspaceId),providerInstance:this.providers.requireExecution(resolved.providerInstance.providerInstanceId)};
+  }
   private executionTarget(sessionId:string):ResolvedSession {
     this.store.assertWriterOwner();
     const resolved=this.resolve(sessionId);
@@ -46,7 +53,10 @@ export class SessionRegistry<R extends SessionRuntime=SessionRuntime> {
     this.catalog.assertRecovered(sessionId);
     if(this.catalog.runtimeCloseForSession(sessionId))throw new CatalogError("RECOVERY_BLOCKED","Runtime close must be settled before loading",true);
     if(this.options.owner.mode==="maintenance")throw new CatalogError("HOST_MAINTENANCE_ONLY");
-    return {...resolved,workspace:this.workspaces.require(resolved.workspace.workspaceId),providerInstance:this.providers.require(resolved.providerInstance.providerInstanceId)};
+    const ready=this.assertExecutionResources(sessionId);
+    const executionCapabilities=["workspaceWrite","resumeConversation","interrupt","interactiveApprovals","structuredQuestions","checkpointCapture"];
+    if(!ready.providerInstance.verification.capabilities.some((capability)=>executionCapabilities.includes(capability)&&ready.providerInstance.policyCapabilities.includes(capability)&&ready.workspace.capabilities.includes(capability)))throw new CatalogError("PROVIDER_CAPABILITY_UNVERIFIED");
+    return ready;
   }
   get(sessionId:string):SessionSummaryV2{return publicSessionSummary(this.resolve(sessionId).session);}
   list(input:unknown={}):ListSessionsV2Response {
@@ -159,6 +169,7 @@ export class SessionRegistry<R extends SessionRuntime=SessionRuntime> {
   }
   async closeRuntimeCommand(command:CatalogCommand,input:unknown,deadlineMs?:number):Promise<CatalogCommit> {
     const parsed=ChangeSessionStatusV2Schema.parse(input);
+    this.assertExecutionResources(parsed.sessionId);
     const knownUnloaded=this.catalog.requireSession(parsed.sessionId).residency==="unloaded"&&!this.entries.get(parsed.sessionId)?.runtime&&!this.entries.get(parsed.sessionId)?.loading;
     const runtimeId=this.loaded(parsed.sessionId)?.runtimeId??this.entries.get(parsed.sessionId)?.runtimeId;
     const begun=this.catalog.beginRuntimeClose(command,parsed,{ownerId:this.options.owner.ownerId,ownerGeneration:this.options.owner.generation,resourceKeys:this.options.owner.resourceKeys,...(runtimeId?{runtimeId}:{})});
@@ -170,12 +181,12 @@ export class SessionRegistry<R extends SessionRuntime=SessionRuntime> {
   }
   createNew(command:CatalogCommand,input:unknown):CatalogCommit {
     const parsed=CreateSessionV2Schema.parse(input);
-    const result=this.catalog.create(command,parsed,{workspace:this.workspaces.require(parsed.workspaceId),provider:this.providers.require(parsed.providerInstanceId)});
+    const result=this.catalog.create(command,parsed,{workspace:this.workspaces.require(parsed.workspaceId),provider:this.providers.requireExecution(parsed.providerInstanceId)});
     this.publish(result.events);return result;
   }
-  rename(command:CatalogCommand,input:unknown):CatalogCommit {const result=this.catalog.change(command,"session.rename",RenameSessionV2Schema.parse(input));this.publish(result.events);return result;}
-  archive(command:CatalogCommand,input:unknown):CatalogCommit {const result=this.catalog.change(command,"session.archive",ChangeSessionStatusV2Schema.parse(input));this.publish(result.events);return result;}
-  unarchive(command:CatalogCommand,input:unknown):CatalogCommit {const result=this.catalog.change(command,"session.unarchive",ChangeSessionStatusV2Schema.parse(input));this.publish(result.events);return result;}
+  rename(command:CatalogCommand,input:unknown):CatalogCommit {const parsed=RenameSessionV2Schema.parse(input);this.assertExecutionResources(parsed.sessionId);const result=this.catalog.change(command,"session.rename",parsed);this.publish(result.events);return result;}
+  archive(command:CatalogCommand,input:unknown):CatalogCommit {const parsed=ChangeSessionStatusV2Schema.parse(input);this.assertExecutionResources(parsed.sessionId);const result=this.catalog.change(command,"session.archive",parsed);this.publish(result.events);return result;}
+  unarchive(command:CatalogCommand,input:unknown):CatalogCommit {const parsed=ChangeSessionStatusV2Schema.parse(input);this.assertExecutionResources(parsed.sessionId);const result=this.catalog.change(command,"session.unarchive",parsed);this.publish(result.events);return result;}
   private publish(events:readonly SessionEvent[]):void {this.publishCommittedEvents(events);}
   async gitStatus(sessionId:string){const resolved=this.resolve(sessionId);const workspace=this.workspaces.require(resolved.workspace.workspaceId);return new GitService(workspace.worktreeRoot).status();}
   async gitDiff(sessionId:string){const resolved=this.resolve(sessionId);const workspace=this.workspaces.require(resolved.workspace.workspaceId);const baseline=this.store.getSessionBaseline(sessionId);const result=await new GitService(workspace.worktreeRoot).diff(baseline?.head);return {...result,...(baseline?.head?{baselineHead:baseline.head}:{}),...(baseline?{baselineDirty:baseline.dirty}:{baselineWarning:"Session baseline has not been captured; historical attribution is unavailable."})};}

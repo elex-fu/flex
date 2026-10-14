@@ -49,7 +49,8 @@ async function fixture() {
   };
   const actor = context();
   let sessionCounter = 0;
-  const createSession = (workspaceId = "repository-workspace") => sessions.createNew({ authSubjectId: actor.subjectId, commandId: "session-" + ++sessionCounter }, { workspaceId, providerInstanceId: "provider-one", title: "Session " + sessionCounter }).summary.sessionId;
+  // Seed controlled fixture facts; actual RPC writes require current resource verification.
+  const createSession = (workspaceId = "repository-workspace") => { const committed = catalog.create({ authSubjectId: actor.subjectId, commandId: "session-" + ++sessionCounter }, { workspaceId, providerInstanceId: "provider-one", title: "Session " + sessionCounter }, { workspace: workspaces.require(workspaceId), provider: providers.require("provider-one") }); sessions.publishCommittedEvents(committed.events); return committed.summary.sessionId; };
   const source = createSession();
   let stopVerified = true, fault: { boundary: string; moment: string } | undefined;
   let boundaryGate: { boundary: string; entered: ReturnType<typeof deferred>; release: ReturnType<typeof deferred> } | undefined;

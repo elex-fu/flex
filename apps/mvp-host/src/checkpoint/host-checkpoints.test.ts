@@ -49,8 +49,10 @@ async function fixture(input: { revert?: boolean; verified?: boolean; helper?: s
     const session = store.getSession(id); if (!session) return undefined;
     return { sessionId: id, workspace: session.workspacePath, source: { get headSequence() { return store.getSession(id)!.headSequence; }, getEvent: (sequence: number) => store.listEvents(id, sequence - 1, 1).events[0], subscribe: (listener) => registry.subscribe(id, listener) }, readSnapshot: () => registry.readSnapshot(id) };
   } }); cleanups.push(() => views.close());
-  const session = registry.createNew({ authSubjectId: "device-1", commandId: "create-one" }, { workspaceId: "workspace-1", providerInstanceId: "provider-1", title: "First" }).summary;
-  const second = registry.createNew({ authSubjectId: "device-1", commandId: "create-two" }, { workspaceId: "workspace-1", providerInstanceId: "provider-1", title: "Second" }).summary;
+  // Historical fixture seeding is separate from the verified public write route.
+  const seed = (commandId: string, title: string) => catalog.create({ authSubjectId: "device-1", commandId }, { workspaceId: "workspace-1", providerInstanceId: "provider-1", title }, { workspace: workspaces.require("workspace-1"), provider: providers.require("provider-1") }).summary;
+  const session = seed("create-one", "First");
+  const second = seed("create-two", "Second");
   const nativeHandle = SessionNativeHandleSchema.parse({ v: 1, provider: "codex", providerInstanceId: "provider-1", workspaceId: "workspace-1", nativeSessionId: "private-native-id", provenance: "native" }); catalog.setNativeHandle(session.sessionId, nativeHandle);
   store.createDevice({ id: "device-1", hostId: "host-1", platform: "test", credentialKind: "browser-session", credentialRevision: 1, scopes: ["session:read", "session:write"], createdAt: new Date().toISOString() });
   store.createDevice({ id: "device-2", hostId: "host-1", platform: "test", credentialKind: "browser-session", credentialRevision: 1, scopes: ["session:read", "session:write"], createdAt: new Date().toISOString() });

@@ -88,7 +88,8 @@ async function fixture() {
     assertSessionAccess: (_actor, target) => { if (denied.has(target.session.sessionId))
       throw new AccessError("FORBIDDEN", "Session grant changed"); } });
   cleanup.push(() => catalog.closeAndWait());
-  const second = catalog.registry.createNew({ authSubjectId: actor.id, commandId: "create-second" }, { workspaceId: "workspace", providerInstanceId: "provider", title: "Second" }).summary.sessionId;
+  // Owned fixture history does not promote the unverified Provider to writable.
+  const second = catalog.catalog.create({ authSubjectId: actor.id, commandId: "create-second" }, { workspaceId: "workspace", providerInstanceId: "provider", title: "Second" }, { workspace: catalog.workspaces.require("workspace"), provider: catalog.providers.require("provider") }).summary.sessionId;
   const first = catalog.legacySessionId;
   const interactions = new InteractionService(new CommandEngine(store), { resolveSession: (id) => { const resource = catalog.registry.resolve(id); return { provider: resource.session.provider, workspaceId: resource.workspace.workspaceId }; }, evidenceSource: "fixture" });
   cleanup.push(() => interactions.close());

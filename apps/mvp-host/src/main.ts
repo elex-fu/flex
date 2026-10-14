@@ -9,6 +9,10 @@ import { getHostIdentityMirror, loadOrCreateHostIdentity, publicHostIdentity, ro
 import { createHostServer } from "./server.js";
 import { SessionOrchestrator } from "./session/orchestrator.js";
 import { runOfflineRecovery } from "./connectivity/recovery-cli.js";
+import { HOST_OPERATIONS_CLI_USAGE, runHostOperationsCommand } from "./connectivity/operations-cli.js";
+import { verifyOfflineHostQuiescence } from "./connectivity/offline-quiescence.js";
+import { CATALOG_IMPORT_CLI_USAGE, runCatalogImportCli } from "./catalog/catalog-import-cli.js";
+import { OperationSnapshotLane } from "./operations/host-operations.js";
 import { SqliteStore } from "./storage/db.js";
 import { HostOwnerLock, assertWorkspacePrivacy, canonicalPath } from "./lifecycle/host-owner.js";
 import { openForMaintenance, openForManagement, openOwned, openReadOnly } from "./storage/open-store.js";
@@ -22,16 +26,66 @@ async function main(): Promise<void> {
   const command = parseHostCommand(process.argv.slice(2));
   if (command.kind === "help") {
     console.log("Flyx Host: start | devices list | devices revoke <deviceId> | devices revoke-all | identity show | identity rotate");
+    console.log(`Operations: ${HOST_OPERATIONS_CLI_USAGE}`);
+    console.log(`Catalog: ${CATALOG_IMPORT_CLI_USAGE}`);
     console.log("Recovery: recovery inspect <sessionId> <turnId> [--attempt <attemptId>] [--upgrade-metadata]");
     console.log("Recovery write: recovery reconcile|acknowledge <sessionId> <turnId> <evidenceId> <recoveryRevision> <commandId> [--attempt <attemptId>] [--acknowledge-unknown]");
     console.log("Select the existing Host using FLYX_DB and FLYX_IDENTITY_DIR. Key rotation requires confirmation in a local terminal.");
     return;
   }
-  const workspace = resolve(process.env.FLYX_WORKSPACE ?? resolve(process.cwd(), "packages/claude-fixtures"));
-  const provider = parseProvider(process.env.FLYX_PROVIDER);
-  const defaultDatabase = provider === "codex" ? ".flyx/mvp-codex.sqlite" : ".flyx/mvp.sqlite";
+  const defaultDatabase = process.env.FLYX_PROVIDER === "codex" ? ".flyx/mvp-codex.sqlite" : ".flyx/mvp.sqlite";
   const databasePath = resolve(process.env.FLYX_DB ?? resolve(process.cwd(), defaultDatabase));
   const identityDirectory = resolve(process.env.FLYX_IDENTITY_DIR ?? join(dirname(databasePath), "identity"));
+  if (command.kind === "operations") {
+    if (command.action === "doctor" || command.action === "validate") {
+      console.log(JSON.stringify(await runHostOperationsCommand(command, { databasePath }), null, 2));
+      return;
+    }
+    await stat(databasePath);
+    const owner = HostOwnerLock.acquire({ databasePath, identityDirectory, mode: "maintenance" });
+    let offlineStore: SqliteStore | undefined;
+    const withSnapshot = new OperationSnapshotLane(() => owner.assertActive()).withSnapshot;
+    try {
+      const config = parseConnectivityConfig();
+      const relay = config.relayEnabled && config.relayUrl ? {
+        registrationPath: join(owner.identityDirectory!, "relay-registration.json"), relayUrl: config.relayUrl,
+      } : undefined;
+      if (command.action === "backup") {
+        offlineStore = openForMaintenance({ databasePath: owner.databasePath, owner });
+        console.log(JSON.stringify(await runHostOperationsCommand(command, { databasePath: owner.databasePath,
+          backup: { store: offlineStore, owner, identityDirectory: owner.identityDirectory!, applicationVersion: "0.0.1", withSnapshot, ...(relay ? { relay } : {}) },
+        }), null, 2));
+      } else {
+        let inspecting = false;
+        console.log(JSON.stringify(await runHostOperationsCommand(command, { databasePath: owner.databasePath,
+          restore: { owner, databasePath: owner.databasePath, identityDirectory: owner.identityDirectory!, applicationVersion: "0.0.1", withSnapshot, ...(relay ? { relay } : {}),
+            verification: {
+              verifyProducersStopped: (scope) => {
+                owner.assertActive(); owner.assertStorePath(scope.databasePath); inspecting = true;
+                try { return verifyOfflineHostQuiescence(scope.databasePath); }
+                finally { inspecting = false; }
+              },
+              verifyDatabaseClosed: (scope) => {
+                owner.assertActive(); owner.assertStorePath(scope.databasePath);
+                return !inspecting && offlineStore?.db.open !== true;
+              },
+            },
+          },
+        }), null, 2));
+      }
+    } finally { offlineStore?.close(); owner.release(); }
+    return;
+  }
+  if (command.kind === "catalog-import") {
+    await stat(databasePath);
+    const owner = HostOwnerLock.acquire({ databasePath, identityDirectory, mode: "maintenance" });
+    let offlineStore: SqliteStore | undefined;
+    try {
+      offlineStore = openForMaintenance({ databasePath: owner.databasePath, owner });
+      console.log(JSON.stringify(await runCatalogImportCli({ store: offlineStore, owner, backupDirectory: command.backupDirectory }, command.request), null, 2));
+    } finally { offlineStore?.close(); owner.release(); }
+    return;
+  }
   if (command.kind === "recovery") {
     console.log(JSON.stringify(await runOfflineRecovery(command, { databasePath, identityDirectory }), null, 2));
     return;
@@ -62,6 +116,9 @@ async function main(): Promise<void> {
     }
     return;
   }
+
+  const workspace = resolve(process.env.FLYX_WORKSPACE ?? resolve(process.cwd(), "packages/claude-fixtures"));
+  const provider = parseProvider(process.env.FLYX_PROVIDER);
 
   // Acquisition precedes schema, identity, recovery and provider preflight.
   const owner = HostOwnerLock.acquire({ databasePath, identityDirectory });

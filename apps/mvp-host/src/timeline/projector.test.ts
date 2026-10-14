@@ -66,7 +66,8 @@ describe("authoritative timeline projector", () => {
     f.commit([{ type: "turn.completed", payload: { turnId: "turn", result: "result text", costUsd: 0 } }]);
     f.commit([{ type: "session.recovery.required", payload: { turnId: "other", reason: "host_restart" } }]);
     const items = f.query().tail(f.session.id).items;
-    expect(items[0]!.content).toEqual({ inline: { provider: "codex", providerSessionId: "native", message: "Codex session initialized" } });
+    expect(items[0]!.content).toEqual({ inline: { provider: "codex", message: "Codex session initialized" } });
+    expect(JSON.stringify(items)).not.toContain("native");
     expect(items[1]!.contentField).toBe("message"); expect(f.text(ref(items[1]!))).toBe("result text");
     expect(items[1]!.metadata).not.toHaveProperty("result");
     expect(items[2]!.status).toBe("outcome_unknown");

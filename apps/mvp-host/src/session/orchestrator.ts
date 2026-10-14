@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { mkdirSync, realpathSync } from "node:fs";
 import { dirname } from "node:path";
 import type { Bootstrap, SessionEvent, TimelineItem } from "@flyx/mvp-protocol";
+import { HostViews, type HostViewsOptions, type ViewInteractionReader, type ViewResourceResolver } from "../timeline/host-views.js";
 import { ProtocolVersion } from "@flyx/mvp-protocol";
 import { ClaudeAdapter } from "../claude/adapter.js";
 import { HostOwnerLock, assertHostOwner, assertWorkspacePrivacy, createTestHostOwner, type HostOwnerHandle } from "../lifecycle/host-owner.js";
@@ -63,12 +64,17 @@ export type OrchestratorOptions = {
   identityDirectory?: string;
   coordinationDirectory?: string;
   privateDirectories?: readonly string[];
+  enableViews?: boolean;
+  resolveViewResource?: ViewResourceResolver;
+  readViewInteractions?: ViewInteractionReader;
+  assertViewSessionAccess?: HostViewsOptions["assertSessionAccess"];
 };
 
 const MAX_PROMPT_BYTES = 16 * 1024;
 
 export class SessionOrchestrator {
   readonly store: SqliteStore;
+  readonly views: HostViews | undefined = undefined;
   readonly owner: HostOwnerHandle;
   private activeWorkspaceLease: WorkspaceLease | undefined;
   private closed = false;
@@ -132,6 +138,17 @@ export class SessionOrchestrator {
       this.hostOwnerId = this.owner.ownerId;
       this.hostOwnerGeneration = this.owner.generation;
       this.runtimeId = options.runtimeId ?? `${provider}:${this.session.id}`;
+      if (HostViews.isAvailable(this.store)) {
+        this.views = new HostViews(this.store, this.owner, {
+          enabled: options.enableViews ?? true,
+          ...(options.assertViewSessionAccess ? { assertSessionAccess: options.assertViewSessionAccess } : {}),
+          resolveResource: options.resolveViewResource ?? ((id) => id === this.session.id ? {
+            sessionId: id, workspace: canonicalWorkspace, source: this, readSnapshot: () => this.publicSnapshot(),
+            ...(options.readViewInteractions ? { readInteractions: (after?: string) => options.readViewInteractions!(id, after) } : {}),
+          } : undefined),
+        });
+        this.views.prepareStoredSessions();
+      }
       this.execution = new ExecutionStore(this.store);
       this.commandEngine = new CommandEngine(this.store, {
         publish: (event) => this.notify(event),
@@ -154,6 +171,7 @@ export class SessionOrchestrator {
     } catch (error) {
       // The Store is only assigned after ownership has been proven. A second
       // Host therefore cannot reach migration, recovery, or provider creation.
+      this.views?.close();
       openedStore?.close();
       this.owner.release();
       throw error;
@@ -205,6 +223,7 @@ export class SessionOrchestrator {
       this.activeWorkspaceLease?.retain("producer_stop_unverified");
       this.owner.retain("producer_stop_unverified");
     }
+    this.views?.close();
     this.store.close();
     if (!this.owner.retainedReason) this.owner.release();
   }
@@ -230,6 +249,8 @@ export class SessionOrchestrator {
         interrupt: true,
         gitDiff: true,
         sandboxRequired: true,
+        timelineProjection: this.views?.ready(this.session.id) ?? false,
+        boundedContent: Boolean(this.views),
       },
     };
   }

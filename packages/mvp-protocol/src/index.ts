@@ -120,6 +120,8 @@ export const BootstrapSchema = z.object({
     interrupt: z.boolean(),
     gitDiff: z.boolean(),
     sandboxRequired: z.boolean(),
+    timelineProjection: z.boolean().optional(),
+    boundedContent: z.boolean().optional(),
   }),
 });
 

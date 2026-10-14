@@ -1,14 +1,16 @@
 import { randomUUID } from "node:crypto";
-import { FrameSchema, ClientHelloV2Schema, ApplicationFrameSchema, BOUNDED_CONTENT_CAPABILITY } from "@flyx/mvp-protocol";
+import { FrameSchema, ClientHelloV2Schema, ApplicationFrameSchema, BOUNDED_CONTENT_CAPABILITY, TIMELINE_PROJECTION_CAPABILITY } from "@flyx/mvp-protocol";
 import { z } from "zod";
 import { OrchestratorError, type SessionOrchestrator } from "../session/orchestrator.js";
 import { DeviceRegistry } from "../auth/device-registry.js";
 import { AccessError, assertMethodScope } from "../auth/connection-authorizer.js";
 import { publicEvent, publicValue, toRpcError } from "./public-projection.js";
 import { RpcDispatcher } from "./rpc-dispatcher.js";
-import { ContentStore } from "../content/content-store.js";
+import type { ContentStore } from "../content/content-store.js";
 import { FrameBudget } from "../content/frame-budget.js";
 import { BoundedRpcProjection } from "../content/bounded-rpc.js";
+import type { HostViewConnection } from "../timeline/host-views.js";
+import type { OpenedTimelineView } from "../timeline/timeline-subscriptions.js";
 import { PublicTextStream } from "../content/public-text.js";
 
 export interface DuplexTransport {
@@ -50,8 +52,8 @@ export class ConnectionGateway {
   private readonly contentStore: ContentStore | undefined;
   private readonly capabilities: string[];
   constructor(private readonly options: ConnectionGatewayOptions) {
-    this.contentStore = options.contentStore ?? (ContentStore.isAvailable(options.orchestrator.store.db) ? new ContentStore(options.orchestrator.store.db, { workspaceForSession: () => options.orchestrator.workspace }) : undefined);
-    this.capabilities = [...CAPABILITIES, ...(this.contentStore ? [BOUNDED_CONTENT_CAPABILITY] : [])];
+    this.contentStore = options.contentStore ?? options.orchestrator.views?.content;
+    this.capabilities = [...CAPABILITIES, ...(this.contentStore ? [BOUNDED_CONTENT_CAPABILITY] : []), ...(options.orchestrator.views?.ready(options.orchestrator.sessionId) ? [TIMELINE_PROJECTION_CAPABILITY] : [])];
     this.dispatcher = new RpcDispatcher({ ...options, ...(this.contentStore ? { contentStore: this.contentStore } : {}) });
   }
 
@@ -71,6 +73,8 @@ export class ConnectionGateway {
     let generation = transport.generation;
     let version: 1 | 2 | undefined;
     let leaseId: string | undefined;
+    let views: HostViewConnection | undefined;
+    let viewRequestId = "\u0000".repeat(128);
     let stopped = false;
     let unsubscribe: (() => void) | undefined;
     let removeMessage: (() => void) | undefined;
@@ -93,7 +97,7 @@ export class ConnectionGateway {
     const cleanup = (closeReason = "TRANSPORT_CLOSED") => {
       if (stopped) return;
       stopped = true;
-      unsubscribe?.(); removeMessage?.(); removeClose?.();
+      unsubscribe?.(); views?.close(); removeMessage?.(); removeClose?.();
       clearInterval(heartbeat); clearTimeout(helloTimeout); clearTimeout(closeDeadline);
       if (leaseId) devices.closeLease(leaseId, closeReason);
       eventBuffer = []; bufferBytes = 0; textStreams.clear();
@@ -145,6 +149,19 @@ export class ConnectionGateway {
       }
       return devices.assertLease(leaseId, generation);
     };
+    const viewOwner = () => { const principal = ensureLease(); return { subjectId: principal.deviceId, leaseId: leaseId!, generation }; };
+    const canonicalViews = () => {
+      if (stopped || version !== 2 || !clientCapabilities.has(TIMELINE_PROJECTION_CAPABILITY) || !clientCapabilities.has(BOUNDED_CONTENT_CAPABILITY) || !orchestrator.views?.ready(orchestrator.sessionId)) throw new OrchestratorError("CAPABILITY_REQUIRED", "Canonical Timeline capability is required");
+      views ??= orchestrator.views.connect(viewOwner(), {
+        fits: (payload) => frameBudget.fits(withGeneration({ type: "response", id: viewRequestId, ok: true, payload }))
+          && frameBudget.fits(withGeneration({ type: "event", sessionId: "\u0000".repeat(256), event: { id: "\u0000".repeat(128), sessionId: "\u0000".repeat(256), sequence: Number.MAX_SAFE_INTEGER, type: "timeline.updated", payload, occurredAt: "2026-10-14T00:00:00.000Z" } })),
+      }, () => {
+        if (stopped) throw new OrchestratorError("LEASE_EXPIRED", "Connection has closed");
+        assertMethodScope(ensureLease().scopes, "timeline.subscribe");
+      });
+      return views;
+    };
+    const deliverCanonical = async (event: ReturnType<SessionOrchestrator["timeline"]>["events"][number]) => { ensureLease(); await send({ type: "event", sessionId: event.sessionId, event }); };
     const eventFrame = (event: ReturnType<SessionOrchestrator["timeline"]>["events"][number], streamText = true) => {
       let projected = publicEvent(event, orchestrator.workspace);
       const payload = event.payload;
@@ -267,7 +284,9 @@ export class ConnectionGateway {
         if (hello.requiredCapabilities?.some((capability) => !this.capabilities.includes(capability))) {
           await rejectProtocol("CAPABILITY_UNSUPPORTED", "A required protocol capability is unavailable"); return;
         }
+        if (hello.requiredCapabilities?.includes(TIMELINE_PROJECTION_CAPABILITY) && !hello.capabilities.includes(BOUNDED_CONTENT_CAPABILITY)) { await rejectProtocol("CAPABILITY_UNSUPPORTED", "Canonical Timeline requires bounded content"); return; }
         clientCapabilities = new Set(hello.capabilities.filter((capability) => this.capabilities.includes(capability)));
+        if (!clientCapabilities.has(BOUNDED_CONTENT_CAPABILITY)) clientCapabilities.delete(TIMELINE_PROJECTION_CAPABILITY);
         generation = hello.transportGeneration; version = 2; clearTimeout(helloTimeout);
         let lease;
         try { lease = deviceId ? ensureLease() : undefined; }
@@ -295,6 +314,9 @@ export class ConnectionGateway {
       if (frame.type !== "request") { stop(1003, "INVALID_REQUEST"); return; }
       if (frame.id.length > 128 || frame.method.length > 128 || (frame.commandId?.length ?? 0) > 128) { stop(1009, "IDENTIFIER_TOO_LARGE"); return; }
       deferOwnClose = frame.method.startsWith("access.");
+      viewRequestId = frame.id;
+      const gates: OpenedTimelineView[] = [];
+      let replied = false;
       try {
         const result = await this.dispatcher.dispatch(frame, {
           subjectId: deviceId ?? "unpaired",
@@ -311,14 +333,24 @@ export class ConnectionGateway {
               throw error;
             }
           },
+          viewOwner,
+          openView: (request) => { const opened = canonicalViews().openView(request, deliverCanonical); gates.push(opened); return opened.response; },
+          timelinePage: (request) => canonicalViews().getPage(request),
+          timelineSubscribe: (request) => { const opened = canonicalViews().subscribe(request, deliverCanonical); gates.push(opened); return opened.response; },
+          timelineUnsubscribe: (id) => canonicalViews().unsubscribe(id),
           subscribe, access,
         });
         const envelope = (payload: unknown) => withGeneration({ type: "response", id: frame.id, ok: true, payload });
-        const payload = frame.method === "content.getChunk" ? result : bounded.bound(result, frameBudget, envelope, { allowRefs: clientCapabilities.has(BOUNDED_CONTENT_CAPABILITY), method: frame.method, subjectId: deviceId ?? "unpaired", pinOwner: `request:${transport.id}:${frame.id}` });
+        const canonical = frame.method === "session.openView" || frame.method.startsWith("timeline.");
+        const payload = frame.method === "content.getChunk" || canonical ? result : bounded.bound(result, frameBudget, envelope, { allowRefs: clientCapabilities.has(BOUNDED_CONTENT_CAPABILITY), method: frame.method, subjectId: deviceId ?? "unpaired", pinOwner: `request:${transport.id}:${frame.id}` });
         await send({ type: "response", id: frame.id, ok: true, payload });
+        replied = true;
+        for (const opened of gates) await opened.activate();
       } catch (error) {
-        await send({ type: "response", id: frame.id, ok: false, error: publicError(error, (error) => withGeneration({ type: "response", id: frame.id, ok: false, error })) });
+        if (replied) for (const opened of gates) opened.cancel();
+        else await send({ type: "response", id: frame.id, ok: false, error: publicError(error, (error) => withGeneration({ type: "response", id: frame.id, ok: false, error })) });
       } finally {
+        if (!replied) for (const opened of gates) opened.cancel();
         deferOwnClose = false;
         if (pendingClose) stop(pendingClose.code, pendingClose.reason);
       }

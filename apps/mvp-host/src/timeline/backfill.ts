@@ -8,13 +8,15 @@ export type BackfillProgress = { epoch: string; indexedSequence: number; targetS
 
 /** Resumable chunks build a new epoch; only a validated current epoch is visible. */
 export class TimelineBackfill {
-  constructor(private readonly projector: TimelineProjector) {}
+  constructor(private readonly projector: TimelineProjector, private readonly assertWriter: () => void = () => {}) {}
 
   begin(sessionId: string, epoch?: string): TimelineEpoch {
+    this.assertWriter();
     return this.projector.db.transaction(() => this.projector.createEpoch(sessionId, "building", epoch))();
   }
 
   step(sessionId: string, epochId: string, batchSize = 500): BackfillProgress {
+    this.assertWriter();
     if (!Number.isSafeInteger(batchSize) || batchSize < 1 || batchSize > 10_000) throw new RangeError("Invalid backfill batch size");
     const db = this.projector.db;
     const progress = db.transaction(() => {
@@ -40,6 +42,7 @@ export class TimelineBackfill {
   }
 
   validateAndActivate(sessionId: string, epochId: string): boolean {
+    this.assertWriter();
     const db = this.projector.db;
     return db.transaction(() => {
       const epoch = this.requireBuilding(sessionId, epochId);

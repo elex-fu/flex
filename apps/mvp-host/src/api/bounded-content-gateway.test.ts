@@ -5,6 +5,8 @@ import { BOUNDED_CONTENT_CAPABILITY, ContentChunkSchema, type ContentRef } from 
 import { DeviceRegistry } from "../auth/device-registry.js";
 import { SessionOrchestrator, OrchestratorError } from "../session/orchestrator.js";
 import { CONTENT_SCHEMA_SQL } from "../storage/migrations/006-content.js";
+import { createTestHostOwner } from "../lifecycle/host-owner.js";
+import { openOwned } from "../storage/open-store.js";
 import { ContentStore } from "../content/content-store.js";
 import { ConnectionGateway, type DuplexTransport } from "./connection-gateway.js";
 
@@ -53,7 +55,10 @@ class MemoryTransport implements DuplexTransport {
   }
 }
 function fixture(kind: "direct" | "relay" = "direct", content = true, maxFrameBytes = 256 * 1024) {
-  const orchestrator = new SessionOrchestrator({ workspace: resolve(process.cwd(), "../../packages/claude-fixtures") });
+  const owner = createTestHostOwner(); const store = openOwned({ databasePath: ":memory:", owner });
+  // Keep this compatibility suite's explicit pre-views admission, even when the central runner installs006 by default.
+  store.db.prepare("DELETE FROM schema_migrations WHERE version = 6").run();
+  const orchestrator = new SessionOrchestrator({ workspace: resolve(process.cwd(), "../../packages/claude-fixtures"), store, owner });
   if (content) orchestrator.store.db.exec(CONTENT_SCHEMA_SQL);
   const devices = new DeviceRegistry(orchestrator.store, HOST_ID);
   const device = devices.createBrowserDevice();

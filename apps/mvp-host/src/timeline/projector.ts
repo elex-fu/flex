@@ -1,10 +1,10 @@
 import type Database from "better-sqlite3";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import type { ProjectedItem, SessionEvent } from "@flyx/mvp-protocol";
 import { publicValue } from "../api/public-projection.js";
 import { inTransaction, record, TimelineError, type ContentReference, type TimelineCommitStore, type TimelineContentStore } from "./contracts.js";
 
-export const TIMELINE_PROJECTOR_VERSION = 1;
+export const TIMELINE_PROJECTOR_VERSION = 2;
 export type TimelineEpoch = { sessionId: string; epoch: string; projectorVersion: number; indexedSequence: number; state: "building" | "active" | "retired" };
 export type ItemVersionRow = {
   session_id: string; epoch: string; item_id: string; revision: number;
@@ -217,7 +217,7 @@ function normalizeEvent(event: SessionEvent): ItemChange | undefined {
     case "approval.resolved": return { itemId: itemId ?? `approval-${String(payload.approvalId ?? event.id)}`, kind: "approval", status: String(payload.status ?? (event.type.endsWith("requested") ? "pending" : "resolved")), metadata };
     case "question.requested":
     case "question.resolved": return { itemId: itemId ?? `question-${String(payload.interactionId ?? payload.questionId ?? event.id)}`, kind: "question", status: event.type.endsWith("requested") ? "pending" : "resolved", metadata };
-    case "provider.session.init": return { itemId: itemId ?? `system-session-${String(payload.providerSessionId ?? event.id)}`, kind: "system", status: "info", metadata: { ...metadata, message: `${payload.provider === "codex" ? "Codex" : "Claude"} session initialized` } };
+    case "provider.session.init": return { itemId: itemId ?? `system-session-${createHash("sha256").update(`${event.sessionId}:${String(payload.providerSessionId ?? event.id)}`).digest("hex").slice(0, 32)}`, kind: "system", status: "info", metadata: { ...metadata, message: `${payload.provider === "codex" ? "Codex" : "Claude"} session initialized` } };
     case "diagnostic": return { itemId: itemId ?? `diagnostic-${event.id}`, kind: "system", status: "diagnostic", metadata };
     case "turn.completed": {
       delete metadata.result;

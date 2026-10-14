@@ -2,6 +2,7 @@ import { basename, isAbsolute, relative, sep } from "node:path";
 import { OrchestratorError, type SessionOrchestrator } from "../session/orchestrator.js";
 import { ContentError } from "../content/content-store.js";
 import { FrameBudgetError } from "../content/frame-budget.js";
+import { TimelineError } from "../timeline/contracts.js";
 import { AccessError } from "../auth/connection-authorizer.js";
 
 type Snapshot = ReturnType<SessionOrchestrator["publicSnapshot"]>;
@@ -53,6 +54,7 @@ export function publicGitDiff(diff: GitDiff, workspace: string): GitDiff {
 }
 
 export function toRpcError(error: unknown, fallbackCode = "INTERNAL_ERROR") {
+  if (error instanceof TimelineError) return { code: error.code, message: error.message, retryable: error.retryable };
   if (error instanceof OrchestratorError) return { code: error.code, message: error.message, retryable: error.retryable };
   if (error instanceof ContentError || error instanceof FrameBudgetError) return { code: error.code, message: error.message, retryable: false };
   if (error instanceof AccessError) return { code: error.code, message: error.message, retryable: false };

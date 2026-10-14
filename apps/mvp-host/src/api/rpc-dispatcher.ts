@@ -1,6 +1,7 @@
 import { z } from "zod";
-import { BOUNDED_CONTENT_CAPABILITY, ContentChunkRequestSchema } from "@flyx/mvp-protocol";
+import { BOUNDED_CONTENT_CAPABILITY, ContentChunkRequestSchema, TIMELINE_PROJECTION_CAPABILITY, OpenViewRequestSchema, TimelinePageRequestSchema, TimelineSubscribeRequestSchema, TimelineUnsubscribeRequestSchema, type OpenViewRequest, type TimelinePageRequest, type TimelineSubscribeRequest } from "@flyx/mvp-protocol";
 import type { ContentStore } from "../content/content-store.js";
+import type { TimelineLeaseOwner } from "../timeline/contracts.js";
 import type { FrameBudget } from "../content/frame-budget.js";
 import { OrchestratorError, type SessionOrchestrator } from "../session/orchestrator.js";
 import { publicEvent, publicGitDiff, publicGitStatus, publicProviderStatus, publicSnapshot, publicValue } from "./public-projection.js";
@@ -22,6 +23,11 @@ export interface RpcContext {
   frameBudget?: FrameBudget;
   responseEnvelope?(payload: unknown): unknown;
   assertContentScope?(scope: string): void;
+  viewOwner?(): TimelineLeaseOwner;
+  openView?(request: OpenViewRequest): unknown;
+  timelinePage?(request: TimelinePageRequest): unknown;
+  timelineSubscribe?(request: TimelineSubscribeRequest): unknown;
+  timelineUnsubscribe?(id: string): unknown;
   assertAuthorized(method: string): void;
   subscribe(afterSequence: number): Promise<unknown>;
   access(method: string, payload: unknown): Promise<unknown>;
@@ -49,7 +55,14 @@ export class RpcDispatcher {
       if (!frame.commandId) throw new OrchestratorError("COMMAND_ID_REQUIRED", "commandId is required");
       return frame.commandId;
     };
+    const requireViews = () => {
+      if (!context.capabilities?.has(TIMELINE_PROJECTION_CAPABILITY) || !context.capabilities.has(BOUNDED_CONTENT_CAPABILITY) || !orchestrator.views?.ready(orchestrator.sessionId)) throw new OrchestratorError("CAPABILITY_REQUIRED", "Canonical Timeline capability is required");
+    };
     switch (frame.method) {
+      case "session.openView": requireViews(); if (!context.openView) throw new OrchestratorError("CAPABILITY_REQUIRED", "Host views are unavailable"); return context.openView(OpenViewRequestSchema.parse(frame.payload));
+      case "timeline.getPage": requireViews(); if (!context.timelinePage) throw new OrchestratorError("CAPABILITY_REQUIRED", "Host views are unavailable"); return context.timelinePage(TimelinePageRequestSchema.parse(frame.payload));
+      case "timeline.subscribe": requireViews(); if (!context.timelineSubscribe) throw new OrchestratorError("CAPABILITY_REQUIRED", "Host views are unavailable"); return context.timelineSubscribe(TimelineSubscribeRequestSchema.parse(frame.payload));
+      case "timeline.unsubscribe": requireViews(); if (!context.timelineUnsubscribe) throw new OrchestratorError("CAPABILITY_REQUIRED", "Host views are unavailable"); return context.timelineUnsubscribe(TimelineUnsubscribeRequestSchema.parse(frame.payload).subscriptionId);
       case "host.bootstrap": return this.options.bootstrap();
       case "host.getDescriptor": return this.options.descriptor();
       case "host.getSnapshot":
@@ -83,7 +96,8 @@ export class RpcDispatcher {
       case "content.getChunk": {
         if (!context.capabilities?.has(BOUNDED_CONTENT_CAPABILITY) || !this.options.contentStore) throw new OrchestratorError("CAPABILITY_REQUIRED", "Bounded content capability is required");
         const payload = ContentChunkRequestSchema.parse(frame.payload);
-        checkSession(payload.sessionId);
+        if (orchestrator.views && context.viewOwner) orchestrator.views.resource(payload.sessionId, context.viewOwner());
+        else checkSession(payload.sessionId);
         return this.options.contentStore.getChunk(payload, {
           subjectId: context.subjectId,
           ...(context.frameBudget ? { budget: context.frameBudget } : {}),
@@ -107,6 +121,7 @@ export class RpcDispatcher {
         return orchestrator.respondApproval(context.subjectId, commandId(), payload.approvalId, payload.action);
       }
       case "session.subscribe": {
+        if (context.capabilities?.has(TIMELINE_PROJECTION_CAPABILITY)) throw new OrchestratorError("SUBSCRIPTION_MODE_CONFLICT", "Canonical clients use session.openView");
         const payload = SubscribePayload.parse(frame.payload);
         checkSession(payload.sessionId);
         return context.subscribe(payload.afterSequence);

@@ -24,6 +24,11 @@ import {
   type JsonRpcId,
 } from "./app-server-client.js";
 
+import { CodexQuestionBridge } from "../interaction/native-question-bridge.js";
+import { rpcRequestKey } from "../interaction/native-question-codec.js";
+import type { InteractionEvidenceSample, NativeQuestionDelivery, QuestionContractEvidence } from "../interaction/types.js";
+import type { QuestionAnswers } from "@flyx/mvp-protocol";
+
 const execFile = promisify(execFileCallback);
 const ADAPTER_VERSION = "codex-app-server-v1";
 const MAX_OUTPUT_BYTES = 64 * 1024;
@@ -111,6 +116,10 @@ export type CodexAdapterOptions = {
   effort?: "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra";
   turnTimeoutMs?: number;
   clientFactory?: AppServerClientFactory;
+  questionContractEvidence?: QuestionContractEvidence;
+  questionVerificationMode?: boolean;
+  interactionEvidenceSource?: "native" | "fixture";
+  onInteractionEvidence?: (evidence: InteractionEvidenceSample) => void;
 };
 
 export class CodexAdapter implements ProviderAdapter {
@@ -126,6 +135,8 @@ export class CodexAdapter implements ProviderAdapter {
   private client: AppServerClient | undefined;
   private runtimePolicyPromise: Promise<JsonObject> | undefined;
   private loadedThreadId: string | undefined;
+  private readonly questionBridge: CodexQuestionBridge<ActiveTurn>;
+  private questionRuntimeVersion = "unverified";
   private readonly unexpectedMcpThreads = new Map<string, string>();
   private readonly observedRequestIds = new Set<string>();
   private active: ActiveTurn | undefined;
@@ -133,6 +144,12 @@ export class CodexAdapter implements ProviderAdapter {
 
   constructor(options: CodexAdapterOptions) {
     this.workspace = options.workspace;
+    this.questionBridge = new CodexQuestionBridge<ActiveTurn>({provider:"codex",adapterVersion:ADAPTER_VERSION,runtimeVersion:()=>this.questionRuntimeVersion,
+      current:()=>this.active,emit:(active,event)=>this.emit(active,event),evidenceSource:options.interactionEvidenceSource ?? (options.clientFactory ? "fixture" : "native"),
+      ...(options.questionContractEvidence ? {contractEvidence:options.questionContractEvidence} : {}),
+      ...(options.questionVerificationMode !== undefined ? {verificationMode:options.questionVerificationMode} : {}),
+      ...(options.onInteractionEvidence ? {onEvidence:options.onInteractionEvidence} : {}),
+    });
     this.onEvent = options.onEvent;
     this.executable = options.executable ?? process.env.FLYX_CODEX_EXECUTABLE ?? "codex";
     this.model = options.model ?? process.env.FLYX_CODEX_MODEL;
@@ -157,6 +174,7 @@ export class CodexAdapter implements ProviderAdapter {
     } catch (error) {
       throw new Error(`CODEX_EXECUTABLE_UNAVAILABLE: ${error instanceof Error ? error.message : String(error)}`);
     }
+    this.questionRuntimeVersion = this.runtimeVersion;
     return {
       provider: this.provider,
       transport: "codex-app-server",
@@ -286,6 +304,12 @@ export class CodexAdapter implements ProviderAdapter {
       return "unavailable";
     }
   }
+
+  respondQuestion(interactionId: string, answers: QuestionAnswers): NativeQuestionDelivery {
+    return this.questionBridge.respond(interactionId,answers,(id,result)=>this.client?.respond(id,result) ?? false);
+  }
+
+  structuredQuestionsAvailable(): boolean { return this.questionBridge.capability(); }
 
   respondApproval(approvalId: string, action: ApprovalAction): boolean {
     const active = this.active;
@@ -498,6 +522,7 @@ export class CodexAdapter implements ProviderAdapter {
     if (method === "serverRequest/resolved") {
       const requestId = params.requestId;
       if (typeof requestId !== "string" && typeof requestId !== "number") return;
+      if (this.questionBridge.nativeResolved(active,requestId)) return;
       const approvalId = active.pendingByRpcId.get(rpcIdKey(requestId));
       if (!approvalId) return;
       const pending = active.pending.get(approvalId);
@@ -574,13 +599,31 @@ export class CodexAdapter implements ProviderAdapter {
       client.respondError(request.id, -32602, "No matching active Flyx turn");
       return;
     }
+    if (request.method === "item/tool/requestUserInput") {
+      try {
+        this.questionBridge.request(active,request.method,request.id,request.params);
+        const key=rpcIdKey(request.id);
+        if (!this.observedRequestIds.has(key) && this.observedRequestIds.size<MAX_TRACKED_REQUEST_IDS) {
+          this.observedRequestIds.add(key);active.unambiguousRequestIds.add(key);
+        }
+      }
+      catch {
+        this.client?.respondError(request.id,-32602,"Native question is unsupported or invalid");
+        this.emit(active,{kind:"diagnostic",code:"CODEX_QUESTION_UNAVAILABLE",message:"Native question is unsupported or invalid"});
+      }
+      return;
+    }
     if (request.method !== "item/commandExecution/requestApproval" && request.method !== "item/fileChange/requestApproval") {
       this.client?.respondError(request.id, -32601, "Flyx MVP does not support this interactive request");
       this.emit(active, { kind: "diagnostic", code: "UNSUPPORTED_CODEX_REQUEST", message: `Unsupported Codex request: ${request.method}` });
       return;
     }
-    const toolUseId = stringValue(request.params.itemId, `codex-request-${String(request.id)}`);
-    const rawApprovalId = typeof request.params.approvalId === "string" ? request.params.approvalId : String(request.id);
+    if (typeof request.params.itemId !== "string" || !request.params.itemId) {
+      this.client?.respondError(request.id,-32602,"Native approval item ID is missing");
+      return;
+    }
+    const toolUseId = request.params.itemId;
+    const rawApprovalId = typeof request.params.approvalId === "string" ? request.params.approvalId : rpcRequestKey(request.id);
     const approvalId = `codex-${createHash("sha256").update(`${active.turnId}:${rawApprovalId}`).digest("hex")}`;
     if (active.pending.has(approvalId)) return;
     const isCommand = request.method.includes("commandExecution");
@@ -613,6 +656,7 @@ export class CodexAdapter implements ProviderAdapter {
       ...(typeof request.params.reason === "string" ? { description: truncate(request.params.reason, 4 * 1024) } : {}),
       cwd: ".",
       createdAt: new Date().toISOString(),
+      dispatchContext:{nativeRequestId:`codex-rpc:${rpcRequestKey(request.id)}`,nativeMethod:request.method},
     };
     const requestKey = rpcIdKey(request.id);
     if (!this.observedRequestIds.has(requestKey) && this.observedRequestIds.size < MAX_TRACKED_REQUEST_IDS) {
@@ -667,6 +711,7 @@ export class CodexAdapter implements ProviderAdapter {
 
   private finish(active: ActiveTurn, outcome: TurnOutcome): void {
     if (active.terminal) return;
+    this.questionBridge.cancelTurn(active);
     active.terminal = true;
     if (active.timer) clearTimeout(active.timer);
     if (active.interruptTimer) clearTimeout(active.interruptTimer);

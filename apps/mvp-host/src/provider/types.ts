@@ -1,5 +1,7 @@
 import { randomUUID } from "node:crypto";
-import type { Bootstrap } from "@flyx/mvp-protocol";
+import type { Bootstrap, QuestionAnswers } from "@flyx/mvp-protocol";
+
+import type { NativeQuestionDelivery, NativeQuestionRequest, NativeInteractionEvidence, NativeInteractionMethod } from "../interaction/types.js";
 
 export type ProviderId = Bootstrap["provider"];
 export type ApprovalAction = "allow_once" | "deny";
@@ -14,6 +16,8 @@ export type ApprovalRequest = {
   description?: string;
   cwd: string;
   createdAt: string;
+  /** Private native request metadata; the public projection strips this key. */
+  dispatchContext?: { nativeRequestId: string; nativeMethod: NativeInteractionMethod };
 };
 
 /** The Engine fixes this identity before any Provider preparation or call. */
@@ -70,6 +74,8 @@ export type AdapterEvent =
       output?: string;
       error?: string;
     }
+    | { kind: "question_requested"; request: NativeQuestionRequest }
+    | { kind: "question_resolved"; interactionId: string; status: "expired" | "superseded" | "confirmed"; evidence?: NativeInteractionEvidence }
     | { kind: "approval_requested"; request: ApprovalRequest }
     | {
       kind: "approval_resolved";
@@ -165,5 +171,7 @@ export interface ProviderAdapter {
   deliverControl?(context: DispatchContext, command: { kind: "interrupt_turn"; reason: string } | { kind: "respond_approval"; approvalId: string; action: ApprovalAction }): Promise<ProviderControlOutcome>;
   interrupt(reason?: string): Promise<"accepted" | "already_terminal" | "unavailable">;
   respondApproval(approvalId: string, action: ApprovalAction): boolean;
+  respondQuestion?(interactionId: string, answers: QuestionAnswers): NativeQuestionDelivery;
+  structuredQuestionsAvailable?(): boolean;
   close?(): void;
 }

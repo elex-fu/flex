@@ -26,13 +26,18 @@ import type {
 } from "./types.js";
 import { dispatchContextForTurn, fenceAdapterEvent } from "./types.js";
 
+import { ClaudeQuestionBridge } from "../interaction/native-question-bridge.js";
+import { parseClaudeQuestions } from "../interaction/native-question-codec.js";
+import type { InteractionEvidenceSample, NativeQuestionDelivery, QuestionContractEvidence } from "../interaction/types.js";
+import type { QuestionAnswers } from "@flyx/mvp-protocol";
+
 const execFile = promisify(execFileCallback);
 const require = createRequire(import.meta.url);
 const sdkEntry = require.resolve("@anthropic-ai/claude-agent-sdk");
 const SDK_PACKAGE = readPackageMetadata(sdkEntry);
 const SDK_VERSION = SDK_PACKAGE.version;
 const BUNDLED_CLAUDE_VERSION = SDK_PACKAGE.claudeCodeVersion;
-const SAFE_TOOLS = ["Read", "Glob", "Grep", "Edit", "Write", "Bash"] as const;
+const SAFE_TOOLS = ["Read", "Glob", "Grep", "Edit", "Write", "Bash", "AskUserQuestion"] as const;
 const MAX_APPROVAL_INPUT_BYTES = 128 * 1024;
 const MAX_TOOL_OUTPUT_BYTES = 64 * 1024;
 const MAX_ASSISTANT_MESSAGE_BYTES = 1024 * 1024;
@@ -70,6 +75,10 @@ export type ClaudeAdapterOptions = {
   workspace: string;
   onEvent?: AdapterEventHandler;
   maxBudgetUsd?: number;
+  questionContractEvidence?: QuestionContractEvidence;
+  questionVerificationMode?: boolean;
+  interactionEvidenceSource?: "native" | "fixture";
+  onInteractionEvidence?: (evidence: InteractionEvidenceSample) => void;
 };
 
 export class ClaudeAdapter implements ProviderAdapter {
@@ -79,11 +88,21 @@ export class ClaudeAdapter implements ProviderAdapter {
   private readonly maxBudgetUsd: number;
   private readonly workspaceRealpathPromise: Promise<string>;
   private active: ActiveQuery | undefined;
+  private readonly questionBridge: ClaudeQuestionBridge<ActiveQuery>;
+  private questionRuntimeVersion: string;
 
   constructor(options: ClaudeAdapterOptions) {
     this.workspace = options.workspace;
     this.onEvent = options.onEvent;
     this.maxBudgetUsd = options.maxBudgetUsd ?? 5;
+    this.questionRuntimeVersion = process.env.FLYX_CLAUDE_EXECUTABLE ? "unverified" : BUNDLED_CLAUDE_VERSION;
+    this.questionBridge = new ClaudeQuestionBridge<ActiveQuery>({provider:"claude",adapterVersion:SDK_VERSION,runtimeVersion:()=>this.questionRuntimeVersion,
+      current:()=>this.active,emit:(active,event)=>this.emit(active,event),
+      ...(options.questionContractEvidence ? {contractEvidence:options.questionContractEvidence} : {}),
+      ...(options.questionVerificationMode !== undefined ? {verificationMode:options.questionVerificationMode} : {}),
+      ...(options.interactionEvidenceSource ? {evidenceSource:options.interactionEvidenceSource} : {}),
+      ...(options.onInteractionEvidence ? {onEvidence:options.onInteractionEvidence} : {}),
+    });
     this.workspaceRealpathPromise = realpath(options.workspace);
   }
 
@@ -93,16 +112,19 @@ export class ClaudeAdapter implements ProviderAdapter {
     const pathOverride = process.env.FLYX_CLAUDE_EXECUTABLE;
     const executable = pathOverride ?? "sdk-bundled";
     let runtimeVersion = BUNDLED_CLAUDE_VERSION;
+    let executableInspected = !pathOverride;
     if (pathOverride) {
       try {
         const result = await execFile(pathOverride, ["--version"], { timeout: 5_000 });
         runtimeVersion = result.stdout.trim() || result.stderr.trim() || "unknown";
+        executableInspected = true;
       } catch (error) {
         // status has no Turn dispatch identity; surface inspection failures
         // through its result rather than emitting an unfenced callback.
         throw new Error(`CLAUDE_EXECUTABLE_UNAVAILABLE: ${error instanceof Error ? error.message : String(error)}`);
       }
     }
+    this.questionRuntimeVersion = executableInspected ? runtimeVersion : "unverified";
     return {
       provider: this.provider,
       transport: "claude-agent-sdk",
@@ -344,6 +366,12 @@ export class ClaudeAdapter implements ProviderAdapter {
     return true;
   }
 
+  respondQuestion(interactionId: string, answers: QuestionAnswers): NativeQuestionDelivery {
+    return this.questionBridge.respond(interactionId,answers);
+  }
+
+  structuredQuestionsAvailable(): boolean { return this.questionBridge.capability(); }
+
   private buildOptions(active: ActiveQuery, resumeSessionId?: string) {
     const pathOverride = process.env.FLYX_CLAUDE_EXECUTABLE;
     return {
@@ -369,7 +397,7 @@ export class ClaudeAdapter implements ProviderAdapter {
       },
       strictMcpConfig: true,
       persistSession: true,
-      tools: [...SAFE_TOOLS],
+      tools: [...SAFE_TOOLS].filter((tool) => tool !== "AskUserQuestion" || this.questionBridge.canHandle()),
       maxTurns: 20,
       maxBudgetUsd: this.maxBudgetUsd,
       systemPrompt: { type: "preset" as const, preset: "claude_code" as const },
@@ -412,6 +440,13 @@ export class ClaudeAdapter implements ProviderAdapter {
         },
       };
     }
+    if (toolName === "AskUserQuestion") {
+      let valid = this.questionBridge.canHandle();
+      try { parseClaudeQuestions(input.tool_use_id,input.tool_input); } catch { valid = false; }
+      return {continue:true,hookSpecificOutput:{hookEventName:"PreToolUse" as const,
+        permissionDecision:valid ? "ask" as const : "deny" as const,
+        permissionDecisionReason:valid ? "A user answer is required" : "Structured questions are not verified or the native request is invalid"}};
+    }
     if (["Read", "Glob", "Grep", "Edit", "Write"].includes(toolName)) {
       const inputRecord = isRecord(input.tool_input) ? input.tool_input : {};
       const candidate = firstString(inputRecord.file_path, inputRecord.path);
@@ -437,6 +472,9 @@ export class ClaudeAdapter implements ProviderAdapter {
     if (options.blockedPath && !(await this.isInsideWorkspace(options.blockedPath))) {
       return { behavior: "deny", message: "Requested path is outside the configured workspace" };
     }
+    if (toolName === "AskUserQuestion") {
+      return this.questionBridge.request(active,options.toolUseID,input,options.signal);
+    }
     if (["Read", "Glob", "Grep", "Edit", "Write"].includes(toolName)) {
       const candidate = firstString(input.file_path, input.path);
       if (candidate && !(await this.isInsideWorkspace(candidate))) {
@@ -453,6 +491,7 @@ export class ClaudeAdapter implements ProviderAdapter {
     if (encodedSize > MAX_APPROVAL_INPUT_BYTES) {
       return { behavior: "deny", message: "Flyx refused an oversized approval request" };
     }
+    if (!options.toolUseID) return {behavior:"deny",message:"Native approval request ID is missing"};
     const approvalId = randomUUID();
     const request: ApprovalRequest = {
       approvalId,
@@ -464,6 +503,7 @@ export class ClaudeAdapter implements ProviderAdapter {
       ...(options.description ? { description: options.description } : {}),
       cwd: ".",
       createdAt: new Date().toISOString(),
+      dispatchContext: {nativeRequestId:options.toolUseID,nativeMethod:"canUseTool/approval"},
     };
     this.emit(active, { kind: "approval_requested", request });
     return new Promise<PermissionResult>((resolve, reject) => {
@@ -618,6 +658,9 @@ export class ClaudeAdapter implements ProviderAdapter {
     content.forEach((block) => {
       const value = block as unknown as Record<string, unknown>;
       if (value.type !== "tool_result" || typeof value.tool_use_id !== "string") return;
+      if (value.is_error !== true && typeof message.uuid === "string") {
+        this.questionBridge.observeToolResult(active,value.tool_use_id,`claude:${message.uuid}`,value.content);
+      }
       const itemId = active.toolItems.get(value.tool_use_id) ?? `tool-${value.tool_use_id}`;
       const output = typeof value.content === "string" ? value.content : JSON.stringify(value.content ?? "");
       const isError = value.is_error === true;
@@ -631,6 +674,7 @@ export class ClaudeAdapter implements ProviderAdapter {
   }
 
   private cleanupApprovals(active: ActiveQuery, action: "aborted"): void {
+    this.questionBridge.cancelTurn(active);
     for (const [approvalId, pending] of active.pending) {
       active.pending.delete(approvalId);
       pending.cleanup();

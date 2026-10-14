@@ -7,6 +7,8 @@ import { DeviceRegistry } from "../auth/device-registry.js";
 import { HostOwnerLock, createTestHostOwner, type HostOwnerHandle } from "../lifecycle/host-owner.js";
 import { SqliteStore } from "./db.js";
 import { openForMaintenance, openForManagement, openOwned, openReadOnly } from "./open-store.js";
+import { LEGACY_V2_SCHEMA } from "../test-support/legacy-v2-schema.js";
+import { SUPPORTED_SCHEMA_VERSION } from "./migrations/schema-version.js";
 
 const roots: string[] = [];
 const owners: HostOwnerHandle[] = [];
@@ -76,16 +78,17 @@ describe("safe Store opening", () => {
     expect(readFileSync(f.databasePath)).toEqual(before);
   });
 
-  it("migrates legacy v2 under ownership and validates the actual v3 shape", () => {
+  it("migrates a pinned legacy v2 database under ownership through the supported schema", () => {
     const f = fixture();
-    const legacy = new SqliteStore(f.databasePath);
-    const session = legacy.createSession("/persisted-workspace");
-    legacy.db.exec("DELETE FROM schema_migrations WHERE version = 3; ALTER TABLE devices DROP COLUMN credential_revision;");
+    const legacy = new Database(f.databasePath);
+    legacy.exec(LEGACY_V2_SCHEMA);
+    legacy.prepare("INSERT INTO sessions(id,workspace_id,workspace_path,provider,status,activity_state,head_sequence,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)")
+      .run("legacy-session", "default", "/persisted-workspace", "claude", "active", "idle", 0, "2026-10-14T00:00:00.000Z", "2026-10-14T00:00:00.000Z");
     legacy.close();
     const owner = f.own();
     const migrated = keep(openOwned({ databasePath: f.databasePath, owner }));
-    expect(migrated.getSession(session.id)?.workspacePath).toBe("/persisted-workspace");
-    expect(migrated.db.prepare("SELECT version FROM schema_migrations ORDER BY version").all()).toEqual([{ version: 1 }, { version: 2 }, { version: 3 }]);
+    expect(migrated.getSession("legacy-session")?.workspacePath).toBe("/persisted-workspace");
+    expect(migrated.db.prepare("SELECT MAX(version) AS version FROM schema_migrations").get()).toEqual({ version: SUPPORTED_SCHEMA_VERSION });
     const columns = migrated.db.prepare("PRAGMA table_info(devices)").all() as Array<{ name: string }>;
     expect(columns.some((column) => column.name === "credential_revision")).toBe(true);
     expect(schema(keep(openReadOnly(f.databasePath)))).toEqual(schema(migrated));
@@ -147,6 +150,6 @@ describe("safe Store opening", () => {
     owner.release();
     const maintenance = f.own("maintenance");
     const store = keep(openForMaintenance({ databasePath: f.databasePath, owner: maintenance }));
-    expect(store.db.prepare("SELECT MAX(version) AS version FROM schema_migrations").get()).toEqual({ version: 3 });
+    expect(store.db.prepare("SELECT MAX(version) AS version FROM schema_migrations").get()).toEqual({ version: SUPPORTED_SCHEMA_VERSION });
   });
 });

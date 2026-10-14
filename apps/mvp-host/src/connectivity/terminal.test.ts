@@ -53,6 +53,15 @@ describe("terminal pairing approval", () => {
 });
 
 describe("Host CLI commands", () => {
+  it("routes exact operations and coordinated Catalog import commands without startup", () => {
+    expect(parseHostCommand(["doctor"])).toEqual({kind:"operations",action:"doctor"});
+    expect(parseHostCommand(["backup","backup-dir"])).toEqual({kind:"operations",action:"backup",directory:"backup-dir"});
+    expect(parseHostCommand(["validate","backup-dir"])).toEqual({kind:"operations",action:"validate",directory:"backup-dir"});
+    expect(parseHostCommand(["restore","backup-dir","rollback-dir"])).toEqual({kind:"operations",action:"restore",directory:"backup-dir",rollbackDirectory:"rollback-dir"});
+    expect(parseHostCommand(["catalog","dry-run","source.sqlite","backup-dir"])).toEqual({kind:"catalog-import",backupDirectory:"backup-dir",request:{mode:"dry-run",sourceDatabasePath:"source.sqlite"}});
+    expect(parseHostCommand(["catalog","import","source.sqlite","backup-dir","a".repeat(64)])).toEqual({kind:"catalog-import",backupDirectory:"backup-dir",request:{mode:"import",sourceDatabasePath:"source.sqlite",approvedSourceDigest:"a".repeat(64)}});
+    for(const args of [["doctor","extra"],["backup"],["restore","backup-dir"],["catalog","import","source.sqlite","backup-dir"]])expect(()=>parseHostCommand(args)).toThrow();
+  });
   it("keeps startup as default and supports device and identity management", () => {
     expect(parseHostCommand([])).toEqual({ kind: "start" });
     expect(parseHostCommand(["devices", "revoke", "device-123"])).toEqual({ kind: "devices-revoke", deviceId: "device-123" });

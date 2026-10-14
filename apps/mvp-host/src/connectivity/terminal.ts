@@ -1,4 +1,6 @@
 import { parseRecoveryCommand, type RecoveryCliCommand } from "./recovery-cli.js";
+import { parseHostOperationsCommand, HOST_OPERATIONS_CLI_USAGE, type HostOperationsCliCommand } from "./operations-cli.js";
+import { parseCatalogImportCommand, CATALOG_IMPORT_CLI_USAGE, type CatalogImportCliCommand } from "../catalog/catalog-import-cli.js";
 import { createHash } from "node:crypto";
 import { createInterface } from "node:readline/promises";
 
@@ -75,9 +77,13 @@ async function askTerminal(prompt: string, signal: AbortSignal): Promise<string>
 }
 
 export type HostCommand = { kind: "start" | "help" | "devices-list" | "devices-revoke-all" | "identity-show" | "identity-rotate" }
-  | { kind: "devices-revoke"; deviceId: string } | RecoveryCliCommand;
+  | { kind: "devices-revoke"; deviceId: string } | RecoveryCliCommand | HostOperationsCliCommand | CatalogImportCliCommand;
 
 export function parseHostCommand(args: readonly string[]): HostCommand {
+  const operations = parseHostOperationsCommand(args);
+  if (operations) return operations;
+  const catalog = parseCatalogImportCommand(args);
+  if (catalog) return catalog;
   const recovery = parseRecoveryCommand(args);
   if (recovery) return recovery;
   if (!args.length || args.length === 1 && args[0] === "start") return { kind: "start" };
@@ -89,5 +95,5 @@ export function parseHostCommand(args: readonly string[]): HostCommand {
   if (args.length === 3 && args[0] === "devices" && args[1] === "revoke" && /^[a-zA-Z0-9_-]{1,128}$/.test(args[2]!)) {
     return { kind: "devices-revoke", deviceId: args[2]! };
   }
-  throw new Error("Usage: start | devices list | devices revoke <deviceId> | devices revoke-all | identity show | identity rotate");
+  throw new Error(`Usage: start | devices list | devices revoke <deviceId> | devices revoke-all | identity show | identity rotate | ${HOST_OPERATIONS_CLI_USAGE} | ${CATALOG_IMPORT_CLI_USAGE}`);
 }

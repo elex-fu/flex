@@ -5,6 +5,7 @@ import { join, resolve } from "node:path";
 import { SessionOrchestrator } from "./orchestrator.js";
 import { CodexAdapter } from "../codex/adapter.js";
 import { fenceAdapterEvent } from "../provider/types.js";
+import { createTestHostOwner, type HostOwnerHandle } from "../lifecycle/host-owner.js";
 import type { AdapterEvent, AdapterEventPayload, AdapterStatus, DispatchContext, ProviderAdapter, TurnOutcome } from "../provider/types.js";
 import type { AppServerClient, AppServerClientHandlers, JsonObject, JsonRpcId } from "../codex/app-server-client.js";
 
@@ -40,7 +41,7 @@ class ContextAdapter implements ProviderAdapter {
   }
 }
 
-function setup(options: { databasePath?: string; owner?: { ownerId: string; generation: number } } = {}) {
+function setup(options: { databasePath?: string; owner?: HostOwnerHandle } = {}) {
   const adapter = new ContextAdapter();
   const orchestrator = new SessionOrchestrator({ workspace, adapter, ...options });
   adapter.orchestrator = orchestrator;
@@ -115,7 +116,8 @@ describe("authoritative Engine Provider fence", () => {
   });
 
   it("rejects every mismatched/unfenced context and keeps reused Item IDs separate across Turns", async () => {
-    const { adapter, orchestrator } = setup({ owner: { ownerId: "actual-owner", generation: 8 } });
+    const owner = createTestHostOwner();
+    const { adapter, orchestrator } = setup({ owner });
     const first = await orchestrator.startTurn("device", "first-command", "first");
     adapter.emit(0, { kind: "session_init", provider: "codex", providerSessionId: "native-session", model: "test", runtimeVersion: "test", tools: [] });
     adapter.emit(0, { kind: "assistant_delta", itemId: "shared-item", text: "first" });
@@ -123,7 +125,7 @@ describe("authoritative Engine Provider fence", () => {
     await waitForTerminal(orchestrator, first.turnId);
     const second = await orchestrator.startTurn("device", "second-command", "second");
     const context = adapter.calls[1]!.context;
-    expect(context).toMatchObject({ hostOwnerId: "actual-owner", hostOwnerGeneration: 8, sessionId: orchestrator.sessionId, flyxTurnId: second.turnId, runtimeGeneration: 2 });
+    expect(context).toMatchObject({ hostOwnerId: owner.ownerId, hostOwnerGeneration: owner.generation, sessionId: orchestrator.sessionId, flyxTurnId: second.turnId, runtimeGeneration: 2 });
     expect(adapter.calls[1]!.resumeSessionId).toBe("native-session");
     adapter.emit(1, { kind: "assistant_delta", itemId: "shared-item", text: "second" });
     await drain(orchestrator);
@@ -157,16 +159,17 @@ describe("authoritative Engine Provider fence", () => {
     const directory = await mkdtemp(join(tmpdir(), "flyx-dispatch-fence-"));
     directories.push(directory);
     const databasePath = join(directory, "host.sqlite");
-    const firstHost = setup({ databasePath, owner: { ownerId: "owner-one", generation: 1 } });
+    const firstHost = setup({ databasePath });
     const first = await firstHost.orchestrator.startTurn("device", "first-command", "first");
     firstHost.adapter.emit(0, { kind: "session_init", provider: "codex", providerSessionId: "native-session", model: "test", runtimeVersion: "test", tools: [] });
     firstHost.adapter.finish(0);
     await waitForTerminal(firstHost.orchestrator, first.turnId);
     open.splice(open.indexOf(firstHost.orchestrator), 1);
     firstHost.orchestrator.close();
-    const secondHost = setup({ databasePath, owner: { ownerId: "owner-two", generation: 2 } });
+    const secondHost = setup({ databasePath });
     const second = await secondHost.orchestrator.startTurn("device", "second-command", "continue");
-    expect(secondHost.adapter.calls[0]!.context).toMatchObject({ hostOwnerId: "owner-two", hostOwnerGeneration: 2, runtimeGeneration: 2, flyxTurnId: second.turnId });
+    expect(secondHost.adapter.calls[0]!.context).toMatchObject({ hostOwnerId: secondHost.orchestrator.owner.ownerId, hostOwnerGeneration: secondHost.orchestrator.owner.generation, runtimeGeneration: 2, flyxTurnId: second.turnId });
+    expect(secondHost.orchestrator.owner.ownerId).not.toBe(firstHost.orchestrator.owner.ownerId);
     expect(secondHost.adapter.calls[0]!.resumeSessionId).toBe("native-session");
     expect(secondHost.orchestrator.store.getTurn(second.turnId)?.generation).toBe(2);
     secondHost.orchestrator.ingestAdapterEvent(fenceAdapterEvent(firstHost.adapter.calls[0]!.context, { kind: "assistant_delta", itemId: "shared-item", text: "old host" }));

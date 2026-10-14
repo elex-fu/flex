@@ -1,5 +1,7 @@
 import { execFile as execFileCallback } from "node:child_process";
 import { promisify } from "node:util";
+import { createHash } from "node:crypto";
+import { parsePorcelainV1Z, type GitStatusFile } from "./porcelain-parser.js";
 
 const execFile = promisify(execFileCallback);
 const MAX_DIFF_BYTES = 2 * 1024 * 1024;
@@ -10,7 +12,7 @@ export type GitStatus = {
   branch?: string;
   head?: string;
   dirty: boolean;
-  files: Array<{ path: string; index: string; worktree: string }>;
+  files: GitStatusFile[];
   filesTruncated?: boolean;
   error?: string;
 };
@@ -28,33 +30,23 @@ export class GitService {
 
   async status(): Promise<GitStatus> {
     try {
-      const result = await execFile("git", ["status", "--porcelain=v1", "--branch", "-z"], {
+      const result = await execFile("git", ["-c", "core.fsmonitor=false", "status", "--porcelain=v1", "--branch", "--untracked-files=all", "-z"], {
         cwd: this.workspace,
         timeout: 10_000,
         maxBuffer: 512 * 1024,
         env: { ...process.env, GIT_OPTIONAL_LOCKS: "0", GIT_PAGER: "cat" },
       });
-      const fields = result.stdout.split("\0").filter(Boolean);
-      const branchField = fields.shift() ?? "## unknown";
-      const branch = branchField.replace(/^##\s*/, "").split("...")[0] || "unknown";
-      const filesTruncated = fields.length > MAX_FILES;
-      const files = fields.slice(0, MAX_FILES).map((field) => ({
-        index: field.slice(0, 1),
-        worktree: field.slice(1, 2),
-        path: field.slice(3),
-      }));
+      const parsed = parsePorcelainV1Z(result.stdout, MAX_FILES);
       let head: string | undefined;
-      try {
-        head = (await execFile("git", ["rev-parse", "HEAD"], {
+      if (!parsed.unborn) {
+        head = (await execFile("git", ["-c", "core.fsmonitor=false", "rev-parse", "--verify", "HEAD"], {
           cwd: this.workspace,
           timeout: 5_000,
           maxBuffer: 64 * 1024,
           env: { ...process.env, GIT_OPTIONAL_LOCKS: "0" },
         })).stdout.trim();
-      } catch {
-        // An unborn repository has no HEAD; status is still useful.
       }
-      return { available: true, branch, ...(head ? { head } : {}), dirty: files.length > 0, files, ...(filesTruncated ? { filesTruncated: true } : {}) };
+      return { available: true, branch: parsed.branch ?? "unknown", ...(head ? { head } : {}), dirty: parsed.dirty, files: parsed.files, ...(parsed.filesTruncated ? { filesTruncated: true } : {}) };
     } catch (error) {
       return { available: false, dirty: false, files: [], error: error instanceof Error ? error.message : String(error) };
     }
@@ -64,10 +56,11 @@ export class GitService {
     const status = await this.status();
     if (!status.available) return { ...status, diff: "", truncated: false };
     try {
-      // Compare against HEAD so both staged and unstaged Claude edits are
-      // visible.  The fixture is a normal Git repository; an unborn HEAD is
-      // reported as a bounded empty diff rather than invoking a shell.
-      const result = await execFile("git", ["diff", baseHead ?? "HEAD", "--no-ext-diff", "--no-textconv", "--no-color", "--unified=3", "--binary", "--"], {
+      // Pin the observed HEAD so staged and unstaged tracked edits are shown
+      // together. Unborn repositories compare against their format's empty
+      // tree; a failed command remains an unavailable diff, never a clean one.
+      const baseline = baseHead ?? status.head ?? await this.emptyTree();
+      const result = await execFile("git", ["-c", "core.fsmonitor=false", "diff", baseline, "--no-ext-diff", "--no-textconv", "--no-color", "--unified=3", "--binary", "--"], {
         cwd: this.workspace,
         timeout: 15_000,
         maxBuffer: MAX_DIFF_BYTES + 64 * 1024,
@@ -82,8 +75,19 @@ export class GitService {
         truncated: true,
       };
     } catch (error) {
-      return { ...status, diff: "", truncated: false, error: error instanceof Error ? error.message : String(error) };
+      return { ...status, available: false, diff: "", truncated: false, error: error instanceof Error ? error.message : String(error) };
     }
+  }
+
+  private async emptyTree(): Promise<string> {
+    const format = (await execFile("git", ["-c", "core.fsmonitor=false", "rev-parse", "--show-object-format"], {
+      cwd: this.workspace,
+      timeout: 5_000,
+      maxBuffer: 64 * 1024,
+      env: { ...process.env, GIT_OPTIONAL_LOCKS: "0" },
+    })).stdout.trim();
+    if (format !== "sha1" && format !== "sha256") throw new Error("Unsupported Git object format");
+    return createHash(format).update("tree 0\0").digest("hex");
   }
 }
 

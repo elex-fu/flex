@@ -48,6 +48,7 @@ function eventItemKind(event: SessionEvent): TimelineItem["kind"] {
 function eventStatus(event: SessionEvent, payload: JsonRecord): string {
   if (typeof payload.status === "string") return payload.status;
   if (event.type === "provider.session.init") return "info";
+  if (event.type === "assistant.message.delta") return "streaming";
   if (event.type === "assistant.message.completed" && payload.aborted === true) return "aborted";
   if (event.type === "turn.interrupt.requested") return "requested";
   if (event.type === "turn.interrupt.unavailable" || event.type.endsWith(".unavailable")) return "error";
@@ -76,18 +77,21 @@ export function timelineItemFromEvent(event: SessionEvent, existing?: TimelineIt
   const itemId = explicitItemId ?? `event-${event.id}`;
   const kind = eventItemKind(event);
   const previousContent = isRecord(existing?.content) ? existing.content : {};
-  // Host assistant deltas are already normalized to the accumulated text.
-  // Replacing only `text` avoids doubling content while still preserving any
-  // metadata already attached to the item. Tool progress/completion payloads,
-  // by contrast, are partial and must be merged with the started item.
+  // Event deltas contain only the next fragment; stored TimelineItems contain
+  // the accumulated body. Completion replaces that body with the final text.
+  // Tool progress contains accumulated output and remains a metadata merge.
   const content: JsonRecord = {
     ...previousContent,
     ...payload,
+    eventType: event.type,
     ...(explicitItemId ? {} : { message: payload.message ?? event.type }),
   };
   if (typeof payload.result === "string" && typeof payload.message !== "string") content.message = payload.result;
   if (event.type === "turn.cancelled" && typeof payload.reason === "string") content.message = `Turn cancelled: ${payload.reason}`;
-  if (kind === "assistant_message" && typeof payload.text === "string") content.text = payload.text;
+  if (kind === "assistant_message" && typeof payload.text === "string") {
+    const previousText = typeof previousContent.text === "string" ? previousContent.text : "";
+    content.text = event.type === "assistant.message.delta" ? previousText + payload.text : payload.text;
+  }
   return {
     sessionId: event.sessionId,
     itemId,
@@ -107,7 +111,8 @@ export function hasTerminalItem(items: TimelineItem[], turnId: string): boolean 
   return items.some((item) => {
     const content = isRecord(item.content) ? item.content : undefined;
     if (content?.turnId !== turnId) return false;
-    if (["completed", "failed", "cancelled", "outcome_unknown"].includes(item.status)) return true;
+    if (content.eventType === "turn.completed" || content.eventType === "turn.failed" || content.eventType === "turn.cancelled") return true;
+    if (content.eventType !== "turn.reconciled") return false;
     const outcome = isRecord(content.outcome) ? content.outcome : undefined;
     return Boolean(outcome && typeof outcome.status === "string" && ["completed", "failed", "cancelled", "outcome_unknown"].includes(outcome.status));
   });

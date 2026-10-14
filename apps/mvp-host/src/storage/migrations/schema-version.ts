@@ -1,7 +1,9 @@
 import type Database from "better-sqlite3";
 import { validateCommandExecutionSchema } from "./004-command-execution.js";
+import { validateRecoverySchema } from "./005-recovery.js";
+import { validateViewsSchema } from "./006-views-schema.js";
 
-export const SUPPORTED_SCHEMA_VERSION = 4;
+export const SUPPORTED_SCHEMA_VERSION = 6;
 
 export class StoreSchemaError extends Error {
   constructor(readonly code: "FUTURE_SCHEMA" | "SCHEMA_INVALID", message: string) {
@@ -71,7 +73,10 @@ export function validateV3Schema(db: Database.Database): void {
   requireUniqueIndex(db, "session_events", ["session_id", "sequence"], false);
   requireUniqueIndex(db, "turns", ["session_id"], true);
   requireUniqueIndex(db, "approvals", ["turn_id", "tool_use_id"], true);
-  requireConstraintSql(db, "index", "one_active_turn_per_session", "WHERE status IN ('queued', 'running', 'waiting_approval', 'interrupting', 'outcome_unknown')");
+  const recoveryInstalled = Boolean(db.prepare("SELECT 1 FROM schema_migrations WHERE version = 5").get());
+  requireConstraintSql(db, "index", "one_active_turn_per_session", recoveryInstalled
+    ? "WHERE status IN ('queued', 'running', 'waiting_approval', 'interrupting')"
+    : "WHERE status IN ('queued', 'running', 'waiting_approval', 'interrupting', 'outcome_unknown')");
   requireConstraintSql(db, "index", "one_pending_approval_per_tool", "WHERE status = 'pending'");
   requireConstraintSql(db, "table", "sessions", "CHECK (status IN ('active', 'archived'))");
   requireConstraintSql(db, "table", "turns", "CHECK (status IN ('queued', 'running', 'waiting_approval', 'interrupting', 'completed', 'failed', 'cancelled', 'outcome_unknown'))");
@@ -113,6 +118,14 @@ export function inspectSchema(db: Database.Database, options: { maximumVersion?:
     if (version >= 4) {
       try { validateCommandExecutionSchema(db); }
       catch { throw new StoreSchemaError("SCHEMA_INVALID", "Declared command execution schema is incomplete; offline repair is required."); }
+    }
+    for (const [migration, validate] of [[5, validateRecoverySchema], [6, validateViewsSchema]] as const) {
+      if (version < migration) continue;
+      if (!rows.some((row) => row.version === migration) || !rows.some((row) => row.version === migration - 1)) {
+        throw new StoreSchemaError("SCHEMA_INVALID", `Declared schema is missing ordered migration ${migration}.`);
+      }
+      try { validate(db); }
+      catch { throw new StoreSchemaError("SCHEMA_INVALID", `Declared migration ${migration} schema is incomplete; offline repair is required.`); }
     }
   }
   return { version, empty: tables.length === 0, legacy: version < 3 };

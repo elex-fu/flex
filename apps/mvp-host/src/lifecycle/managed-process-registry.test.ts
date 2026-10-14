@@ -3,7 +3,7 @@ import { PassThrough } from "node:stream";
 import type { ChildProcess, spawn } from "node:child_process";
 import { describe, expect, it } from "vitest";
 import Database from "better-sqlite3";
-import { MANAGED_PROCESS_SCHEMA, MANAGED_PROCESS_IDENTITY_SCHEMA, SqliteProcessJournal, ManagedProcessRegistry, type ManagedProcessRecord } from "./managed-process-registry.js";
+import { MANAGED_PROCESS_SCHEMA, MANAGED_PROCESS_IDENTITY_SCHEMA, SqliteProcessJournal, ManagedProcessRegistry, processIdentityDigest, type ManagedProcessRecord } from "./managed-process-registry.js";
 
 const context = { hostOwnerId: "owner", hostOwnerGeneration: 1, runtimeId: "runtime", runtimeGeneration: 2, attemptId: "attempt" };
 function fixture(group: "present" | "absent" | "unknown" = "absent") {
@@ -15,7 +15,8 @@ function fixture(group: "present" | "absent" | "unknown" = "absent") {
     journal: { save: (record) => records.push({ ...record }) }, context: () => context,
     spawn: (() => { expect(records.at(-1)?.state).toBe("launching"); spawned = true; return child; }) as typeof spawn,
     groupExists: () => group,
-    treeExitContractVerified: true,
+    identify: (pid) => ({ pid, platform: "linux", birth: { kind: "linux", bootId: "12345678-1234-1234-1234-123456789abc", startTicks: "10" } }),
+    verifyDescendantStop: (record) => ({ kind: "verified-tree-stop", sourceId: "controlled-tree-stop", contractId: "fixture-descendant-contract", identityDigest: processIdentityDigest(record.processIdentity!) }),
   });
   return { registry, child, records, spawned: () => spawned };
 }
@@ -78,5 +79,33 @@ describe("managed process ownership", () => {
     registry.spawn("fixture", [], {}); const count = records.length;
     registry.sealJournal(); child.emit("exit", 0, null);
     expect(records).toHaveLength(count);
+  });
+  it("persists exact launch boundary before spawn and rolls back attempts to replace it", () => {
+    const db = new Database(":memory:");
+    try {
+      db.exec(MANAGED_PROCESS_SCHEMA + MANAGED_PROCESS_IDENTITY_SCHEMA);
+      const journal = new SqliteProcessJournal(db);
+      const record: ManagedProcessRecord = { ...context, id: "bound-process", state: "launching", treeControl: "process_group",
+        boundaryEvidence: { proof: { policyDigest: "private-denial", verifiedDescendantStop: false }, launchDigest: "a".repeat(64) } };
+      journal.save(record);
+      expect(db.prepare("SELECT proof_json,launch_digest FROM managed_process_boundaries").get()).toEqual({ proof_json: JSON.stringify(record.boundaryEvidence!.proof), launch_digest: "a".repeat(64) });
+      expect(() => journal.save({ ...record, state: "unknown", boundaryEvidence: { ...record.boundaryEvidence!, launchDigest: "b".repeat(64) } })).toThrow("PROCESS_BOUNDARY_CONFLICT");
+      expect(db.prepare("SELECT state FROM managed_processes").get()).toEqual({ state: "launching" });
+    } finally { db.close(); }
+  });
+  it("requires a birth-bound immutable stop proof before persisting stopped", () => {
+    const db = new Database(":memory:");
+    try {
+      db.exec(MANAGED_PROCESS_SCHEMA + MANAGED_PROCESS_IDENTITY_SCHEMA);
+      const journal = new SqliteProcessJournal(db);
+      const identity = { pid: 42, platform: "linux" as const, birth: { kind: "linux" as const, bootId: "12345678-1234-1234-1234-123456789abc", startTicks: "10" } };
+      const record: ManagedProcessRecord = { ...context, id: "stopped-process", state: "running", pid: 42, treeControl: "process_group", processIdentity: identity };
+      journal.save(record);
+      expect(() => journal.save({ ...record, state: "stopped" })).toThrow("PROCESS_STOP_PROOF_REQUIRED");
+      const stopProof = { kind: "verified-tree-stop" as const, sourceId: "tree-exit", contractId: "verified-contract", identityDigest: processIdentityDigest(identity) };
+      journal.save({ ...record, state: "stopped", stopProof });
+      expect(() => journal.save({ ...record, state: "stopped", stopProof: { ...stopProof, sourceId: "other-exit" } })).toThrow("PROCESS_STOP_PROOF_CONFLICT");
+      expect(db.prepare("SELECT proof_json FROM managed_process_stop_proofs").get()).toEqual({ proof_json: JSON.stringify(stopProof) });
+    } finally { db.close(); }
   });
 });

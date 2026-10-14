@@ -7,6 +7,7 @@ import { HostOwnerLock, type HostOwnerHandle, type OwnershipRecoveryProof, type 
 import { SystemProcessInspector, type ProcessInspector } from "./process-inspector.js";
 import { openForMaintenance, openForRecoveryMaintenance, openOwned, upgradeForRecoveryMaintenance } from "../storage/open-store.js";
 import type { SqliteStore } from "../storage/db.js";
+import { SUPPORTED_SCHEMA_VERSION } from "../storage/migrations/schema-version.js";
 
 const roots:string[]=[];
 const stores:SqliteStore[]=[];
@@ -47,7 +48,7 @@ describe("retained owner recovery-maintenance bootstrap",()=>{
     expect(()=>store.assertWriterOwner()).toThrow("HOST_RECOVERY_ONLY");
     expect(()=>store.commitEvent(f.session.id,"business.forbidden",{})).toThrow("HOST_RECOVERY_ONLY");
     expect(store.getTurn("unverified-turn")?.status).toBe("queued");
-    expect(store.db.prepare("SELECT MAX(version) AS version FROM schema_migrations").get()).toEqual({version:4});
+    expect(store.db.prepare("SELECT MAX(version) AS version FROM schema_migrations").get()).toEqual({version:SUPPORTED_SCHEMA_VERSION});
     expect(f.files()).toEqual(before);
     store.withRecoveryTransaction(()=>store.db.prepare("INSERT INTO host_state VALUES('recovery-evidence','\"stopped\"','now')").run());
     expect(()=>store.withRecoveryTransaction(async()=>{})).toThrow("SYNCHRONOUS_COMMIT_REQUIRED");
@@ -131,7 +132,7 @@ describe("retained owner recovery-maintenance bootstrap",()=>{
       db.exec("CREATE TABLE forbidden_future_metadata(id TEXT); INSERT INTO schema_migrations VALUES(99,'future')");
     })).toThrow("newer than supported");
     expect(store.db.prepare("SELECT 1 FROM sqlite_master WHERE name='forbidden_future_metadata'").get()).toBeUndefined();
-    expect(store.db.prepare("SELECT MAX(version) AS version FROM schema_migrations").get()).toEqual({version:4});
+    expect(store.db.prepare("SELECT MAX(version) AS version FROM schema_migrations").get()).toEqual({version:SUPPORTED_SCHEMA_VERSION});
     expect(()=>upgradeForRecoveryMaintenance(scope,store.db,async()=>{})).toThrow("SYNCHRONOUS_METADATA_MIGRATION_REQUIRED");
     expect(()=>store.assertWriterOwner()).toThrow("HOST_RECOVERY_ONLY");
     expect(f.files()).toEqual(retained);scope.closeMaintenance();

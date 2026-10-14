@@ -83,6 +83,7 @@ export class SessionOrchestrator {
     const provider = options.adapter?.provider ?? options.provider ?? "claude";
     const databasePath = options.databasePath ?? options.owner?.databasePath ?? ":memory:";
     if (options.store && !options.owner) throw new Error("An injected Store requires its verified owner handle");
+    if (options.owner?.recoveryOnly) throw new Error("HOST_RECOVERY_ONLY");
     this.owner = options.owner ?? (databasePath === ":memory:" ? createTestHostOwner() : HostOwnerLock.acquire({
       databasePath,
       ...(options.identityDirectory ? { identityDirectory: options.identityDirectory } : {}),

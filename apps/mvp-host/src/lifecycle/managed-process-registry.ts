@@ -2,7 +2,10 @@ import { spawn, type ChildProcess, type SpawnOptions } from "node:child_process"
 import { randomUUID } from "node:crypto";
 import type Database from "better-sqlite3";
 import { SystemProcessInspector, type ProcessIdentity } from "./process-inspector.js";
+import { validateTreeStopEvidence, type ProcessBoundaryEvidence, type ProcessTreeStopEvidence } from "./managed-process-evidence.js";
+import { MANAGED_PROCESS_EVIDENCE_SCHEMA } from "../storage/migrations/005-process-evidence.js";
 export { MANAGED_PROCESS_SCHEMA } from "../storage/migrations/004-managed-process-schema.js";
+export { processIdentityDigest, type ProcessBoundaryEvidence, type ProcessTreeStopEvidence } from "./managed-process-evidence.js";
 
 export type ProcessLaunchContext = {
   hostOwnerId: string;
@@ -22,21 +25,27 @@ export type ManagedProcessRecord = ProcessLaunchContext & {
   treeControl: "process_group" | "unavailable";
   errorCode?: string;
   processIdentity?: ProcessIdentity;
+  boundaryEvidence?: ProcessBoundaryEvidence;
+  stopProof?: ProcessTreeStopEvidence;
 };
 export type ProcessStopResult = { stopped: boolean; treeStopped: boolean; records: ManagedProcessRecord[] };
 export interface ProcessJournal { save(record: ManagedProcessRecord): void; }
 
-export const MANAGED_PROCESS_IDENTITY_SCHEMA = `
-CREATE TABLE IF NOT EXISTS managed_process_identities (
-  process_id TEXT PRIMARY KEY REFERENCES managed_processes(id),
-  identity_json TEXT NOT NULL
-);
-`;
+/** Compatibility export; production installs the complete 005 evidence metadata. */
+export const MANAGED_PROCESS_IDENTITY_SCHEMA = MANAGED_PROCESS_EVIDENCE_SCHEMA;
 
 export class SqliteProcessJournal implements ProcessJournal {
   constructor(private readonly db: Database.Database) {}
   save(record: ManagedProcessRecord): void {
     this.db.transaction(() => {
+    if (record.state === "stopped" && !record.stopProof) throw new Error("PROCESS_STOP_PROOF_REQUIRED");
+    const previous = this.db.prepare("SELECT owner_id,owner_generation,runtime_id,runtime_generation,attempt_id,session_id,turn_id,pid,process_group,tree_control FROM managed_processes WHERE id = ?").get(record.id) as Record<string, unknown> | undefined;
+    const immutable = { owner_id: record.hostOwnerId, owner_generation: record.hostOwnerGeneration, runtime_id: record.runtimeId,
+      runtime_generation: record.runtimeGeneration, attempt_id: record.attemptId, session_id: record.sessionId ?? null,
+      turn_id: record.flyxTurnId ?? null, tree_control: record.treeControl };
+    if (previous && (Object.entries(immutable).some(([key, value]) => previous[key] !== value) ||
+        (previous.pid !== null && previous.pid !== record.pid) ||
+        (previous.process_group !== null && previous.process_group !== record.processGroup))) throw new Error("PROCESS_BIRTH_CONFLICT");
     this.db.prepare(`INSERT INTO managed_processes
       (id,owner_id,owner_generation,runtime_id,runtime_generation,attempt_id,session_id,turn_id,pid,process_group,tree_control,state,error_code,updated_at)
       VALUES (@id,@ownerId,@ownerGeneration,@runtimeId,@runtimeGeneration,@attemptId,@sessionId,@turnId,@pid,@processGroup,@treeControl,@state,@errorCode,@updatedAt)
@@ -53,6 +62,21 @@ export class SqliteProcessJournal implements ProcessJournal {
       this.db.prepare("INSERT OR IGNORE INTO managed_process_identities(process_id,identity_json) VALUES(?,?)").run(record.id, identity);
       const saved = this.db.prepare("SELECT identity_json FROM managed_process_identities WHERE process_id = ?").get(record.id) as { identity_json: string };
       if (saved.identity_json !== identity) throw new Error("PROCESS_BIRTH_CONFLICT");
+    }
+    if (record.boundaryEvidence) {
+      const { proof, launchDigest } = record.boundaryEvidence;
+      if (!/^[a-f0-9]{64}$/.test(launchDigest)) throw new Error("PROCESS_BOUNDARY_INVALID");
+      const encoded = JSON.stringify(proof);
+      this.db.prepare("INSERT OR IGNORE INTO managed_process_boundaries(process_id,proof_json,launch_digest) VALUES(?,?,?)").run(record.id, encoded, launchDigest);
+      const saved = this.db.prepare("SELECT proof_json,launch_digest FROM managed_process_boundaries WHERE process_id = ?").get(record.id) as { proof_json: string; launch_digest: string };
+      if (saved.proof_json !== encoded || saved.launch_digest !== launchDigest) throw new Error("PROCESS_BOUNDARY_CONFLICT");
+    }
+    if (record.stopProof) {
+      validateTreeStopEvidence(record.stopProof, record.processIdentity);
+      const encoded = JSON.stringify(record.stopProof);
+      this.db.prepare("INSERT OR IGNORE INTO managed_process_stop_proofs(process_id,proof_json) VALUES(?,?)").run(record.id, encoded);
+      const saved = this.db.prepare("SELECT proof_json FROM managed_process_stop_proofs WHERE process_id = ?").get(record.id) as { proof_json: string };
+      if (saved.proof_json !== encoded) throw new Error("PROCESS_STOP_PROOF_CONFLICT");
     }
     })();
   }
@@ -71,16 +95,17 @@ export class ManagedProcessRegistry {
     groupExists?: (pid: number) => "present" | "absent" | "unknown";
     gracefulExitMs?: number;
     identify?: (pid: number) => ProcessIdentity;
-    /** Supplied by a verified container/SDK exit boundary; group absence alone is insufficient. */
-    treeExitContractVerified?: boolean;
+    /** Trusted local verifier bound to this process's persisted boundary and birth identity. */
+    verifyDescendantStop?: (record: ManagedProcessRecord) => ProcessTreeStopEvidence | undefined | Promise<ProcessTreeStopEvidence | undefined>;
   }) {}
 
-  spawn(command: string, args: readonly string[], options: SpawnOptions): ChildProcess {
+  spawn(command: string, args: readonly string[], options: SpawnOptions, boundaryEvidence?: ProcessBoundaryEvidence): ChildProcess {
     if (this.closing) throw new Error("RUNTIME_CLOSING");
     const grouped = process.platform !== "win32";
     const record: ManagedProcessRecord = {
       ...this.options.context(), id: randomUUID(), state: "launching",
       treeControl: grouped ? "process_group" : "unavailable",
+      ...(boundaryEvidence ? { boundaryEvidence } : {}),
     };
     // Commit launching before crossing the external spawn boundary.
     this.options.journal.save(record);
@@ -149,9 +174,16 @@ export class ManagedProcessRegistry {
     if (entry.record.state === "not_spawned") return true;
     const group = entry.record.processGroup;
     const proof = group === undefined ? "unknown" : (this.options.groupExists ?? groupExists)(group);
-    if (entry.exited && proof === "absent" && this.options.treeExitContractVerified) {
-      entry.record.state = "stopped";
-      return this.persist(entry.record);
+    if (entry.exited && proof === "absent" && this.options.verifyDescendantStop) {
+      try {
+        const stopProof = await this.options.verifyDescendantStop({ ...entry.record });
+        if (stopProof) {
+          validateTreeStopEvidence(stopProof, entry.record.processIdentity);
+          entry.record.stopProof = stopProof;
+          entry.record.state = "stopped";
+          return this.persist(entry.record);
+        }
+      } catch { /* Unavailable or invalid proof retains the recovery gate. */ }
     }
     // Never infer descendant exit from root exit or the boolean returned by kill().
     entry.record.state = "unknown"; entry.record.errorCode = "PROCESS_TREE_STOP_UNPROVEN";

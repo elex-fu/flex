@@ -1,9 +1,10 @@
 import Database from "better-sqlite3";
 import { randomUUID } from "node:crypto";
 import { HostOwnerLock, assertHostOwner, canonicalPath, createTestHostOwner, type HostOwnerHandle } from "../lifecycle/host-owner.js";
-import { inspectSchema, StoreSchemaError, validateV3Schema } from "./migrations/schema-version.js";
+import { inspectSchema, StoreSchemaError } from "./migrations/schema-version.js";
 import type { ProviderId, RpcError, Session, SessionEvent, TimelineItem, Turn } from "@flyx/mvp-protocol";
 import { applyRecoveryMigration } from "./migrations/005-recovery.js";
+import { applyViewsSchemaMigration } from "./migrations/006-views.js";
 import { applyCommandExecutionMigration } from "./migrations/004-command-execution.js";
 import { ExecutionStore, toExecutionIntent, type RawExecutionIntent } from "./execution-store.js";
 import { decideAcceptTurn } from "../orchestration/decider.js";
@@ -435,7 +436,7 @@ export class SqliteStore {
         this.db.transaction(() => {
           this.db.exec(SCHEMA);
           this.migrateSchema();
-          validateV3Schema(this.db);
+          inspectSchema(this.db);
         })();
       } catch (error) {
         this.db.close();
@@ -515,6 +516,7 @@ export class SqliteStore {
     this.db.prepare("INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (3, ?)").run(now());
     applyCommandExecutionMigration(this.db);
     applyRecoveryMigration(this.db);
+    applyViewsSchemaMigration(this.db);
   }
 
   private upsertTimelineInternal(sessionId: string, input: TimelineUpsert, updatedAt: string): void {

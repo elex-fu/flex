@@ -1,4 +1,5 @@
 import type Database from "better-sqlite3";
+import { MANAGED_PROCESS_EVIDENCE_SCHEMA, validateProcessEvidenceSchema } from "./005-process-evidence.js";
 
 export const RECOVERY_SCHEMA_VERSION = 5;
 export const RECOVERY_REQUIRED_COLUMNS: Record<string, readonly string[]> = {
@@ -12,6 +13,7 @@ export function validateRecoverySchema(db: Database.Database): void {
     const columns = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
     if (expected.some((name) => !columns.some((column) => column.name === name))) throw new Error(`SCHEMA_INVALID: migration 005 table ${table}`);
   }
+  validateProcessEvidenceSchema(db);
 }
 
 /** Active relation consumers must be upgraded in the same release before relaxing the index. */
@@ -48,6 +50,7 @@ export function applyRecoveryMigration(db: Database.Database, appliedAt = new Da
       );
       CREATE INDEX recovery_operations_target ON recovery_operations(session_id,turn_id,phase);
     `);
+    db.exec(MANAGED_PROCESS_EVIDENCE_SCHEMA);
     const sessions = db.prepare("SELECT id FROM sessions").all() as Array<{ id: string }>;
     for (const session of sessions) {
       const candidates = db.prepare("SELECT id FROM turns WHERE session_id = ? AND status IN ('queued','running','waiting_approval','interrupting','outcome_unknown')")

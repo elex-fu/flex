@@ -80,3 +80,63 @@ export function applyCheckpointSchema(db: Database.Database): void {
     }
   })();
 }
+
+
+/** R16 shares migration009 and the owned Store transaction. Never waits for Git or Native here. */
+export const REVERT_SCHEMA_SQL = `
+CREATE TABLE IF NOT EXISTS checkpoint_revert_operations (
+  operation_id TEXT PRIMARY KEY, session_id TEXT NOT NULL REFERENCES sessions(id),
+  actor_id TEXT NOT NULL, command_id TEXT NOT NULL,
+  plan_id TEXT NOT NULL REFERENCES checkpoint_preview_plans(plan_id),
+  revision INTEGER NOT NULL, stage TEXT NOT NULL CHECK(stage IN ('validated','safety_captured','workspace_restored','provider_rewound','projection_committed','partial_failure')),
+  status TEXT NOT NULL CHECK(status IN ('queued','running','blocked','completed','rolled_back')),
+  operation_json TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+  UNIQUE(actor_id,command_id), FOREIGN KEY(actor_id,command_id) REFERENCES command_receipts(auth_subject_id,command_id)
+);
+CREATE INDEX IF NOT EXISTS checkpoint_reverts_by_session ON checkpoint_revert_operations(session_id,status);
+CREATE TABLE IF NOT EXISTS checkpoint_revert_steps (
+  operation_id TEXT NOT NULL REFERENCES checkpoint_revert_operations(operation_id),
+  step_id TEXT NOT NULL, ordinal INTEGER NOT NULL, kind TEXT NOT NULL, state TEXT NOT NULL,
+  step_json TEXT NOT NULL, PRIMARY KEY(operation_id,step_id), UNIQUE(operation_id,ordinal)
+);
+CREATE TABLE IF NOT EXISTS checkpoint_revert_step_attempts (
+  attempt_id TEXT PRIMARY KEY, operation_id TEXT NOT NULL, step_id TEXT NOT NULL,
+  state TEXT NOT NULL CHECK(state IN ('dispatching','applied','outcome_unknown')), attempt_json TEXT NOT NULL,
+  FOREIGN KEY(operation_id,step_id) REFERENCES checkpoint_revert_steps(operation_id,step_id)
+);
+CREATE TABLE IF NOT EXISTS checkpoint_revert_gates (
+  session_id TEXT PRIMARY KEY REFERENCES sessions(id), operation_id TEXT NOT NULL REFERENCES checkpoint_revert_operations(operation_id) DEFERRABLE INITIALLY DEFERRED,
+  recovery_revision INTEGER NOT NULL, state TEXT NOT NULL CHECK(state IN ('blocked','released'))
+);
+CREATE TABLE IF NOT EXISTS checkpoint_revert_evidence (
+  evidence_id TEXT PRIMARY KEY, operation_id TEXT NOT NULL REFERENCES checkpoint_revert_operations(operation_id),
+  session_id TEXT NOT NULL REFERENCES sessions(id), actor_id TEXT NOT NULL,
+  evidence_json TEXT NOT NULL, expires_at TEXT NOT NULL, consumed_by TEXT
+);
+CREATE TABLE IF NOT EXISTS checkpoint_revert_view_boundaries (
+  operation_id TEXT PRIMARY KEY REFERENCES checkpoint_revert_operations(operation_id), session_id TEXT NOT NULL REFERENCES sessions(id),
+  old_epoch TEXT NOT NULL, new_epoch TEXT NOT NULL, target_checkpoint_id TEXT NOT NULL REFERENCES checkpoint_captures(checkpoint_id),
+  safety_checkpoint_id TEXT NOT NULL REFERENCES checkpoint_captures(checkpoint_id), source_sequence INTEGER NOT NULL,
+  native_binding TEXT NOT NULL, created_at TEXT NOT NULL
+);
+`;
+export function applyRevertSchema(db: Database.Database): void {
+  const names = (db.prepare("PRAGMA table_info(sessions)").all() as Array<{name:string}>).map((row) => row.name);
+  if (!["revision", "active_turn_id", "recovery_state", "recovery_revision"].every((name) => names.includes(name))) throw new Error("REVERT_REQUIRES_COMMAND_AND_RECOVERY_SCHEMA");
+  db.exec(REVERT_SCHEMA_SQL);validateRevertSchema(db);
+}
+
+export const REVERT_REQUIRED_COLUMNS: Record<string, readonly string[]> = {
+  checkpoint_revert_operations: ["operation_id","session_id","actor_id","command_id","plan_id","revision","stage","status","operation_json","created_at","updated_at"],
+  checkpoint_revert_steps: ["operation_id","step_id","ordinal","kind","state","step_json"],
+  checkpoint_revert_step_attempts: ["attempt_id","operation_id","step_id","state","attempt_json"],
+  checkpoint_revert_gates: ["session_id","operation_id","recovery_revision","state"],
+  checkpoint_revert_evidence: ["evidence_id","operation_id","session_id","actor_id","evidence_json","expires_at","consumed_by"],
+  checkpoint_revert_view_boundaries: ["operation_id","session_id","old_epoch","new_epoch","target_checkpoint_id","safety_checkpoint_id","source_sequence","native_binding","created_at"],
+};
+export function validateRevertSchema(db: Database.Database): void {
+  for (const [table, expected] of Object.entries(REVERT_REQUIRED_COLUMNS)) {
+    const columns = (db.prepare(`PRAGMA table_info(${table})`).all() as Array<{name:string}>).map((row)=>row.name);
+    if (expected.some((name)=>!columns.includes(name))) throw new Error(`SCHEMA_INVALID: migration009 ${table}`);
+  }
+}

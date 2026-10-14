@@ -55,9 +55,12 @@ export function boundedCheckpointUnsupported(items: Array<{ path?: string; reaso
   return result;
 }
 export class CheckpointService {
+  private sealed=false;
   private readonly pending = new Set<Promise<unknown>>();
   readonly store: CheckpointStore;
   constructor(private readonly options: CheckpointServiceOptions) { this.store = options.store; }
+  seal():void {this.sealed=true;this.store.seal();}
+  private assertOpen():void {if(this.sealed)throw new CheckpointError("CHECKPOINT_SEALED","Checkpoint publication is sealed");}
   /** Await this hook while holding the workspace lease, before native prompt dispatch. */
   captureBefore(context: CheckpointContext & { turnId: string; attemptId: string }): Promise<CheckpointManifest> {
     return this.capture(context, "before");
@@ -163,7 +166,7 @@ export class CheckpointService {
     const file = { ...publicFile(entry), binary }; const pageBytes = this.options.pageBytes ?? 48 * 1024;
     const perPartBytes = Math.floor((pageBytes - Buffer.byteLength(JSON.stringify({ diffId: record.diffId, file })) - 512) / 3);
     if (perPartBytes < 512) throw new CheckpointError("RESPONSE_TOO_LARGE", "Diff file metadata exceeds the response budget");
-    return this.store.db.transaction(() => {
+    this.assertOpen();return this.store.db.transaction(() => {
       const result = { diffId: record.diffId, file,
         before: this.content(input.sessionId, record.diffId, entry.fileId, "before", oldBytes, before.workspacePath, perPartBytes),
         after: this.content(input.sessionId, record.diffId, entry.fileId, "after", newBytes, before.workspacePath, perPartBytes),
@@ -182,13 +185,13 @@ export class CheckpointService {
   driver(workspaceId: string): CheckpointGitDriver { return this.options.driverFor(workspaceId); }
   async assertLease(context: CheckpointContext): Promise<void> { await this.options.assertLease(context); }
   private capture(context: CheckpointContext, phase: CheckpointPhase, additionalPaths: readonly string[] = []): Promise<CheckpointManifest> {
-    const work = this.runCapture(context, phase, additionalPaths); this.pending.add(work); void work.finally(() => this.pending.delete(work)).catch(() => {}); return work;
+    this.assertOpen();const work = this.runCapture(context, phase, additionalPaths); this.pending.add(work); void work.finally(() => this.pending.delete(work)).catch(() => {}); return work;
   }
   private async runCapture(context: CheckpointContext, phase: CheckpointPhase, additionalPaths: readonly string[]): Promise<CheckpointManifest> {
     if (context.lease.workspaceId !== context.workspaceId || !context.lease.leaseId || !Number.isSafeInteger(context.lease.generation) || context.lease.generation < 0) {
       throw new CheckpointError("WORKSPACE_LEASE_INVALID", "Checkpoint requires a fenced workspace lease");
     }
-    await this.assertLease(context);
+    await this.assertLease(context);this.assertOpen();
     if ((phase === "before" || phase === "after") && context.turnId && context.attemptId) {
       const existing = this.store.findAttempt(context.sessionId, context.turnId, context.attemptId, phase);
       if (existing) {
@@ -211,10 +214,10 @@ export class CheckpointService {
     let manifest: CheckpointManifest;
     try {
       const capture = await driver.capture(checkpointId, additionalPaths);
-      await this.assertLease(context);
+      await this.assertLease(context);this.assertOpen();
       const capturedAt = this.now(); manifest = { ...initial, ...capture, unsupportedCount: capture.unsupported.length, capturedAt, completedAt: capturedAt };
     } catch (error) {
-      const code = error instanceof CheckpointError ? error.code : "CAPTURE_FAILED";
+      this.assertOpen();const code = error instanceof CheckpointError ? error.code : "CAPTURE_FAILED";
       const unsupported = code.startsWith("UNSUPPORTED_") ? [{ reason: code.toLowerCase() }] : [];
       manifest = { ...initial, status: unsupported.length ? "unsupported" : "failed", completedAt: this.now(),
         errorCode: code, unsupported, unsupportedCount: unsupported.length, warnings: [code.toLowerCase()] };

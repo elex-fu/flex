@@ -126,21 +126,35 @@ test.describe("Flyx MVP deterministic browser E2E", () => {
     await waitForIdle(verify);
   });
 
-  test("logout invalidates the cookie and websocket tickets", async ({ page }) => {
+  test("offline local forget preserves the HttpOnly cookie and blocks automatic bootstrap on reload", async ({ page, context }) => {
     await pair(page);
-    // Scenario 16: after logout the old cookie can no longer mint a ticket.
-    const ticket = await page.evaluate(async () => {
-      const response = await fetch("/api/auth/websocket-ticket", { method: "POST" });
-      return response.status;
-    });
-    expect(ticket).toBe(200);
-    await page.getByRole("button", { name: "退出配对" }).click();
-    await expect(page.getByRole("heading", { name: "连接电脑 Host" })).toBeVisible({ timeout: 15_000 });
-    const rejected = await page.evaluate(async () => {
-      const response = await fetch("/api/auth/websocket-ticket", { method: "POST" });
-      return response.status;
-    });
-    expect(rejected).toBe(401);
+    await page.locator("textarea").fill("local draft to delete");
+    await expect(page.getByRole("status").filter({hasText:"草稿按 Host"})).toBeVisible();
+    expect((await context.cookies()).some((cookie) => cookie.name === "flyx_session" && cookie.httpOnly)).toBe(true);
+    await context.setOffline(true);
+    await page.getByRole("button", { name: "移除本地 Host", exact:true }).click();
+    await page.getByRole("button", { name: "确认移除本地记录", exact:true }).click();
+    await expect(page.getByText(/已移除本地.*并停止自动连接/)).toBeVisible();
+    expect((await context.cookies()).some((cookie) => cookie.name === "flyx_session" && cookie.httpOnly)).toBe(true);
+    expect(await page.evaluate(() => localStorage.getItem("flyx:web:automatic-bootstrap:v1"))).toBe("blocked");
+    await context.setOffline(false);
+    const authRequests:string[]=[];
+    page.on("request",(request) => {if (/\/api\/auth\/|\/api\/(?:snapshot|bootstrap|status)(?:\?|$)/.test(request.url())) authRequests.push(new URL(request.url()).pathname);});
+    await page.reload();
+    await expect(page.getByRole("heading", { name: "连接电脑 Host" })).toBeVisible();
+    await page.waitForTimeout(300);
+    expect(authRequests).toEqual([]);
+    expect((await context.cookies()).some((cookie) => cookie.name === "flyx_session" && cookie.httpOnly)).toBe(true);
+    const stored=await page.evaluate(() => new Promise<Record<string,number>>((resolve,reject) => {
+      const open=indexedDB.open("flyx-client-v1");open.onerror=()=>reject(open.error);open.onsuccess=()=>{
+        const db=open.result;const names=["profiles","commands","drafts"].filter((name)=>db.objectStoreNames.contains(name));const tx=db.transaction(names,"readonly");const counts:Record<string,number>={};
+        for(const name of names){const read=tx.objectStore(name).count();read.onsuccess=()=>{counts[name]=read.result;};}
+        tx.oncomplete=()=>{db.close();resolve(counts);};tx.onabort=()=>{db.close();reject(tx.error);};
+      };
+    }));
+    expect(Object.values(stored).every((count)=>count===0)).toBe(true);
+    await pair(page);
+    expect(await page.evaluate(() => localStorage.getItem("flyx:web:automatic-bootstrap:v1"))).toBeNull();
   });
 
   test("page refresh replays the persisted timeline", async ({ page }) => {

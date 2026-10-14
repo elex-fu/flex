@@ -16,7 +16,7 @@ import { killHost, killSpawnedHosts, startHost } from "./host-control";
  * Product-gap note (asserted as current behaviour, see the individual tests):
  * after recovery the Host keeps the crashed Turn in the explicit
  * `outcome_unknown` state and never returns the session to `idle`, so new
- * Turns are rejected with TURN_BUSY and the Web composer stays disabled.
+ * Turns are rejected with TURN_BUSY and execution stays disabled while local drafts remain editable.
  */
 
 type SnapshotShape = {
@@ -27,7 +27,7 @@ type SnapshotShape = {
 
 type EventShape = { sequence: number; type: string; payload: Record<string, unknown> };
 
-const RECOVERY_TEXT = "Host restarted while this Turn was executing";
+const RECOVERY_TEXT = "执行状态需要 Host 恢复核对。草稿可以继续编辑；核对完成前不能发起新任务。";
 
 async function apiSnapshot(page: Page): Promise<SnapshotShape> {
   return page.evaluate(async () => fetch("/api/snapshot", { cache: "no-store" }).then((r) => r.json()));
@@ -96,10 +96,11 @@ test.describe("Flyx resilience: Host crash and network partition", () => {
     // PRODUCT GAP (docs §5.5.3 "仅在明确状态后允许新 Turn"): the recovered
     // Turn is in the explicit outcome_unknown terminal state, but the Host
     // still counts it as the session's active Turn (startTurn replies
-    // TURN_BUSY) and no acknowledge/repair path returns the session to idle.
-    // The Web composer therefore stays disabled forever after a mid-Turn
+    // TURN_BUSY) and no recovery proof has been submitted through this browser flow.
+    // The Web composer therefore keeps execution disabled after a mid-Turn
     // crash; asserted as current behaviour until that step is implemented.
-    await expect(page.locator("textarea")).toBeDisabled();
+    await expect(page.locator("textarea")).toBeEnabled();
+    await expect(page.getByRole("button",{name:"发送任务",exact:true})).toBeDisabled();
   });
 
   test("scenario 14: crash during a pending approval supersedes the approval and records a durable recovery event", async ({ page }) => {
@@ -129,11 +130,10 @@ test.describe("Flyx resilience: Host crash and network partition", () => {
     // §5.5.3 recovery assertions observable over the public API.
     const events = await fetchAllEvents(page);
     expectContiguousSequences(events);
-    const recoveryEvents = events.filter((event) => event.type === "session.recovery.required");
+    const recoveryEvents = events.filter((event) => event.type === "turn.reconciled" && event.payload.turnId === before.activeTurn?.id);
     expect(recoveryEvents).toHaveLength(1);
-    expect(recoveryEvents[0]!.payload.reason).toBe("host_restart");
-    expect(recoveryEvents[0]!.payload.previousStatus).toBe("waiting_approval");
-    expect(recoveryEvents[0]!.payload.pendingApprovalIds).toEqual([approvalId]);
+    expect(recoveryEvents[0]!.payload.outcome).toMatchObject({status:"outcome_unknown",error:"DISPATCH_OUTCOME_UNPROVEN"});
+    expect(events.some((event)=>event.type === "approval.superseded" && event.payload.approvalId === approvalId)).toBe(true);
 
     // The crashed Turn reached the explicit outcome_unknown terminal state
     // (never left dangling as running) and the pending approval was
@@ -145,9 +145,10 @@ test.describe("Flyx resilience: Host crash and network partition", () => {
 
     // PRODUCT GAP (docs §5.5.2 T4/T5 + §5.5.3): same as scenario 13 — after
     // the explicit outcome_unknown marking the Host still refuses new Turns
-    // (TURN_BUSY) with no acknowledgement path, so "恢复后可正常发起新 Turn
+    // (TURN_BUSY) without a committed proof in this test, so "恢复后可正常发起新 Turn
     // 并完成" cannot hold yet.  Asserted as current behaviour.
-    await expect(page.locator("textarea")).toBeDisabled();
+    await expect(page.locator("textarea")).toBeEnabled();
+    await expect(page.getByRole("button",{name:"发送任务",exact:true})).toBeDisabled();
   });
 
   test("30s WSS partition during a slow Turn re-synchronizes without sequence gaps", async ({ page }) => {

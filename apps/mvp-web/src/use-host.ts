@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { type ClientState, type HostProfile, type PendingCommand, type SessionReplicaState } from "@flyx/client-core";
-import { InteractionListResponseSchema, InteractionResponseSchema, InteractionSchema, type Bootstrap, type Interaction, type InteractionRespondApprovalRequest, type InteractionResponse, type QuestionRespondRequest, type SessionEvent, type TimelineItem } from "@flyx/mvp-protocol";
+import { INTERACTION_CAPABILITY, InteractionListResponseSchema, InteractionResponseSchema, InteractionSchema, type Bootstrap, type Interaction, type InteractionRespondApprovalRequest, type InteractionResponse, type QuestionRespondRequest, type SessionEvent, type TimelineItem } from "@flyx/mvp-protocol";
 import { canonicalTimelineItem } from "./canonical-timeline.js";
 import { WebDraftController } from "./draft-controller.js";
 import { getWebHostRuntimes, type WebHostRuntimes } from "./host-runtimes.js";
@@ -80,7 +80,7 @@ export function useHost(runtimes: WebHostRuntimes = getWebHostRuntimes()) {
   }, [client, runtimes]);
   const refreshInteractions = useCallback(async () => {
     const sessionId = sessionIdRef.current;
-    if (!sessionId || client.getState().connection !== "online" || client.getProjectionMode() !== "canonical") return;
+    if (!sessionId || client.getState().connection !== "online" || client.getProjectionMode() !== "canonical" || !client.getNegotiatedHello()?.capabilities.includes(INTERACTION_CAPABILITY)) return;
     return interactionLoader.load(async () => {
       const page = InteractionListResponseSchema.parse(await client.request("interaction.list", {sessionId}));
       // Each card receives a current authenticated DTO; summaries alone cannot enable responses.
@@ -248,10 +248,11 @@ export function useHost(runtimes: WebHostRuntimes = getWebHostRuntimes()) {
     void refreshInteractions(); return response;
   }, [client,refreshInteractions]);
 
+  const typedInteractionsAvailable = client.getProjectionMode() === "canonical" && Boolean(client.getNegotiatedHello()?.capabilities.includes(INTERACTION_CAPABILITY));
   const online = connection.connection === "online";
   const ready = online && connection.sync === "synced" && Boolean(selectedSessionId) && (client.getProjectionMode() === "legacy" || replicaState?.interactionsAuthoritative === true && !replicaState.stale);
   return { client,connection,bootstrap,snapshot,items,hostStatus,profiles,pendingCommands,error,cacheError,replicaState,selectedSessionId,sessions,deviceScopes,draft,drafts,
-    status:connectionLabel(connection),online,ready,readOnly:!ready,
+    status:connectionLabel(connection),online,ready,readOnly:!ready,typedInteractionsAvailable,
     pair,selectHost,selectSession,loadMoreSessions,nextSessionId,sendPrompt,queryCommandReceipt,sendSavedCommand,forgetLocalHost,forgetState,revokeRemoteSelf,remoteRevokeState,interrupt,
     loadItemContent,itemLoads,diffState,loadDiff,loadDiffReference,interactionState,refreshInteractions,
     onApprove:(request:InteractionRespondApprovalRequest) => respondInteraction("interaction.respondApproval",request), onAnswer:(request:QuestionRespondRequest) => respondInteraction("question.respond",request), run,setError };

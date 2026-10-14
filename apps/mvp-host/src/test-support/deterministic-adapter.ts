@@ -118,6 +118,8 @@ export class DeterministicAdapter implements ProviderAdapter {
   private readonly onEvent: AdapterEventHandler | undefined;
   private readonly scenarios = new Map<string, DeterministicScenario>();
   private active: ActiveDeterministicTurn | undefined;
+  private readonly runs = new Set<Promise<TurnOutcome>>();
+  private closing = false;
 
   constructor(options: { workspace: string; provider?: ProviderId; onEvent?: AdapterEventHandler; scenarios?: DeterministicScenario[] }) {
     this.workspace = options.workspace;
@@ -159,7 +161,23 @@ export class DeterministicAdapter implements ProviderAdapter {
     return this.status();
   }
 
-  async runTurn(turnId: string, prompt: string, _resumeSessionId?: string, context?: DispatchContext): Promise<TurnOutcome> {
+  runTurn(turnId: string, prompt: string, resumeSessionId?: string, context?: DispatchContext): Promise<TurnOutcome> {
+    if (this.closing) return Promise.resolve({ status: "failed", error: "deterministic fixture is closing" });
+    const run = this.runScenario(turnId,prompt,resumeSessionId,context);
+    this.runs.add(run);
+    void run.finally(() => this.runs.delete(run)).catch(() => undefined);
+    return run;
+  }
+
+  /** Fixture-only proof: every original in-process run has settled; no OS producer exists. */
+  async closeAndWait(_deadlineMs?: number): Promise<import("../lifecycle/managed-process-registry.js").ProcessStopResult> {
+    this.closing = true;
+    await this.interrupt();
+    await Promise.allSettled([...this.runs]);
+    return { stopped: true, treeStopped: true, records: [] };
+  }
+
+  private async runScenario(turnId: string, prompt: string, _resumeSessionId?: string, context?: DispatchContext): Promise<TurnOutcome> {
     if (this.active && !this.active.terminal) {
       return { status: "failed", error: "deterministic adapter already has an active turn" };
     }

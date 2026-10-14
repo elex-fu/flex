@@ -51,8 +51,8 @@ test.describe("Host identity and transport-neutral Web", () => {
     await page.getByText("连接与设备", { exact: true }).click();
     await page.getByRole("button", { name: "管理设备" }).click();
     await expect(page.getByRole("region", { name: "已配对设备" })).toBeVisible();
-    await expect(page.getByRole("button", { name: "撤销本设备" })).toBeEnabled();
-    await page.getByRole("button", { name: "撤销本设备" }).click();
+    await expect(page.getByRole("button", { name: "撤销本设备授权", exact: true }).first()).toBeEnabled();
+    await page.getByRole("button", { name: "撤销本设备授权", exact: true }).first().click();
     await expect(page.getByRole("heading", { name: "连接电脑 Host" })).toBeVisible();
     const ticketStatus = await page.evaluate(async () => (await fetch("/api/auth/websocket-ticket", { method: "POST" })).status);
     expect(ticketStatus).toBe(401);

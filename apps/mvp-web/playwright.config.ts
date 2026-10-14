@@ -10,7 +10,7 @@ import { defineConfig } from "@playwright/test";
  */
 export default defineConfig({
   testDir: "./e2e",
-  projects: [{ name: "chromium", use: { browserName: "chromium" } }],
+  projects: [{ name: "chromium", use: { browserName: "chromium", ...(process.env.FLYX_E2E_BROWSER_CHANNEL ? { channel: process.env.FLYX_E2E_BROWSER_CHANNEL } : {}) } }],
   globalSetup: "./e2e/global-setup.ts",
   timeout: 60_000,
   fullyParallel: false,

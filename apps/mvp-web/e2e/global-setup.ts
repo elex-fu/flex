@@ -30,13 +30,13 @@ function prepareFixtureWorkspace(): string | undefined {
   return temporary;
 }
 
-function startDeterministicHost(): { child: ChildProcess } {
+function startDeterministicHost(e2eRoot: string): { child: ChildProcess } {
   const child = spawn(
     "pnpm",
     ["--filter", "@flyx/mvp-host", "exec", "tsx", "src/test-support/e2e-main.ts"],
     {
       cwd: repoRoot,
-      env: { ...process.env, FLYX_WEB_ROOT: distRoot, FLYX_E2E_ROOT: resolve(repoRoot, ".flyx-e2e") },
+      env: { ...process.env, FLYX_WEB_ROOT: distRoot, FLYX_E2E_ROOT: e2eRoot },
       stdio: ["ignore", "pipe", "pipe"],
     },
   );
@@ -75,7 +75,8 @@ function waitForHostReady(child: ChildProcess): Promise<{ baseUrl: string; token
 export default async function globalSetup(_config: FullConfig): Promise<() => Promise<void>> {
   buildWeb();
   const fixtureTemporary = prepareFixtureWorkspace();
-  const { child } = startDeterministicHost();
+  const e2eRoot = mkdtempSync(resolve(tmpdir(),"flyx-browser-host-"));
+  const { child } = startDeterministicHost(e2eRoot);
   const { baseUrl, token, tokens, pid } = await waitForHostReady(child);
   // Env mutations here propagate to every test worker.
   process.env.FLYX_E2E_BASE_URL = baseUrl;
@@ -91,19 +92,19 @@ export default async function globalSetup(_config: FullConfig): Promise<() => Pr
     command: "pnpm",
     args: ["--filter", "@flyx/mvp-host", "exec", "tsx", "src/test-support/e2e-main.ts"],
     cwd: repoRoot,
-    env: { FLYX_WEB_ROOT: distRoot, FLYX_E2E_ROOT: resolve(repoRoot, ".flyx-e2e"), FLYX_WORKSPACE: process.env.FLYX_WORKSPACE! },
+    env: { FLYX_WEB_ROOT: distRoot, FLYX_E2E_ROOT: e2eRoot, FLYX_WORKSPACE: process.env.FLYX_WORKSPACE! },
   });
   // A file-based claim counter survives worker restarts (Playwright recycles
   // the worker after a failed test, which would otherwise reset in-memory
   // token queues and hand out already-consumed tokens).
-  const claimFile = resolve(repoRoot, ".flyx-e2e", "token-claims.txt");
+  const claimFile = resolve(e2eRoot,"token-claims.txt");
   mkdirSync(dirname(claimFile), { recursive: true });
   writeFileSync(claimFile, "");
   process.env.FLYX_E2E_CLAIM_FILE = claimFile;
 
   return async () => {
     if (child.exitCode === null) {
-      child.kill("SIGTERM");
+      if (pid) { try { process.kill(pid,"SIGTERM"); } catch { /* fixture already exited */ } } else child.kill("SIGTERM");
       await new Promise<void>((resolvePromise) => {
         const timeout = setTimeout(() => {
           child.kill("SIGKILL");
@@ -112,6 +113,7 @@ export default async function globalSetup(_config: FullConfig): Promise<() => Pr
         child.on("exit", () => { clearTimeout(timeout); resolvePromise(); });
       });
     }
+    rmSync(e2eRoot,{recursive:true,force:true});
     if (fixtureTemporary) rmSync(fixtureTemporary, { recursive: true, force: true });
   };
 }

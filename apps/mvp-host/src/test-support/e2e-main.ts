@@ -2,6 +2,8 @@ import { mkdir, rm } from "node:fs/promises";
 import { realpathSync } from "node:fs";
 import { createHash, randomBytes } from "node:crypto";
 import { dirname, resolve } from "node:path";
+import { HostOwnerLock } from "../lifecycle/host-owner.js";
+import { openOwned } from "../storage/open-store.js";
 import { createHostServer } from "../server.js";
 import { SessionOrchestrator } from "../session/orchestrator.js";
 import type { ClaudeAdapter } from "../claude/adapter.js";
@@ -44,7 +46,18 @@ if (!webRoot) {
 if (!keepData) {
   await rm(e2eRoot, { recursive: true, force: true });
 }
-await mkdir(dirname(resolve(e2eRoot, "host.sqlite")), { recursive: true });
+const databasePath = resolve(e2eRoot,"host-data/host.sqlite");
+const identityDirectory = resolve(e2eRoot,"host-data/identity");
+const coordinationDirectory = resolve(e2eRoot,"coordination");
+await mkdir(dirname(databasePath), { recursive: true, mode: 0o700 });
+const ownerOptions = { databasePath,identityDirectory,coordinationDirectory };
+if (keepData) {
+  // SIGKILL recovery may proceed only after the original process birth is proved exited.
+  const maintenance = HostOwnerLock.acquire({...ownerOptions,mode:"maintenance",reclaimStale:true});
+  maintenance.release();
+}
+const owner = HostOwnerLock.acquire(ownerOptions);
+const store = openOwned({databasePath:owner.databasePath,owner});
 
 // The injected deterministic adapter must feed its events through the same
 // durable pipeline as the built-in ClaudeAdapter; wire it after construction
@@ -53,10 +66,13 @@ let orchestratorRef: SessionOrchestrator | undefined;
 const adapter = new DeterministicAdapter({
   workspace,
   onEvent: (event) => orchestratorRef?.ingestAdapterEvent(event),
+  scenarios:[{id:"large-body",steps:[{kind:"text",text:"bounded browser body start\n"+"fixture-body-line\n".repeat(20_000)+"bounded browser body end"}],result:"bounded browser body completed"}],
 });
 const orchestrator = new SessionOrchestrator({
   workspace,
-  databasePath: resolve(e2eRoot, "host.sqlite"),
+  databasePath: owner.databasePath, identityDirectory: owner.identityDirectory!, owner, store,
+  // The fixture has only tracked in-process scenarios, never native OS producers.
+  canReleaseWorkspace: () => true,
   adapter: adapter as unknown as ClaudeAdapter,
 });
 orchestratorRef = orchestrator;
@@ -80,14 +96,18 @@ for (let index = 0; index < 63; index += 1) {
 }
 console.log(`FLYX_E2E_HOST_READY base=${address} token=${server.auth.pairingUrlToken} tokens=${mintedTokens.join(",")} pid=${process.pid}`);
 
-const shutdown = async () => {
+let shutdownPromise: Promise<void> | undefined;
+const shutdown = () => shutdownPromise ??= (async () => {
   try {
     await server.stop();
-  } finally {
-    orchestrator.close();
+    const report = await orchestrator.closeAndWait();
+    if (!report.clean) throw new Error("E2E_SHUTDOWN_UNVERIFIED");
     if (!keepData) await rm(e2eRoot, { recursive: true, force: true });
     process.exit(0);
+  } catch {
+    console.error("E2E_SHUTDOWN_UNVERIFIED");
+    process.exit(1);
   }
-};
+})();
 process.once("SIGINT", () => void shutdown());
 process.once("SIGTERM", () => void shutdown());

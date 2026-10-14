@@ -67,7 +67,7 @@ test.describe("Hosted Web through the real E2EE Relay", () => {
       const direct = owner.locator("li.endpoint").filter({ hasText: /Direct|Tailscale/ });
       await direct.getByRole("button", { name: "使用此路径" }).click();
       await expect(direct).toHaveClass(/active/, { timeout: 20_000 });
-      await expect(owner.getByRole("status")).toHaveText("已同步");
+      await expect(owner.locator(".connection[role=status]")).toHaveText("已同步");
       await expect(owner.getByTestId("host-fingerprint")).toHaveAttribute("title", network.fixture.fingerprint);
       const relay = owner.locator("li.endpoint").filter({ hasText: "Relay" });
       await relay.getByRole("button", { name: "使用此路径" }).click();
@@ -78,9 +78,9 @@ test.describe("Hosted Web through the real E2EE Relay", () => {
       await owner.getByRole("button", { name: "管理设备" }).click();
       const remoteDevice = owner.locator(".device-list li").filter({ hasNotText: "本设备" });
       await expect(remoteDevice).toHaveCount(1);
-      await remoteDevice.getByRole("button", { name: "撤销设备", exact: true }).click();
+      await remoteDevice.getByRole("button", { name: "撤销设备授权", exact: true }).click();
       await expect(phone.getByRole("heading", { name: "连接电脑 Host" })).toBeVisible({ timeout: 10_000 });
-      await expect(owner.getByRole("status")).toHaveText("已同步");
+      await expect(owner.locator(".connection[role=status]")).toHaveText("已同步");
       await expect(owner.getByText("deterministic result: slow scenario completed").last()).toHaveCount(1);
     } finally { await ownerContext.close(); await phoneContext.close(); }
   });

@@ -36,23 +36,30 @@ export async function pair(page: Page): Promise<string> {
   // The Host intentionally enforces a per-IP pairing-attempt budget.  Each
   // browser test models a separate phone, so give it a deterministic fixture
   // address to keep the suite from tripping the production guardrail.
-  await page.setExtraHTTPHeaders({ "x-forwarded-for": `198.18.0.${nextPairingClient++}` });
+  const fixtureClient = nextFixtureClient();
+  await page.setExtraHTTPHeaders({ "x-forwarded-for": `198.18.${Math.floor(fixtureClient / 250)}.${fixtureClient % 250 + 1}` });
   await page.goto(baseUrl());
   await expect(page.getByRole("heading", { name: "连接电脑 Host" })).toBeVisible();
   await page.getByPlaceholder("配对 Token").fill(token);
   await page.getByRole("button", { name: "配对并连接" }).click();
   await expect(page.getByRole("heading", { name: "执行 Timeline" })).toBeVisible({ timeout: 15_000 });
+  await expect(page.locator(".connection[role=status]")).toHaveText("已同步",{timeout:15_000});
   return token;
 }
 
+function nextFixtureClient(): number {
+  const claimFile = process.env.FLYX_E2E_CLAIM_FILE;
+  return claimFile ? readFileSync(claimFile,"utf8").split("\n").length - 1 : nextPairingClient++;
+}
+
 export type SubmittedTurn = { commandId: string; turnId: string };
-type StoredCommand = { commandId: string; method: string; createdAt: string; payload?: { prompt?: string }; result?: { turnId?: string } };
+export type StoredCommand = { commandId: string; method: string; createdAt: string; payload?: { prompt?: string }; result?: { turnId?: string } };
 const submittedTurns = new WeakMap<Page, SubmittedTurn>();
 
 /** Read the durable write identity through the same storage used by Direct and Relay. */
-async function storedCommands(page: Page): Promise<StoredCommand[]> {
+export async function storedCommands(page: Page): Promise<StoredCommand[]> {
   return page.evaluate(() => new Promise<StoredCommand[]>((resolve, reject) => {
-    const open = indexedDB.open("flyx-client-v1", 1);
+    const open = indexedDB.open("flyx-client-v1");
     open.onerror = () => reject(open.error);
     open.onsuccess = () => {
       const db = open.result;
@@ -96,4 +103,14 @@ export async function waitForIdle(page: Page, expected?: SubmittedTurn): Promise
   await expect(page.locator("article.system.completed[data-item-id=" + result + "], article.system.cancelled[data-item-id=" + result + "], article.error.failed[data-item-id=" + error + "]"))
     .toBeVisible({ timeout: 30_000 });
   await expect(page.locator("textarea")).toBeEnabled({ timeout: 30_000 });
+}
+
+/** Inspect deterministic browser persistence without requesting an old IndexedDB version. */
+export async function clientRecords<T>(page:Page,name:string):Promise<T[]> {
+  return page.evaluate((name) => new Promise<T[]>((resolve,reject) => {
+    const open=indexedDB.open("flyx-client-v1");open.onerror=()=>reject(open.error);open.onsuccess=()=>{
+      const db=open.result;const tx=db.transaction(name,"readonly");const read=tx.objectStore(name).getAll();
+      tx.oncomplete=()=>{db.close();resolve(read.result as T[]);};tx.onabort=()=>{db.close();reject(tx.error);};
+    };
+  }),name);
 }

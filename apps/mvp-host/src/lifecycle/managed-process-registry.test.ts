@@ -22,6 +22,15 @@ function fixture(group: "present" | "absent" | "unknown" = "absent") {
 }
 
 describe("managed process ownership", () => {
+  it("seals owned pipes/IPC after durable unknown without claiming descendant stop", async () => {
+    const { registry, child, records } = fixture("present");
+    const stdout = new PassThrough(); const stderr = new PassThrough(); let disconnected = 0; let unreferenced = 0;
+    Object.assign(child, { stdout, stderr, connected: true, disconnect: () => { disconnected++; }, unref: () => { unreferenced++; } });
+    registry.spawn("fixture", [], {}); child.emit("exit", 0, null);
+    expect((await registry.closeAndWait(0)).treeStopped).toBe(false); const durable = records.length;
+    registry.sealJournal(); expect(child.stdin?.destroyed).toBe(true); expect(stdout.destroyed).toBe(true); expect(stderr.destroyed).toBe(true); expect(disconnected).toBe(1); expect(unreferenced).toBe(1);
+    child.emit("exit", 0, null); expect(records).toHaveLength(durable); expect(records.at(-1)?.state).toBe("unknown"); expect(records.at(-1)?.stopProof).toBeUndefined();
+  });
   it("journals before spawn and only accepts descendant exit proof", async () => {
     const { registry, child, records } = fixture();
     registry.spawn("fixture", [], { stdio: "pipe" });

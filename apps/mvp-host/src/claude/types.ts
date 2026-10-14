@@ -9,6 +9,8 @@ export type {
   ProviderAdapter,
   ProviderId,
   TurnOutcome,
+  ProviderControlOutcome,
+  ProviderEvidence,
 } from "../provider/types.js";
 
 export { dispatchContextForTurn, fenceAdapterEvent } from "../provider/types.js";

@@ -147,7 +147,18 @@ export class ManagedProcessRegistry {
 
   records(): ManagedProcessRecord[] { return [...this.entries.values()].map(({ record }) => ({ ...record })); }
   /** Called after durable unknown settlement and before closing the shared Store. */
-  sealJournal(): void { this.journalSealed = true; }
+  sealJournal(): void {
+    this.journalSealed = true;
+    // Detach only this Host's IPC handles after drain/unknown settlement. An
+    // escaped descendant holding a pipe is still durably unknown, never stopped.
+    for (const entry of this.entries.values()) {
+      try { entry.child.stdin?.destroy?.(); } catch { /* Handle cleanup is not process proof. */ }
+      try { entry.child.stdout?.destroy?.(); } catch { /* Handle cleanup is not process proof. */ }
+      try { entry.child.stderr?.destroy?.(); } catch { /* Handle cleanup is not process proof. */ }
+      try { if (entry.child.connected) entry.child.disconnect(); } catch { /* IPC may already be closed. */ }
+      try { entry.child.unref?.(); } catch { /* Detached handles never become stop evidence. */ }
+    }
+  }
   closeAndWait(deadlineMs = 5_000): Promise<ProcessStopResult> {
     this.closing = true;
     this.closePromise ??= this.closeInternal(deadlineMs);

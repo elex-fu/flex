@@ -13,7 +13,7 @@ const workspace = resolve(process.cwd(), "../../packages/claude-fixtures");
 const open: SessionOrchestrator[] = [];
 const directories: string[] = [];
 afterEach(async () => {
-  while (open.length) open.pop()!.close();
+  while (open.length) await open.pop()!.closeAndWait();
   for (const directory of directories.splice(0)) await rm(directory, { recursive: true, force: true });
 });
 
@@ -171,7 +171,7 @@ describe("authoritative Engine Provider fence", () => {
     firstHost.adapter.finish(0);
     await waitForTerminal(firstHost.orchestrator, first.turnId);
     open.splice(open.indexOf(firstHost.orchestrator), 1);
-    firstHost.orchestrator.close();
+    await firstHost.orchestrator.closeAndWait();
     const secondHost = setup({ databasePath });
     const second = await secondHost.orchestrator.startTurn("device", "second-command", "continue");
     await secondHost.orchestrator.worker.drainDispatch();

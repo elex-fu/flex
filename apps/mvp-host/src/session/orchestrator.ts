@@ -10,6 +10,11 @@ import type { ExecutionCheckpointBinding } from "./execution-integrations.js";
 import { ClaudeAdapter } from "../claude/adapter.js";
 import { HostOwnerLock, assertHostOwner, assertWorkspacePrivacy, createTestHostOwner, type HostOwnerHandle } from "../lifecycle/host-owner.js";
 import { openOwned } from "../storage/open-store.js";
+import { HostLifecycle } from "../lifecycle/host-lifecycle.js";
+import { OperationRegistry, type OperationKind } from "../lifecycle/operation-registry.js";
+import { HostManagedRuntime } from "../provider/native-runtime-factory.js";
+import type { NativeBoundaryAssessment, prepareNativeExecutionBoundary } from "../lifecycle/native-execution-boundary.js";
+import type { ProcessStopResult } from "../lifecycle/managed-process-registry.js";
 import { WorkspaceLease } from "../workspace/workspace-lease.js";
 import { CodexAdapter } from "../codex/adapter.js";
 import type { AdapterEvent, DispatchContext, ProviderAdapter, ProviderId } from "../provider/types.js";
@@ -78,10 +83,18 @@ export type OrchestratorOptions = {
   coordinationDirectory?: string;
   privateDirectories?: readonly string[];
   enableViews?: boolean;
+  hostViews?: HostViews;
   resolveViewResource?: ViewResourceResolver;
   readViewInteractions?: ViewInteractionReader;
   assertViewSessionAccess?: HostViewsOptions["assertSessionAccess"];
+  providerOptions?: { executable?: string; model?: string; environment?: Readonly<Record<string, string>> };
+  nativeStateRoots?: readonly string[];
+  nativeBoundaryFactory?: typeof prepareNativeExecutionBoundary;
+  shutdownDeadlineMs?: number;
 };
+
+export type RuntimeCloseReport = { closed: boolean; producerStopped: boolean; clean: boolean; state: "stopped" | "recovery_required"; stopped: boolean; recoveryRequired: boolean };
+export type ShutdownService = { drain(deadlineMs: number): Promise<void | boolean>; close?(): Promise<void> | void };
 
 const MAX_PROMPT_BYTES = 16 * 1024;
 
@@ -89,9 +102,17 @@ export class SessionOrchestrator {
   readonly requestFormatVersions = [1, 2] as const;
   readonly store: SqliteStore;
   readonly views: HostViews | undefined = undefined;
+  readonly ownsViews: boolean = false;
   readonly owner: HostOwnerHandle;
   readonly ownsStore: boolean;
   readonly recoverOnStart: boolean;
+  readonly operations = new OperationRegistry();
+  readonly lifecycle: HostLifecycle;
+  private nativeRuntime: HostManagedRuntime | undefined;
+  private closePromise: Promise<RuntimeCloseReport> | undefined;
+  private producerStop: ProcessStopResult | undefined;
+  private readonly shutdownServices = new Set<ShutdownService>();
+  private readonly transportClosers = new Set<() => Promise<void>>();
   private activeWorkspaceLease: WorkspaceLease | undefined;
   private closed = false;
   readonly workspace: string;
@@ -108,7 +129,7 @@ export class SessionOrchestrator {
   private eventTail: Promise<void> = Promise.resolve();
   private readonly hostOwnerId: string;
   private readonly hostOwnerGeneration: number;
-  private readonly runtimeId: string;
+  readonly runtimeId: string;
   private readonly dispatchContexts = new Map<string, DispatchContext>();
   private readonly canReleaseWorkspace: (context: DispatchContext) => boolean;
   private readonly checkpointBinding: ExecutionCheckpointBinding | undefined;
@@ -120,7 +141,7 @@ export class SessionOrchestrator {
   private readonly session: SessionRow;
 
   constructor(options: OrchestratorOptions) {
-    this.canReleaseWorkspace = options.canReleaseWorkspace ?? (() => false);
+    this.canReleaseWorkspace = options.canReleaseWorkspace ?? ((context) => this.nativeRuntime?.canReleaseWorkspace(context) ?? false);
     this.ownsStore = options.ownsStore ?? true;
     this.recoverOnStart = options.recoverOnStart ?? true;
     if (!this.ownsStore && (!options.owner || !options.store || !options.sessionId)) throw new Error("A shared Session runtime requires explicit owner, Store and Session ID");
@@ -175,7 +196,11 @@ export class SessionOrchestrator {
       this.hostOwnerId = this.owner.ownerId;
       this.hostOwnerGeneration = this.owner.generation;
       this.runtimeId = options.runtimeId ?? `${provider}:${this.session.id}`;
-      if (HostViews.isAvailable(this.store)) {
+      if (options.hostViews) {
+        if (options.hostViews.store !== this.store || options.hostViews.owner !== this.owner) throw new OrchestratorError("HOST_VIEWS_MISMATCH", "Shared Host views require the same Store and owner");
+        this.views = options.hostViews;
+      } else if (HostViews.isAvailable(this.store)) {
+        this.ownsViews = true;
         this.views = new HostViews(this.store, this.owner, {
           enabled: options.enableViews ?? true,
           ...(options.assertViewSessionAccess ? { assertSessionAccess: options.assertViewSessionAccess } : {}),
@@ -202,17 +227,15 @@ export class SessionOrchestrator {
         },
       });
       this.git = new GitService(this.checkoutRoot);
-      this.adapter = options.adapter ?? (provider === "codex"
-        ? new CodexAdapter({ workspace: canonicalWorkspace, onEvent: (event) => this.enqueueAdapterEvent(event) })
-        : new ClaudeAdapter({ workspace: canonicalWorkspace, onEvent: (event) => this.enqueueAdapterEvent(event) }));
+      if (!options.adapter) this.nativeRuntime = new HostManagedRuntime({ store: this.store, owner: this.owner, sessionId: this.session.id, runtimeId: this.runtimeId, workspace: canonicalWorkspace, provider,
+        ...(options.privateDirectories ? { privateRoots: options.privateDirectories } : {}), ...(options.nativeStateRoots ? { nativeStateRoots: options.nativeStateRoots } : {}), ...(options.nativeBoundaryFactory ? { boundaryFactory: options.nativeBoundaryFactory } : {}) });
+      const nativeOptions = { ...options.providerOptions, ...this.nativeRuntime?.options, workspace: canonicalWorkspace, onEvent: (event: AdapterEvent) => this.enqueueAdapterEvent(event) };
+      this.adapter = options.adapter ?? (provider === "codex" ? new CodexAdapter(nativeOptions) : new ClaudeAdapter(nativeOptions));
     } catch (error) {
       // The Store is only assigned after ownership has been proven. A second
       // Host therefore cannot reach migration, recovery, or provider creation.
-      this.views?.close();
-      if (this.ownsStore) {
-        openedStore?.close();
-        this.owner.release();
-      }
+      if (this.ownsViews) this.views?.close();
+      if (this.ownsStore) { openedStore?.close(); this.owner.release(); }
       throw error;
     }
     this.runtimes = new RuntimeRegistry({ drainIngestion: () => this.ingestion.drain() });
@@ -234,6 +257,7 @@ export class SessionOrchestrator {
       },
       afterTerminal: (intent, outcome) => this.finalizeTurn(intent, outcome, options.executionHooks?.afterTerminal),
       assertWriteReady: () => this.assertWriteReady(),
+      track: (kind, run) => this.operations.track(kind, () => options.executionHooks?.track ? options.executionHooks.track(kind, run) : run()),
       revalidateDevice: (intent) => { this.revalidateIntentDevice(intent); return options.revalidateDevice?.(intent); },
       onDispatch: (intent, context) => {
         if (intent.turnId) this.dispatchContexts.set(intent.turnId, context);
@@ -247,6 +271,26 @@ export class SessionOrchestrator {
       drainIngestion: () => this.ingestion.drain(),
       failed: (error) => { if (error instanceof Error && !/^(DEVICE_|SCOPE_|PRE_DISPATCH_|DISPATCH_)/.test(error.message)) this.degraded = true; },
     });
+    this.lifecycle = new HostLifecycle({
+      stopAdmission: () => { this.closed = true; this.worker.stopAdmission(); },
+      stopDispatch: () => this.worker.stopDispatch(),
+      stopProducers: (deadline) => this.stopProducers(deadline),
+      drainIngestion: async () => { await this.ingestion.drain(); return true; },
+      drainOperations: async (deadline) => {
+        const worker = await this.worker.drainOperations(deadline);
+        const registered = await this.operations.drain(["producer", "control", "ingestion", "checkpoint"], deadline);
+        return worker && registered;
+      },
+      drainServices: async (deadline) => { await this.checkpointBinding?.service.drain?.(); for (const service of this.shutdownServices) if (await service.drain(deadline) === false) return false; return true; },
+      fenceCallbacks: () => { this.ingestion.seal(); this.worker.seal(); this.operations.seal(); if (this.ownsStore) this.checkpointBinding?.service.seal?.(); },
+      recordUnknown: (reason) => this.recordShutdownUnknown(reason),
+      retainOwnership: (reason) => { this.activeWorkspaceLease?.retain(reason); this.owner.retain(reason); },
+      closeTransports: async () => { for (const close of this.transportClosers) await close(); for (const service of this.shutdownServices) await service.close?.(); if (this.ownsViews) this.views?.close(); await this.nativeRuntime?.disposeBoundary(); },
+      sealJournal: () => { this.adapter.sealCallbacks?.(); this.adapter.sealProcessJournal?.(); this.nativeRuntime?.sealJournals(); },
+      closeStore: () => { if (this.ownsStore) this.store.close(); },
+      releaseOwnership: () => { if (this.ownsStore && !this.owner.retainedReason) this.owner.release(); },
+    }, options.shutdownDeadlineMs);
+    this.lifecycle.markReady(!this.nativeRuntime);
     for (const [kind, handler] of Object.entries(options.genericOperations ?? {})) this.worker.registerOperation(kind, handler);
     const configured = options.executionSetup?.(this) as unknown;
     if (configured && typeof (configured as { then?: unknown }).then === "function") {
@@ -270,21 +314,53 @@ export class SessionOrchestrator {
       sessionId: this.session.id, flyxTurnId: resourceId, runtimeId: this.runtimeId, runtimeGeneration, attemptId });
   }
 
-  close(): void {
-    if (this.closed) return;
-    this.closed = true;
-    this.worker.seal();
-    this.ingestion.seal();
-    this.adapter.close?.();
+  close(): void { void this.closeAndWait().catch(() => {}); }
+  closeAndWait(deadlineMs?: number): Promise<RuntimeCloseReport> {
+    this.closePromise ??= this.lifecycle.shutdown(deadlineMs).then((result) => ({ ...result, closed: true, producerStopped: !!this.producerStop?.treeStopped, clean: result.stopped && !result.recoveryRequired && (!this.ownsStore || !this.owner.retainedReason),
+      state: result.stopped && !result.recoveryRequired && (!this.ownsStore || !this.owner.retainedReason) ? "stopped" as const : "recovery_required" as const }));
+    return this.closePromise;
+  }
+  registerShutdownService(service: ShutdownService): () => void { this.shutdownServices.add(service); return () => this.shutdownServices.delete(service); }
+  registerTransportShutdown(close: () => Promise<void>): () => void { this.transportClosers.add(close); return () => this.transportClosers.delete(close); }
+  trackOperation<T>(kind: OperationKind, run: () => Promise<T>): Promise<T> {
+    if (this.closed && kind === "producer") return Promise.reject(new OrchestratorError("HOST_DRAINING", "Host is draining", true));
+    return this.operations.track(kind, run);
+  }
+  markProviderUnavailable(): void { this.lifecycle.markReady(false); }
+  async prepareNativeRuntime(): Promise<NativeBoundaryAssessment | undefined> {
+    if (!this.nativeRuntime) return undefined;
+    const assessment = await this.nativeRuntime.prepare();
+    this.lifecycle.markReady(assessment.ready);
+    return assessment;
+  }
+  private async stopProducers(deadlineMs: number): Promise<{ stopped: boolean }> {
+    const active = this.store.getActiveTurn(this.session.id) !== undefined || this.runtimes.isBusy(this.runtimeId);
+    if (active) void this.worker.track("control", async () => { await this.adapter.interrupt("host_shutdown"); }).catch(() => {});
+    const adapterStopping = this.worker.track("control", async () => {
+      if (this.adapter.closeAndWait) return this.adapter.closeAndWait(deadlineMs);
+      this.adapter.close?.(); return { stopped: !active, treeStopped: !active, records: [] };
+    });
+    const managedStopping = this.nativeRuntime?.closeAndWait(deadlineMs);
+    const [adapter, managed] = await Promise.all([adapterStopping, managedStopping]);
+    this.producerStop = { stopped: adapter.stopped && (managed?.stopped ?? true), treeStopped: adapter.treeStopped && (managed?.treeStopped ?? true), records: managed?.records ?? adapter.records };
+    return { stopped: this.producerStop.stopped && this.producerStop.treeStopped };
+  }
+  private recordShutdownUnknown(reason: string): void {
+    if (!this.store.db.open) return;
     const active = this.store.getActiveTurn(this.session.id);
-    if (active || this.activeWorkspaceLease) {
-      // R04's async drain will release after proving the producer stopped.
-      this.activeWorkspaceLease?.retain("producer_stop_unverified");
-      this.owner.retain("producer_stop_unverified");
-    }
-    this.views?.close();
-    this.store.close();
-    if (!this.owner.retainedReason) this.owner.release();
+    const contextTurn = this.producerStop?.records.find((record) => record.flyxTurnId && this.store.getTurn(record.flyxTurnId))?.flyxTurnId;
+    const turnId = active?.id ?? contextTurn;
+    const event = this.store.db.transaction(() => {
+      const receipt = active ? this.receiptUpdateForTurn(active.id, "outcome_unknown", { turnId: active.id, status: "outcome_unknown", reason }) : undefined;
+      const pending = this.execution.list({ sessionId: this.session.id }).filter((intent) => ["claimed", "dispatching", "acknowledged"].includes(intent.state));
+      const event = this.store.commitEvent(this.session.id, "host.shutdown.unknown", { reason, ...(turnId ? { turnId } : {}) }, {
+        activityState: "outcome_unknown", ...(active ? { turnId: active.id, turnStatus: "outcome_unknown" } : {}), ...(receipt ? { commandReceipt: receipt } : {}),
+        executionIntentUpdates: pending.filter((intent) => !(active && intent.turnId === active.id && intent.kind === "start_turn")).map((intent) => ({ id: intent.id, expectedStates: [intent.state], state: "outcome_unknown" as const, resultCode: reason, result: { reason } })),
+      });
+      this.store.db.prepare("UPDATE sessions SET recovery_state = 'blocked', recovery_revision = recovery_revision + 1, active_turn_id = COALESCE(active_turn_id, ?) WHERE id = ?").run(turnId ?? null, this.session.id);
+      return event;
+    })();
+    this.notify(event);
   }
 
   get sessionId(): string {
@@ -818,11 +894,11 @@ export class SessionOrchestrator {
   }
 
   private enqueueCommand<T>(fn: () => Promise<T>): Promise<T> {
-    const next = this.commandTail.then(() => {
+    const next = this.operations.track("control", () => this.commandTail.then(() => {
       if (this.closed) throw new OrchestratorError("HOST_DRAINING", "Host is closed to new commands", true);
       this.owner.assertActive();
       return fn();
-    }).catch((error: unknown) => {
+    })).catch((error: unknown) => {
       if (error instanceof OrchestratorError) throw error;
       if (error instanceof Error && /^[A-Z][A-Z0-9_]+$/.test(error.message)) {
         throw new OrchestratorError(error.message, error.message, error.message === "TURN_BUSY" || error.message === "SESSION_REVISION_CONFLICT");
@@ -858,6 +934,7 @@ export class SessionOrchestrator {
 
   private assertWritable(): void {
     this.assertWriteReady();
+    this.lifecycle.assertWritable();
     if (this.degraded) throw new OrchestratorError("HOST_DEGRADED", "Host event persistence is degraded; restart the Host before accepting commands", true);
   }
 

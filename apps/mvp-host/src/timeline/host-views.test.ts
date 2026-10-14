@@ -10,8 +10,8 @@ import { applyViewsMigration, validateViewsSchema } from "./host-views.js";
 import { TimelineQuery } from "./timeline-query.js";
 import { JsonTimelineBudget } from "./contracts.js";
 
-const cleanups: Array<() => void> = [];
-afterEach(() => { for (const cleanup of cleanups.splice(0).reverse()) cleanup(); });
+const cleanups: Array<() => Promise<unknown> | void> = [];
+afterEach(async () => { for (const cleanup of cleanups.splice(0).reverse()) await cleanup(); });
 const workspace = resolve(process.cwd(), "../../packages/claude-fixtures");
 function adapter(): ProviderAdapter {
   const status = { provider: "claude" as const, transport: "deterministic" as const, adapterVersion: "test", executable: "test", runtimeVersion: "test", workspace, sandboxRequired: true as const };
@@ -71,7 +71,7 @@ describe("owned Timeline migration and Host lifecycle", () => {
     });
     applyViewsMigration(f.store, f.owner);
     const orch = new SessionOrchestrator({ store: f.store, owner: f.owner, workspace, adapter: adapter() });
-    cleanups.push(() => orch.close());
+    cleanups.push(() => orch.closeAndWait());
     const views = orch.views!; expect(views.ready(orch.sessionId)).toBe(true);
     const query = new TimelineQuery(f.store.db, views.content, { workspaceForSession: () => workspace });
     const tail = query.tail(orch.sessionId);
@@ -81,33 +81,33 @@ describe("owned Timeline migration and Host lifecycle", () => {
     const connection = views.connect({ subjectId: "device", leaseId: "lease", generation: 1 }, new JsonTimelineBudget(32 * 1024), () => {});
     const opened = connection.openView({ sessionId: orch.sessionId, tailLimit: 10 }, async () => {}); await opened.activate();
     expect(connection.subscriptionCount).toBe(1);
-    orch.close(); expect(connection.subscriptionCount).toBe(0); expect(views.ready(orch.sessionId)).toBe(false);
+    await orch.closeAndWait(); expect(connection.subscriptionCount).toBe(0); expect(views.ready(orch.sessionId)).toBe(false);
   });
 
   it("captures complete injected Interaction pages at the same canonical watermark", () => {
     const f = fixture(); applyViewsMigration(f.store, f.owner);
     const readInteractions = vi.fn((_id: string, after?: string) => after ? { interactions: [{ id: "b", status: "pending" }], hasMore: false } : { interactions: [{ id: "a", status: "responding" }], hasMore: true, nextAfterInteractionId: "a" });
-    const orch = new SessionOrchestrator({ store: f.store, owner: f.owner, workspace, adapter: adapter(), readViewInteractions: readInteractions }); cleanups.push(() => orch.close());
+    const orch = new SessionOrchestrator({ store: f.store, owner: f.owner, workspace, adapter: adapter(), readViewInteractions: readInteractions }); cleanups.push(() => orch.closeAndWait());
     const connection = orch.views!.connect({ subjectId: "device", leaseId: "lease", generation: 1 }, new JsonTimelineBudget(32 * 1024), () => {});
     const opened = connection.openView({ sessionId: orch.sessionId, tailLimit: 10 }, async () => {});
     expect(opened.response.interactions).toEqual({ total: 2, directoryRevision: 0, complete: true, items: [{ id: "a", status: "responding" }, { id: "b", status: "pending" }] });
     expect(readInteractions.mock.calls).toEqual([[orch.sessionId, undefined], [orch.sessionId, "a"]]); opened.cancel();
   });
 
-  it("cleanly reopens an owned006 Store with the same active epoch and no replay", () => {
+  it("cleanly reopens an owned006 Store with the same active epoch and no replay", async () => {
     const root = mkdtempSync(join(tmpdir(), "flyx-views-owned-")); cleanups.push(() => rmSync(root, { recursive: true, force: true }));
     const paths = { databasePath: join(root, "data", "flyx.sqlite"), identityDirectory: join(root, "identity"), coordinationDirectory: join(root, "owners") };
     let owner = HostOwnerLock.acquire(paths);
     // The production Orchestrator creates the database parent after ownership and privacy checks.
-    let orch = new SessionOrchestrator({ ...paths, owner, workspace, adapter: adapter() }); cleanups.push(() => orch.close());
+    let orch = new SessionOrchestrator({ ...paths, owner, workspace, adapter: adapter() }); cleanups.push(() => orch.closeAndWait());
     orch.store.commitEvent(orch.sessionId, "assistant.message.completed", { itemId: "persisted", text: "persisted ".repeat(40_000) + workspace });
     applyViewsMigration(orch.store, owner);
-    orch.close();
+    await orch.closeAndWait();
     owner = HostOwnerLock.acquire(paths); orch = new SessionOrchestrator({ ...paths, owner, workspace, adapter: adapter() });
     const epoch = orch.views!.projector.activeEpoch(orch.sessionId)!.epoch;
     const view = orch.views!.connect({ subjectId: "device", leaseId: "lease", generation: 1 }, new JsonTimelineBudget(32 * 1024), () => {}).openView({ sessionId: orch.sessionId, tailLimit: 10 }, async () => {});
     expect(view.response.watermark.sequence).toBe(1); expect(view.response.page.items.map((item) => item.itemId)).toEqual(["persisted"]); view.cancel();
-    orch.close(); owner = HostOwnerLock.acquire(paths); orch = new SessionOrchestrator({ ...paths, owner, workspace, adapter: adapter() });
+    await orch.closeAndWait(); owner = HostOwnerLock.acquire(paths); orch = new SessionOrchestrator({ ...paths, owner, workspace, adapter: adapter() });
     expect(orch.views!.projector.activeEpoch(orch.sessionId)!.epoch).toBe(epoch);
     expect(orch.snapshot().session.headSequence).toBe(1); expect(orch.store.listEventCommits(orch.sessionId)).toHaveLength(1);
   });

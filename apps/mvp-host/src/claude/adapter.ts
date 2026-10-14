@@ -1,6 +1,4 @@
-import { execFile as execFileCallback } from "node:child_process";
 import { realpath, stat } from "node:fs/promises";
-import { promisify } from "node:util";
 import { createRequire } from "node:module";
 import { randomUUID } from "node:crypto";
 import { dirname, join, resolve as resolvePath, isAbsolute, basename, relative } from "node:path";
@@ -12,6 +10,8 @@ import {
   type PermissionResult,
   type Query,
   type SDKMessage,
+  type SpawnOptions as SdkSpawnOptions,
+  type SpawnedProcess,
 } from "@anthropic-ai/claude-agent-sdk";
 import type {
   AdapterEvent,
@@ -23,7 +23,12 @@ import type {
   ApprovalRequest,
   ProviderAdapter,
   TurnOutcome,
+  ProviderControlOutcome,
+  ProviderEvidence,
 } from "./types.js";
+import { ManagedRuntimeController, inspectNativeVersion, type ManagedRuntimeOptions, type PreparedNativeRuntime } from "../provider/managed-runtime.js";
+import type { ProcessStopResult } from "../lifecycle/managed-process-registry.js";
+import { sameDispatchContext } from "../provider/runtime-registry.js";
 import { dispatchContextForTurn, fenceAdapterEvent } from "./types.js";
 
 import { ClaudeQuestionBridge } from "../interaction/native-question-bridge.js";
@@ -31,7 +36,6 @@ import { parseClaudeQuestions } from "../interaction/native-question-codec.js";
 import type { InteractionEvidenceSample, NativeQuestionDelivery, QuestionContractEvidence } from "../interaction/types.js";
 import type { QuestionAnswers } from "@flyx/mvp-protocol";
 
-const execFile = promisify(execFileCallback);
 const require = createRequire(import.meta.url);
 const sdkEntry = require.resolve("@anthropic-ai/claude-agent-sdk");
 const SDK_PACKAGE = readPackageMetadata(sdkEntry);
@@ -56,6 +60,9 @@ type ActiveQuery = {
   turnId: string;
   context: DispatchContext;
   query: Query;
+  runtime: PreparedNativeRuntime;
+  possibleDispatch: boolean;
+  nativeTerminal?: ProviderEvidence | undefined;
   providerSessionId?: string;
   pending: Map<string, PendingApproval>;
   interruptRequested: boolean;
@@ -69,9 +76,10 @@ type ActiveQuery = {
   toolInputJson: Map<string, string>;
   sessionIdChanged: boolean;
   timer?: NodeJS.Timeout;
+  interruptTimer?: NodeJS.Timeout;
 };
 
-export type ClaudeAdapterOptions = {
+export type ClaudeAdapterOptions = ManagedRuntimeOptions & {
   workspace: string;
   onEvent?: AdapterEventHandler;
   maxBudgetUsd?: number;
@@ -79,6 +87,10 @@ export type ClaudeAdapterOptions = {
   questionVerificationMode?: boolean;
   interactionEvidenceSource?: "native" | "fixture";
   onInteractionEvidence?: (evidence: InteractionEvidenceSample) => void;
+  queryFactory?: typeof query;
+  executable?: string;
+  model?: string;
+  environment?: Readonly<Record<string, string>>;
 };
 
 export class ClaudeAdapter implements ProviderAdapter {
@@ -90,6 +102,17 @@ export class ClaudeAdapter implements ProviderAdapter {
   private active: ActiveQuery | undefined;
   private readonly questionBridge: ClaudeQuestionBridge<ActiveQuery>;
   private questionRuntimeVersion: string;
+  private lastNativeTerminal: { context: DispatchContext; evidence: Extract<ProviderEvidence, { kind: "native-terminal" }> } | undefined;
+  private readonly runtimes: ManagedRuntimeController;
+  private readonly runtimeOptions: ManagedRuntimeOptions;
+  private readonly queryFactory: typeof query;
+  private readonly executableOverride: string | undefined;
+  private readonly model: string | undefined;
+  private readonly environment: Readonly<Record<string, string>> | undefined;
+  private readonly probes = new Set<ClaudeAdapter>();
+  private closing = false;
+  private callbacksSealed = false;
+  private closePromise: Promise<ProcessStopResult> | undefined;
 
   constructor(options: ClaudeAdapterOptions) {
     this.workspace = options.workspace;
@@ -104,19 +127,25 @@ export class ClaudeAdapter implements ProviderAdapter {
       ...(options.onInteractionEvidence ? {onEvidence:options.onInteractionEvidence} : {}),
     });
     this.workspaceRealpathPromise = realpath(options.workspace);
+    this.runtimeOptions = options;
+    this.runtimes = new ManagedRuntimeController(options);
+    this.queryFactory = options.queryFactory ?? query;
+    this.executableOverride = options.executable ?? process.env.FLYX_CLAUDE_EXECUTABLE;
+    this.model = options.model; this.environment = options.environment ? Object.freeze({ ...options.environment }) : undefined;
+    restrictedEnvironment(this.environment);
   }
 
   async status(): Promise<AdapterStatus> {
     const workspace = await this.workspaceRealpathPromise;
     await stat(workspace);
-    const pathOverride = process.env.FLYX_CLAUDE_EXECUTABLE;
+    const pathOverride = this.executableOverride;
     const executable = pathOverride ?? "sdk-bundled";
     let runtimeVersion = BUNDLED_CLAUDE_VERSION;
     let executableInspected = !pathOverride;
     if (pathOverride) {
       try {
-        const result = await execFile(pathOverride, ["--version"], { timeout: 5_000 });
-        runtimeVersion = result.stdout.trim() || result.stderr.trim() || "unknown";
+        const runtime = await this.runtimes.prepare(this.runtimes.inspectionContext());
+        runtimeVersion = await inspectNativeVersion(runtime, pathOverride, this.workspace, restrictedEnvironment(this.environment));
         executableInspected = true;
       } catch (error) {
         // status has no Turn dispatch identity; surface inspection failures
@@ -146,11 +175,15 @@ export class ClaudeAdapter implements ProviderAdapter {
   async preflight(): Promise<AdapterStatus> {
     const status = await this.status();
     const probeEvents: AdapterEvent[] = [];
-    const probe = new ClaudeAdapter({ workspace: this.workspace, maxBudgetUsd: 0.25, onEvent: (event) => probeEvents.push(event) });
-    const outcome = await probe.runTurn(
-      `flyx-preflight-${randomUUID()}`,
+    const probe = new ClaudeAdapter({ ...this.runtimeOptions, workspace: this.workspace, queryFactory: this.queryFactory, maxBudgetUsd: 0.25, onEvent: (event) => probeEvents.push(event) });
+    this.probes.add(probe);
+    const probeContext = this.runtimes.inspectionContext();
+    let outcome: TurnOutcome;
+    try { outcome = await probe.runTurn(
+      probeContext.flyxTurnId,
       "Use only the Read tool to read README.md in the configured workspace, then reply exactly FLYX_HOST_READY. Do not use any other tool and do not modify files.",
-    );
+      undefined, probeContext,
+    ); } finally { await probe.closeAndWait(); }
     if (outcome.status !== "completed") {
       throw new Error(`CLAUDE_PREFLIGHT_FAILED: ${outcome.status === "outcome_unknown" ? outcome.error : outcome.status === "failed" ? outcome.error : "unexpected cancellation"}`);
     }
@@ -171,12 +204,15 @@ export class ClaudeAdapter implements ProviderAdapter {
   }
 
   async runTurn(turnId: string, prompt: string, resumeSessionId?: string, context?: DispatchContext): Promise<TurnOutcome> {
+    if (this.closing) throw new Error("RUNTIME_CLOSING");
     if (this.active) throw new Error("CLAUDE_TURN_BUSY");
     const dispatchContext = dispatchContextForTurn(turnId, context);
     const active: ActiveQuery = {
       turnId,
       context: dispatchContext,
       query: undefined as never,
+      runtime: undefined as never,
+      possibleDispatch: false,
       pending: new Map(),
       interruptRequested: false,
       interruptAcknowledged: false,
@@ -189,12 +225,20 @@ export class ClaudeAdapter implements ProviderAdapter {
       sessionIdChanged: false,
     };
     this.active = active;
+    try { active.runtime = await this.runtimes.prepare(dispatchContext); }
+    catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.emit(active, { kind: "diagnostic", code: "TURN_NOT_DISPATCHED", message });
+      this.clearActive(active);
+      return { status: "failed", error: message, evidence: { kind: "not-dispatched" } };
+    }
 
     let resultMessage: Extract<SDKMessage, { type: "result" }> | undefined;
     let iteratorError: unknown;
 
     try {
-      active.query = query({ prompt, options: this.buildOptions(active, resumeSessionId) });
+      active.possibleDispatch = true;
+      active.query = this.queryFactory({ prompt, options: this.buildOptions(active, resumeSessionId) });
       active.timer = setTimeout(() => {
         if (this.active === active) void this.interrupt("turn_timeout");
       }, TURN_TIMEOUT_MS);
@@ -212,24 +256,21 @@ export class ClaudeAdapter implements ProviderAdapter {
     } finally {
       active.resultSeen = true;
       if (active.timer) clearTimeout(active.timer);
+      if (active.interruptTimer) clearTimeout(active.interruptTimer);
       this.cleanupApprovals(active, "aborted");
+      try { active.query?.close?.(); } catch { /* The managed stop proof remains authoritative. */ }
+      await active.runtime.closeAndWait();
     }
 
     const providerSessionId = active.providerSessionId;
-    if (resultMessage) {
+    if (resultMessage && typeof resultMessage.uuid === "string" && resultMessage.uuid) {
+      const evidence = { kind: "native-terminal" as const, sourceId: resultMessage.uuid };
+      active.nativeTerminal = evidence;
       active.resultSeen = true;
       if (active.sessionIdChanged) {
-        this.emit(active, {
-          kind: "turn_failed",
-          subtype: "session_id_changed",
-          errors: ["Claude reported more than one session id for one Flyx Turn"],
-        });
+        this.emit(active, { kind: "diagnostic", code: "SESSION_ID_CHANGED", message: "Claude reported more than one session id for one Flyx Turn" });
         this.clearActive(active);
-        return {
-          status: "failed",
-          ...(providerSessionId ? { providerSessionId } : {}),
-          error: "Claude reported more than one session id for one Flyx Turn",
-        };
+        return { status: "outcome_unknown", ...(providerSessionId ? { providerSessionId } : {}), error: "Claude session identity changed", evidence: { kind: "unknown", reason: "session_id_changed" } };
       }
       // Claude Code may surface an acknowledged interrupt as a result message
       // instead of ending the async iterator without a result.  `aborted_*`
@@ -237,18 +278,19 @@ export class ClaudeAdapter implements ProviderAdapter {
       // to the phone as a generic provider failure.
       if (active.interruptRequested && active.interruptAcknowledged
         && (resultMessage.terminal_reason === "aborted_tools" || resultMessage.terminal_reason === "aborted_streaming")) {
-        this.emit(active, { kind: "turn_cancelled", reason: resultMessage.terminal_reason });
+        this.emit(active, { kind: "turn_cancelled", reason: resultMessage.terminal_reason, terminalEvidence: evidence });
         this.clearActive(active);
-        return { status: "cancelled", ...(providerSessionId ? { providerSessionId } : {}) };
+        return { status: "cancelled", ...(providerSessionId ? { providerSessionId } : {}), evidence };
       }
       if (resultMessage.subtype === "success") {
         if (/not logged in|please run \/login/i.test(resultMessage.result)) {
-          this.emit(active, { kind: "turn_failed", subtype: "auth_required", errors: ["Claude Code is not authenticated for this Host"] });
+          this.emit(active, { kind: "turn_failed", subtype: "auth_required", errors: ["Claude Code is not authenticated for this Host"], terminalEvidence: evidence });
           this.clearActive(active);
           return {
             status: "failed",
             ...(providerSessionId ? { providerSessionId } : {}),
             error: "Claude Code is not authenticated for this Host",
+            evidence,
           };
         }
         this.emit(active, {
@@ -256,15 +298,17 @@ export class ClaudeAdapter implements ProviderAdapter {
           result: truncate(resultMessage.result, MAX_TOOL_OUTPUT_BYTES),
           costUsd: resultMessage.total_cost_usd,
           numTurns: resultMessage.num_turns,
+          terminalEvidence: evidence,
           ...(resultMessage.terminal_reason ? { terminalReason: resultMessage.terminal_reason } : {}),
         });
         this.clearActive(active);
-        return { status: "completed", providerSessionId: providerSessionId ?? "" };
+        return { status: "completed", providerSessionId: providerSessionId ?? "", evidence };
       }
       this.emit(active, {
         kind: "turn_failed",
         subtype: resultMessage.subtype,
         errors: resultMessage.errors.map((error) => truncate(error, MAX_TOOL_OUTPUT_BYTES)),
+        terminalEvidence: evidence,
         ...(resultMessage.terminal_reason ? { terminalReason: resultMessage.terminal_reason } : {}),
       });
       this.clearActive(active);
@@ -272,36 +316,15 @@ export class ClaudeAdapter implements ProviderAdapter {
         status: "failed",
         ...(providerSessionId ? { providerSessionId } : {}),
         error: resultMessage.errors.join("; ") || resultMessage.subtype,
+        evidence,
       };
-    }
-
-    // Once the SDK has acknowledged interrupt, an iterator ending without a
-    // result is the provider's cancellation boundary.  An implementation may
-    // surface that boundary as an iterator error; the absence of a result,
-    // not the error wording, is what distinguishes it from a failed Turn.
-    if (active.interruptRequested && active.interruptAcknowledged && !active.interruptTimedOut) {
-      this.emit(active, { kind: "turn_cancelled", reason: "interrupt_confirmed" });
-      this.clearActive(active);
-      return { status: "cancelled", ...(providerSessionId ? { providerSessionId } : {}) };
     }
 
     const message = iteratorError instanceof Error ? iteratorError.message : "stream_ended_without_result";
-    if (active.interruptTimedOut) {
-      this.emit(active, { kind: "diagnostic", code: "INTERRUPT_UNCONFIRMED", message });
-      this.clearActive(active);
-      return {
-        status: "outcome_unknown",
-        ...(providerSessionId ? { providerSessionId } : {}),
-        error: message,
-      };
-    }
-    this.emit(active, { kind: "turn_failed", subtype: "stream_ended_without_result", errors: [message] });
+    // Interrupt delivery and iterator termination are not a native terminal fact.
+    this.emit(active, { kind: "diagnostic", code: active.interruptRequested ? "INTERRUPT_UNCONFIRMED" : "TURN_DISPATCH_UNCONFIRMED", message });
     this.clearActive(active);
-    return {
-      status: "failed",
-      ...(providerSessionId ? { providerSessionId } : {}),
-      error: message,
-    };
+    return { status: "outcome_unknown", ...(providerSessionId ? { providerSessionId } : {}), error: message, evidence: { kind: "unknown", reason: message } };
   }
 
   async interrupt(reason = "user_interrupt"): Promise<"accepted" | "already_terminal" | "unavailable"> {
@@ -314,7 +337,7 @@ export class ClaudeAdapter implements ProviderAdapter {
     try {
       await active.query.interrupt();
       active.interruptAcknowledged = true;
-      setTimeout(() => {
+      active.interruptTimer = setTimeout(() => {
         if (this.active === active && !active.resultSeen) {
           active.interruptTimedOut = true;
           this.emit(active, {
@@ -372,12 +395,43 @@ export class ClaudeAdapter implements ProviderAdapter {
 
   structuredQuestionsAvailable(): boolean { return this.questionBridge.capability(); }
 
+  async deliverControl(context: DispatchContext, command: { kind: "interrupt_turn"; reason: string } | { kind: "respond_approval"; approvalId: string; action: ApprovalAction }): Promise<ProviderControlOutcome> {
+    const active = this.active;
+    if (!active || !sameDispatchContext(active.context, context)) {
+      if (command.kind === "interrupt_turn" && this.lastNativeTerminal && sameDispatchContext(this.lastNativeTerminal.context, context)) return { status: "already_terminal", evidence: this.lastNativeTerminal.evidence };
+      return { status: "not_dispatched", evidence: { kind: "not-dispatched" } };
+    }
+    if (command.kind === "respond_approval") {
+      return this.respondApproval(command.approvalId, command.action) ? { status: "delivered", evidence: { kind: "local-delivery" } }
+        : { status: "outcome_unknown", evidence: { kind: "unknown", reason: "APPROVAL_DELIVERY_UNCONFIRMED" } };
+    }
+    const result = await this.interrupt(command.reason);
+    if (result === "accepted") return { status: "delivered", evidence: { kind: "local-delivery" } };
+    if (result === "already_terminal" && active.nativeTerminal?.kind === "native-terminal") return { status: "already_terminal", evidence: active.nativeTerminal };
+    return { status: "outcome_unknown", evidence: { kind: "unknown", reason: "INTERRUPT_DELIVERY_UNCONFIRMED" } };
+  }
+  close(): void { void this.closeAndWait().catch(() => {}); }
+  closeAndWait(deadlineMs = 5_000): Promise<ProcessStopResult> {
+    if (this.closePromise) return this.closePromise;
+    this.closing = true;
+    const active = this.active;
+    if (active) {
+      this.cleanupApprovals(active, "aborted");
+      try { active.query?.close?.(); } catch { /* Managed producer proof is still required. */ }
+    }
+    this.closePromise = Promise.all([this.runtimes.closeAndWait(deadlineMs), ...[...this.probes].map((probe) => probe.closeAndWait(deadlineMs))]).then((results) => ({ stopped: results.every((result) => result.stopped), treeStopped: results.every((result) => result.treeStopped), records: results.flatMap((result) => result.records) }));
+    return this.closePromise;
+  }
+  sealCallbacks(): void { this.callbacksSealed = true; for (const probe of this.probes) probe.sealCallbacks(); }
+  sealProcessJournal(): void { this.runtimes.sealJournals(); for (const probe of this.probes) probe.sealProcessJournal(); }
   private buildOptions(active: ActiveQuery, resumeSessionId?: string) {
-    const pathOverride = process.env.FLYX_CLAUDE_EXECUTABLE;
+    const pathOverride = this.executableOverride;
     return {
       cwd: this.workspace,
+      spawnClaudeCodeProcess: (request: SdkSpawnOptions): SpawnedProcess => active.runtime.spawn({ command: request.command, args: request.args, cwd: request.cwd ?? this.workspace, env: request.env, signal: request.signal, stdio: ["pipe", "pipe", "pipe"], windowsHide: true }) as SpawnedProcess,
       ...(pathOverride ? { pathToClaudeCodeExecutable: pathOverride } : {}),
       ...(resumeSessionId ? { resume: resumeSessionId } : {}),
+      ...(this.model ? { model: this.model } : {}),
       includePartialMessages: true,
       permissionMode: "default" as const,
       // Auth for a local Claude Code login is resolved from the user source. The
@@ -413,7 +467,7 @@ export class ClaudeAdapter implements ProviderAdapter {
       // readable by a model through Bash.  HOME is retained for the local
       // Claude login; the small explicit auth list covers the supported local
       // account/API modes without turning this into an environment passthrough.
-      env: restrictedEnvironment(),
+      env: restrictedEnvironment(this.environment),
       canUseTool: ((toolName, input, toolOptions) => this.canUseTool(active, toolName, input, toolOptions)) as CanUseTool,
       hooks: {
         PreToolUse: [
@@ -590,7 +644,7 @@ export class ClaudeAdapter implements ProviderAdapter {
       });
       return undefined;
     }
-    if (message.type === "result") return message;
+    if (message.type === "result") { active.nativeTerminal = typeof message.uuid === "string" && message.uuid ? { kind: "native-terminal", sourceId: message.uuid } : undefined; return message; }
     return undefined;
   }
 
@@ -684,11 +738,12 @@ export class ClaudeAdapter implements ProviderAdapter {
   }
 
   private clearActive(active: ActiveQuery): void {
+    if (active.nativeTerminal?.kind === "native-terminal" && !active.sessionIdChanged) this.lastNativeTerminal = { context: active.context, evidence: active.nativeTerminal };
     if (this.active === active) this.active = undefined;
   }
 
   private emit(active: ActiveQuery, event: AdapterEventPayload): void {
-    this.onEvent?.(fenceAdapterEvent(active.context, event));
+    if (!this.callbacksSealed) this.onEvent?.(fenceAdapterEvent(active.context, event));
   }
 
   private async isInsideWorkspace(candidate: string): Promise<boolean> {
@@ -797,7 +852,7 @@ function readPackageMetadata(entry: string): { version: string; claudeCodeVersio
   return { version: "unknown", claudeCodeVersion: "unknown" };
 }
 
-function restrictedEnvironment(): NodeJS.ProcessEnv {
+function restrictedEnvironment(overrides?: Readonly<Record<string, string>>): NodeJS.ProcessEnv {
   const allowed = [
     "PATH",
     "HOME",
@@ -826,6 +881,10 @@ function restrictedEnvironment(): NodeJS.ProcessEnv {
   for (const name of allowed) {
     const value = process.env[name];
     if (value !== undefined) result[name] = value;
+  }
+  for (const [name, value] of Object.entries(overrides ?? {})) {
+    if (!["PATH", "LANG", "LC_ALL", "LC_CTYPE", "TERM", "NO_COLOR"].includes(name) || typeof value !== "string" || value.includes("\0")) throw new Error("PROVIDER_ENVIRONMENT_INVALID");
+    result[name] = value;
   }
   return result;
 }

@@ -1,8 +1,6 @@
-import { execFile as execFileCallback } from "node:child_process";
 import { createHash } from "node:crypto";
 import { realpath, stat } from "node:fs/promises";
 import { isAbsolute, relative, resolve } from "node:path";
-import { promisify } from "node:util";
 import type {
   AdapterEventPayload,
   DispatchContext,
@@ -12,7 +10,12 @@ import type {
   ApprovalRequest,
   ProviderAdapter,
   TurnOutcome,
+  ProviderControlOutcome,
+  ProviderEvidence,
 } from "../provider/types.js";
+import { ManagedRuntimeController, inspectNativeVersion, type ManagedRuntimeOptions, type PreparedNativeRuntime } from "../provider/managed-runtime.js";
+import type { ProcessStopResult } from "../lifecycle/managed-process-registry.js";
+import { sameDispatchContext } from "../provider/runtime-registry.js";
 import { dispatchContextForTurn, fenceAdapterEvent } from "../provider/types.js";
 import {
   StdioAppServerClient,
@@ -29,7 +32,6 @@ import { rpcRequestKey } from "../interaction/native-question-codec.js";
 import type { InteractionEvidenceSample, NativeQuestionDelivery, QuestionContractEvidence } from "../interaction/types.js";
 import type { QuestionAnswers } from "@flyx/mvp-protocol";
 
-const execFile = promisify(execFileCallback);
 const ADAPTER_VERSION = "codex-app-server-v1";
 const MAX_OUTPUT_BYTES = 64 * 1024;
 const MAX_MESSAGE_BYTES = 1024 * 1024;
@@ -91,6 +93,8 @@ type ActiveTurn = {
   threadId: string;
   client?: AppServerClient;
   starting: boolean;
+  possibleDispatch: boolean;
+  nativeTerminal?: ProviderEvidence;
   deferred: Array<{ notification: AppServerNotification } | { request: AppServerRequest }>;
   codexTurnId?: string;
   pending: Map<string, PendingApproval>;
@@ -108,11 +112,12 @@ type ActiveTurn = {
   resolve(outcome: TurnOutcome): void;
 };
 
-export type CodexAdapterOptions = {
+export type CodexAdapterOptions = ManagedRuntimeOptions & {
   workspace: string;
   onEvent?: AdapterEventHandler;
   executable?: string;
   model?: string;
+  environment?: Readonly<Record<string, string>>;
   effort?: "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra";
   turnTimeoutMs?: number;
   clientFactory?: AppServerClientFactory;
@@ -120,6 +125,8 @@ export type CodexAdapterOptions = {
   questionVerificationMode?: boolean;
   interactionEvidenceSource?: "native" | "fixture";
   onInteractionEvidence?: (evidence: InteractionEvidenceSample) => void;
+  /** Injected clients may opt into the same per-attempt lifetime as production. */
+  rotateClientEachTurn?: boolean;
 };
 
 export class CodexAdapter implements ProviderAdapter {
@@ -128,9 +135,17 @@ export class CodexAdapter implements ProviderAdapter {
   private readonly onEvent: AdapterEventHandler | undefined;
   private readonly executable: string;
   private readonly model: string | undefined;
+  private readonly environment: Readonly<Record<string, string>> | undefined;
   private readonly effort: CodexAdapterOptions["effort"];
   private readonly turnTimeoutMs: number;
-  private readonly clientFactory: AppServerClientFactory;
+  private readonly clientFactory: AppServerClientFactory | undefined;
+  private readonly runtimes: ManagedRuntimeController;
+  private readonly rotateClientEachTurn: boolean;
+  private readonly clientRuntimes = new Map<AppServerClient, PreparedNativeRuntime>();
+  private readonly clientStops = new Map<AppServerClient, Promise<ProcessStopResult>>();
+  private closing = false;
+  private callbacksSealed = false;
+  private closePromise: Promise<ProcessStopResult> | undefined;
   private readonly workspaceRealpathPromise: Promise<string>;
   private client: AppServerClient | undefined;
   private runtimePolicyPromise: Promise<JsonObject> | undefined;
@@ -140,6 +155,7 @@ export class CodexAdapter implements ProviderAdapter {
   private readonly unexpectedMcpThreads = new Map<string, string>();
   private readonly observedRequestIds = new Set<string>();
   private active: ActiveTurn | undefined;
+  private lastNativeTerminal: { context: DispatchContext; evidence: Extract<ProviderEvidence, { kind: "native-terminal" }> } | undefined;
   private runtimeVersion = "unknown";
 
   constructor(options: CodexAdapterOptions) {
@@ -153,24 +169,21 @@ export class CodexAdapter implements ProviderAdapter {
     this.onEvent = options.onEvent;
     this.executable = options.executable ?? process.env.FLYX_CODEX_EXECUTABLE ?? "codex";
     this.model = options.model ?? process.env.FLYX_CODEX_MODEL;
+    this.environment = options.environment ? Object.freeze({ ...options.environment }) : undefined; restrictedEnvironment(this.environment);
     this.effort = options.effort ?? parseEffort(process.env.FLYX_CODEX_EFFORT);
     this.turnTimeoutMs = options.turnTimeoutMs ?? TURN_TIMEOUT_MS;
     this.workspaceRealpathPromise = realpath(options.workspace);
-    this.clientFactory = options.clientFactory ?? ((handlers) => new StdioAppServerClient({
-      executable: this.executable,
-      cwd: this.workspace,
-      env: restrictedEnvironment(),
-      args: APP_SERVER_SECURITY_ARGS,
-      handlers,
-    }));
+    this.clientFactory = options.clientFactory;
+    this.runtimes = new ManagedRuntimeController(options);
+    this.rotateClientEachTurn = options.rotateClientEachTurn ?? (!!options.processRegistryFactory || !options.clientFactory);
   }
 
   async status(): Promise<AdapterStatus> {
     const workspace = await this.workspaceRealpathPromise;
     await stat(workspace);
     try {
-      const result = await execFile(this.executable, ["--version"], { timeout: 5_000 });
-      this.runtimeVersion = result.stdout.trim() || result.stderr.trim() || "unknown";
+      const runtime = await this.runtimes.prepare(this.runtimes.inspectionContext());
+      this.runtimeVersion = await inspectNativeVersion(runtime, this.executable, this.workspace, restrictedEnvironment(this.environment));
     } catch (error) {
       throw new Error(`CODEX_EXECUTABLE_UNAVAILABLE: ${error instanceof Error ? error.message : String(error)}`);
     }
@@ -188,16 +201,17 @@ export class CodexAdapter implements ProviderAdapter {
 
   async preflight(): Promise<AdapterStatus> {
     const status = await this.status();
-    const client = await this.ensureClient();
-    await this.ensureRuntimePolicy(client);
-    const account = await client.request<JsonObject>("account/read", { refreshToken: false }, 15_000);
-    if (account.requiresOpenaiAuth === true && !isRecord(account.account)) {
-      throw new Error("CODEX_PREFLIGHT_FAILED: Codex is not authenticated on this Host");
-    }
-    return status;
+    const client = await this.ensureClient(this.runtimes.inspectionContext());
+    try {
+      await this.ensureRuntimePolicy(client);
+      const account = await client.request<JsonObject>("account/read", { refreshToken: false }, 15_000);
+      if (account.requiresOpenaiAuth === true && !isRecord(account.account)) throw new Error("CODEX_PREFLIGHT_FAILED: Codex is not authenticated on this Host");
+      return status;
+    } finally { await this.retireClient(client); }
   }
 
   async runTurn(turnId: string, prompt: string, resumeSessionId?: string, context?: DispatchContext): Promise<TurnOutcome> {
+    if (this.closing) throw new Error("RUNTIME_CLOSING");
     if (this.active) throw new Error("CODEX_TURN_BUSY");
     const dispatchContext = dispatchContextForTurn(turnId, context);
     let settle!: (outcome: TurnOutcome) => void;
@@ -208,6 +222,7 @@ export class CodexAdapter implements ProviderAdapter {
       context: dispatchContext,
       threadId: resumeSessionId ?? "",
       starting: false,
+      possibleDispatch: false,
       deferred: [],
       pending: new Map(),
       pendingByRpcId: new Map(),
@@ -224,7 +239,7 @@ export class CodexAdapter implements ProviderAdapter {
     this.active = active;
     let client: AppServerClient;
     try {
-      client = await this.ensureClient();
+      client = await this.ensureClient(dispatchContext);
       active.client = client;
     } catch (error) {
       this.failStart(active, "client_start_failed", error);
@@ -248,6 +263,7 @@ export class CodexAdapter implements ProviderAdapter {
     });
     active.timer = setTimeout(() => void this.timeoutTurn(active), this.turnTimeoutMs);
     active.starting = true;
+    active.possibleDispatch = true;
     try {
       const response = await client.request<JsonObject>("turn/start", {
         threadId: active.threadId,
@@ -279,8 +295,9 @@ export class CodexAdapter implements ProviderAdapter {
   private failStart(active: ActiveTurn, subtype: string, error: unknown): void {
     if (active.terminal) return;
     const message = error instanceof Error ? error.message : String(error);
-    this.emit(active, { kind: "turn_failed", subtype, errors: [truncate(message, MAX_OUTPUT_BYTES)] });
-    this.finish(active, { status: "failed", ...(active.threadId ? { providerSessionId: active.threadId } : {}), error: message });
+    this.emit(active, { kind: "diagnostic", code: active.possibleDispatch ? "TURN_DISPATCH_UNCONFIRMED" : "TURN_NOT_DISPATCHED", message: truncate(message, MAX_OUTPUT_BYTES), details: { subtype } });
+    this.finish(active, { status: active.possibleDispatch ? "outcome_unknown" : "failed", ...(active.threadId ? { providerSessionId: active.threadId } : {}), error: message,
+      evidence: active.possibleDispatch ? { kind: "unknown", reason: subtype } : { kind: "not-dispatched" } });
   }
 
   async interrupt(reason = "user_interrupt"): Promise<"accepted" | "already_terminal" | "unavailable"> {
@@ -322,36 +339,72 @@ export class CodexAdapter implements ProviderAdapter {
     return true;
   }
 
-  close(): void {
-    this.client?.close();
-    this.client = undefined;
-    this.runtimePolicyPromise = undefined;
-    this.loadedThreadId = undefined;
-    this.unexpectedMcpThreads.clear();
-    this.observedRequestIds.clear();
+  async deliverControl(context: DispatchContext, command: { kind: "interrupt_turn"; reason: string } | { kind: "respond_approval"; approvalId: string; action: ApprovalAction }): Promise<ProviderControlOutcome> {
+    const active = this.active;
+    if (!active || !sameDispatchContext(active.context, context)) {
+      if (command.kind === "interrupt_turn" && this.lastNativeTerminal && sameDispatchContext(this.lastNativeTerminal.context, context)) return { status: "already_terminal", evidence: this.lastNativeTerminal.evidence };
+      return { status: "not_dispatched", evidence: { kind: "not-dispatched" } };
+    }
+    if (command.kind === "respond_approval") return this.respondApproval(command.approvalId, command.action)
+      ? { status: "delivered", evidence: { kind: "local-delivery" } }
+      : { status: "outcome_unknown", evidence: { kind: "unknown", reason: "APPROVAL_DELIVERY_UNCONFIRMED" } };
+    const result = await this.interrupt(command.reason);
+    if (result === "already_terminal" && active.nativeTerminal?.kind === "native-terminal") return { status: "already_terminal", evidence: active.nativeTerminal };
+    if (result === "accepted" && active.codexTurnId) return { status: "delivered", evidence: { kind: "native-ack", sourceId: `${active.codexTurnId}:interrupt` } };
+    return { status: "outcome_unknown", evidence: { kind: "unknown", reason: "INTERRUPT_DELIVERY_UNCONFIRMED" } };
   }
-
-  private async ensureClient(): Promise<AppServerClient> {
-    if (this.client) {
-      await this.client.start();
-      return this.client;
+  close(): void { void this.closeAndWait().catch(() => {}); }
+  closeAndWait(deadlineMs = 5_000): Promise<ProcessStopResult> {
+    if (this.closePromise) return this.closePromise;
+    this.closing = true;
+    const active = this.active;
+    if (active && !active.terminal) this.finish(active, { status: "outcome_unknown", ...(active.threadId ? { providerSessionId: active.threadId } : {}), error: "Host is shutting down", evidence: { kind: "unknown", reason: "host_shutdown" } });
+    const client = this.client;
+    this.closePromise = (async () => {
+      const clientStop = client ? await this.retireClient(client, deadlineMs, active !== undefined) : { stopped: true, treeStopped: true, records: [] };
+      const runtimes = await this.runtimes.closeAndWait(deadlineMs);
+      return { stopped: clientStop.stopped && runtimes.stopped, treeStopped: clientStop.treeStopped && runtimes.treeStopped, records: runtimes.records };
+    })();
+    return this.closePromise;
+  }
+  sealCallbacks(): void { this.callbacksSealed = true; }
+  sealProcessJournal(): void { this.runtimes.sealJournals(); }
+  private retireClient(client: AppServerClient, deadlineMs = 5_000, hadActive = false): Promise<ProcessStopResult> {
+    const prior = this.clientStops.get(client); if (prior) return prior;
+    const runtime = this.clientRuntimes.get(client);
+    if (this.client === client) {
+      this.client = undefined; this.runtimePolicyPromise = undefined; this.loadedThreadId = undefined;
+      this.unexpectedMcpThreads.clear(); this.observedRequestIds.clear();
     }
-    let client!: AppServerClient;
-    client = this.clientFactory({
-      onNotification: (notification) => this.handleNotification(client, notification),
-      onRequest: (request) => this.handleRequest(client, request),
-      onExit: (error) => this.handleExit(client, error),
-    });
-    this.client = client;
-    this.observedRequestIds.clear();
-    try {
-      await client.start();
-      return client;
-    } catch (error) {
-      if (this.client === client) this.client = undefined;
+    const stop = (async () => {
+      if (client.closeAndWait) {
+        const peer = client.closeAndWait(deadlineMs);
+        // Await the controller wrapper too: it records this immutable attempt's
+        // producer proof before the native outcome reaches checkpoint/release.
+        const [clientResult, runtimeResult] = await Promise.all([peer, runtime?.closeAndWait(deadlineMs)]);
+        return runtimeResult ? { stopped: clientResult.stopped && runtimeResult.stopped, treeStopped: clientResult.treeStopped && runtimeResult.treeStopped, records: runtimeResult.records } : clientResult;
+      }
       client.close();
-      throw error;
-    }
+      return runtime ? runtime.closeAndWait(deadlineMs) : { stopped: !hadActive, treeStopped: !hadActive, records: [] };
+    })();
+    this.clientStops.set(client, stop); return stop;
+  }
+  private async ensureClient(context = this.runtimes.inspectionContext()): Promise<AppServerClient> {
+    if (this.closing) throw new Error("RUNTIME_CLOSING");
+    if (this.client) { await this.client.start(); return this.client; }
+    const runtime = this.clientFactory ? undefined : await this.runtimes.prepare(context);
+    if (this.closing) { await runtime?.closeAndWait(); throw new Error("RUNTIME_CLOSING"); }
+    let client!: AppServerClient;
+    const handlers = {
+      onNotification: (notification: AppServerNotification) => this.handleNotification(client, notification),
+      onRequest: (request: AppServerRequest) => this.handleRequest(client, request),
+      onExit: (error: Error) => this.handleExit(client, error),
+    };
+    client = this.clientFactory?.(handlers, context) ?? new StdioAppServerClient({ executable: this.executable, cwd: this.workspace, env: restrictedEnvironment(this.environment), args: APP_SERVER_SECURITY_ARGS, handlers, processes: runtime!.registry, spawn: (command, args, options) => runtime!.spawn({ command, args, ...options, cwd: typeof options.cwd === "string" ? options.cwd : this.workspace, env: options.env ?? restrictedEnvironment(this.environment) }) });
+    this.client = client; if (runtime) this.clientRuntimes.set(client, runtime);
+    this.observedRequestIds.clear();
+    try { await client.start(); return client; }
+    catch (error) { await this.retireClient(client); throw error; }
   }
 
   private async loadThread(client: AppServerClient, resumeSessionId?: string): Promise<string> {
@@ -671,22 +724,29 @@ export class CodexAdapter implements ProviderAdapter {
   private handleTurnCompleted(active: ActiveTurn, params: JsonObject): void {
     if (active.terminal) return;
     const turn = isRecord(params.turn) ? params.turn : {};
-    const status = stringValue(turn.status, "failed");
+    const status = stringValue(turn.status, "unknown");
+    if (!["completed", "interrupted", "failed"].includes(status)) {
+      this.emit(active, { kind: "diagnostic", code: "CODEX_TERMINAL_UNCONFIRMED", message: "Codex returned an invalid terminal status" });
+      this.finish(active, { status: "outcome_unknown", providerSessionId: active.threadId, error: "Codex terminal status is unconfirmed", evidence: { kind: "unknown", reason: "invalid_terminal_status" } });
+      return;
+    }
+    const evidence = { kind: "native-terminal" as const, sourceId: `${active.threadId}:${active.codexTurnId}:${status}` };
+    active.nativeTerminal = evidence;
     if (status === "completed") {
       const result = active.lastAssistantText || "Codex turn completed";
-      this.emit(active, { kind: "turn_completed", result, costUsd: 0, numTurns: 1, terminalReason: status });
-      this.finish(active, { status: "completed", providerSessionId: active.threadId });
+      this.emit(active, { kind: "turn_completed", result, costUsd: 0, numTurns: 1, terminalReason: status, terminalEvidence: evidence });
+      this.finish(active, { status: "completed", providerSessionId: active.threadId, evidence });
       return;
     }
     if (status === "interrupted") {
-      this.emit(active, { kind: "turn_cancelled", reason: active.interruptRequested ? "interrupt_confirmed" : "codex_interrupted" });
-      this.finish(active, { status: "cancelled", providerSessionId: active.threadId });
+      this.emit(active, { kind: "turn_cancelled", reason: active.interruptRequested ? "interrupt_confirmed" : "codex_interrupted", terminalEvidence: evidence });
+      this.finish(active, { status: "cancelled", providerSessionId: active.threadId, evidence });
       return;
     }
     const turnError = isRecord(turn.error) ? turn.error : {};
     const message = stringValue(turnError.message, active.errors.join("; ") || `Codex turn ended with status ${status}`);
-    this.emit(active, { kind: "turn_failed", subtype: stringValue(turnError.codexErrorInfo, "codex_failed"), errors: [truncate(message, MAX_OUTPUT_BYTES)], terminalReason: status });
-    this.finish(active, { status: "failed", providerSessionId: active.threadId, error: message });
+    this.emit(active, { kind: "turn_failed", subtype: stringValue(turnError.codexErrorInfo, "codex_failed"), errors: [truncate(message, MAX_OUTPUT_BYTES)], terminalReason: status, terminalEvidence: evidence });
+    this.finish(active, { status: "failed", providerSessionId: active.threadId, error: message, evidence });
   }
 
   private handleExit(client: AppServerClient, error: Error): void {
@@ -722,8 +782,13 @@ export class CodexAdapter implements ProviderAdapter {
     active.pendingByRpcId.clear();
     active.unambiguousRequestIds.clear();
     active.deferred.length = 0;
-    if (this.active === active) this.active = undefined;
-    active.resolve(outcome);
+    if (outcome.evidence?.kind === "native-terminal") this.lastNativeTerminal = { context: active.context, evidence: outcome.evidence };
+    const normalized: TurnOutcome = outcome.evidence ? outcome : { ...outcome, evidence: { kind: "unknown", reason: "native_outcome_unconfirmed" } };
+    const retiring = this.rotateClientEachTurn && active.client ? this.retireClient(active.client, 5_000, true) : Promise.resolve();
+    void retiring.catch(() => {}).then(() => {
+      if (this.active === active) this.active = undefined;
+      active.resolve(normalized);
+    });
   }
 
   private deferCallback(active: ActiveTurn, callback: ActiveTurn["deferred"][number]): void {
@@ -736,7 +801,7 @@ export class CodexAdapter implements ProviderAdapter {
   }
 
   private emit(active: ActiveTurn, event: AdapterEventPayload): void {
-    this.onEvent?.(fenceAdapterEvent(active.context, event));
+    if (!this.callbacksSealed) this.onEvent?.(fenceAdapterEvent(active.context, event));
   }
 
 }
@@ -820,7 +885,7 @@ async function waitFor(predicate: () => boolean, timeoutMs: number): Promise<voi
   while (!predicate() && Date.now() < deadline) await new Promise<void>((resolvePromise) => setTimeout(resolvePromise, 10));
 }
 
-function restrictedEnvironment(): NodeJS.ProcessEnv {
+function restrictedEnvironment(overrides?: Readonly<Record<string, string>>): NodeJS.ProcessEnv {
   const allowed = [
     "PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LC_ALL", "LC_CTYPE", "TMPDIR", "TMP", "TEMP", "TERM",
     "CODEX_HOME", "OPENAI_API_KEY", "HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY", "NO_PROXY", "SSL_CERT_FILE", "SSL_CERT_DIR",
@@ -829,6 +894,10 @@ function restrictedEnvironment(): NodeJS.ProcessEnv {
   for (const name of allowed) {
     const value = process.env[name];
     if (value !== undefined) result[name] = value;
+  }
+  for (const [name, value] of Object.entries(overrides ?? {})) {
+    if (!["PATH", "LANG", "LC_ALL", "LC_CTYPE", "TERM", "NO_COLOR"].includes(name) || typeof value !== "string" || value.includes("\0")) throw new Error("PROVIDER_ENVIRONMENT_INVALID");
+    result[name] = value;
   }
   return result;
 }

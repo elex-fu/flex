@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { resolve } from "node:path";
 import type { CanUseTool, Query, SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 import { ClaudeAdapter } from "./adapter.js";
+import { ManagedProcessRegistry } from "../lifecycle/managed-process-registry.js";
 import type { AdapterEvent, DispatchContext } from "../provider/types.js";
 
 const { queryMock } = vi.hoisted(() => ({ queryMock: vi.fn() }));
@@ -9,6 +10,10 @@ vi.mock("@anthropic-ai/claude-agent-sdk", () => ({ query: queryMock }));
 
 beforeEach(() => queryMock.mockReset());
 
+const managed = {
+  processRegistryFactory: (context: DispatchContext) => new ManagedProcessRegistry({ journal: { save() {} }, context: () => context }),
+  executionBoundary: async () => ({ ready: true as const, proof: { verifiedPrivateReadBoundary: true as const, verifiedDescendantStop: false }, boundary: { spawn: (registry: ManagedProcessRegistry, request: import("../provider/managed-runtime.js").NativeSpawnRequest) => { const { command, args, ...options } = request; return registry.spawn(command, args, options); } } }),
+};
 const workspace = resolve(process.cwd(), "../../packages/claude-fixtures");
 function context(turnId: string, generation: number): DispatchContext {
   return { hostOwnerId: "test-owner", hostOwnerGeneration: 3, sessionId: "test-session", flyxTurnId: turnId,
@@ -19,7 +24,7 @@ function init(): SDKMessage {
   return message({ type: "system", subtype: "init", session_id: "native-session", claude_code_version: "test", model: "test", tools: [] });
 }
 function result(): SDKMessage {
-  return message({ type: "result", subtype: "success", session_id: "native-session", result: "done", total_cost_usd: 0.01, num_turns: 1 });
+  return message({ type: "result", uuid: "native-result-uuid", subtype: "success", session_id: "native-session", result: "done", total_cost_usd: 0.01, num_turns: 1 });
 }
 function fakeQuery(messages: SDKMessage[]): Query {
   return { async *[Symbol.asyncIterator]() { yield* messages; }, interrupt: vi.fn(async () => {}), close: vi.fn() } as unknown as Query;
@@ -34,11 +39,11 @@ function deferred<T>() {
 describe("Claude Engine dispatch fence", () => {
   it("fences a synchronous query construction failure and the next streamed Turn", async () => {
     const events: AdapterEvent[] = [];
-    const adapter = new ClaudeAdapter({ workspace, onEvent: (event) => events.push(event) });
+    const adapter = new ClaudeAdapter({ ...managed, workspace, onEvent: (event) => events.push(event) });
     queryMock.mockImplementationOnce(() => { throw new Error("injected query preparation failure"); });
     const firstContext = context("failed-turn", 31);
-    await expect(adapter.runTurn("failed-turn", "first", undefined, firstContext)).resolves.toMatchObject({ status: "failed" });
-    expect(events).toContainEqual(expect.objectContaining({ kind: "turn_failed", turnId: "failed-turn", generation: 31, dispatchContext: firstContext }));
+    await expect(adapter.runTurn("failed-turn", "first", undefined, firstContext)).resolves.toMatchObject({ status: "outcome_unknown", evidence: { kind: "unknown" } });
+    expect(events).toContainEqual(expect.objectContaining({ kind: "diagnostic", code: "TURN_DISPATCH_UNCONFIRMED", turnId: "failed-turn", generation: 31, dispatchContext: firstContext }));
     queryMock.mockReturnValueOnce(fakeQuery([
       init(),
       message({ type: "stream_event", session_id: "native-session", event: { type: "message_start", message: { id: "shared-message" } } }),
@@ -56,7 +61,7 @@ describe("Claude Engine dispatch fence", () => {
 
   it("denies a stale SDK permission callback instead of attaching it to a new Turn", async () => {
     const events: AdapterEvent[] = [];
-    const adapter = new ClaudeAdapter({ workspace, onEvent: (event) => events.push(event) });
+    const adapter = new ClaudeAdapter({ ...managed, workspace, onEvent: (event) => events.push(event) });
     queryMock.mockReturnValueOnce(fakeQuery([init(), result()]));
     await adapter.runTurn("first-turn", "first", undefined, context("first-turn", 4));
     const oldCanUseTool = queryMock.mock.calls[0]?.[0]?.options.canUseTool as CanUseTool;
@@ -77,7 +82,7 @@ describe("Claude Engine dispatch fence", () => {
 
   it("keeps a late interrupt failure on the old captured context", async () => {
     const events: AdapterEvent[] = [];
-    const adapter = new ClaudeAdapter({ workspace, onEvent: (event) => events.push(event) });
+    const adapter = new ClaudeAdapter({ ...managed, workspace, onEvent: (event) => events.push(event) });
     const oldRelease = deferred<void>();
     const oldStarted = deferred<void>();
     const interrupt = deferred<void>();

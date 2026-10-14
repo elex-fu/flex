@@ -146,7 +146,7 @@ function localConnectivity(overrides: Partial<ConnectivityConfig> = {}): Connect
 function createDeterministicServer(connectivity: ConnectivityConfig, options: { port?: number } = {}): { server: HostServer; orchestrator: SessionOrchestrator; adapter: DeterministicAdapter } {
   let orchestratorRef: SessionOrchestrator | undefined;
   const adapter = new DeterministicAdapter({ workspace: WORKSPACE, onEvent: (event) => orchestratorRef?.ingestAdapterEvent(event) });
-  const orchestrator = new SessionOrchestrator({ workspace: WORKSPACE, adapter });
+  const orchestrator = new SessionOrchestrator({ workspace: WORKSPACE, adapter, canReleaseWorkspace: () => true });
   orchestratorRef = orchestrator;
   const server = createHostServer({ orchestrator, pairingConfirmation: () => true, connectivity, ...(options.port === undefined ? {} : { port: options.port }) });
   return { server, orchestrator, adapter };

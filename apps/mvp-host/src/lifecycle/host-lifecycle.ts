@@ -7,10 +7,12 @@ export type HostLifecycleHooks = {
   stopProducers(deadlineMs: number): Promise<{ stopped: boolean }>;
   drainIngestion(deadlineMs: number): Promise<boolean>;
   drainOperations(deadlineMs: number): Promise<boolean>;
+  drainServices?(deadlineMs: number): Promise<boolean>;
   fenceCallbacks(): void;
   recordUnknown(reason: string): Promise<void> | void;
   retainOwnership(reason: string): void;
   closeTransports(): Promise<void>;
+  sealJournal?(): void;
   closeStore(): Promise<void> | void;
   releaseOwnership(): void;
 };
@@ -26,41 +28,40 @@ export class HostLifecycle {
     this.state = writable ? "ready" : "read_only";
   }
   assertWritable(): void { if (this.state !== "ready") throw new Error("HOST_NOT_WRITABLE"); }
-  shutdown(): Promise<ShutdownResult> {
-    this.shutdownPromise ??= this.shutdownInternal();
+  shutdown(deadlineMs = this.deadlineMs): Promise<ShutdownResult> {
+    this.shutdownPromise ??= this.shutdownInternal(deadlineMs);
     return this.shutdownPromise;
   }
-  private async shutdownInternal(): Promise<ShutdownResult> {
+  private async shutdownInternal(deadlineMs: number): Promise<ShutdownResult> {
     this.state = "draining";
     this.hooks.stopAdmission();
     this.hooks.stopDispatch();
     let safe = false;
     let failure: unknown;
     try {
-      const producers = await bounded(this.hooks.stopProducers(this.deadlineMs), this.deadlineMs, { stopped: false });
-      const ingestion = await bounded(this.hooks.drainIngestion(this.deadlineMs), this.deadlineMs, false);
-      const operations = await bounded(this.hooks.drainOperations(this.deadlineMs), this.deadlineMs, false);
-      safe = producers.stopped && ingestion && operations;
+      const producers = await bounded(this.hooks.stopProducers(deadlineMs), deadlineMs, { stopped: false });
+      const ingestion = await bounded(this.hooks.drainIngestion(deadlineMs), deadlineMs, false);
+      const operations = await bounded(this.hooks.drainOperations(deadlineMs), deadlineMs, false);
+      const services = this.hooks.drainServices ? await bounded(this.hooks.drainServices(deadlineMs), deadlineMs, false) : true;
+      safe = producers.stopped && ingestion && operations && services;
       this.hooks.fenceCallbacks();
       if (!safe) {
         this.hooks.retainOwnership("SHUTDOWN_STOP_UNPROVEN");
-        await bounded(this.hooks.recordUnknown("SHUTDOWN_STOP_UNPROVEN"), this.deadlineMs, undefined);
+        await bounded(this.hooks.recordUnknown("SHUTDOWN_STOP_UNPROVEN"), deadlineMs, undefined);
       }
     } catch (error) {
       failure = error;
       this.hooks.fenceCallbacks();
       this.hooks.retainOwnership("SHUTDOWN_FAILED");
-      try { await bounded(this.hooks.recordUnknown("SHUTDOWN_FAILED"), this.deadlineMs, undefined); } catch { /* retained journal is the fallback */ }
+      try { await bounded(this.hooks.recordUnknown("SHUTDOWN_FAILED"), deadlineMs, undefined); } catch { /* retained journal is the fallback */ }
     }
+    try { await boundedOrThrow(this.hooks.closeTransports(), deadlineMs); }
+    catch (error) { failure ??= error; safe = false; this.hooks.retainOwnership("SHUTDOWN_CLOSE_FAILED"); }
     try {
-      await boundedOrThrow(this.hooks.closeTransports(), this.deadlineMs);
-      await boundedOrThrow(this.hooks.closeStore(), this.deadlineMs);
+      this.hooks.sealJournal?.();
+      await boundedOrThrow(this.hooks.closeStore(), deadlineMs);
       if (safe && !failure) this.hooks.releaseOwnership();
-    } catch (error) {
-      failure ??= error;
-      safe = false;
-      this.hooks.retainOwnership("SHUTDOWN_CLOSE_FAILED");
-    }
+    } catch (error) { failure ??= error; safe = false; this.hooks.retainOwnership("SHUTDOWN_CLOSE_FAILED"); }
     this.state = safe && !failure ? "stopped" : "recovery_required";
     if (failure) throw failure;
     return { stopped: safe, recoveryRequired: !safe };

@@ -72,9 +72,16 @@ async function main(): Promise<void> {
     const connectivity = await resolveConnectivityConfig(parseConnectivityConfig());
     orchestrator = new SessionOrchestrator({ workspace, databasePath: owner.databasePath, provider, owner, store });
     pairingConfirmation = createPairingConfirmation();
-    if (process.env.FLYX_SKIP_PREFLIGHT !== "1" && process.env.NODE_ENV !== "test") {
-      const status = await orchestrator.adapter.preflight();
-      console.log(`${providerName(status.provider)} preflight passed: ${status.transport} ${status.adapterVersion}, runtime ${status.runtimeVersion}`);
+    const boundary = await orchestrator.prepareNativeRuntime();
+    if (boundary && !boundary.ready) console.error(`Native execution unavailable (${boundary.code}); Host remains available for read-only history and recovery.`);
+    if ((!boundary || boundary.ready) && process.env.FLYX_SKIP_PREFLIGHT !== "1" && process.env.NODE_ENV !== "test") {
+      try {
+        const status = await orchestrator.adapter.preflight();
+        console.log(`${providerName(status.provider)} preflight passed: ${status.transport} ${status.adapterVersion}, runtime ${status.runtimeVersion}`);
+      } catch (error) {
+        orchestrator.markProviderUnavailable();
+        console.error(`Provider unavailable; Host remains read-only: ${error instanceof Error ? error.message : "Preflight failed"}`);
+      }
     }
     server = createHostServer({ orchestrator, pairingConfirmation, identity, identityDirectory: owner.identityDirectory!, connectivity,
       ...(process.env.FLYX_WEB_ROOT ? { webRoot: process.env.FLYX_WEB_ROOT } : {}) });
@@ -111,7 +118,7 @@ async function main(): Promise<void> {
   } catch (error) {
     pairingConfirmation?.close();
     if (server) await server.stop();
-    else if (orchestrator) orchestrator.close();
+    else if (orchestrator) await orchestrator.closeAndWait();
     else { store?.close(); owner.release(); }
     throw error;
   }

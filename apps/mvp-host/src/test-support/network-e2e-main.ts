@@ -16,6 +16,9 @@ import type { HostProfile, SocketFactory } from "@flyx/client-core";
 import { DEVICE_SCOPES } from "../auth/connection-authorizer.js";
 import { loadOrCreateHostIdentity, publicHostIdentity } from "../identity/host-identity.js";
 import type { RelaySocketFactory } from "../relay/relay-socket.js";
+import { HostOwnerLock } from "../lifecycle/host-owner.js";
+import { openOwned } from "../storage/open-store.js";
+import { getHostIdentityMirror } from "../identity/host-identity.js";
 import { createHostServer, type HostServer } from "../server.js";
 import { SessionOrchestrator } from "../session/orchestrator.js";
 import { DeterministicAdapter } from "./deterministic-adapter.js";
@@ -286,8 +289,14 @@ export async function createNetworkFixture(options: { webRoot?: string; offerCou
     onMetric: (metric) => relayMetrics.push(metric),
   });
   const { websocketUrl: relayUrl } = await relay.listen();
-  const identityDirectory = join(root, "identity");
-  const identity = await loadOrCreateHostIdentity({ directory: identityDirectory });
+  const dataRoot = join(root, "host-data");
+  await mkdir(dataRoot, { recursive: true, mode: 0o700 });
+  const identityDirectory = join(dataRoot, "identity");
+  const databasePath = join(dataRoot, "host.sqlite");
+  const owner = HostOwnerLock.acquire({ databasePath, identityDirectory });
+  const store = openOwned({ databasePath: owner.databasePath, owner });
+  const identity = await loadOrCreateHostIdentity({ directory: owner.identityDirectory!, expectedMirror: store.getHostIdentityMirror() ?? null });
+  store.setHostIdentityMirror(getHostIdentityMirror(identity));
   let orchestratorRef: SessionOrchestrator | undefined;
   const adapter = new DeterministicAdapter({
     workspace,
@@ -297,7 +306,7 @@ export async function createNetworkFixture(options: { webRoot?: string; offerCou
       { id: "network-recovery", steps: [{ kind: "text", text: "started before transport interruption" }, { kind: "delay", ms: 900 }, { kind: "text", text: NETWORK_OUTPUT_MARKER }], result: NETWORK_OUTPUT_MARKER },
     ],
   });
-  const orchestrator = new SessionOrchestrator({ workspace, databasePath: join(root, "host.sqlite"), adapter });
+  const orchestrator = new SessionOrchestrator({ workspace, databasePath: owner.databasePath, identityDirectory: owner.identityDirectory!, owner, store, adapter, canReleaseWorkspace: () => true });
   orchestratorRef = orchestrator;
   const hostRelaySockets = new Set<WebSocket>();
   const host = createHostServer({
@@ -307,16 +316,16 @@ export async function createNetworkFixture(options: { webRoot?: string; offerCou
     relayOptions: { fetch: createFixtureFetch(), socketFactory: nodeRelaySocketFactory(hostRelaySockets), openTimeoutMs: 3_000, handshakeTimeoutMs: 3_000 },
   });
   const clientSockets = new Set<WebSocket>();
-  let stopped = false;
-  const close = async () => {
-    if (stopped) return;
-    stopped = true;
+  let closePromise: Promise<void> | undefined;
+  const close = () => closePromise ??= (async () => {
     for (const socket of clientSockets) socket.terminate();
-    await host.stop();
-    await relay.close();
-    await Promise.all([tlsProxy.close(), app.close()]);
-    await rm(root, { recursive: true, force: true });
-  };
+    try { await host.stop(); }
+    finally {
+      await relay.close();
+      await Promise.all([tlsProxy.close(), app.close()]);
+      await rm(root, { recursive: true, force: true });
+    }
+  })();
   try {
     const hostLoopbackUrl = await host.start();
     tlsProxy.setUpstream(hostLoopbackUrl);

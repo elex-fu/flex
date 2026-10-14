@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { resolve } from "node:path";
 import { CodexAdapter } from "./adapter.js";
 import type {
@@ -77,25 +77,29 @@ class FakeAppServerClient implements AppServerClient {
   }
 }
 
+function deferred<T>() { let resolve!: (value: T) => void; const promise = new Promise<T>((yes) => { resolve = yes; }); return { promise, resolve }; }
+
 const adapters: CodexAdapter[] = [];
 
 afterEach(() => {
   while (adapters.length) adapters.pop()!.close();
 });
 
-function setup(options: { startFailures?: number; requestFailure?: string } = {}) {
+function setup(options: { startFailures?: number; requestFailure?: string; rotateClientEachTurn?: boolean; onClient?: (client: FakeAppServerClient) => void; onEvent?: (event: AdapterEvent) => void } = {}) {
   const events: AdapterEvent[] = [];
   let client: FakeAppServerClient | undefined;
   let startFailures = options.startFailures ?? 0;
   const adapter = new CodexAdapter({
     workspace: resolve(process.cwd(), "../../packages/claude-fixtures"),
     executable: process.execPath,
-    onEvent: (event) => events.push(event),
+    ...(options.rotateClientEachTurn !== undefined ? { rotateClientEachTurn: options.rotateClientEachTurn } : {}),
+    onEvent: (event) => { events.push(event); options.onEvent?.(event); },
     clientFactory: (handlers) => {
       client = new FakeAppServerClient(handlers, () => {
         if (startFailures > 0) { startFailures -= 1; throw new Error("injected client startup failure"); }
       });
       if (options.requestFailure) client.failures.set(options.requestFailure, 1);
+      options.onClient?.(client);
       return client;
     },
   });
@@ -112,6 +116,26 @@ async function waitFor(predicate: () => boolean): Promise<void> {
 }
 
 describe("CodexAdapter", () => {
+  it("keeps a malformed possible-send turn/start reply unknown without a fake terminal", async () => {
+    const requested = deferred<void>(); const response = deferred<JsonObject>();
+    const state = setup({ onClient: (client) => { client.turnStart = () => { requested.resolve(); return response.promise; }; } });
+    const turn = state.adapter.runTurn("malformed-turn", "task"); await requested.promise; response.resolve({ turn: { status: "inProgress" } });
+    expect(await turn).toMatchObject({ status: "outcome_unknown", evidence: { kind: "unknown" } }); expect(state.events.some((event) => event.kind === "turn_failed")).toBe(false);
+  });
+  it("quiesces per-attempt clients before returning native terminal and resumes on a new client", async () => {
+    const stop = deferred<import("../lifecycle/managed-process-registry.js").ProcessStopResult>(); const stopping = deferred<void>();
+    const firstBound = deferred<void>(); const nextBound = deferred<void>(); let original: FakeAppServerClient | undefined;
+    const state = setup({ rotateClientEachTurn: true,
+      onClient: (client) => { if (!original) { original = client; Object.assign(client, { closeAndWait: vi.fn(() => { client.closed = true; stopping.resolve(); return stop.promise; }) }); } },
+      onEvent: (event) => { if (event.kind === "native_binding") (event.turnId === "first-managed-turn" ? firstBound : nextBound).resolve(); },
+    });
+    const first = state.adapter.runTurn("first-managed-turn", "task", undefined, context("first-managed-turn", 51)); await firstBound.promise;
+    let finished = false; void first.then(() => { finished = true; }); complete(original!, "codex-turn-1"); await stopping.promise; expect(finished).toBe(false);
+    stop.resolve({ stopped: true, treeStopped: true, records: [] }); expect(await first).toMatchObject({ status: "completed", evidence: { kind: "native-terminal" } });
+    const next = state.adapter.runTurn("second-managed-turn", "continue", "codex-thread-new", context("second-managed-turn", 52)); await nextBound.promise;
+    expect(state.client).not.toBe(original); expect(state.client.requests.find((request) => request.method === "thread/resume")?.params.threadId).toBe("codex-thread-new");
+    complete(original!, "codex-turn-1", "stale"); complete(state.client, "codex-turn-1", "new"); expect(await next).toMatchObject({ status: "completed" }); expect(state.events.find((event) => event.kind === "assistant_message" && event.turnId === "second-managed-turn")).toMatchObject({ text: "new" });
+  });
   it("preflights the executable, app-server handshake and local account", async () => {
     const state = setup();
     const status = await state.adapter.preflight();
@@ -170,7 +194,7 @@ describe("CodexAdapter", () => {
     state.client.notification("item/completed", { ...scope, startedAtMs: Date.now(), item: { type: "agentMessage", id: "answer-1", text: "done" } });
     state.client.notification("turn/completed", { threadId: scope.threadId, turn: { id: scope.turnId, status: "completed", items: [] } });
 
-    await expect(outcomePromise).resolves.toEqual({ status: "completed", providerSessionId: "codex-thread-new" });
+    await expect(outcomePromise).resolves.toMatchObject({ status: "completed", providerSessionId: "codex-thread-new" });
     expect(state.events).toEqual(expect.arrayContaining([
       expect.objectContaining({ kind: "session_init", provider: "codex", providerSessionId: "codex-thread-new" }),
       expect.objectContaining({ kind: "tool_started", toolName: "Bash" }),
@@ -231,7 +255,7 @@ describe("CodexAdapter", () => {
     await expect(state.adapter.interrupt()).resolves.toBe("accepted");
     expect(state.client.requests).toContainEqual({ method: "turn/interrupt", params: { threadId: "persisted-thread", turnId: "codex-turn-1" } });
     state.client.notification("turn/completed", { threadId: "persisted-thread", turn: { id: "codex-turn-1", status: "interrupted", items: [] } });
-    await expect(outcomePromise).resolves.toEqual({ status: "cancelled", providerSessionId: "persisted-thread" });
+    await expect(outcomePromise).resolves.toMatchObject({ status: "cancelled", providerSessionId: "persisted-thread" });
   });
 
   it("marks an active turn outcome unknown if app-server exits before a terminal event", async () => {
@@ -239,7 +263,7 @@ describe("CodexAdapter", () => {
     const outcomePromise = state.adapter.runTurn("flyx-turn-crash", "keep working");
     await waitFor(() => state.client.requests.some((request) => request.method === "turn/start"));
     state.client.exit("simulated crash");
-    await expect(outcomePromise).resolves.toEqual({ status: "outcome_unknown", providerSessionId: "codex-thread-new", error: "simulated crash" });
+    await expect(outcomePromise).resolves.toMatchObject({ status: "outcome_unknown", providerSessionId: "codex-thread-new", error: "simulated crash" });
     expect(state.events).toContainEqual(expect.objectContaining({ kind: "diagnostic", code: "CODEX_APP_SERVER_EXITED" }));
   });
 
@@ -252,7 +276,7 @@ describe("CodexAdapter", () => {
       name: "unexpected-server",
       status: "starting",
     });
-    await expect(outcomePromise).resolves.toEqual({
+    await expect(outcomePromise).resolves.toMatchObject({
       status: "outcome_unknown",
       providerSessionId: "codex-thread-new",
       error: "Codex security policy failed: unexpected MCP server unexpected-server",
@@ -278,8 +302,9 @@ describe("Codex Engine dispatch fence", () => {
   it.each(["client", "thread", "turn"])("fences %s preparation/start failure and the next successful streamed Turn", async (stage) => {
     const state = setup(stage === "client" ? { startFailures: 1 } : { requestFailure: stage === "thread" ? "thread/start" : "turn/start" });
     const firstContext = context("failed-turn", 41);
-    await expect(state.adapter.runTurn(firstContext.flyxTurnId, "first", undefined, firstContext)).resolves.toMatchObject({ status: "failed" });
-    expect(state.events.some((event) => event.kind === "turn_failed")).toBe(true);
+    await expect(state.adapter.runTurn(firstContext.flyxTurnId, "first", undefined, firstContext)).resolves.toMatchObject({ status: stage === "turn" ? "outcome_unknown" : "failed", evidence: { kind: stage === "turn" ? "unknown" : "not-dispatched" } });
+    expect(state.events.some((event) => event.kind === "turn_failed")).toBe(false);
+    expect(state.events.some((event) => event.kind === "diagnostic")).toBe(true);
     expect(state.events.every((event) => event.turnId === "failed-turn" && event.generation === 41 && JSON.stringify(event.dispatchContext) === JSON.stringify(firstContext))).toBe(true);
     const secondContext = context("successful-turn", 42);
     const next = state.adapter.runTurn(secondContext.flyxTurnId, "second", undefined, secondContext);

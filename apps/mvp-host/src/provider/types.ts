@@ -174,4 +174,8 @@ export interface ProviderAdapter {
   respondQuestion?(interactionId: string, answers: QuestionAnswers): NativeQuestionDelivery;
   structuredQuestionsAvailable?(): boolean;
   close?(): void;
+  closeAndWait?(deadlineMs?: number): Promise<import("../lifecycle/managed-process-registry.js").ProcessStopResult>;
+  /** Called only after durable unknown settlement and all bounded drains. */
+  sealCallbacks?(): void;
+  sealProcessJournal?(): void;
 }

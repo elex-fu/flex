@@ -1,4 +1,4 @@
-import type { ChildProcessWithoutNullStreams } from "node:child_process";
+import type { ChildProcess, ChildProcessWithoutNullStreams, SpawnOptions } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { ManagedProcessRegistry, type ProcessStopResult } from "../lifecycle/managed-process-registry.js";
 import { JsonlDecoder } from "./jsonl-decoder.js";
@@ -31,7 +31,7 @@ export interface AppServerClient {
   closeAndWait?(deadlineMs?: number): Promise<ProcessStopResult>;
 }
 
-export type AppServerClientFactory = (handlers: AppServerClientHandlers) => AppServerClient;
+export type AppServerClientFactory = (handlers: AppServerClientHandlers, context?: import("../provider/types.js").DispatchContext) => AppServerClient;
 
 type PendingRequest = {
   method: string;
@@ -67,6 +67,7 @@ export class StdioAppServerClient implements AppServerClient {
       args?: readonly string[];
       handlers: AppServerClientHandlers;
       processes?: ManagedProcessRegistry;
+      spawn?: (command: string, args: readonly string[], options: SpawnOptions) => ChildProcess;
     },
   ) {
     // Direct adapter contract tests can use an isolated registry. Production
@@ -117,7 +118,7 @@ export class StdioAppServerClient implements AppServerClient {
   }
 
   private async startInternal(): Promise<void> {
-    const child = this.processes.spawn(this.options.executable, this.options.args ?? ["app-server", "--listen", "stdio://"], {
+    const child = (this.options.spawn ?? this.processes.spawn.bind(this.processes))(this.options.executable, this.options.args ?? ["app-server", "--listen", "stdio://"], {
       cwd: this.options.cwd,
       env: this.options.env,
       stdio: ["pipe", "pipe", "pipe"],

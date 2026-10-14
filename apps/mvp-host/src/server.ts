@@ -386,6 +386,8 @@ export function createHostServer(options: HostServerOptions): HostServer {
     });
   }));
 
+  let stopPromise: Promise<void> | undefined;
+  options.orchestrator.registerTransportShutdown(() => app.close());
   return {
     app, auth,
     get identity() { if (!identity) throw new Error("Host is not ready"); return identity; },
@@ -401,7 +403,12 @@ export function createHostServer(options: HostServerOptions): HostServer {
       app.log.info({ address }, "Flyx Host started");
       return address;
     },
-    async stop() { await app.close(); options.orchestrator.close(); },
+    stop() {
+      stopPromise ??= options.orchestrator.closeAndWait().then((result) => {
+        if (!result.clean) throw new OrchestratorError("SHUTDOWN_RECOVERY_REQUIRED", "Host stopped with retained unverified execution ownership");
+      });
+      return stopPromise;
+    },
   };
 }
 

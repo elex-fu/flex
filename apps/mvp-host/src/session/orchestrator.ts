@@ -50,6 +50,7 @@ export type ControlResponse = {
 
 export type OrchestratorOptions = {
   workspace: string;
+  checkoutRoot?: string;
   sessionId?: string;
   ownsStore?: boolean;
   recoverOnStart?: boolean;
@@ -83,6 +84,7 @@ export class SessionOrchestrator {
   private activeWorkspaceLease: WorkspaceLease | undefined;
   private closed = false;
   readonly workspace: string;
+  readonly checkoutRoot: string;
   readonly git: GitService;
   readonly adapter: ProviderAdapter;
   readonly commandEngine: CommandEngine;
@@ -109,10 +111,12 @@ export class SessionOrchestrator {
     if (!this.ownsStore && (!options.owner || !options.store || !options.sessionId)) throw new Error("A shared Session runtime requires explicit owner, Store and Session ID");
     if (!this.ownsStore && this.recoverOnStart) throw new Error("Shared Session runtimes cannot recover the Host on construction");
     const canonicalWorkspace = realpathSync(options.workspace);
+    this.checkoutRoot = realpathSync(options.checkoutRoot ?? canonicalWorkspace);
     const provider = options.adapter?.provider ?? options.provider ?? "claude";
     const databasePath = options.databasePath ?? options.owner?.databasePath ?? ":memory:";
     if (options.store && !options.owner) throw new Error("An injected Store requires its verified owner handle");
     if (options.owner?.recoveryOnly) throw new Error("HOST_RECOVERY_ONLY");
+    if (options.owner?.mode === "maintenance") throw new Error("HOST_MAINTENANCE_ONLY");
     this.owner = options.owner ?? (databasePath === ":memory:" ? createTestHostOwner() : HostOwnerLock.acquire({
       databasePath,
       ...(options.identityDirectory ? { identityDirectory: options.identityDirectory } : {}),
@@ -124,6 +128,10 @@ export class SessionOrchestrator {
       this.owner.assertStorePath(databasePath);
       if (databasePath !== ":memory:") {
         assertWorkspacePrivacy(canonicalWorkspace, [dirname(this.owner.databasePath),
+          ...(this.owner.identityDirectory ? [this.owner.identityDirectory] : []),
+          ...(this.owner.coordinationDirectory ? [this.owner.coordinationDirectory] : []),
+          ...(options.privateDirectories ?? [])]);
+        assertWorkspacePrivacy(this.checkoutRoot, [dirname(this.owner.databasePath),
           ...(this.owner.identityDirectory ? [this.owner.identityDirectory] : []),
           ...(this.owner.coordinationDirectory ? [this.owner.coordinationDirectory] : []),
           ...(options.privateDirectories ?? [])]);
@@ -175,7 +183,7 @@ export class SessionOrchestrator {
           if (device && !device.scopes.includes(scope)) throw new OrchestratorError("SCOPE_REQUIRED", "Device cannot perform this command");
         },
       });
-      this.git = new GitService(canonicalWorkspace);
+      this.git = new GitService(this.checkoutRoot);
       this.adapter = options.adapter ?? (provider === "codex"
         ? new CodexAdapter({ workspace: canonicalWorkspace, onEvent: (event) => this.enqueueAdapterEvent(event) })
         : new ClaudeAdapter({ workspace: canonicalWorkspace, onEvent: (event) => this.enqueueAdapterEvent(event) }));
@@ -344,7 +352,7 @@ export class SessionOrchestrator {
       if (this.activeWorkspaceLease) throw new OrchestratorError("WORKSPACE_BUSY", "Checkout ownership remains retained", true);
       const leaseOperationId = randomUUID();
       let lease: WorkspaceLease;
-      try { lease = WorkspaceLease.acquire({ workspace: this.workspace, owner: this.owner, operationId: leaseOperationId }); }
+      try { lease = WorkspaceLease.acquire({ workspace: this.checkoutRoot, owner: this.owner, operationId: leaseOperationId }); }
       catch (error) { throw new OrchestratorError("WORKSPACE_BUSY", error instanceof Error ? error.message : "Workspace is owned by another write task", true); }
       this.activeWorkspaceLease = lease;
       try {

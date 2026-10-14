@@ -38,4 +38,8 @@ describe("selected Session runtime constructor",()=>{
     expect(()=>new SessionOrchestrator({workspace:f.workspace,owner:f.owner,store:f.store,sessionId:session.id,ownsStore:false,adapter:f.adapter("claude")})).toThrow("cannot recover the Host");
     expect(f.store.getSession(session.id)).toBeDefined();f.owner.assertActive();
   });
+  it("keeps Provider cwd distinct from the registered actual checkout used by Git and leases",()=>{
+    const f=fixture();const nested=join(f.workspace,"nested");mkdirSync(nested);const session=f.store.createSession(nested,"claude","nested-session");const adapter={...f.adapter("claude"),workspace:nested};
+    const host=new SessionOrchestrator({workspace:nested,checkoutRoot:f.workspace,owner:f.owner,store:f.store,sessionId:session.id,ownsStore:false,recoverOnStart:false,adapter});expect(host.workspace).toBe(nested);expect(host.checkoutRoot).toBe(f.workspace);expect(host.adapter.workspace).toBe(nested);
+  });
 });

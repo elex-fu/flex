@@ -64,7 +64,8 @@ describe("owned Timeline migration and Host lifecycle", () => {
 
   it("attaches projection before restart recovery and closes every actor subscription", async () => {
     const f = fixture();
-    f.store.acceptTurn({ authSubjectId: "device", commandId: "start", requestHash: "start", sessionId: f.session.id, turnId: "pending-turn", prompt: "work", generation: 1 });
+    // Legacy facts have no execution intent. R06 owns recovery of current durable intents.
+    f.store.createTurn({ authSubjectId: "device", commandId: "start", requestHash: "start", sessionId: f.session.id, turnId: "pending-turn", prompt: "work", generation: 1 });
     f.store.commitEvent(f.session.id, "approval.requested", { approvalId: "approval", itemId: "approval-approval", toolName: "Bash" }, {
       activityState: "waiting_approval", turnId: "pending-turn", turnStatus: "waiting_approval", approval: { approvalId: "approval", sessionId: f.session.id, turnId: "pending-turn", toolUseId: "tool", version: 0, status: "pending", request: { toolName: "Bash", input: { command: "work" } }, createdAt: "2026-10-14T00:00:00.000Z" },
     });

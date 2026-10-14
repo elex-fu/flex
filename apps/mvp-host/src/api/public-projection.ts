@@ -12,7 +12,12 @@ type GitStatus = Awaited<ReturnType<SessionOrchestrator["gitStatus"]>>;
 type GitDiff = Awaited<ReturnType<SessionOrchestrator["gitDiff"]>>;
 
 const PATH_KEYS = new Set(["cwd", "path", "filePath", "file_path", "targetPath", "target_path", "workspacePath", "workspace_path", "workspace", "directory"]);
-const PRIVATE_RUNTIME_KEYS = new Set(["dispatchContext", "providerSessionId", "nativeSessionId", "nativeTurnId", "nativeItemId"]);
+const PRIVATE_RUNTIME_KEYS = new Set(["dispatchContext", "providerSessionId", "nativeSessionId", "nativeTurnId", "nativeItemId", "terminalEvidence", "boundaryEvidence", "stopProof"]);
+const PRIVATE_EVIDENCE_KINDS = new Set(["native-terminal", "native-ack", "local-delivery", "not-dispatched", "unknown", "verified-tree-stop"]);
+function privateEvidence(key: string, value: unknown): boolean {
+  return key === "evidence" && !!value && typeof value === "object" && "kind" in value &&
+    typeof value.kind === "string" && PRIVATE_EVIDENCE_KINDS.has(value.kind);
+}
 
 /** The identical projection is used by HTTP, Direct WS and encrypted Relay RPC. */
 export function publicValue(value: unknown, workspace: string, key?: string): unknown {
@@ -26,7 +31,7 @@ export function publicValue(value: unknown, workspace: string, key?: string): un
   }
   if (Array.isArray(value)) return value.map((item) => publicValue(item, workspace));
   if (value && typeof value === "object") {
-    return Object.fromEntries(Object.entries(value).filter(([childKey]) => !PRIVATE_RUNTIME_KEYS.has(childKey)).map(([childKey, childValue]) => [childKey, publicValue(childValue, workspace, childKey)]));
+    return Object.fromEntries(Object.entries(value).filter(([childKey, childValue]) => !PRIVATE_RUNTIME_KEYS.has(childKey) && !privateEvidence(childKey, childValue)).map(([childKey, childValue]) => [childKey, publicValue(childValue, workspace, childKey)]));
   }
   return value;
 }

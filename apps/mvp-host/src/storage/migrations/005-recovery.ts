@@ -3,6 +3,7 @@ import { MANAGED_PROCESS_EVIDENCE_SCHEMA, validateProcessEvidenceSchema } from "
 
 export const RECOVERY_SCHEMA_VERSION = 5;
 export const RECOVERY_REQUIRED_COLUMNS: Record<string, readonly string[]> = {
+  execution_intents: ["dispatch_context_json"],
   sessions: ["active_turn_id", "recovery_state", "recovery_revision"],
   native_turn_bindings: ["id", "session_id", "turn_id", "attempt_id", "provider", "provider_instance_id", "native_session_id", "native_turn_id", "workspace_path", "configuration_fingerprint", "verified_version", "context_json", "revision", "updated_at"],
   recovery_evidence: ["id", "session_id", "turn_id", "attempt_id", "recovery_revision", "facts_fingerprint", "evidence_json", "observed_at", "expires_at"],
@@ -21,6 +22,8 @@ export function applyRecoveryMigration(db: Database.Database, appliedAt = new Da
   db.transaction(() => {
     if (db.prepare("SELECT 1 FROM schema_migrations WHERE version = 5").get()) { validateRecoverySchema(db); return; }
     if (!db.prepare("SELECT 1 FROM schema_migrations WHERE version = 4").get()) throw new Error("RECOVERY_MIGRATION_REQUIRES_004");
+    const intentColumns = db.prepare("PRAGMA table_info(execution_intents)").all() as Array<{ name: string }>;
+    if (!intentColumns.some((column) => column.name === "dispatch_context_json")) db.exec("ALTER TABLE execution_intents ADD COLUMN dispatch_context_json TEXT");
     db.exec(`
       ALTER TABLE sessions ADD COLUMN active_turn_id TEXT REFERENCES turns(id);
       ALTER TABLE sessions ADD COLUMN recovery_state TEXT NOT NULL DEFAULT 'idle' CHECK (recovery_state IN ('idle','blocked'));

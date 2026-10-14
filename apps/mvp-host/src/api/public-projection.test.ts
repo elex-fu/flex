@@ -8,4 +8,13 @@ describe("public runtime facts", () => {
     expect(publicValue(source, "/private/workspace")).toEqual({ text: "read ./file", turnId: "turn", nested: { allowed: "visible" } });
     expect(source.text).toBe("read /private/workspace/file");
   });
+  it("keeps native terminal and process proof source identities out of public outcome bodies", () => {
+    const source = { status: "completed", outcome: { status: "completed", evidence: { kind: "native-terminal", sourceId: "native-turn:private-source" } },
+      terminalEvidence: { kind: "native-terminal", sourceId: "sdk-private-uuid" },
+      boundaryEvidence: { proof: { policyDigest: "private" }, launchDigest: "private-launch" },
+      stopProof: { kind: "verified-tree-stop", sourceId: "private-process-source" },
+      userOutput: { evidence: "tests passed", sourceId: "public-document" } };
+    expect(publicValue(source, "/workspace")).toEqual({ status: "completed", outcome: { status: "completed" }, userOutput: { evidence: "tests passed", sourceId: "public-document" } });
+    expect(source.outcome.evidence.sourceId).toBe("native-turn:private-source");
+  });
 });

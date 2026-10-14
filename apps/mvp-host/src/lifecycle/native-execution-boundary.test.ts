@@ -32,7 +32,7 @@ async function prepared(options: NativeBoundaryOptions) {
 }
 function registry() {
   const records: ManagedProcessRecord[] = [], evidence: NativeBoundaryLaunchEvidence[] = [];
-  const processes = new ManagedProcessRegistry({ journal: { save(record) { records.push({ ...record }); } }, context: () => ({ hostOwnerId: "local-test", hostOwnerGeneration: 1, runtimeId: "boundary-probe", runtimeGeneration: 1, attemptId: "local-test" }), spawn: ((command, args, options) => { expect(records.at(-1)?.state).toBe("launching"); return spawn(command, args, options); }) as typeof spawn });
+  const processes = new ManagedProcessRegistry({ journal: { save(record) { records.push({ ...record }); } }, context: () => ({ hostOwnerId: "local-test", hostOwnerGeneration: 1, runtimeId: "boundary-probe", runtimeGeneration: 1, attemptId: "local-test" }), spawn: ((command: string, args: readonly string[], options: SpawnOptions) => { expect(records.at(-1)?.state).toBe("launching"); return spawn(command, args, options); }) as unknown as typeof spawn });
   const wrapped: NativeBoundaryProcessRegistry = { spawn(command, args, options, proof) { evidence.push(proof); const child = processes.spawn(command, args, options, proof); children.push(child); return child; } };
   return { wrapped, processes, records, evidence };
 }

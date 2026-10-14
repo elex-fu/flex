@@ -4,7 +4,7 @@ import type { ProjectedItem, SessionEvent } from "@flyx/mvp-protocol";
 import { publicValue } from "../api/public-projection.js";
 import { inTransaction, record, TimelineError, type ContentReference, type TimelineCommitStore, type TimelineContentStore } from "./contracts.js";
 
-export const TIMELINE_PROJECTOR_VERSION = 2;
+export const TIMELINE_PROJECTOR_VERSION = 3;
 export type TimelineEpoch = { sessionId: string; epoch: string; projectorVersion: number; indexedSequence: number; state: "building" | "active" | "retired" };
 export type ItemVersionRow = {
   session_id: string; epoch: string; item_id: string; revision: number;

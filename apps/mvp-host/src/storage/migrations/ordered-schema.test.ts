@@ -32,6 +32,8 @@ function seedV4(path: string): void {
       ALTER TABLE pairing_grants ADD COLUMN device_id TEXT REFERENCES devices(id);
       INSERT INTO schema_migrations VALUES(3,'legacy')`);
     applyCommandExecutionMigration(db);
+    // A frozen R05 v4 file predates the durable original dispatch binding.
+    db.exec("ALTER TABLE execution_intents DROP COLUMN dispatch_context_json");
     expect(inspectSchema(db).version).toBe(4);
   } finally { db.close(); }
 }
@@ -43,6 +45,7 @@ describe("ordered owned schema and recovery metadata", () => {
     const session = first.createSession("/controlled-workspace");
     const schema = first.db.prepare("SELECT name,sql FROM sqlite_master ORDER BY name").all();
     expect(inspectSchema(first.db).version).toBe(SUPPORTED_SCHEMA_VERSION);
+    expect((first.db.prepare("PRAGMA table_info(execution_intents)").all() as Array<{ name: string }>).some((column) => column.name === "dispatch_context_json")).toBe(true);
     expect(first.db.prepare("SELECT version FROM schema_migrations ORDER BY version").all()).toEqual([1, 2, 3, 4, 5, 6].map((version) => ({ version })));
     first.close();
     const second = new SqliteStore(f.databasePath, { mode: "owned" });

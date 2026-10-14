@@ -34,6 +34,7 @@ export type HostOwnerHandle = {
   readonly identityDirectory?: string;
   readonly coordinationDirectory?: string;
   readonly mode: HostOwnerMode;
+  readonly recoveryOnly: boolean;
   readonly retainedReason?: string | undefined;
   readonly resourceKeys: readonly string[];
   assertActive(): void;
@@ -42,6 +43,12 @@ export type HostOwnerHandle = {
   retain(reason: string): void;
   clearRetention(proof: OwnershipRecoveryProof, verifyProof: OwnershipRecoveryVerifier): void;
   release(): void;
+};
+
+export type RecoveryMaintenanceOwnerHandle = HostOwnerHandle & {
+  readonly recoveryOnly: true;
+  /** End an unsuccessful recovery scope without deleting retained ownership. */
+  closeMaintenance(): void;
 };
 
 export type HostOwnerOptions = {
@@ -160,7 +167,9 @@ function readRecord(path: string): { record: OwnerRecord; stat: Stats } {
     const value = JSON.parse(readFileSync(fd, "utf8")) as Partial<OwnerRecord>;
     if (value.v !== 1 || typeof value.ownerId !== "string" || !Number.isSafeInteger(value.ownerGeneration) ||
         typeof value.resourceKey !== "string" || !value.process || !Number.isSafeInteger(value.process.pid) ||
-        typeof value.process.platform !== "string") throw new Error("invalid_lock");
+        typeof value.process.platform !== "string" || value.process.pid <= 0 ||
+        (value.process.birth && (value.process.platform !== "linux" || value.process.birth.kind !== "linux" ||
+          !/^[a-f0-9-]{36}$/i.test(value.process.birth.bootId) || !/^\d+$/.test(value.process.birth.startTicks)))) throw new Error("invalid_lock");
     return { record: value as OwnerRecord, stat };
   } finally { closeSync(fd); }
 }
@@ -170,7 +179,8 @@ export class ExclusiveFileLock {
   private released = false;
   private readonly identity: Stats;
 
-  private constructor(readonly path: string, private readonly fd: number, private readonly record: OwnerRecord) {
+  private constructor(readonly path: string, private readonly fd: number, private readonly record: OwnerRecord,
+    private readonly heldGuard?: { path: string; fd: number; identity: Stats; maintenanceId: string }) {
     this.identity = fstatSync(fd);
   }
 
@@ -224,19 +234,107 @@ export class ExclusiveFileLock {
     });
   }
 
+  static acquireRetainedForMaintenance(options: { directory: string; resourceKey: string; inspector: ProcessInspector }): ExclusiveFileLock {
+    const directory = privateCoordinationDirectory(options.directory);
+    const path = join(directory, `${createHash("sha256").update(options.resourceKey).digest("hex")}.owner`);
+    const guardPath = `${path}.maintenance`;
+    let guardFd: number;
+    try { guardFd = openSync(guardPath, constants.O_RDWR | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600); }
+    catch (error) {
+      if (errorCode(error) === "EEXIST") throw new HostOwnershipError("OWNER_MAINTENANCE_BUSY", "Another maintenance scope holds the retained owner.");
+      throw error;
+    }
+    const heldGuard = { path: guardPath, fd: guardFd, identity: fstatSync(guardFd), maintenanceId: randomUUID() };
+    let ownerFd: number | undefined;
+    try {
+      writeSync(guardFd, JSON.stringify({ v: 1, maintenanceId: heldGuard.maintenanceId, resourceKey: options.resourceKey, process: options.inspector.currentIdentity() }));
+      fsyncSync(guardFd);
+      const current = readRecord(path);
+      if (!current.record.retainedReason || current.record.resourceKey !== options.resourceKey) {
+        throw new HostOwnershipError("OWNER_RECOVERY_REQUIRED", "Recovery maintenance requires the exact retained owner resource.");
+      }
+      const inspected = options.inspector.inspect(current.record.process);
+      if (inspected.state !== "exited") throw new HostOwnershipError(inspected.state === "alive" ? "HOST_ALREADY_OWNED" : "HOST_OWNER_UNKNOWN", "The original Host process cannot be proven exited; recovery maintenance is blocked.");
+      const verified = readRecord(path);
+      if (verified.record.ownerId !== current.record.ownerId || verified.record.ownerGeneration !== current.record.ownerGeneration ||
+          verified.record.resourceKey !== options.resourceKey || JSON.stringify(verified.record) !== JSON.stringify(current.record) || !sameFile(verified.stat, current.stat)) {
+        throw new HostOwnershipError("HOST_OWNER_LOST", "Retained ownership changed during process inspection.");
+      }
+      ownerFd = openSync(path, constants.O_RDWR | constants.O_NOFOLLOW);
+      if (!sameFile(fstatSync(ownerFd), verified.stat)) throw new HostOwnershipError("HOST_OWNER_LOST", "Retained owner file changed while opening recovery scope.");
+      return new ExclusiveFileLock(path, ownerFd, verified.record, heldGuard);
+    } catch (error) {
+      if (ownerFd !== undefined) closeSync(ownerFd);
+      ExclusiveFileLock.closeHeldGuard(heldGuard);
+      throw error;
+    }
+  }
+
+  ownership(): { ownerId: string; ownerGeneration: number; resourceKey: string; retainedReason?: string } {
+    return { ownerId: this.record.ownerId, ownerGeneration: this.record.ownerGeneration, resourceKey: this.record.resourceKey,
+      ...(this.record.retainedReason ? { retainedReason: this.record.retainedReason } : {}) };
+  }
+
+  /** Verify every resource before the caller clears any retained file. */
+  validateRecovery(proof: OwnershipRecoveryProof, verifyProof: OwnershipRecoveryVerifier): OwnershipRecoveryContext {
+    return this.withGuard(() => {
+      this.assertActive();
+      const current = readRecord(this.path);
+      verifyRecovery(current.record, { proof, verifyProof });
+      this.assertActive();
+      return { resourceKey: current.record.resourceKey, ownerId: current.record.ownerId, ownerGeneration: current.record.ownerGeneration,
+        purpose: current.record.purpose, retainedReason: current.record.retainedReason ?? "" };
+    });
+  }
+
+  closeMaintenance(): void {
+    if (this.released) return;
+    if (!this.heldGuard) throw new HostOwnershipError("OFFLINE_OWNER_REQUIRED", "Only a held recovery scope can close without releasing ownership.");
+    this.released = true;
+    try { closeSync(this.fd); } finally { ExclusiveFileLock.closeHeldGuard(this.heldGuard); }
+  }
+
+  private assertHeldGuard(): void {
+    if (!this.heldGuard) return;
+    const stat = lstatSync(this.heldGuard.path);
+    const value = JSON.parse(readFileSync(this.heldGuard.path, "utf8")) as {maintenanceId?:string};
+    if (!sameFile(stat, this.heldGuard.identity) || value.maintenanceId !== this.heldGuard.maintenanceId) {
+      throw new HostOwnershipError("HOST_OWNER_LOST", "Recovery maintenance guard changed ownership.");
+    }
+  }
+
+  private withGuard<T>(operation: () => T): T {
+    if (!this.heldGuard) return ExclusiveFileLock.guarded(this.path, operation);
+    this.assertHeldGuard();
+    return operation();
+  }
+
+  private static closeHeldGuard(guard: { path: string; fd: number; identity: Stats; maintenanceId: string }): void {
+    try {
+      const stat = lstatSync(guard.path);
+      const record = JSON.parse(readFileSync(guard.path, "utf8")) as {maintenanceId?:string};
+      if (!sameFile(stat, guard.identity) || record.maintenanceId !== guard.maintenanceId) {
+        throw new HostOwnershipError("HOST_OWNER_LOST", "Recovery maintenance guard must not delete a successor's exclusion.");
+      }
+      unlinkSync(guard.path);
+    } finally { closeSync(guard.fd); }
+  }
+
   assertActive(): void {
     if (this.released) throw new HostOwnershipError("HOST_OWNER_LOST", "Host owner has already been released.");
     try {
+      this.assertHeldGuard();
       const current = readRecord(this.path);
       if (current.record.ownerId !== this.record.ownerId || current.record.ownerGeneration !== this.record.ownerGeneration || current.record.resourceKey !== this.record.resourceKey ||
-          !sameFile(current.stat, this.identity)) throw new Error("owner_replaced");
+          !sameFile(current.stat, this.identity) || (this.heldGuard && JSON.stringify(current.record) !== JSON.stringify(this.record))) throw new Error("owner_replaced");
     } catch {
       throw new HostOwnershipError("HOST_OWNER_LOST", "Host owner file no longer matches this invocation.");
     }
   }
 
   heartbeat(): void {
-    ExclusiveFileLock.guarded(this.path, () => {
+    if (this.heldGuard) throw new HostOwnershipError("HOST_RECOVERY_ONLY", "Recovery scope cannot rewrite retained ownership before evidence commits.");
+    this.withGuard(() => {
       this.assertActive();
       this.record.heartbeatAt = new Date().toISOString();
       ftruncateSync(this.fd, 0);
@@ -246,8 +344,9 @@ export class ExclusiveFileLock {
   }
 
   retain(reason: string): void {
+    if (this.heldGuard) throw new HostOwnershipError("HOST_RECOVERY_ONLY", "Recovery scope cannot rewrite retained ownership before evidence commits.");
     if (!reason) throw new Error("Owner retention requires a reason");
-    ExclusiveFileLock.guarded(this.path, () => {
+    this.withGuard(() => {
       this.assertActive();
       this.record.retainedReason = reason.slice(0, 1024);
       ftruncateSync(this.fd, 0);
@@ -257,7 +356,7 @@ export class ExclusiveFileLock {
   }
 
   clearRetention(proof: OwnershipRecoveryProof, verifyProof: OwnershipRecoveryVerifier): void {
-    ExclusiveFileLock.guarded(this.path, () => {
+    this.withGuard(() => {
       this.assertActive();
       const current = readRecord(this.path);
       verifyRecovery(current.record, { proof, verifyProof });
@@ -274,13 +373,13 @@ export class ExclusiveFileLock {
     if (this.released) return;
     if (this.record.retainedReason) throw new HostOwnershipError("OWNER_RECOVERY_REQUIRED", "Host owner must remain in place until retained execution is reconciled.");
     try {
-      ExclusiveFileLock.guarded(this.path, () => {
+      this.withGuard(() => {
         this.assertActive();
         unlinkSync(this.path);
       });
     } finally {
       this.released = true;
-      closeSync(this.fd);
+      try { closeSync(this.fd); } finally { if (this.heldGuard) ExclusiveFileLock.closeHeldGuard(this.heldGuard); }
     }
   }
 
@@ -310,6 +409,65 @@ export function assertHostOwner(owner: HostOwnerHandle): void {
 }
 
 export class HostOwnerLock {
+  /** Offline journal/evidence scope. Retained records are unchanged until committed proof clears them. */
+  static acquireForRecoveryMaintenance(options: Omit<HostOwnerOptions, "mode" | "reclaimStale" | "recovery">): RecoveryMaintenanceOwnerHandle {
+    if (options.databasePath === ":memory:") throw new HostOwnershipError("OFFLINE_OWNER_REQUIRED", "Recovery maintenance requires an existing retained file-backed Host.");
+    const databasePath = canonicalPath(options.databasePath);
+    const identityDirectory = canonicalPath(options.identityDirectory ?? join(dirname(databasePath), "identity"));
+    const coordinationDirectory = privateCoordinationDirectory(options.coordinationDirectory ?? defaultCoordinationDirectory());
+    const resourceKeys = [`db:${databasePath}`, `identity:${identityDirectory}`].sort();
+    const locks: ExclusiveFileLock[] = [];
+    try {
+      for (const resourceKey of resourceKeys) locks.push(ExclusiveFileLock.acquireRetainedForMaintenance({ directory: coordinationDirectory, resourceKey, inspector: options.inspector ?? new SystemProcessInspector() }));
+      const first = locks[0]!.ownership();
+      if (locks.some((lock) => lock.ownership().ownerId !== first.ownerId || lock.ownership().ownerGeneration !== first.ownerGeneration)) {
+        throw new HostOwnershipError("HOST_OWNER_UNKNOWN", "Retained DB and identity resources belong to different Host invocations.");
+      }
+    } catch (error) {
+      for (const lock of [...locks].reverse()) lock.closeMaintenance();
+      throw error;
+    }
+    const original = locks[0]!.ownership();
+    let retainedReason: string | undefined = original.retainedReason;
+    let closed = false;
+    const handle: RecoveryMaintenanceOwnerHandle = {
+      ownerId: original.ownerId, generation: original.ownerGeneration, databasePath, identityDirectory, coordinationDirectory,
+      mode: "maintenance", recoveryOnly: true, resourceKeys: Object.freeze(resourceKeys), get retainedReason() { return retainedReason; },
+      assertActive: () => {
+        if (closed) throw new HostOwnershipError("HOST_OWNER_LOST", "Recovery maintenance scope has closed.");
+        locks.forEach((lock) => { lock.assertActive(); lock.ownership(); });
+      },
+      assertStorePath: (path) => { handle.assertActive(); if (canonicalPath(path) !== databasePath) throw new HostOwnershipError("OWNER_STORE_MISMATCH", "Recovery scope belongs to another database."); },
+      heartbeat: () => handle.assertActive(),
+      retain: () => { throw new HostOwnershipError("HOST_RECOVERY_ONLY", "Recovery scope preserves its original retained ownership."); },
+      clearRetention: (proof, verifyProof) => {
+        handle.assertActive(); exactResources(proof, resourceKeys);
+        const verified = locks.map((lock) => lock.validateRecovery(proof, verifyProof));
+        const cachedVerifier: OwnershipRecoveryVerifier = (_, context) => verified.some((originalContext) =>
+          JSON.stringify(originalContext) === JSON.stringify(context));
+        locks.forEach((lock) => lock.clearRetention(proof, cachedVerifier));
+        retainedReason = undefined;
+      },
+      release: () => {
+        if (closed) return;
+        if (retainedReason) throw new HostOwnershipError("OWNER_RECOVERY_REQUIRED", "Recovery maintenance cannot release retained ownership without committed stop evidence.");
+        const failures: unknown[] = [];
+        for (const lock of [...locks].reverse()) { try { lock.release(); } catch (error) { failures.push(error); } }
+        closed = true;
+        if (failures.length) throw new AggregateError(failures, "Recovery owner release could not verify every resource.");
+      },
+      closeMaintenance: () => {
+        if (closed) return;
+        const failures: unknown[] = [];
+        for (const lock of [...locks].reverse()) { try { lock.closeMaintenance(); } catch (error) { failures.push(error); } }
+        closed = true;
+        if (failures.length) throw new AggregateError(failures, "Recovery maintenance exclusion could not safely close.");
+      },
+    };
+    handles.add(handle);
+    return Object.freeze(handle);
+  }
+
   static acquire(options: HostOwnerOptions): HostOwnerHandle {
     if (options.databasePath === ":memory:") throw new HostOwnershipError("HOST_OWNER_REQUIRED", "Use an explicit test owner for an in-memory Store.");
     const mode = options.mode ?? "host";
@@ -338,7 +496,7 @@ export class HostOwnerLock {
     }
     let released = false;
     let retainedReason: string | undefined;
-    const handle: HostOwnerHandle = { ownerId, generation, databasePath, identityDirectory, coordinationDirectory, mode,
+    const handle: HostOwnerHandle = { ownerId, generation, databasePath, identityDirectory, coordinationDirectory, mode, recoveryOnly: false,
       resourceKeys: Object.freeze(resourceKeys),
       get retainedReason() { return retainedReason; },
       assertActive: () => {
@@ -377,7 +535,7 @@ export class HostOwnerLock {
 /** Explicit ephemeral owner. It cannot authorize opening any file-backed Store. */
 export function createTestHostOwner(): HostOwnerHandle {
   let active = true;
-  const handle: HostOwnerHandle = { ownerId: `test-${randomUUID()}`, generation: 1, databasePath: ":memory:", mode: "test", resourceKeys: [],
+  const handle: HostOwnerHandle = { ownerId: `test-${randomUUID()}`, generation: 1, databasePath: ":memory:", mode: "test", recoveryOnly: false, resourceKeys: [],
     assertActive: () => { if (!active) throw new HostOwnershipError("HOST_OWNER_LOST", "Test owner has been released."); },
     assertStorePath: (path) => { handle.assertActive(); if (path !== ":memory:") throw new HostOwnershipError("OWNER_STORE_MISMATCH", "Test owner can only open an in-memory Store."); },
     heartbeat: () => handle.assertActive(), release: () => { active = false; },

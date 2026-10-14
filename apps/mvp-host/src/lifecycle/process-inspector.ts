@@ -47,6 +47,10 @@ export class SystemProcessInspector implements ProcessInspector {
     if (!Number.isSafeInteger(identity.pid) || identity.pid <= 0 || identity.platform !== this.platform) {
       return { state: "unknown", reason: "invalid_or_foreign_process_identity" };
     }
+    if (identity.birth && (identity.birth.kind !== "linux" || identity.platform !== "linux" ||
+        !/^[a-f0-9-]{36}$/i.test(identity.birth.bootId) || !/^\d+$/.test(identity.birth.startTicks))) {
+      return { state: "unknown", reason: "process_birth_invalid" };
+    }
     try {
       this.signal(identity.pid);
     } catch (error) {

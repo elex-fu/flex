@@ -28,7 +28,7 @@ function acquire(options: Parameters<typeof HostOwnerLock.acquire>[0]) {
 }
 
 const inspector = (state: "alive" | "exited" | "unknown"): ProcessInspector => ({
-  currentIdentity: () => ({ pid: 42, platform: "linux", birth: { kind: "linux", bootId: "test-boot", startTicks: "123" } }),
+  currentIdentity: () => ({ pid: 42, platform: "linux", birth: { kind: "linux", bootId: "12345678-1234-1234-1234-123456789abc", startTicks: "123" } }),
   inspect: () => ({ state, reason: `test_${state}` }),
 });
 
@@ -168,5 +168,6 @@ describe("process inspection", () => {
     expect(linux.inspect(identity)).toEqual({ state: "exited", reason: "recorded_process_exited_pid_reused" });
     const unverifiable = new SystemProcessInspector({ platform: "linux", signal: () => {}, read: () => { throw new Error("no proc access"); } });
     expect(unverifiable.inspect(identity).state).toBe("unknown");
+    expect(linux.inspect({ ...identity, birth: { kind: "linux", bootId: "invalid", startTicks: "1234" } })).toEqual({ state: "unknown", reason: "process_birth_invalid" });
   });
 });

@@ -378,7 +378,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 export type SqliteStoreOptions = {
-  mode?: "owned" | "readonly" | "maintenance" | "management" | "test-fixture";
+  mode?: "owned" | "readonly" | "maintenance" | "management" | "recovery-maintenance" | "test-fixture";
   owner?: HostOwnerHandle;
 };
 
@@ -387,6 +387,7 @@ export class SqliteStore {
   readonly mode: NonNullable<SqliteStoreOptions["mode"]>;
   private readonly ownerHandle: HostOwnerHandle | undefined;
   private readonly releaseOwnerOnClose: boolean;
+  private recoveryTransactionDepth = 0;
   private readonly projectionHooks = new Set<(sessionId: string, event: SessionEvent, options: EventCommitOptions) => void>();
   private readonly commitHooks = new Set<(events: readonly SessionEvent[], commit: EventCommitRow) => void>();
 
@@ -396,22 +397,29 @@ export class SqliteStore {
     // supplies a real owner, including under Vitest.
     this.mode = options.mode ?? (filePath !== ":memory:" && process.env.NODE_ENV === "test" ? "test-fixture" : "owned");
     if (this.mode === "test-fixture" && process.env.NODE_ENV !== "test") throw new Error("Raw file-backed fixtures are only allowed under NODE_ENV=test");
-    const isWriter = this.mode === "owned" || this.mode === "maintenance";
+    if (this.mode === "recovery-maintenance" && !options.owner) throw new Error("HOST_OWNER_REQUIRED");
+    const isWriter = this.mode === "owned" || this.mode === "maintenance" || this.mode === "recovery-maintenance";
     this.ownerHandle = isWriter ? options.owner ?? (filePath === ":memory:" ? createTestHostOwner() : HostOwnerLock.acquire({ databasePath: filePath, mode: this.mode === "maintenance" ? "maintenance" : "host" })) : undefined;
     this.releaseOwnerOnClose = isWriter && !options.owner;
     try {
       if (this.ownerHandle) {
         assertHostOwner(this.ownerHandle);
         this.ownerHandle.assertStorePath(filePath);
-        if (this.mode === "maintenance" && this.ownerHandle.mode !== "maintenance") throw new Error("Offline maintenance owner required");
+        if ((this.mode === "maintenance" || this.mode === "recovery-maintenance") && this.ownerHandle.mode !== "maintenance") throw new Error("Offline maintenance owner required");
+        if (this.ownerHandle.recoveryOnly && this.mode !== "recovery-maintenance") throw new Error("HOST_RECOVERY_ONLY");
+        if (this.mode === "recovery-maintenance" && !this.ownerHandle.recoveryOnly) throw new Error("Recovery-maintenance owner required");
       }
       const connectionPath = this.ownerHandle?.databasePath ?? (filePath === ":memory:" ? filePath : canonicalPath(filePath));
-      this.db = new Database(connectionPath, { readonly: this.mode === "readonly", fileMustExist: this.mode === "readonly" || this.mode === "management", timeout: this.mode === "management" ? 1_000 : 5_000 });
+      this.db = new Database(connectionPath, { readonly: this.mode === "readonly", fileMustExist: this.mode === "readonly" || this.mode === "management" || this.mode === "recovery-maintenance", timeout: this.mode === "management" || this.mode === "recovery-maintenance" ? 1_000 : 5_000 });
       try {
         this.ownerHandle?.assertStorePath(connectionPath);
         const schema = inspectSchema(this.db);
-        if (this.mode === "readonly" || this.mode === "management") {
+        if (this.mode === "readonly" || this.mode === "management" || this.mode === "recovery-maintenance") {
           if (this.mode === "management" && schema.version < 3) throw new StoreSchemaError("SCHEMA_INVALID", "Local revocation requires the current schema; migrate the offline Host first.");
+          if (this.mode === "recovery-maintenance") {
+            if (schema.version < 3) throw new StoreSchemaError("SCHEMA_INVALID", "Recovery maintenance requires an existing supported baseline");
+            this.db.pragma("foreign_keys = ON");
+          }
           return;
         }
         this.ownerHandle?.assertActive();
@@ -438,7 +446,23 @@ export class SqliteStore {
   /** Business write admission; management connection only permits its local revocation path. */
   assertWriterOwner(): void {
     if (this.mode === "readonly" || this.mode === "management") throw new Error("HOST_OWNER_REQUIRED");
+    if (this.ownerHandle?.recoveryOnly && this.recoveryTransactionDepth === 0) throw new Error("HOST_RECOVERY_ONLY");
     this.ownerHandle?.assertActive();
+  }
+
+  /** Explicit sync lane for committed recovery facts; no Provider or async I/O may run here. */
+  withRecoveryTransaction<T>(work: () => T): T {
+    if (this.mode === "readonly" || this.mode === "management") throw new Error("HOST_OWNER_REQUIRED");
+    this.ownerHandle?.assertActive();
+    this.recoveryTransactionDepth += 1;
+    try {
+      return this.db.transaction(() => {
+        const result = work();
+        assertSynchronous(result);
+        this.ownerHandle?.assertActive();
+        return result;
+      })();
+    } finally { this.recoveryTransactionDepth -= 1; }
   }
 
   close(): void {

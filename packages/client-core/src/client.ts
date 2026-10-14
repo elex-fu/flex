@@ -1,29 +1,46 @@
 import { decodeConnectionFragment, verifyHostDescriptor } from "@flyx/mvp-protocol";
 import type { HostDescriptorV1, SessionEvent } from "@flyx/mvp-protocol";
 import { generateNoiseKeyPair } from "@flyx/secure-channel";
-import { assertNotAborted, ClientError, errorInfo, isRecord, Signal, toBase64Url, validateDirectUrl } from "./common.js";
+import { abortError, assertNotAborted, ClientError, errorInfo, isRecord, payloadHash, Signal, toBase64Url, validateDirectUrl } from "./common.js";
 import { CommandOutbox } from "./command-outbox.js";
 import { ConnectionSupervisor } from "./connection-supervisor.js";
 import { IndexedDbClientStore } from "./host-profile-store.js";
 import { RpcClient } from "./rpc-client.js";
+import { systemMonotonicClock } from "./platform.js";
+import type { MonotonicClock, PlatformSignals } from "./platform.js";
 import { SyncEngine } from "./sync-engine.js";
 import { connectDirectWeb, directJson, fetchDirectDescriptor, pairDirectWeb } from "./transports/direct-web.js";
 import type { DirectWebOptions } from "./transports/direct-web.js";
 import { connectRelayE2ee } from "./transports/relay-e2ee.js";
 import type { SocketFactory } from "./transports/websocket.js";
-import type { ClientState, ClientStore, ClientTransport, ConnectionEndpoint, DeviceCredential, HostProfile, PendingCommand, Unsubscribe } from "./types.js";
+import type { ClientState, ClientStore, ClientTransport, ConnectionEndpoint, DeviceCredential, DraftKey, HostProfile, PendingCommand, Unsubscribe } from "./types.js";
 
 export interface FlyxClientOptions extends DirectWebOptions {
   profile?: HostProfile;
+  /** Fixed owner for a registry runtime, independent of the selected UI Host. */
+  hostId?: string;
   store?: ClientStore;
   directBaseUrl?: string;
   onlineTarget?: Pick<EventTarget, "addEventListener" | "removeEventListener">;
+  platformSignals?: PlatformSignals;
+  clock?: MonotonicClock;
+  random?: () => number;
+  stableWindowMs?: number;
+  suspensionThresholdMs?: number;
+  probeDeadlineMs?: number;
   /** Dependency injection for native shells and deterministic contract tests. */
   connectTransport?: (endpoint: ConnectionEndpoint, profile: HostProfile, generation: number, signal: AbortSignal) => Promise<ClientTransport>;
   socketFactory?: SocketFactory;
   /** Origin serving the web app. Defaults to globalThis.location.origin in a
    * browser and makes exact same-origin Direct connections prefer cookies. */
   appOrigin?: string;
+}
+
+export interface DraftCommandOptions {
+  commandId?: string;
+  draftUpdatedAt?: number;
+  /** The composer may clear its input only after this callback runs. */
+  onPersisted?: (command: PendingCommand) => void;
 }
 
 interface MemoryDeviceKey { publicKey: Uint8Array; secretKey: Uint8Array; deviceId?: string }
@@ -69,6 +86,7 @@ export class FlyxClient {
   constructor(private options: FlyxClientOptions = {}) {
     this.store = options.store ?? new IndexedDbClientStore();
     this.profile = options.profile;
+    if (options.hostId && options.profile && options.hostId !== options.profile.hostId) throw new ClientError("HOST_RUNTIME_BOUND", "Runtime profile belongs to a different Host");
     this.sync = new SyncEngine({ request: (method, payload) => this.rpc.request(method, payload), isCurrent: (generation) => this.supervisor?.generation === generation, recover: () => this.reconnect() });
     this.sync.onState((sync) => this.update({ sync }));
     this.rpc.onEvent((event) => this.sync.receive(event, this.rpc.generation));
@@ -79,6 +97,14 @@ export class FlyxClient {
       if (transition?.generation === this.rpc.generation) { transition.deferred = error; return; }
       void this.failAuthorization(error);
     });
+  }
+  /** A registry binds an adopted bootstrap client once its identity is known. */
+  bindHostOwner(hostId: string): void {
+    if (this.options.hostId && this.options.hostId !== hostId || this.profile && this.profile.hostId !== hostId) throw new ClientError("HOST_RUNTIME_BOUND", "Runtime already belongs to a different Host");
+    this.options = { ...this.options, hostId };
+  }
+  private assertHostOwner(hostId: string): void {
+    if (this.options.hostId && this.options.hostId !== hostId) throw new ClientError("HOST_RUNTIME_BOUND", "Select the other Host's registry runtime");
   }
   getState(): ClientState { return structuredClone(this.state); }
   onState(handler: (state: ClientState) => void): Unsubscribe { handler(this.getState()); return this.states.subscribe(handler); }
@@ -97,6 +123,20 @@ export class FlyxClient {
       return result;
     });
   }
+  async commandFromDraft<T = unknown>(method: string, payload: unknown, key: DraftKey, options: DraftCommandOptions = {}): Promise<T> {
+    if (!this.outbox || this.state.connection !== "online" || this.state.sync !== "synced") throw new ClientError("NOT_CONNECTED", "Wait until the Host is connected and synchronized");
+    if (key.hostId !== this.requireProfile().hostId) throw new ClientError("DRAFT_HOST_MISMATCH", "Draft belongs to a different Host");
+    if (isRecord(payload) && typeof payload.sessionId === "string" && payload.sessionId !== key.sessionId) throw new ClientError("DRAFT_SESSION_MISMATCH", "Command targets a different draft Session");
+    const lifecycle = this.lifecycle;
+    const commandId = options.commandId ?? crypto.randomUUID();
+    const hash = await payloadHash(method, payload);
+    if (lifecycle !== this.lifecycle) throw abortError();
+    const command: PendingCommand = { commandId, hostId: key.hostId, method, payloadHash: hash, payload: structuredClone(payload), createdAt: new Date().toISOString(), state: "queued", dispatchState: "not_dispatched" };
+    await this.store.putCommandAndClearDraft(command, key, options.draftUpdatedAt);
+    if (lifecycle !== this.lifecycle) throw abortError();
+    options.onPersisted?.(structuredClone(command));
+    return this.command<T>(method, payload, commandId);
+  }
   retryCommand<T = unknown>(commandId: string): Promise<T> {
     if (!this.outbox || this.state.connection !== "online" || this.state.sync !== "synced") return Promise.reject(new ClientError("NOT_CONNECTED", "Wait until the Host is connected and synchronized"));
     return this.outbox.retry<T>(commandId);
@@ -109,19 +149,23 @@ export class FlyxClient {
     this.initializing = this.initialize(lifecycle).catch((error: unknown) => {
       if (lifecycle !== this.lifecycle) return;
       this.update({ connection: "failed", error: errorInfo(error), pairingRequired: error instanceof ClientError && error.code === "PAIRING_REQUIRED" });
-    }).finally(() => { this.initializing = undefined; });
+    }).finally(() => { if (lifecycle === this.lifecycle) this.initializing = undefined; });
     return this.initializing;
   }
   private async initialize(lifecycle: number): Promise<void> {
     this.update({ connection: "connecting" });
     if (!this.profile) {
-      const selected = await this.store.getSelectedHost();
-      if (selected) this.profile = await this.store.getProfile(selected);
+      const selected = this.options.hostId ?? await this.store.getSelectedHost();
+      const profile = selected ? await this.store.getProfile(selected) : undefined;
+      if (lifecycle !== this.lifecycle) return;
+      this.profile = profile;
     }
     if (!this.profile) {
       const baseUrl = this.options.directBaseUrl;
       if (!baseUrl) throw new ClientError("PAIRING_REQUIRED", "Scan a Host pairing offer to connect");
       const descriptor = await fetchDirectDescriptor(baseUrl, undefined, this.options);
+      if (lifecycle !== this.lifecycle) return;
+      if (this.options.hostId && descriptor.hostId !== this.options.hostId) throw new ClientError("IDENTITY_MISMATCH", "Endpoint belongs to a different registry Host");
       this.profile = this.profileFromDescriptor(descriptor);
       this.addEndpoint({ id: "direct-current-origin", kind: "direct-https", source: "manual", baseUrl: validateDirectUrl(baseUrl, this.options.allowInsecureLoopback).origin, availability: "unknown" });
     }
@@ -141,8 +185,11 @@ export class FlyxClient {
   private requireProfile(): HostProfile { if (!this.profile) throw new ClientError("PAIRING_REQUIRED", "Select a Host first"); return this.profile; }
   private async persistProfile(): Promise<void> {
     const profile = this.requireProfile();
+    const lifecycle = this.lifecycle;
     await this.store.putProfile(profile);
+    if (lifecycle !== this.lifecycle || this.profile !== profile) throw abortError();
     await this.store.setSelectedHost(profile.hostId);
+    if (lifecycle !== this.lifecycle || this.profile !== profile) throw abortError();
     this.update({ profile });
   }
   private isSameOrigin(baseUrl: string): boolean {
@@ -153,7 +200,22 @@ export class FlyxClient {
   }
   private configure(): void {
     const profile = this.requireProfile();
-    this.outbox = new CommandOutbox(this.store, profile.hostId, (method, payload, commandId) => this.rpc.request(method, payload, commandId));
+    const lifecycle = this.lifecycle;
+    // A late outbox result after stop/forget must not recreate deleted Host data.
+    const commandStore = new Proxy(this.store, {
+      get: (target, property) => {
+        if (property === "putCommand") return (command: PendingCommand) => {
+          if (lifecycle !== this.lifecycle || this.profile !== profile) return Promise.reject(abortError());
+          return target.putCommand(command);
+        };
+        const value: unknown = Reflect.get(target, property, target);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    this.outbox = new CommandOutbox(commandStore, profile.hostId, (method, payload, commandId) => {
+      if (lifecycle !== this.lifecycle || this.profile !== profile) return Promise.reject(abortError());
+      return this.rpc.request(method, payload, commandId);
+    });
     this.outbox.onChange((commands) => { this.unresolvedWrites = commands.some((command) => ["sent", "receipt_unknown"].includes(command.state)); this.outboxChanges.emit(commands); });
     this.supervisor = new ConnectionSupervisor({
       endpoints: () => profile.endpoints,
@@ -176,20 +238,28 @@ export class FlyxClient {
       ping: (nonce) => this.rpc.ping(nonce),
       probe: async (endpoint, signal) => {
         if (endpoint.kind !== "direct-https") throw new ClientError("INVALID_ENDPOINT", "Only Direct endpoints can be probed");
-        const before = Date.now();
+        const clock = this.options.clock ?? this.options.platformSignals?.clock ?? systemMonotonicClock;
+        const before = clock.now();
         await fetchDirectDescriptor(endpoint.baseUrl, profile, this.options, signal);
-        return Date.now() - before;
+        return Math.max(0, clock.now() - before);
       },
       canUpgrade: () => !this.unresolvedWrites && !(this.outbox?.hasUnresolvedWrites ?? false),
       endpointChanged: (endpoint) => {
         const index = profile.endpoints.findIndex((value) => value.id === endpoint.id);
         if (index >= 0) profile.endpoints[index] = endpoint;
-        void this.store.putProfile(profile).catch(() => this.update({ error: { code: "STORAGE_WRITE_FAILED", message: "Unable to save connection profile" } }));
+        if (lifecycle !== this.lifecycle) return;
+        void this.store.putProfile(profile).catch(() => { if (lifecycle === this.lifecycle) this.update({ error: { code: "STORAGE_WRITE_FAILED", message: "Unable to save connection profile" } }); });
       },
       ...(this.options.onlineTarget ? { onlineTarget: this.options.onlineTarget } : typeof window !== "undefined" ? { onlineTarget: window } : {}),
+      ...(this.options.platformSignals ? { platformSignals: this.options.platformSignals } : {}),
+      ...(this.options.clock ? { clock: this.options.clock } : {}),
+      ...(this.options.random ? { random: this.options.random } : {}),
+      ...(this.options.stableWindowMs !== undefined ? { stableWindowMs: this.options.stableWindowMs } : {}),
+      ...(this.options.suspensionThresholdMs !== undefined ? { suspensionThresholdMs: this.options.suspensionThresholdMs } : {}),
+      ...(this.options.probeDeadlineMs !== undefined ? { probeDeadlineMs: this.options.probeDeadlineMs } : {}),
     });
     this.supervisor.onState((state) => {
-      if (state.connection !== "online" && state.transportGeneration !== this.state.transportGeneration) { this.rpc.unbind(); this.sync.invalidate(); }
+      if (state.transportGeneration !== this.state.transportGeneration) { this.rpc.unbind(); this.sync.invalidate(); }
       if (!state.error) delete this.state.error;
       this.update({ ...state, profile, pairingRequired: state.error !== undefined && ["PAIRING_REQUIRED", "AUTHENTICATION_REQUIRED", "DEVICE_REVOKED", "CREDENTIAL_EXPIRED"].includes(state.error.code) });
     });
@@ -201,6 +271,7 @@ export class FlyxClient {
     await this.rpc.hello(profile, transport.deviceId);
     assertNotAborted(signal);
     const stored = await this.store.getCredential(profile.hostId);
+    assertNotAborted(signal);
     // A Direct same-origin ticket is already backed by the HttpOnly cookie.
     // Do not rotate that browser session into script-readable device auth on
     // every reload merely because the ephemeral Relay key was lost.
@@ -230,6 +301,7 @@ export class FlyxClient {
     let verified: HostDescriptorV1;
     try { verified = await verifyHostDescriptor(descriptor, profile, this.options.allowInsecureLoopback ? { allowLoopbackHttp: true } : {}); }
     catch { throw new ClientError("IDENTITY_MISMATCH", "Host descriptor does not match its pinned identity"); }
+    assertNotAborted(signal);
     for (const advertised of verified.endpoints) {
       const known = profile.endpoints.find((candidate) => candidate.id === advertised.id);
       this.addEndpoint({ ...advertised, availability: known?.availability ?? "unknown", ...(known?.lastRttMs !== undefined ? { lastRttMs: known.lastRttMs } : {}) });
@@ -248,7 +320,8 @@ export class FlyxClient {
     this.credentialTransition = transition;
     try {
       const response = await this.rpc.request<CredentialResponse>(method, payload, crypto.randomUUID());
-      await this.saveCredential(response, key);
+      if (this.supervisor?.generation !== generation) throw abortError();
+      await this.saveCredential(response, key, generation);
       transition.accepted = true;
       return response;
     } catch (error) {
@@ -261,10 +334,12 @@ export class FlyxClient {
       throw transition.deferred ?? error;
     }
   }
-  private async saveCredential(response: CredentialResponse, key: MemoryDeviceKey): Promise<void> {
+  private async saveCredential(response: CredentialResponse, key: MemoryDeviceKey, generation: number): Promise<void> {
     if (!isRecord(response) || typeof response.deviceId !== "string" || typeof response.refreshCredential !== "string" || typeof response.expiresAt !== "string" || !Array.isArray(response.scopes)) throw new ClientError("INVALID_CREDENTIAL", "Host returned an invalid device credential");
     const credential: DeviceCredential = { hostId: this.requireProfile().hostId, deviceId: response.deviceId, refreshCredential: response.refreshCredential, expiresAt: response.expiresAt, scopes: response.scopes, storage: "short-lived-refresh" };
+    if (this.supervisor?.generation !== generation) throw abortError();
     await this.store.putCredential(credential);
+    if (this.supervisor?.generation !== generation) throw abortError();
     key.deviceId = response.deviceId;
     await this.persistProfile();
     this.update({ securityLevel: "short-lived-refresh" });
@@ -275,18 +350,26 @@ export class FlyxClient {
     this.initializing = undefined;
     this.supervisor?.stop();
     this.supervisor = undefined;
+    this.outbox = undefined;
+    this.credentialTransition = undefined;
+    this.unresolvedWrites = false;
     this.rpc.unbind();
     this.sync.invalidate();
     this.update({ connection: "closed" });
   }
   reconnect(): void { if (this.supervisor) void this.supervisor.reconnect(); else { this.started = false; void this.start(); } }
   async selectHost(hostId: string): Promise<void> {
+    this.assertHostOwner(hostId);
+    const previousLifecycle = this.lifecycle;
     const profile = await this.store.getProfile(hostId);
+    if (previousLifecycle !== this.lifecycle) throw abortError();
     if (!profile) throw new ClientError("HOST_NOT_FOUND", "Saved Host does not exist");
     this.stop();
     this.sync.reset();
     this.profile = profile;
+    const lifecycle = this.lifecycle;
     await this.store.setSelectedHost(hostId);
+    if (lifecycle !== this.lifecycle) throw abortError();
     await this.start();
   }
   async preferEndpoint(endpointId: string): Promise<void> {
@@ -298,6 +381,7 @@ export class FlyxClient {
   }
   async pair(input: string, deviceName = "Flyx browser"): Promise<void> {
     this.stop();
+    const lifecycle = this.lifecycle;
     this.sync.reset();
     this.update({ connection: "authenticating", pairingRequired: true });
     try {
@@ -307,11 +391,14 @@ export class FlyxClient {
         value = url.hash || url.searchParams.get("pair") || url.searchParams.get("pairing") || "";
       }
       const decoded = await decodeConnectionFragment(value, this.options.allowInsecureLoopback ? { allowLoopbackHttp: true } : {});
+      if (lifecycle !== this.lifecycle) throw abortError();
       let directGrant: string | undefined;
       let directUrl: string | undefined;
       if (decoded) {
         const offer = decoded.offer;
+        this.assertHostOwner(offer.hostId);
         const stored = await this.store.getProfile(offer.hostId);
+        if (lifecycle !== this.lifecycle) throw abortError();
         if (stored && !sameIdentity(stored, offer)) throw new ClientError("IDENTITY_MISMATCH", "Pairing offer changes a saved Host identity; verify the replacement on the Host first");
         this.profile = stored ?? { hostId: offer.hostId, label: "Flyx Host", hostPublicKey: offer.hostPublicKey, signingPublicKey: offer.signingPublicKey, fingerprint: offer.fingerprint, endpoints: [] };
         if (decoded.kind === "relay") {
@@ -328,7 +415,10 @@ export class FlyxClient {
         directUrl = this.options.directBaseUrl;
         if (!directUrl) throw new ClientError("PAIRING_REQUIRED", "A plain grant requires opening this Host's HTTPS app");
         const descriptor = await fetchDirectDescriptor(directUrl, this.profile, this.options);
+        if (lifecycle !== this.lifecycle) throw abortError();
+        this.assertHostOwner(descriptor.hostId);
         const stored = await this.store.getProfile(descriptor.hostId);
+        if (lifecycle !== this.lifecycle) throw abortError();
         if (stored && !sameIdentity(stored, descriptor)) throw new ClientError("IDENTITY_MISMATCH", "Host identity differs from its saved pin");
         this.profile = stored ?? this.profileFromDescriptor(descriptor);
         this.addEndpoint({ id: "direct-current-origin", kind: "direct-https", source: "manual", baseUrl: validateDirectUrl(directUrl, this.options.allowInsecureLoopback).origin, availability: "unknown" });
@@ -336,12 +426,40 @@ export class FlyxClient {
       }
       if (directGrant && directUrl) {
         await fetchDirectDescriptor(directUrl, this.requireProfile(), this.options);
+        if (lifecycle !== this.lifecycle) throw abortError();
         await pairDirectWeb(directUrl, directGrant, this.options, deviceName);
+        if (lifecycle !== this.lifecycle) throw abortError();
         this.pendingPair = undefined;
       }
+      if (lifecycle !== this.lifecycle) throw abortError();
       await this.persistProfile();
+      if (lifecycle !== this.lifecycle) throw abortError();
       await this.start();
-    } catch (error) { this.update({ connection: "failed", pairingRequired: true, error: errorInfo(error) }); throw error; }
+    } catch (error) { if (lifecycle === this.lifecycle) this.update({ connection: "failed", pairingRequired: true, error: errorInfo(error) }); throw error; }
+  }
+  /** Local deletion is available offline and does not claim remote revocation. */
+  async forgetLocalHost(hostId: string = this.requireProfile().hostId): Promise<void> {
+    const current = this.profile?.hostId === hostId || this.options.hostId === hostId;
+    if (current) { this.stop(); this.sync.reset(); this.pendingPair = undefined; }
+    const lifecycle = this.lifecycle;
+    const key = this.memoryKeys.get(hostId);
+    key?.secretKey.fill(0);
+    this.memoryKeys.delete(hostId);
+    await this.store.forgetLocalHost(hostId);
+    if (current && lifecycle === this.lifecycle && (!this.profile || this.profile.hostId === hostId)) {
+      this.profile = undefined;
+      delete this.state.profile;
+      delete this.state.securityLevel;
+      delete this.state.endpointId;
+      delete this.state.transportKind;
+      delete this.state.error;
+      this.outboxChanges.emit([]);
+      this.update({ connection: "closed", sync: "unknown", pairingRequired: true });
+    }
+  }
+  /** A separate, authenticated server mutation; never implied by local forget. */
+  revokeRemoteDevice<T = unknown>(deviceId?: string): Promise<T> {
+    return deviceId ? this.command<T>("access.revokeDevice", { deviceId }) : this.command<T>("access.revokeSelf", {});
   }
   async logout(): Promise<void> {
     const profile = this.requireProfile();
@@ -356,15 +474,18 @@ export class FlyxClient {
     this.update({ pairingRequired: true, connection: "closed" });
   }
   private async clearCurrentCredential(): Promise<void> {
-    if (!this.profile) return;
-    await this.store.deleteCredential(this.profile.hostId);
-    const key = this.memoryKeys.get(this.profile.hostId);
+    const hostId = this.profile?.hostId;
+    if (!hostId) return;
+    await this.store.deleteCredential(hostId);
+    const key = this.memoryKeys.get(hostId);
     key?.secretKey.fill(0);
-    this.memoryKeys.delete(this.profile.hostId);
+    this.memoryKeys.delete(hostId);
   }
   private async failAuthorization(error: ClientError): Promise<void> {
+    const lifecycle = this.lifecycle;
     this.locallyRevoked = true;
     await this.clearCurrentCredential();
+    if (lifecycle !== this.lifecycle) return;
     this.stop();
     this.update({ connection: "failed", pairingRequired: true, error: errorInfo(error) });
   }

@@ -9,3 +9,8 @@ export * from "./sync-engine.js";
 export * from "./transports/direct-web.js";
 export * from "./transports/relay-e2ee.js";
 export type { SocketFactory } from "./transports/websocket.js";
+export * from "./platform.js";
+export * from "./cache-store.js";
+export * from "./draft-store.js";
+export * from "./host-runtime.js";
+export * from "./host-runtime-registry.js";

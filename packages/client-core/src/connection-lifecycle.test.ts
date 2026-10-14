@@ -1,0 +1,161 @@
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { ClientError } from "./common.js";
+import { ConnectionSupervisor } from "./connection-supervisor.js";
+import { deferred, TestPlatformSignals } from "./platform-test-support.js";
+import { TestTransport } from "./test-support.js";
+import type { ConnectionEndpoint } from "./types.js";
+
+afterEach(() => vi.useRealTimers());
+const endpoint = (): ConnectionEndpoint => ({ id: "direct", kind: "direct-https", source: "tailscale", baseUrl: "https://host.example", availability: "unknown" });
+const idleTimers = { heartbeatMs: 1_000_000, probeMs: 1_000_000 };
+
+describe("platform connection lifecycle", () => {
+  it("waits offline without consuming jitter or retries and coalesces every wakeup", async () => {
+    vi.useFakeTimers();
+    const platform = new TestPlatformSignals({ online: false, visibility: "visible" });
+    const candidates = [endpoint()];
+    const opening = deferred<TestTransport>();
+    const random = vi.fn(() => 0.5);
+    const connect = vi.fn((_endpoint, generation: number) => opening.promise);
+    const supervisor = new ConnectionSupervisor({ endpoints: () => candidates, platformSignals: platform, random, connect, activate: async () => {}, ping: async () => {}, ...idleTimers });
+    await supervisor.start();
+    expect(supervisor.getState().error?.code).toBe("OFFLINE");
+    expect(connect).not.toHaveBeenCalled();
+    expect(vi.getTimerCount()).toBe(0);
+    await vi.advanceTimersByTimeAsync(300_000);
+    await supervisor.reconnect();
+    expect(random).not.toHaveBeenCalled();
+    platform.online(true); platform.pageshow(true);
+    const retry = supervisor.reconnect();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(connect).toHaveBeenCalledTimes(1);
+    opening.resolve(new TestTransport(supervisor.generation));
+    await retry;
+    expect(supervisor.getState().connection).toBe("online");
+    supervisor.stop();
+    expect(platform.observers).toBe(0);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("probes the current lease after a short background and coalesces foreground pageshow/retry", async () => {
+    vi.useFakeTimers();
+    const platform = new TestPlatformSignals();
+    const connect = vi.fn(async (_endpoint, generation: number) => new TestTransport(generation));
+    const pings: string[] = [];
+    const supervisor = new ConnectionSupervisor({ endpoints: () => [endpoint()], platformSignals: platform, connect, activate: async () => {}, ping: async (nonce) => { pings.push(nonce); }, suspensionThresholdMs: 2_000, probeDeadlineMs: 50, ...idleTimers });
+    await supervisor.start();
+    const generation = supervisor.generation;
+    platform.visibility("hidden");
+    await vi.advanceTimersByTimeAsync(1_000);
+    platform.visibility("visible"); platform.pageshow(true);
+    const retry = supervisor.reconnect();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(pings).toHaveLength(1);
+    expect(connect).toHaveBeenCalledTimes(1);
+    supervisor.receivedPong(pings[0]!);
+    await retry;
+    expect(supervisor.generation).toBe(generation);
+    expect(supervisor.getState().connection).toBe("online");
+    supervisor.stop();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("replaces a long-suspended generation once and ignores old callbacks", async () => {
+    vi.useFakeTimers();
+    const platform = new TestPlatformSignals();
+    const transports: TestTransport[] = [];
+    const supervisor = new ConnectionSupervisor({ endpoints: () => [endpoint()], platformSignals: platform, connect: async (_endpoint, generation) => { const transport = new TestTransport(generation); transports.push(transport); return transport; }, activate: async () => {}, ping: async () => {}, suspensionThresholdMs: 2_000, ...idleTimers });
+    await supervisor.start();
+    const oldGeneration = supervisor.generation;
+    platform.visibility("hidden");
+    await vi.advanceTimersByTimeAsync(2_001);
+    platform.visibility("visible"); platform.pageshow(true);
+    await supervisor.reconnect();
+    expect(transports).toHaveLength(2);
+    expect(supervisor.generation).toBeGreaterThan(oldGeneration);
+    const generation = supervisor.generation;
+    transports[0]!.disconnect();
+    expect(supervisor.generation).toBe(generation);
+    expect(transports[0]!.closes).toContainEqual({ code: 1000, reason: "CONNECTION_REPLACED" });
+    supervisor.stop();
+  });
+
+  it("replaces a short-resume lease only after its probe deadline", async () => {
+    vi.useFakeTimers();
+    const platform = new TestPlatformSignals();
+    const connect = vi.fn(async (_endpoint, generation: number) => new TestTransport(generation));
+    const pings: string[] = [];
+    const supervisor = new ConnectionSupervisor({ endpoints: () => [endpoint()], platformSignals: platform, connect, activate: async () => {}, ping: async (nonce) => { pings.push(nonce); }, probeDeadlineMs: 50, ...idleTimers });
+    await supervisor.start();
+    platform.visibility("hidden"); await vi.advanceTimersByTimeAsync(10);
+    platform.visibility("visible"); platform.pageshow();
+    await vi.advanceTimersByTimeAsync(49);
+    expect(connect).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(connect).toHaveBeenCalledTimes(2);
+    const generation = supervisor.generation;
+    supervisor.receivedPong(pings[0]!);
+    expect(supervisor.generation).toBe(generation);
+    supervisor.stop();
+  });
+
+  it("keeps flapping backoff until 30 seconds of foreground stability", async () => {
+    vi.useFakeTimers();
+    const platform = new TestPlatformSignals();
+    let reachable = false;
+    const transports: TestTransport[] = [];
+    const connect = vi.fn(async (_endpoint, generation: number) => {
+      if (!reachable) throw new ClientError("NETWORK_FAILED", "unreachable");
+      const transport = new TestTransport(generation); transports.push(transport); return transport;
+    });
+    const supervisor = new ConnectionSupervisor({ endpoints: () => [endpoint()], platformSignals: platform, random: () => 0.5, connect, activate: async () => {}, ping: async () => {}, ...idleTimers });
+    await supervisor.start();
+    reachable = true;
+    await vi.advanceTimersByTimeAsync(250);
+    expect(connect).toHaveBeenCalledTimes(2);
+    reachable = false;
+    transports[0]!.disconnect();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(connect).toHaveBeenCalledTimes(3);
+    reachable = true;
+    await vi.advanceTimersByTimeAsync(999);
+    expect(connect).toHaveBeenCalledTimes(3);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(connect).toHaveBeenCalledTimes(4);
+    await vi.advanceTimersByTimeAsync(30_000);
+    reachable = false;
+    transports[1]!.disconnect();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(connect).toHaveBeenCalledTimes(5);
+    reachable = true;
+    await vi.advanceTimersByTimeAsync(249);
+    expect(connect).toHaveBeenCalledTimes(5);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(connect).toHaveBeenCalledTimes(6);
+    supervisor.stop();
+  });
+
+  it("lets online replace an aborted pending connect and fences its late result", async () => {
+    vi.useFakeTimers();
+    const platform = new TestPlatformSignals();
+    const old = deferred<TestTransport>();
+    let calls = 0;
+    const activate = vi.fn(async () => {});
+    const supervisor = new ConnectionSupervisor({ endpoints: () => [endpoint()], platformSignals: platform, connect: async (_endpoint, generation) => ++calls === 1 ? old.promise : new TestTransport(generation), activate, ping: async () => {}, ...idleTimers });
+    const started = supervisor.start();
+    await vi.advanceTimersByTimeAsync(0);
+    const oldGeneration = supervisor.generation;
+    platform.online(false); platform.online(true);
+    await supervisor.reconnect();
+    const generation = supervisor.generation;
+    const stale = new TestTransport(oldGeneration);
+    old.resolve(stale);
+    await started;
+    expect(calls).toBe(2);
+    expect(activate).toHaveBeenCalledTimes(1);
+    expect(stale.closes).toContainEqual({ code: 1000, reason: "CONNECTION_REPLACED" });
+    expect(supervisor.generation).toBe(generation);
+    expect(supervisor.getState().connection).toBe("online");
+    supervisor.stop();
+  });
+});

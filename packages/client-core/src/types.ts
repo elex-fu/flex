@@ -75,6 +75,32 @@ export interface PendingCommand {
   dispatchState?: "not_dispatched" | "possibly_dispatched";
 }
 
+export interface DraftKey { hostId: string; sessionId: string }
+export interface ClientDraft extends DraftKey { text: string; updatedAt: number; clientMessageId?: string }
+
+/** These identity fields are all part of the on-disk namespace. */
+export interface ReplicaCacheKey {
+  hostId: string;
+  fingerprint: string;
+  sessionId: string;
+  epoch: string;
+  projectorVersion: string | number;
+}
+export interface ReplicaCacheRecord<T = unknown> extends ReplicaCacheKey {
+  revision: number;
+  value: T;
+  cachedAt: number;
+  expiresAt: number;
+  byteLength: number;
+}
+export interface ContentMetadataKey extends ReplicaCacheKey { contentId: string }
+export interface ContentMetadata extends ContentMetadataKey {
+  hash: string;
+  byteLength: number;
+  cachedAt: number;
+  expiresAt: number;
+}
+
 export interface ClientStore {
   listProfiles(): Promise<HostProfile[]>;
   getProfile(hostId: string): Promise<HostProfile | undefined>;
@@ -87,4 +113,20 @@ export interface ClientStore {
   listCommands(hostId: string): Promise<PendingCommand[]>;
   getCommand(commandId: string): Promise<PendingCommand | undefined>;
   putCommand(command: PendingCommand): Promise<void>;
+  getDraft(key: DraftKey): Promise<ClientDraft | undefined>;
+  putDraft(draft: ClientDraft): Promise<void>;
+  deleteDraft(key: DraftKey): Promise<void>;
+  /** The command is durable before the draft is removed. A newer draft is retained. */
+  putCommandAndClearDraft(command: PendingCommand, key: DraftKey, expectedUpdatedAt?: number): Promise<void>;
+  getReplicaCache(key: ReplicaCacheKey): Promise<ReplicaCacheRecord | undefined>;
+  listReplicaCaches(hostId: string): Promise<ReplicaCacheRecord[]>;
+  /** Refuses a lower revision in the same namespace, in the write transaction. */
+  putReplicaCache(record: ReplicaCacheRecord): Promise<boolean>;
+  deleteReplicaCache(key: ReplicaCacheKey): Promise<void>;
+  getContentMetadata(key: ContentMetadataKey): Promise<ContentMetadata | undefined>;
+  listContentMetadata(hostId: string): Promise<ContentMetadata[]>;
+  putContentMetadata(metadata: ContentMetadata): Promise<void>;
+  deleteContentMetadata(key: ContentMetadataKey): Promise<void>;
+  /** One transaction removes all locally owned data, including selectedHost. */
+  forgetLocalHost(hostId: string): Promise<void>;
 }

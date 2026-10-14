@@ -22,7 +22,7 @@ describe("IndexedDB durable state", () => {
     expect((await resumed.getCredential(profile.hostId))?.refreshCredential).toBe("bounded-token");
     expect((await resumed.listCommands(profile.hostId))[0]?.state).toBe("receipt_unknown");
     const database = await new Promise<IDBDatabase>((resolve) => { const request = factory.open("restart"); request.onsuccess = () => resolve(request.result); });
-    expect([...database.objectStoreNames]).toEqual(["commands", "credentials", "meta", "profiles"]);
+    expect([...database.objectStoreNames]).toEqual(["commands", "contentMetadata", "credentials", "drafts", "meta", "profiles", "replicaCache"]);
     database.close();
     await resumed.close();
   });

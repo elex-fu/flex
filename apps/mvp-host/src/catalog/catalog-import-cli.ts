@@ -16,6 +16,24 @@ export const CatalogImportCliRequestSchema = z.strictObject({
     approvedSourceDigest: z.string().regex(/^[a-f0-9]{64}$/).optional(),
 });
 export type CatalogImportCliRequest = z.input<typeof CatalogImportCliRequestSchema>;
+export type CatalogImportCliCommand = {
+    kind: "catalog-import";
+    backupDirectory: string;
+    request: CatalogImportCliRequest;
+};
+export const CATALOG_IMPORT_CLI_USAGE = "catalog dry-run <sourceDatabasePath> <backupDirectory> | catalog import <sourceDatabasePath> <backupDirectory> <approvedSourceDigest>";
+/** Local argv only. Workspace and Provider mappings come from Host configuration. */
+export function parseCatalogImportCommand(args: readonly string[]): CatalogImportCliCommand | undefined {
+    if (args[0] !== "catalog")
+        return undefined;
+    const mode = args[1];
+    if (mode !== "dry-run" && mode !== "import" || args.length !== (mode === "dry-run" ? 4 : 5) || args.slice(2).some((value) => !value || value.includes("\0")))
+        throw new Error(`Usage: ${CATALOG_IMPORT_CLI_USAGE}`);
+    const request = CatalogImportCliRequestSchema.safeParse({ mode, sourceDatabasePath: args[2], ...(mode === "import" ? { approvedSourceDigest: args[4] } : {}) });
+    if (!request.success)
+        throw new Error(`Usage: ${CATALOG_IMPORT_CLI_USAGE}`);
+    return { kind: "catalog-import", backupDirectory: args[3]!, request: request.data };
+}
 export type CatalogImportCliResult = {
     mode: "dry-run";
     plan: CatalogImportPlan;

@@ -5,7 +5,7 @@ import { assertHostOwner } from "../lifecycle/host-owner.js";
 import type { SqliteStore, CommandReceiptRow } from "../storage/db.js";
 import { CatalogError, CatalogStore, publicSessionSummary, type CatalogCommit, type CatalogSession, type ProviderVerification } from "../storage/catalog-store.js";
 import { validateCatalogSchema } from "../storage/migrations/007-catalog.js";
-import { registerConfiguredCatalog, type LocalCatalogConfiguration } from "../session/configured-catalog.js";
+import { registerConfiguredCatalog, LocalCatalogConfigurationSchema, type LocalCatalogConfiguration } from "../session/configured-catalog.js";
 import { SessionRegistry, type SessionRuntimeContext, type RuntimeCloseReport, type ResolvedSession } from "../session/session-registry.js";
 import { LegacySessionFacade } from "../session/legacy-session-facade.js";
 import { SessionOrchestrator, OrchestratorError, type OrchestratorOptions, type StartTurnResponse, type ControlResponse } from "../session/orchestrator.js";
@@ -408,7 +408,7 @@ export class HostCatalog {
                 this.assertActor(context.subjectId, "session:read");
                 const input = z.strictObject({ commandId: z.string().min(1).max(128) }).parse(frame.payload);
                 const receipt = this.store.getCommandReceipt(context.subjectId, input.commandId);
-                if (!receipt)
+                if (!receipt || receipt.method.startsWith("access."))
                     return handled({ found: false, commandId: input.commandId });
                 if (receipt.targetSessionId)
                     this.target(context, receipt.targetSessionId, "session:read");
@@ -561,17 +561,29 @@ export async function createHostCatalogBindings(options: HostCatalogOptions): Pr
     options.owner.assertStorePath(options.store.db.name);
     if (options.owner.recoveryOnly || options.owner.mode === "maintenance")
         throw new CatalogError("HOST_RECOVERY_ONLY");
+    options.store.assertWriterOwner();
     if (!options.store.db.prepare("SELECT 1 FROM schema_migrations WHERE version=7").get())
         throw new CatalogError("CATALOG_SCHEMA_UNAVAILABLE");
     validateCatalogSchema(options.store.db);
+    // Central 007 backfills pre-existing Sessions. A raw legacy insert after
+    // that migration has no trusted Workspace/Provider binding to adopt here.
+    if (options.store.db.prepare("SELECT 1 FROM sessions s LEFT JOIN session_catalog c ON c.session_id=s.id WHERE c.session_id IS NULL LIMIT 1").get())
+        throw new CatalogError("CATALOG_SESSION_BINDING_MISSING", "A Session has no catalog binding; reconcile it during offline maintenance");
+    const configuration = LocalCatalogConfigurationSchema.parse(options.configuration);
+    const hasSessions = Boolean(options.store.db.prepare("SELECT 1 FROM sessions LIMIT 1").get());
     if (openCatalogStores.has(options.store))
         throw new CatalogError("CATALOG_ALREADY_OPEN");
     openCatalogStores.add(options.store);
     const catalog = new CatalogStore(options.store, { ...(options.restoreWriteReady ? { restoreWriteReady: options.restoreWriteReady } : {}) });
     try {
-        const configured = await registerConfiguredCatalog(catalog, options.owner, options.configuration, { ...(options.privateDirectories ? { privateDirectories: options.privateDirectories } : {}), ...(options.readOnlyGit ? { readOnlyGit: options.readOnlyGit } : {}) });
+        const legacyDefault = catalog.legacyDefaultSessionId();
+        if (!legacyDefault && hasSessions && !configuration.legacyDefaultSessionId)
+            throw new CatalogError("LEGACY_DEFAULT_REQUIRED", "Choose the existing default Session in local Host configuration");
+        if (legacyDefault && configuration.legacyDefaultSessionId && legacyDefault !== configuration.legacyDefaultSessionId)
+            throw new CatalogError("LEGACY_DEFAULT_CONFLICT");
+        const configured = await registerConfiguredCatalog(catalog, options.owner, configuration, { ...(options.privateDirectories ? { privateDirectories: options.privateDirectories } : {}), ...(options.readOnlyGit ? { readOnlyGit: options.readOnlyGit } : {}) });
         const initial = options.initialLegacySession;
-        if (!catalog.legacyDefaultSessionId() && initial)
+        if (!catalog.legacyDefaultSessionId() && !hasSessions && initial)
             options.store.db.transaction(() => { const input = { ...initial, title: initial.title ?? "Untitled session" }; const created = catalog.create({ authSubjectId: "host-bootstrap", commandId: "catalog-legacy-default" }, input, { workspace: configured.workspaces.require(input.workspaceId), provider: configured.providers.require(input.providerInstanceId) }); catalog.setLegacyDefaultOnce(created.summary.sessionId); })();
         if (!catalog.legacyDefaultSessionId())
             throw new CatalogError("LEGACY_DEFAULT_REQUIRED");

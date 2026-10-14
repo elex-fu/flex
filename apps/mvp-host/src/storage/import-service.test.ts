@@ -1,13 +1,14 @@
 import Database from "better-sqlite3";
 import {randomUUID,createHash} from "node:crypto";
 import {execFileSync} from "node:child_process";
-import {existsSync,mkdirSync,mkdtempSync,readFileSync,realpathSync,rmSync} from "node:fs";
+import {existsSync,mkdirSync,mkdtempSync,readFileSync,realpathSync,rmSync,writeFileSync} from "node:fs";
 import {tmpdir} from "node:os";
 import {join} from "node:path";
 import {afterEach,describe,expect,it,vi} from "vitest";
 import {HostOwnerLock,type HostOwnerHandle} from "../lifecycle/host-owner.js";
-import {openOwned,openForMaintenance} from "./open-store.js";
-import type {SqliteStore} from "./db.js";
+import {openForMaintenance} from "./open-store.js";
+import {SqliteStore} from "./db.js";
+import {FROZEN_V6_SCHEMA} from "../test-support/frozen-v6-schema.js";
 import {applyCatalogMigration} from "./migrations/007-catalog.js";
 import {CatalogStore} from "./catalog-store.js";
 import {CatalogImportService} from "./import-service.js";
@@ -30,13 +31,16 @@ async function fixture() {
   const providers=new ProviderInstanceRegistry(catalog);for(const provider of ["claude","codex"] as const)providers.registerLocal({providerInstanceId:`instance-${provider}`,provider,executable:process.execPath});
   const service=new CatalogImportService(catalog,workspaces,providers,{owner,backupDirectory:join(root,"backups")});
   const source=(name="source",provider:"claude"|"codex"="claude",sessionId=randomUUID())=>{
-    const options=ownerOptions(name);const sourceOwner=HostOwnerLock.acquire(options);mkdirSync(join(root,name),{recursive:true});const sourceStore=openOwned({databasePath:sourceOwner.databasePath,owner:sourceOwner});sourceStore.setHostIdentityMirror(mirror);
+    const options=ownerOptions(name);const sourceOwner=HostOwnerLock.acquire(options);mkdirSync(join(root,name),{recursive:true});const sourceStore=new SqliteStore(":memory:",{mode:"test-fixture",fixtureSchema:FROZEN_V6_SCHEMA});sourceStore.setHostIdentityMirror(mirror);
     const session=sourceStore.createSession(checkout,provider,sessionId);sourceStore.db.prepare("UPDATE sessions SET provider_session_id=? WHERE id=?").run(`native-${name}`,sessionId);
     sourceStore.commitEvent(session.id,"assistant.message",{text:`history-${provider}`},{timeline:{itemId:`item-${name}`,kind:"assistant_message",status:"completed",content:{text:`history-${provider}`}}});
     sourceStore.putCommandReceipt({authSubjectId:`secondary-actor-${name}`,commandId:`historical-${name}`,method:"session.startTurn",requestHash:"original-legacy-hash",targetSessionId:session.id,requestFormatVersion:1,state:"completed",response:{status:"completed",original:true}});
     sourceStore.createAuthSession("private-secondary-auth","2099-01-01",`secondary-auth-${name}`);sourceStore.createPairingGrant("private-secondary-grant","2099-01-01",`secondary-grant-${name}`,{hostId:mirror.hostId,scopes:["session:write"]});
     sourceStore.createDevice({id:`secondary-actor-${name}`,hostId:mirror.hostId,displayName:"Secondary device",platform:"test",credentialKind:"browser-session",credentialRevision:1,scopes:["session:read","session:write"],createdAt:new Date().toISOString()});
-    let closed=false;const close=()=>{if(!closed){closed=true;sourceStore.close();sourceOwner.release();}};cleanups.push(close);
+    // Keep this source on its declared legacy v6 shape. Serializing the
+    // pinned fixture also captures any unresolved Turn added before close.
+    writeFileSync(sourceOwner.databasePath,sourceStore.db.serialize());
+    let closed=false;const close=()=>{if(!closed){closed=true;writeFileSync(sourceOwner.databasePath,sourceStore.db.serialize());sourceStore.close();sourceOwner.release();}};cleanups.push(close);
     return {options,owner:sourceOwner,store:sourceStore,sessionId:session.id,close};
   };
   const input=(path:string)=>({sourceDatabasePath:path,legacyWorkspaceByCanonicalRoot:{[checkout]:"workspace-one"},legacyProviderInstances:{claude:"instance-claude",codex:"instance-codex"}});
@@ -81,7 +85,7 @@ describe("offline same-Host catalog import",()=>{
   });
   it("revalidates source facts after dry-run and before any target publication",async()=>{
     const f=await fixture();const source=f.source();source.close();const plan=f.service.dryRun(f.input(source.options.databasePath));
-    const owner=HostOwnerLock.acquire(source.options);const writer=openOwned({databasePath:owner.databasePath,owner});writer.commitEvent(source.sessionId,"late.fact",{});writer.close();owner.release();
+    const owner=HostOwnerLock.acquire(source.options);const writer=new Database(owner.databasePath);writer.transaction(()=>{const at=new Date().toISOString();writer.prepare("INSERT INTO session_events(id,session_id,sequence,type,payload_json,occurred_at) VALUES(?,?,2,'late.fact','{}',?)").run(randomUUID(),source.sessionId,at);writer.prepare("UPDATE sessions SET head_sequence=2,revision=revision+1,updated_at=? WHERE id=?").run(at,source.sessionId);})();writer.close();owner.release();
     await expect(f.service.import(plan)).rejects.toThrow("Source facts changed after dry-run");
     expect(f.store.getSession(source.sessionId)).toBeUndefined();expect(f.store.db.prepare("SELECT COUNT(*) AS count FROM catalog_import_manifests").get()).toEqual({count:0});
   });

@@ -6,6 +6,8 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { BOUNDED_CONTENT_CAPABILITY, SESSION_CATALOG_CAPABILITY, TIMELINE_PROJECTION_CAPABILITY, CatalogMutationResponseSchema, SessionSnapshotV2Schema, type SessionEvent, type CatalogMutationResponse } from "@flyx/mvp-protocol";
 import { createTestHostOwner } from "../lifecycle/host-owner.js";
 import { openOwned } from "../storage/open-store.js";
+import { SqliteStore } from "../storage/db.js";
+import { FROZEN_V6_SCHEMA } from "../test-support/frozen-v6-schema.js";
 import { applyCatalogMigration } from "../storage/migrations/007-catalog.js";
 import { applyInteractionMigration } from "../storage/migrations/008-interactions.js";
 import { CommandEngine, hashCommandRequest } from "../orchestration/command-engine.js";
@@ -89,6 +91,12 @@ async function fixture(options: Partial<HostCatalogOptions> = {}, withInteractio
     return { root, checkout, providerRoot, host, owner, store, configuration, runtimeFactory, context, rpc, create };
 }
 describe("production Host catalog binding", () => {
+    it("keeps access command receipts private when called directly through the catalog port", async () => {
+        const f = await fixture();
+        f.store.putCommandReceipt({ authSubjectId: "reader", commandId: "access-private", method: "access.deviceRevoke", requestHash: "private-hash", state: "completed", response: { credential: "private-response" } });
+        expect(await f.rpc("command.getReceipt", { commandId: "access-private" }, undefined, f.context("reader")))
+            .toEqual({ found: false, commandId: "access-private" });
+    });
     it("rejects foreign View interactions and applies restore/policy gates before selecting a response port", async () => {
         const foreign={interactionId:"foreign-interaction",sessionId:"foreign-session",turnId:"foreign-turn",kind:"approval" as const,version:1,status:"pending" as const,deliveryState:"none" as const,evidenceKind:"native_request" as const,request:{toolName:"Edit"},allowedActions:["deny" as const],createdAt:new Date().toISOString(),expiresAt:"2099-01-01T00:00:00.000Z",responseAvailable:true};
         const response=vi.fn(()=>({status:"accepted"}));
@@ -338,7 +346,7 @@ describe("production Host catalog binding", () => {
     });
     it("does not advertise or install007 until the central runner declares its validated shape", async () => {
         const owner = createTestHostOwner();
-        const store = openOwned({ databasePath: ":memory:", owner });
+        const store = new SqliteStore(":memory:", { mode: "test-fixture", fixtureSchema: FROZEN_V6_SCHEMA });
         cleanup.push(() => { store.close(); owner.release(); });
         const before = store.db.prepare("SELECT name,sql FROM sqlite_master ORDER BY name").all();
         await expect(createHostCatalogBindings({ owner, store, configuration: {} })).rejects.toMatchObject({ code: "CATALOG_SCHEMA_UNAVAILABLE" });

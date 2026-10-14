@@ -128,3 +128,44 @@ describe("durable command outbox", () => {
     expect((await store.listCommands("host-a"))).toHaveLength(1);
   });
 });
+
+
+describe("outbox directly selects access receipts", () => {
+  it("uses actor-scoped access.getReceipt without a sender bridge and coalesces pending queries", async () => {
+    const store = new MemoryClientStore(); await store.putCommand({ commandId: "access-one", hostId: "host-a", method: "access.revokeDevice", payloadHash: "hash", payload: { deviceId: "other" }, createdAt: "now", state: "accepted", dispatchState: "possibly_dispatched" });
+    const methods: string[] = []; let resolve!: (value: unknown) => void;
+    const outbox = new CommandOutbox(store, "host-a", async (method, payload, commandId) => { methods.push(method); expect(payload).toEqual({ commandId: "access-one" }); expect(commandId).toBeUndefined(); return new Promise((done) => { resolve = done; }); }, { supportsAccessReceipts: () => true });
+    const first = outbox.queryReceipt("access-one"), second = outbox.queryReceipt("access-one"); await expect.poll(() => methods.length).toBe(1); resolve({ found: true, commandId: "access-one", method: "access.revokeDevice", state: "completed", response: { revoked: true } }); await Promise.all([first, second]); expect(methods).toEqual(["access.getReceipt"]); expect((await store.getCommand("access-one"))?.state).toBe("terminal");
+  });
+  it("does not convert missing capability into queried absence or dispatch", async () => {
+    const store = new MemoryClientStore(); const stored = { commandId: "queued-access", hostId: "host-a", method: "access.revokeDevice", payloadHash: "hash", payload: {}, createdAt: "now", state: "queued" as const, dispatchState: "not_dispatched" as const }; await store.putCommand(stored);
+    let calls = 0; const outbox = new CommandOutbox(store, "host-a", async () => { calls++; }, { supportsAccessReceipts: () => false }); await outbox.reconcile(); await expect(outbox.queryReceipt("queued-access")).rejects.toMatchObject({ code: "CAPABILITY_UNSUPPORTED" }); await expect(outbox.retry("queued-access")).rejects.toMatchObject({ code: "REVIEW_REQUIRED" }); expect(calls).toBe(0); expect(await store.getCommand("queued-access")).toEqual(stored);
+  });
+});
+
+
+describe("strict catalog mutation receipts", () => {
+  it("uses the bound receipt state instead of Session status", async () => {
+    const store = new MemoryClientStore(); let state = "accepted", calls = 0;
+    const outbox = new CommandOutbox(store, "host-a", async (_method, _payload, commandId) => { calls++; return { session: { sessionId: "new-session", status: "active" }, receipt: { commandId, state } }; });
+    await outbox.execute("session.createNew", { workspaceId: "workspace-a", providerInstanceId: "provider-a" }, "create-a"); expect((await store.getCommand("create-a"))?.state).toBe("accepted");
+    for (const terminal of ["completed", "failed", "cancelled"]) {
+      state = terminal;
+      await outbox.execute("session.rename", { sessionId: "session-b", title: "Title" }, `rename-${terminal}`);
+      expect(await store.getCommand(`rename-${terminal}`)).toMatchObject({ state: "terminal", dispatchState: "possibly_dispatched", result: { receipt: { state: terminal } } });
+      await outbox.queryReceipt(`rename-${terminal}`);
+    }
+    state = "outcome_unknown"; await expect(outbox.execute("session.closeRuntime", { sessionId: "session-b" }, "close-a")).rejects.toMatchObject({ code: "OUTCOME_UNKNOWN" }); expect(await store.getCommand("close-a")).toMatchObject({ state: "receipt_unknown", outcomeUnknown: true, dispatchState: "possibly_dispatched" }); expect(calls).toBe(5);
+  });
+  it("retains possible dispatch after a missing, foreign, or malformed receipt and only permits read-only outcome review", async () => {
+    for (const receipt of [undefined, { commandId: "other", state: "completed" }, { commandId: "archive-a", state: "active" }, { commandId: "archive-a" }]) {
+      const store = new MemoryClientStore(); const methods: string[] = [];
+      const outbox = new CommandOutbox(store, "host-a", async (method) => { methods.push(method); if (method === "command.getReceipt") return { found: false }; return { session: { sessionId: "session-a", status: "archived" }, ...(receipt ? { receipt } : {}) }; });
+      await expect(outbox.execute("session.archive", { sessionId: "session-a" }, "archive-a")).rejects.toMatchObject({ code: "INVALID_RPC_RESPONSE" }); expect(await store.getCommand("archive-a")).toMatchObject({ state: "receipt_unknown", dispatchState: "possibly_dispatched" });
+      await expect(outbox.retry("archive-a")).rejects.toMatchObject({ code: "OUTCOME_UNKNOWN" }); expect(methods).toEqual(["session.archive", "command.getReceipt"]);
+    }
+  });
+  it("keeps existing non-catalog response contracts unchanged", async () => {
+    const store = new MemoryClientStore(); await new CommandOutbox(store, "host-a", async () => ({ status: "completed" })).execute("session.startTurn", { prompt: "task" }, "start-old"); expect((await store.getCommand("start-old"))?.state).toBe("accepted");
+  });
+});

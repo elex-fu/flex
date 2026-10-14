@@ -69,6 +69,22 @@ function sameIdentity(a: HostProfile, b: Pick<HostProfile, "hostId" | "hostPubli
   return a.hostId === b.hostId && a.hostPublicKey === b.hostPublicKey && a.signingPublicKey === b.signingPublicKey && a.fingerprint === b.fingerprint;
 }
 function endpointAddress(endpoint: ConnectionEndpoint): string { return endpoint.kind === "direct-https" ? endpoint.baseUrl : `${endpoint.relayUrl}/${endpoint.routeId}`; }
+/** Catalog and explicit legacy facades name the same public Session differently.
+ * Validate both forms before choosing one; an ambiguous ID is never a fallback. */
+function snapshotSessionId(snapshot: unknown, expectedSessionId?: string): string {
+  if (!isRecord(snapshot) || !isRecord(snapshot.session)) throw new ClientError("INVALID_SNAPSHOT", "Host did not return a Session identity");
+  const session = snapshot.session;
+  const catalogId = session.sessionId, legacyId = session.id;
+  const valid = (value: unknown): value is string => typeof value === "string" && value.length > 0;
+  if (catalogId !== undefined && !valid(catalogId) || legacyId !== undefined && !valid(legacyId) || !valid(catalogId) && !valid(legacyId)) throw new ClientError("INVALID_SNAPSHOT", "Host returned an invalid Session identity");
+  if (valid(catalogId) && valid(legacyId) && catalogId !== legacyId) throw new ClientError("SESSION_IDENTITY_MISMATCH", "Host returned ambiguous Session identities");
+  const sessionId = valid(catalogId) ? catalogId : legacyId as string;
+  if (expectedSessionId !== undefined && sessionId !== expectedSessionId) throw new ClientError("SESSION_IDENTITY_MISMATCH", "Snapshot belongs to another selected Session");
+  const turn = isRecord(snapshot.activeTurn) ? snapshot.activeTurn : undefined;
+  if (turn?.sessionId !== undefined && turn.sessionId !== sessionId) throw new ClientError("SESSION_IDENTITY_MISMATCH", "Active Turn belongs to another Session");
+  return sessionId;
+}
+
 
 export type CachedSessionReplica = Pick<SessionReplicaState, "epoch" | "projectorVersion" | "sourceCursor" | "items" | "loadedWindow">;
 
@@ -119,17 +135,24 @@ export class FlyxClient {
     this.reconciler = new TimelineReconciler(this.replica, { api: this.rpc, onBegin: (fence) => this.loadCachedReplica(fence), isCurrentTransport: (generation) => this.supervisor?.generation === generation && this.rpc.generation === generation });
     this.sync.onState((sync) => { if (this.getProjectionMode() === "legacy") { if (sync === "synced") delete this.state.error; this.update({ sync }); } });
     this.sync.onSnapshot((snapshot) => {
-      if (this.getProjectionMode() === "legacy" && isRecord(snapshot) && isRecord(snapshot.session) && typeof snapshot.session.id === "string") this.reconciler.selectLegacy(snapshot.session.id, this.rpc.generation);
-      this.noteReceiptAuthority(snapshot, isRecord(snapshot) && Array.isArray(snapshot.pendingApprovals) ? snapshot.pendingApprovals : []);
+      const sessionId = snapshotSessionId(snapshot, this.selectedSessionId);
+      if (this.getProjectionMode() === "legacy") { this.selectedSessionId = sessionId; this.reconciler.selectLegacy(sessionId, this.rpc.generation); }
+      this.noteReceiptAuthority(snapshot, isRecord(snapshot) && Array.isArray(snapshot.pendingApprovals) ? snapshot.pendingApprovals : [], sessionId);
       this.snapshots.emit(snapshot);
     });
     this.replica.onChange((state) => {
+      if (state.mode === "canonical" && state.interactionsAuthoritative && state.snapshot !== undefined) {
+        // Validate before caching, publishing authority or waking receipt review.
+        // Throwing lets the reconciler fail this exact Replica fence.
+        if (!state.sessionId || state.sessionId !== this.selectedSessionId || state.transportGeneration !== this.rpc.generation) throw new ClientError("SESSION_IDENTITY_MISMATCH", "Replica authority belongs to another selection");
+        snapshotSessionId(state.snapshot, state.sessionId);
+      }
       this.persistReplicaCache(state);
       if (this.getProjectionMode() !== "canonical" || state.mode !== "canonical") return;
       if (state.sync === "synced" && !state.error) delete this.state.error;
       this.update({ sync: state.sync, ...(state.error ? { error: state.error } : {}) });
       if (state.interactionsAuthoritative && state.snapshot !== undefined) {
-        this.noteReceiptAuthority(state.snapshot, state.interactions?.items ?? []);
+        this.noteReceiptAuthority(state.snapshot, state.interactions?.items ?? [], state.sessionId);
         this.snapshots.emit(state.snapshot);
       }
     });
@@ -161,6 +184,7 @@ export class FlyxClient {
   getCacheError(): { code: string; message: string } | undefined { return this.cacheError ? { ...this.cacheError } : undefined; }
   onCacheError(handler: (error: { code: string; message: string } | undefined) => void): Unsubscribe { handler(this.getCacheError()); return this.cacheErrors.subscribe(handler); }
   getNegotiatedHello(): ServerHelloV2 | undefined { return this.rpc.getNegotiatedHello(); }
+  supportsCapability(capability: string): boolean { return this.rpc.supports(capability); }
   getProjectionMode(): ReplicaMode { return this.rpc.supports(TIMELINE_PROJECTION_CAPABILITY) && this.rpc.supports(BOUNDED_CONTENT_CAPABILITY) ? "canonical" : "legacy"; }
   async selectSession(sessionId: string): Promise<void> {
     if (!sessionId || this.getProjectionMode() !== "canonical") throw new ClientError("CAPABILITY_UNSUPPORTED", "Host does not support session view selection");
@@ -170,8 +194,9 @@ export class FlyxClient {
   retrySynchronization(): Promise<void> {
     if (!this.supervisor || !this.rpc.getNegotiatedHello()) return Promise.reject(new ClientError("NOT_CONNECTED", "Host has not finished secure negotiation"));
     const generation = this.rpc.generation;
+    const revision = this.domainRevision + 1;
     const work = this.synchronizeDomain(generation).catch((error: unknown) => {
-      if (this.rpc.generation === generation) this.update({ sync: "resync_required", error: errorInfo(error) });
+      if (this.rpc.generation === generation && this.domainRevision === revision) this.update({ sync: "resync_required", error: errorInfo(error) });
       throw error;
     });
     this.domainWork = work;
@@ -183,12 +208,16 @@ export class FlyxClient {
   onReset(handler: () => void): Unsubscribe { return this.sync.onReset(handler); }
   onOutbox(handler: (commands: PendingCommand[]) => void): Unsubscribe { return this.outboxChanges.subscribe(handler); }
   private update(patch: Partial<ClientState>): void { this.state = { ...this.state, ...patch }; this.states.emit(this.getState()); this.scheduleReceiptReview(); }
-  private noteReceiptAuthority(snapshot: unknown, interactions: unknown[]): void {
-    if (!isRecord(snapshot) || !isRecord(snapshot.session) || typeof snapshot.session.id !== "string") return;
+  private noteReceiptAuthority(snapshot: unknown, interactions: unknown[], expectedSessionId: string | undefined): void {
+    const sessionId = snapshotSessionId(snapshot, expectedSessionId);
+    if (!isRecord(snapshot) || !isRecord(snapshot.session)) return;
     const turn = isRecord(snapshot.activeTurn) ? snapshot.activeTurn : undefined;
     // Sequence counters and body deltas do not change an operation's outcome.
     const directory = interactions.filter(isRecord).map((item) => [item.id ?? item.interactionId ?? item.approvalId, item.version ?? item.revision, item.status, item.deliveryState]).map((item) => JSON.stringify(item)).sort();
-    this.authoritativeReceiptSignature = JSON.stringify([snapshot.session.id, snapshot.session.activityState, turn?.id, turn?.status, directory]);
+    const metadata = snapshot.session.sessionId === undefined ? undefined : [snapshot.session.title, snapshot.session.status, snapshot.session.residency, snapshot.session.nativeSessionAvailable];
+    // V2 revision also advances for body events; only meaningful catalog facts
+    // join the wakeup key, never revision/headSequence or streamed content.
+    this.authoritativeReceiptSignature = JSON.stringify([sessionId, snapshot.session.activityState, turn?.id, turn?.status, directory, metadata]);
     this.scheduleReceiptReview();
   }
   private scheduleReceiptReview(force = false): void {
@@ -207,6 +236,7 @@ export class FlyxClient {
         for (const command of await outbox.list()) {
           if (!current()) return;
           if (command.state !== "accepted" || this.receiptChecks.get(command.commandId) === signature) continue;
+          if (command.method.startsWith("access.") && !this.supportsCapability(ACCESS_RECEIPTS_CAPABILITY)) continue;
           this.receiptChecks.set(command.commandId, signature);
           // Receipt responses may remain accepted. Mark before querying so the
           // resulting store notification cannot turn into a polling loop.
@@ -334,11 +364,6 @@ export class FlyxClient {
     this.outbox = new CommandOutbox(commandStore, profile.hostId, async (method, payload, commandId) => {
       if (lifecycle !== this.lifecycle || this.profile !== profile) return Promise.reject(abortError());
       if (method === "access.getReceipt" && isRecord(payload) && typeof payload.commandId === "string") return this.rpc.getAccessReceipt({ commandId: payload.commandId });
-      if (method === "command.getReceipt" && isRecord(payload) && typeof payload.commandId === "string" && this.rpc.supports(ACCESS_RECEIPTS_CAPABILITY)) {
-        const stored = await commandStore.getCommand(payload.commandId);
-        if (lifecycle !== this.lifecycle || this.profile !== profile) throw abortError();
-        if (stored?.hostId === profile.hostId && stored.method.startsWith("access.")) return this.rpc.getAccessReceipt({ commandId: payload.commandId });
-      }
       return this.rpc.request(method, payload, commandId);
     }, { supportsAccessReceipts: () => this.rpc.supports(ACCESS_RECEIPTS_CAPABILITY) });
     this.outbox.onChange((commands) => { this.unresolvedWrites = commands.some((command) => ["sent", "receipt_unknown"].includes(command.state)); this.outboxChanges.emit(commands); if (commands.some((command) => command.state === "accepted" && this.receiptChecks.get(command.commandId) !== this.authoritativeReceiptSignature)) this.scheduleReceiptReview(true); });
@@ -439,8 +464,9 @@ export class FlyxClient {
     this.update({ securityLevel });
     // Security activation owns the socket. Domain catch-up/outbox failures are
     // recoverable on this authenticated lease and do not reject activation.
+    const revision = this.domainRevision + 1;
     this.domainWork = this.synchronizeDomain(transport.generation).catch((error: unknown) => {
-      if (this.rpc.generation === transport.generation) this.update({ sync: "resync_required", error: errorInfo(error) });
+      if (this.rpc.generation === transport.generation && this.domainRevision === revision) this.update({ sync: "resync_required", error: errorInfo(error) });
     });
   }
   private async loadCachedReplica(fence: ReplicaFence): Promise<void> {
@@ -487,8 +513,7 @@ export class FlyxClient {
       if (!sessionId) {
         const discovery = await this.rpc.request<unknown>("host.getSnapshot");
         if (!current()) return;
-        if (!isRecord(discovery) || !isRecord(discovery.session) || typeof discovery.session.id !== "string") throw new ClientError("INVALID_SNAPSHOT", "Host did not return its default session identity");
-        sessionId = discovery.session.id;
+        sessionId = snapshotSessionId(discovery);
         this.selectedSessionId = sessionId;
       }
       await this.reconciler.synchronize(sessionId, generation);

@@ -132,6 +132,9 @@ describe("safe Store opening", () => {
     const local = new DeviceRegistry(management, "test-host", { recoverLeases: false });
     try {
       expect(management.db.pragma("busy_timeout", { simple: true })).toBe(1_000);
+      expect(() => management.createSession("/forbidden-business")).toThrow("HOST_OWNER_REQUIRED");
+      expect(() => management.setHostIdentityMirror({hostId:"forbidden",fingerprint:"forbidden"})).toThrow("HOST_OWNER_REQUIRED");
+      expect(() => management.createPairingGrant("forbidden",new Date(Date.now()+60_000).toISOString())).toThrow("HOST_OWNER_REQUIRED");
       expect(management.db.transaction(() => local.revokeFromLocal(device.id))()).toBe(true);
       expect(host.getDevice(device.id)?.revokedAt).toBeDefined();
       expect(host.getTurn("active")?.status).toBe("queued");

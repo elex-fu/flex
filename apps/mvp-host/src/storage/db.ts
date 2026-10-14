@@ -455,6 +455,12 @@ export class SqliteStore {
     this.ownerHandle?.assertActive();
   }
 
+  /** The live management connection permits only local access revocation and its audit. */
+  private assertAccessManagementWrite(): void {
+    if (this.mode === "management") return;
+    this.assertWriterOwner();
+  }
+
   /** Explicit sync lane for committed recovery facts; no Provider or async I/O may run here. */
   withRecoveryTransaction<T>(work: () => T): T {
     if (this.mode === "readonly" || this.mode === "management") throw new Error("HOST_OWNER_REQUIRED");
@@ -556,6 +562,7 @@ export class SqliteStore {
   }
 
   createSession(workspacePath: string, provider: ProviderId = "claude", id: string = randomUUID()): SessionRow {
+    this.assertWriterOwner();
     const timestamp = now();
     this.db.prepare(`
       INSERT INTO sessions (id, workspace_id, workspace_path, provider, status, activity_state, head_sequence, created_at, updated_at)
@@ -575,6 +582,7 @@ export class SqliteStore {
   }
 
   setSessionBaseline(sessionId: string, baseline: { head?: string; dirty: boolean; files: unknown }): void {
+    this.assertWriterOwner();
     this.db.prepare(`
       UPDATE sessions SET baseline_head = ?, baseline_dirty = ?, baseline_status_json = ?, baseline_captured_at = ?, updated_at = ?
       WHERE id = ?
@@ -631,6 +639,7 @@ export class SqliteStore {
     prompt: string;
     generation: number;
   }): TurnRow {
+    this.assertWriterOwner();
     return this.db.transaction(() => {
       this.insertTurnInternal(input, now());
       return this.getTurn(input.turnId)!;
@@ -859,6 +868,7 @@ export class SqliteStore {
   }
 
   upsertTimeline(sessionId: string, input: TimelineUpsert): TimelineItem {
+    this.assertWriterOwner();
     const timestamp = now();
     const transaction = this.db.transaction(() => {
       this.upsertTimelineInternal(sessionId, input, timestamp);
@@ -894,6 +904,7 @@ export class SqliteStore {
   }
 
   insertApproval(approval: ApprovalRow): void {
+    this.assertWriterOwner();
     const transaction = this.db.transaction(() => this.insertApprovalInternal(approval));
     transaction();
   }
@@ -904,6 +915,7 @@ export class SqliteStore {
   }
 
   resolveApproval(approvalId: string, expectedVersion: number, action: string): ApprovalRow | undefined {
+    this.assertWriterOwner();
     const resolvedAt = now();
     const transaction = this.db.transaction(() => {
       return this.resolveApprovalInternal(approvalId, expectedVersion, action, resolvedAt);
@@ -964,6 +976,7 @@ export class SqliteStore {
   }
 
   supersedePendingApprovals(sessionId: string, turnId?: string): number {
+    this.assertWriterOwner();
     const where = turnId ? "session_id = ? AND turn_id = ?" : "session_id = ?";
     const args = turnId ? [sessionId, turnId] : [sessionId];
     const result = this.db.prepare(`
@@ -974,6 +987,7 @@ export class SqliteStore {
   }
 
   recoverActiveTurns(): Array<{ sessionId: string; turnId: string }> {
+    this.assertWriterOwner();
     const rows = this.db.prepare(`
       SELECT t.session_id, t.id, t.auth_subject_id, t.command_id, t.request_hash, t.status
       FROM sessions s JOIN turns t ON t.id = s.active_turn_id AND t.session_id = s.id
@@ -1196,6 +1210,7 @@ export class SqliteStore {
   }
 
   createAuthSession(tokenHash: string, expiresAt: string, id: string = randomUUID()): void {
+    this.assertWriterOwner();
     const timestamp = now();
     this.db.prepare(`
       INSERT INTO auth_sessions (id, token_hash, created_at, expires_at, last_seen_at)
@@ -1216,14 +1231,17 @@ export class SqliteStore {
   }
 
   revokeAuthSession(id: string): void {
+    this.assertAccessManagementWrite();
     this.db.prepare("UPDATE auth_sessions SET revoked_at = ? WHERE id = ?").run(now(), id);
   }
 
   updateLastSeen(id: string): void {
+    this.assertWriterOwner();
     this.db.prepare("UPDATE auth_sessions SET last_seen_at = ? WHERE id = ?").run(now(), id);
   }
 
   createPairingGrant(tokenHash: string, expiresAt: string, id: string = randomUUID(), metadata: { hostId?: string; scopes?: string[] } = {}): void {
+    this.assertWriterOwner();
     const timestamp = now();
     this.db.prepare(`
       INSERT INTO pairing_grants (id, token_hash, created_at, expires_at, consumed_at, host_id, requested_scopes)
@@ -1242,6 +1260,7 @@ export class SqliteStore {
   }
 
   consumePairingGrant(tokenHash: string): boolean {
+    this.assertWriterOwner();
     const timestamp = now();
     const result = this.db.prepare(`
       UPDATE pairing_grants SET consumed_at = ?, confirmed_at = ?, approved_at = ?
@@ -1270,6 +1289,7 @@ export class SqliteStore {
   /** The caller invokes this only after local confirmation; approval, consume
    * and registration share one transaction so a failed insert never burns a grant. */
   createDeviceFromPairingGrant(tokenHash: string, device: DeviceRecord): boolean {
+    this.assertWriterOwner();
     return this.db.transaction(() => {
       const grant = this.getPairingGrant(tokenHash);
       if (grant?.requestedScopes && device.scopes.some((scope) => !grant.requestedScopes!.includes(scope))) throw new Error("PAIRING_SCOPE_INVALID");
@@ -1296,6 +1316,7 @@ export class SqliteStore {
   }
 
   setHostIdentityMirror(value: HostIdentityMirror): void {
+    this.assertWriterOwner();
     if (!value.hostId || !value.fingerprint) throw new Error("HOST_IDENTITY_MISMATCH");
     this.db.transaction(() => {
       const previous = this.getHostIdentityMirror();
@@ -1310,6 +1331,7 @@ export class SqliteStore {
 
   /** Explicit local key rotation. The expected mirror fences concurrent rotations. */
   rotateHostIdentityMirror(value: HostIdentityMirror, expectedPrevious?: HostIdentityMirror): void {
+    this.assertWriterOwner();
     if (!value.hostId || !value.fingerprint || (expectedPrevious && (
       !expectedPrevious.hostId || !expectedPrevious.fingerprint || value.hostId !== expectedPrevious.hostId
     ))) {
@@ -1328,6 +1350,7 @@ export class SqliteStore {
   }
 
   createDevice(device: DeviceRecord): void {
+    this.assertWriterOwner();
     this.db.prepare(`
       INSERT INTO devices (id, host_id, display_name, platform, credential_kind, public_key, scopes_json, credential_revision, created_at, last_seen_at, expires_at, revoked_at)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -1355,6 +1378,7 @@ export class SqliteStore {
   }
 
   bindAuthSession(id: string, deviceId: string, timestamp = now()): boolean {
+    this.assertWriterOwner();
     return this.db.transaction(() => {
       const result = this.db.prepare(`
         UPDATE auth_sessions SET device_id = ?
@@ -1405,6 +1429,7 @@ export class SqliteStore {
   }
 
   createProtocolSession(record: ProtocolSessionRecord): void {
+    this.assertWriterOwner();
     this.db.prepare(`
       INSERT INTO protocol_sessions (id, device_id, protocol_version, transport_kind, transport_generation, capability_json, connected_at, expires_at, auth_session_id)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -1425,11 +1450,13 @@ export class SqliteStore {
   }
 
   disconnectProtocolSession(id: string, closeCode: string, timestamp = now()): boolean {
+    this.assertAccessManagementWrite();
     return this.db.prepare("UPDATE protocol_sessions SET disconnected_at = ?, close_code = ? WHERE id = ? AND disconnected_at IS NULL")
       .run(timestamp, closeCode, id).changes === 1;
   }
 
   recordAccessAudit(event: Omit<AccessAuditEvent, "id"> & { id?: string }): void {
+    this.assertAccessManagementWrite();
     this.db.prepare(`
       INSERT INTO access_audit_events (id, device_id, action, target_type, target_id, transport_kind, occurred_at, result_code)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?)

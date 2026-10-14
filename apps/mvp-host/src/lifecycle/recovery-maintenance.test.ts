@@ -46,8 +46,15 @@ describe("retained owner recovery-maintenance bootstrap",()=>{
     expect(()=>openForMaintenance({databasePath:f.options.databasePath,owner:scope})).toThrow("cannot migrate");
     const store=openForRecoveryMaintenance({databasePath:f.options.databasePath,owner:scope});stores.push(store);
     expect(()=>store.assertWriterOwner()).toThrow("HOST_RECOVERY_ONLY");
+    expect(()=>store.createSession("/forbidden-business")).toThrow("HOST_RECOVERY_ONLY");
+    expect(()=>store.createTurn({sessionId:f.session.id,turnId:"forbidden",commandId:"forbidden",requestHash:"hash",prompt:"must not be stored",generation:2})).toThrow("HOST_RECOVERY_ONLY");
+    expect(()=>store.setSessionBaseline(f.session.id,{dirty:false,files:[]})).toThrow("HOST_RECOVERY_ONLY");
+    expect(()=>store.createAuthSession("forbidden",new Date(Date.now()+60_000).toISOString())).toThrow("HOST_RECOVERY_ONLY");
+    expect(()=>store.createPairingGrant("forbidden",new Date(Date.now()+60_000).toISOString())).toThrow("HOST_RECOVERY_ONLY");
+    expect(()=>store.supersedePendingApprovals(f.session.id)).toThrow("HOST_RECOVERY_ONLY");
     expect(()=>store.commitEvent(f.session.id,"business.forbidden",{})).toThrow("HOST_RECOVERY_ONLY");
     expect(store.getTurn("unverified-turn")?.status).toBe("queued");
+    expect(store.db.prepare("SELECT COUNT(*) AS count FROM sessions").get()).toEqual({count:1});
     expect(store.db.prepare("SELECT MAX(version) AS version FROM schema_migrations").get()).toEqual({version:SUPPORTED_SCHEMA_VERSION});
     expect(f.files()).toEqual(before);
     store.withRecoveryTransaction(()=>store.db.prepare("INSERT INTO host_state VALUES('recovery-evidence','\"stopped\"','now')").run());

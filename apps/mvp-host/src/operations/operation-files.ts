@@ -3,6 +3,8 @@ import { lstat, mkdir, open, realpath } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { dirname, resolve } from "node:path";
 import type Database from "better-sqlite3";
+import { assertHostOwner, type HostOwnerHandle } from "../lifecycle/host-owner.js";
+import { inspectSchema, SUPPORTED_SCHEMA_VERSION, StoreSchemaError } from "../storage/migrations/schema-version.js";
 
 /** The lifecycle owner is adapted to this narrow capability at the call site. */
 export interface OperationOwner {
@@ -12,8 +14,9 @@ export interface OperationOwner {
 }
 
 /** Identity rotation and Relay generation changes must use this same lane. */
-export function operationOwnerFromHost(handle: { readonly mode: "host" | "maintenance"; readonly databasePath: string; assertActive(): void }): OperationOwner {
-  return { mode: handle.mode === "host" ? "runtime" : "maintenance", databasePath: handle.databasePath, assertActive: () => handle.assertActive() };
+export function operationOwnerFromHost(handle: HostOwnerHandle): OperationOwner {
+  assertHostOwner(handle);
+  return { mode: handle.mode === "maintenance" ? "maintenance" : "runtime", databasePath: handle.databasePath, assertActive: () => assertHostOwner(handle) };
 }
 
 export type SnapshotCoordinator = <T>(work: () => Promise<T>) => Promise<T>;
@@ -99,13 +102,13 @@ export function schemaVersions(db: Database.Database): { migrationVersion: numbe
 }
 
 export function assertSupportedSchema(db: Database.Database, supportedVersion: number): ReturnType<typeof schemaVersions> {
-  const versions = schemaVersions(db);
   if (!Number.isSafeInteger(supportedVersion) || supportedVersion < 1) throw new OperationsError("BACKUP_SCHEMA_INVALID");
-  if (versions.migrationVersion > supportedVersion || versions.userVersion > supportedVersion) throw new OperationsError("SCHEMA_TOO_NEW");
-  for (const table of ["host_state", "sessions", "turns", "command_receipts"]) {
-    if (!hasTable(db, table)) throw new OperationsError("BACKUP_SCHEMA_INVALID");
+  try { inspectSchema(db, { maximumVersion: Math.min(supportedVersion, SUPPORTED_SCHEMA_VERSION) }); }
+  catch (error) {
+    if (error instanceof StoreSchemaError && error.code === "FUTURE_SCHEMA") throw new OperationsError("SCHEMA_TOO_NEW");
+    throw new OperationsError("BACKUP_SCHEMA_INVALID");
   }
-  return versions;
+  return schemaVersions(db);
 }
 
 export function identityMirror(db: Database.Database): { hostId: string; fingerprint: string } {
@@ -169,10 +172,11 @@ export function validateContentReferences(db: Database.Database): number {
 }
 
 export function validateDatabase(db: Database.Database, supportedVersion: number): { schema: ReturnType<typeof schemaVersions>; checkedContentRefs: number } {
+  const schema = assertSupportedSchema(db, supportedVersion);
   const integrity = db.pragma("integrity_check") as Array<{ integrity_check: string }>;
   if (integrity.length !== 1 || integrity[0]?.integrity_check !== "ok") throw new OperationsError("BACKUP_INTEGRITY_FAILED");
   if ((db.pragma("foreign_key_check") as unknown[]).length !== 0) throw new OperationsError("BACKUP_FOREIGN_KEYS_FAILED");
-  return { schema: assertSupportedSchema(db, supportedVersion), checkedContentRefs: validateContentReferences(db) };
+  return { schema, checkedContentRefs: validateContentReferences(db) };
 }
 
 export async function fileDigest(path: string): Promise<string> {

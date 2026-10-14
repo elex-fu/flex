@@ -4,17 +4,23 @@ import { chmod, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/pr
 import { createHash, randomBytes } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { SqliteStore } from "../storage/db.js";
+import type { SqliteStore } from "../storage/db.js";
+import { HostOwnerLock, type HostOwnerHandle } from "../lifecycle/host-owner.js";
+import { openOwned } from "../storage/open-store.js";
+import { SUPPORTED_SCHEMA_VERSION } from "../storage/migrations/schema-version.js";
+import { ContentStore } from "../content/content-store.js";
 import { getHostIdentityMirror, loadOrCreateHostIdentity } from "../identity/host-identity.js";
 import { persistRelayRegistration, type RelayRegistration } from "../relay/relay-registration.js";
 import { BackupService } from "./backup-service.js";
 import { assertRestoreWriteReady, readRestoreReadinessGate, RestoreService, validateBackup } from "./restore-service.js";
-import { digest, fileDigest, validateContentReferences, type OperationOwner, type SnapshotCoordinator } from "./operation-files.js";
+import { digest, fileDigest, operationOwnerFromHost, validateContentReferences, type SnapshotCoordinator } from "./operation-files.js";
 
 const roots: string[] = [];
 const stores: SqliteStore[] = [];
+const owners: HostOwnerHandle[] = [];
 afterEach(async () => {
   for (const store of stores.splice(0)) if (store.db.open) store.close();
+  for (const owner of owners.splice(0)) owner.release();
   for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true });
 });
 const coordinate: SnapshotCoordinator = async (work) => work();
@@ -24,19 +30,21 @@ async function fixture() {
   roots.push(root);
   await chmod(root, 0o700);
   const databasePath = join(root, "host.sqlite");
-  const store = new SqliteStore(databasePath);
-  stores.push(store);
-  const identityDirectory = join(root, "identity");
+  const identityDirectory = join(root, "identity"); const coordinationDirectory = join(root, "owners");
+  const hostOwner = HostOwnerLock.acquire({ databasePath, identityDirectory, coordinationDirectory }); owners.push(hostOwner);
+  const store = openOwned({ databasePath, owner: hostOwner }); stores.push(store);
   const identity = await loadOrCreateHostIdentity({ directory: identityDirectory });
   store.setHostIdentityMirror(getHostIdentityMirror(identity));
-  const owner: OperationOwner = { mode: "runtime", databasePath, assertActive: vi.fn() };
+  const owner = operationOwnerFromHost(hostOwner);
   const session = store.createSession(join(root, "workspace"));
-  const base = { db: store.db, owner, identityDirectory, directory: join(root, "backup"), applicationVersion: "test-build", supportedSchemaVersion: 3, withSnapshot: coordinate };
-  return { root, databasePath, store, identityDirectory, identity, owner, session, base };
+  const base = { db: store.db, owner, identityDirectory, directory: join(root, "backup"), applicationVersion: "test-build", supportedSchemaVersion: SUPPORTED_SCHEMA_VERSION, withSnapshot: coordinate };
+  return { root, databasePath, store, identityDirectory, coordinationDirectory, identity, owner, hostOwner, session, base };
 }
 
-function addContentTables(db: Database.Database) {
-  db.exec("CREATE TABLE content_streams (id TEXT PRIMARY KEY, session_id TEXT NOT NULL); CREATE TABLE content_segments (stream_id TEXT, source_sequence INTEGER, byte_start INTEGER, byte_end INTEGER, data BLOB); CREATE TABLE content_refs (id TEXT PRIMARY KEY, session_id TEXT, kind TEXT, state TEXT, stream_id TEXT, through_sequence INTEGER, byte_length INTEGER, sha256 TEXT, blob_data BLOB)");
+function maintenance(f: Awaited<ReturnType<typeof fixture>>) {
+  f.store.close(); f.hostOwner.release();
+  const owner = HostOwnerLock.acquire({ databasePath: f.databasePath, identityDirectory: f.identityDirectory, coordinationDirectory: f.coordinationDirectory, mode: "maintenance" }); owners.push(owner);
+  return operationOwnerFromHost(owner);
 }
 
 async function patchManifestHash(directory: string) {
@@ -57,7 +65,7 @@ describe("owner coordinated consistent backup", () => {
     let coordinated = 0;
     const backup = await new BackupService().create({ ...f.base, relay: { registrationPath: relayPath, relayUrl: registration.relayUrl }, withSnapshot: async (work) => { coordinated += 1; return work(); } });
     expect(coordinated).toBe(1);
-    expect(backup.manifest.schema).toEqual({ migrationVersion: 3, userVersion: 0 });
+    expect(backup.manifest.schema).toEqual({ migrationVersion: SUPPORTED_SCHEMA_VERSION, userVersion: 0 });
     expect(backup.manifest.identity.fingerprint).toBe(f.identity.fingerprint);
     expect(backup.manifest.relay?.generation).toBe(17);
     const serialized = JSON.stringify(backup.manifest);
@@ -67,7 +75,7 @@ describe("owner coordinated consistent backup", () => {
     const db = new Database(join(backup.directory, "database.sqlite"), { readonly: true, fileMustExist: true });
     try { expect(db.prepare("SELECT prompt FROM turns WHERE id = 'turn-1'").get()).toEqual({ prompt: "private prompt" }); }
     finally { db.close(); }
-    await expect(validateBackup(backup.directory, 3)).resolves.toEqual(backup.manifest);
+    await expect(validateBackup(backup.directory, SUPPORTED_SCHEMA_VERSION)).resolves.toEqual(backup.manifest);
   });
 
   it("rejects a generation drift and removes the incomplete backup", async () => {
@@ -93,25 +101,35 @@ describe("owner coordinated consistent backup", () => {
     await expect(stat(f.base.directory)).rejects.toMatchObject({ code: "ENOENT" });
   });
 
+  it("clamps requested support to the installed validator and rejects corrupt declared constraints", async () => {
+    const f = await fixture(); f.store.db.pragma(`user_version = ${SUPPORTED_SCHEMA_VERSION + 1}`);
+    await expect(new BackupService().create({ ...f.base, supportedSchemaVersion: SUPPORTED_SCHEMA_VERSION + 100 })).rejects.toThrow("SCHEMA_TOO_NEW");
+    await expect(stat(f.base.directory)).rejects.toMatchObject({ code: "ENOENT" });
+    f.store.db.pragma("user_version = 0"); f.store.db.exec("DROP INDEX one_active_timeline_epoch");
+    await expect(new BackupService().create(f.base)).rejects.toThrow("BACKUP_SCHEMA_INVALID");
+    expect(f.store.db.prepare("SELECT 1 FROM sqlite_master WHERE name = 'one_active_timeline_epoch'").get()).toBeUndefined();
+    await expect(stat(f.base.directory)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
   it("validates bytes and contiguous stream prefixes rather than trusting lengths", async () => {
     const f = await fixture();
-    addContentTables(f.store.db);
-    const bytes = Buffer.from("secret output");
-    f.store.db.prepare("INSERT INTO content_refs VALUES (?, ?, 'blob', 'ready', NULL, NULL, ?, ?, ?)").run("blob", f.session.id, bytes.length, digest(bytes), bytes);
+    const content = new ContentStore(f.store.db); const bytes = Buffer.from("secret output");
+    const blob = content.putBlob({ sessionId: f.session.id, format: "text/plain", text: bytes.toString("utf8") });
     expect(validateContentReferences(f.store.db)).toBe(1);
-    f.store.db.prepare("UPDATE content_refs SET blob_data = ? WHERE id = 'blob'").run(Buffer.alloc(bytes.length, 1));
+    f.store.db.prepare("UPDATE content_refs SET blob_data = ? WHERE id = ?").run(Buffer.alloc(bytes.length, 1), blob.ref);
     await expect(new BackupService().create(f.base)).rejects.toThrow("BACKUP_CONTENT_INVALID");
-    f.store.db.exec("DELETE FROM content_refs");
-    f.store.db.prepare("INSERT INTO content_streams VALUES ('stream', ?)").run(f.session.id);
-    f.store.db.prepare("INSERT INTO content_segments VALUES ('stream', 1, 1, 4, ?)").run(Buffer.from("abc"));
-    f.store.db.prepare("INSERT INTO content_refs VALUES ('prefix', ?, 'stream_prefix', 'ready', 'stream', 1, 3, ?, NULL)").run(f.session.id, digest("abc"));
+    f.store.db.prepare("UPDATE content_refs SET blob_data = ? WHERE id = ?").run(bytes, blob.ref);
+    const stream = content.beginStream({ sessionId: f.session.id, itemId: "stream-item", format: "text/plain" });
+    const old = content.appendSegment({ streamId: stream.streamId, sourceSequence: 1, text: "abc" });
+    content.appendSegment({ streamId: stream.streamId, sourceSequence: 2, text: "def" });
+    f.store.db.prepare("UPDATE content_segments SET byte_start = 1, byte_end = 4 WHERE stream_id = ? AND byte_start = 0").run(stream.streamId);
     expect(() => validateContentReferences(f.store.db)).toThrow("BACKUP_CONTENT_INVALID");
-    f.store.db.exec("DELETE FROM content_segments; DELETE FROM content_refs");
-    f.store.db.prepare("INSERT INTO content_segments VALUES ('stream', 1, 0, 3, ?)").run(Buffer.from("abc"));
-    f.store.db.prepare("INSERT INTO content_segments VALUES ('stream', 1, 3, 6, ?)").run(Buffer.from("def"));
-    f.store.db.prepare("INSERT INTO content_refs VALUES ('old-prefix', ?, 'stream_prefix', 'ready', 'stream', 1, 3, ?, NULL)").run(f.session.id, digest("abc"));
-    f.store.db.prepare("INSERT INTO content_refs VALUES ('inside-segment', ?, 'stream_prefix', 'ready', 'stream', 1, 4, ?, NULL)").run(f.session.id, digest("abcd"));
-    expect(validateContentReferences(f.store.db)).toBe(2);
+    f.store.db.prepare("UPDATE content_segments SET byte_start = 0, byte_end = 3 WHERE stream_id = ? AND byte_start = 1").run(stream.streamId);
+    f.store.db.prepare("INSERT INTO content_refs(id,session_id,kind,state,stream_id,through_sequence,byte_length,sha256,format,created_at) VALUES ('inside-segment',?,'stream_prefix','ready',?,2,4,?,'text/plain','now')")
+      .run(f.session.id, stream.streamId, digest("abcd"));
+    expect(validateContentReferences(f.store.db)).toBe(4);
+    const oldChunk = content.getChunk({ sessionId: f.session.id, ref: old.ref, offset: 0 });
+    if (oldChunk.encoding !== "utf8") throw new Error("Expected public text"); expect(oldChunk.text).toBe("abc");
   });
 });
 
@@ -125,8 +143,11 @@ describe("offline database restore", () => {
     f.store.db.prepare("INSERT INTO auth_sessions (id, token_hash, created_at, expires_at, last_seen_at, device_id) VALUES ('auth-1', 'token-hash', ?, '2099-01-01', ?, 'device-1')").run(timestamp, timestamp);
     f.store.createPairingGrant("grant-hash", "2099-01-01");
     f.store.createProtocolSession({ id: "lease-1", deviceId: "device-1", protocolVersion: 2, transportKind: "direct", transportGeneration: 3, capabilities: [], connectedAt: timestamp, expiresAt: "2099-01-01", authSessionId: "auth-1" });
-    f.store.db.exec("CREATE TABLE execution_intents (id TEXT PRIMARY KEY, state TEXT NOT NULL, claim_owner_id TEXT, claim_owner_generation INTEGER, result_code TEXT, updated_at TEXT NOT NULL)");
-    for (const state of ["pending", "claimed", "dispatching", "acknowledged", "settled"]) f.store.db.prepare("INSERT INTO execution_intents VALUES (?, ?, 'old-owner', 9, NULL, ?)").run(state, state, timestamp);
+    const original = f.store.db.prepare("SELECT id FROM execution_intents WHERE command_id = 'command-1'").get() as { id: string };
+    for (const [ordinal, state] of ["pending", "claimed", "dispatching", "acknowledged", "settled"].entries()) f.store.db.prepare(`INSERT INTO execution_intents
+      (id,session_id,turn_id,auth_subject_id,command_id,ordinal,actor_kind,kind,resource_id,payload_json,request_hash,request_format_version,source_sequence,commit_id,runtime_generation,attempt_id,state,claim_owner_id,claim_owner_generation,result_code,created_at,updated_at)
+      SELECT ?,session_id,turn_id,auth_subject_id,command_id,?,actor_kind,kind,resource_id,payload_json,request_hash,request_format_version,source_sequence,commit_id,runtime_generation,attempt_id,?,'old-owner',9,?,created_at,? FROM execution_intents WHERE id=?`)
+      .run(state, ordinal + 1, state, state === "settled" ? "completed" : null, timestamp, original.id);
     const relayPath = join(f.root, "relay.json");
     const registration: RelayRegistration = { v: 1, relayUrl: "wss://relay.example", routeId: randomBytes(24).toString("base64url"), relayCredential: randomBytes(32).toString("base64url"), generation: 17, createdAt: timestamp };
     await persistRelayRegistration(relayPath, registration);
@@ -137,9 +158,9 @@ describe("offline database restore", () => {
     await writeFile(external, "Git and Provider advanced after backup");
     f.store.close();
     const result = await new RestoreService().restore({
-      owner: { ...f.owner, mode: "maintenance" }, databasePath: f.databasePath, directory: f.base.directory,
+      owner: maintenance(f), databasePath: f.databasePath, directory: f.base.directory,
       rollbackDirectory: join(f.root, "rollback"), identityDirectory: f.identityDirectory,
-      applicationVersion: "test-build", supportedSchemaVersion: 3, withSnapshot: coordinate,
+      applicationVersion: "test-build", supportedSchemaVersion: SUPPORTED_SCHEMA_VERSION, withSnapshot: coordinate,
       assertDatabaseClosed: () => expect(f.store.db.open).toBe(false), relay,
       now: () => new Date("2026-10-02T00:00:00.000Z"),
     });
@@ -169,7 +190,7 @@ describe("offline database restore", () => {
 
   it("requires maintenance ownership and closed handles before any installation", async () => {
     const f = await fixture();
-    const options = { owner: f.owner, databasePath: f.databasePath, directory: f.base.directory, rollbackDirectory: join(f.root, "rollback"), identityDirectory: f.identityDirectory, applicationVersion: "test", supportedSchemaVersion: 3, withSnapshot: coordinate, assertDatabaseClosed: vi.fn() };
+    const options = { owner: f.owner, databasePath: f.databasePath, directory: f.base.directory, rollbackDirectory: join(f.root, "rollback"), identityDirectory: f.identityDirectory, applicationVersion: "test", supportedSchemaVersion: SUPPORTED_SCHEMA_VERSION, withSnapshot: coordinate, assertDatabaseClosed: vi.fn() };
     await expect(new RestoreService().restore(options)).rejects.toThrow("RESTORE_OFFLINE_OWNER_REQUIRED");
     expect(options.assertDatabaseClosed).not.toHaveBeenCalled();
     expect(f.store.getSession(f.session.id)?.activityState).toBe("idle");
@@ -184,9 +205,9 @@ describe("offline database restore", () => {
     backup.prepare("INSERT INTO turns (id, session_id, command_id, request_hash, status, prompt, generation, created_at) VALUES ('bad', 'missing-session', 'bad-command', 'bad-hash', 'completed', 'x', 1, '2026-01-01')").run();
     backup.pragma("wal_checkpoint(TRUNCATE)");
     backup.close();
-    await expect(validateBackup(f.base.directory, 3)).rejects.toThrow("BACKUP_HASH_MISMATCH");
+    await expect(validateBackup(f.base.directory, SUPPORTED_SCHEMA_VERSION)).rejects.toThrow("BACKUP_HASH_MISMATCH");
     await patchManifestHash(f.base.directory);
-    await expect(validateBackup(f.base.directory, 3)).rejects.toThrow("BACKUP_FOREIGN_KEYS_FAILED");
+    await expect(validateBackup(f.base.directory, SUPPORTED_SCHEMA_VERSION)).rejects.toThrow("BACKUP_FOREIGN_KEYS_FAILED");
     expect(f.store.getSession(f.session.id)?.activityState).toBe("idle");
     await expect(stat(join(f.root, "rollback"))).rejects.toMatchObject({ code: "ENOENT" });
   });
@@ -197,8 +218,8 @@ describe("offline database restore", () => {
     f.store.commitEvent(f.session.id, "test.current", {});
     f.store.close();
     await expect(new RestoreService().restore({
-      owner: { ...f.owner, mode: "maintenance" }, databasePath: f.databasePath, directory: f.base.directory, rollbackDirectory: join(f.root, "rollback"),
-      identityDirectory: f.identityDirectory, applicationVersion: "test", supportedSchemaVersion: 3, withSnapshot: coordinate, assertDatabaseClosed: () => undefined,
+      owner: maintenance(f), databasePath: f.databasePath, directory: f.base.directory, rollbackDirectory: join(f.root, "rollback"),
+      identityDirectory: f.identityDirectory, applicationVersion: "test", supportedSchemaVersion: SUPPORTED_SCHEMA_VERSION, withSnapshot: coordinate, assertDatabaseClosed: () => undefined,
       beforeInstall: () => { throw new Error("injected preinstall failure"); },
     })).rejects.toThrow("injected preinstall failure");
     const current = new Database(f.databasePath, { readonly: true, fileMustExist: true });

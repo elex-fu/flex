@@ -1,7 +1,8 @@
 import type Database from "better-sqlite3";
 import { basename } from "node:path";
 import { HostDiagnosticsSchema, UsageEvidenceSchema, type HostDiagnostics, type UsageEvidence, type VerifiedProviderEvidence } from "@flyx/mvp-protocol";
-import { columns, hasTable, OperationsError, schemaVersions } from "../operations/operation-files.js";
+import { assertSupportedSchema, columns, hasTable, OperationsError, schemaVersions } from "../operations/operation-files.js";
+import { SUPPORTED_SCHEMA_VERSION } from "../storage/migrations/schema-version.js";
 import { readRestoreReadinessGate } from "../operations/restore-service.js";
 
 export interface DoctorContext {
@@ -36,11 +37,14 @@ export function collectDoctor(context: DoctorContext): HostDiagnostics {
   const sessionAccess = context.access.kind === "local" || context.access.scopes.has("session:read");
   if (!hostAccess) throw new OperationsError("FORBIDDEN");
   const schema = schemaVersions(context.db);
-  const future = Math.max(schema.migrationVersion, schema.userVersion) > context.supportedSchemaVersion;
+  const supportedVersion = Math.min(context.supportedSchemaVersion, SUPPORTED_SCHEMA_VERSION);
+  let schemaFailure: string | undefined;
+  try { assertSupportedSchema(context.db, supportedVersion); }
+  catch (error) { schemaFailure = error instanceof OperationsError && error.code === "SCHEMA_TOO_NEW" ? "SCHEMA_TOO_NEW" : "SCHEMA_INVALID"; }
   const owner = context.owner ?? { mode: "read_only", state: "unverified" };
   const restore = readRestoreReadinessGate(context.db);
   const reasons = [...(context.readiness?.reasonCodes ?? [])].map(safeCode);
-  if (future) reasons.push("SCHEMA_TOO_NEW");
+  if (schemaFailure) reasons.push(schemaFailure);
   if (restore) reasons.push(...restore.reasonCodes);
   if (owner.state !== "active") reasons.push("HOST_OWNER_UNVERIFIED");
   const status = reasons.length > 0 ? "blocked" : owner.mode === "maintenance" ? "maintenance"
@@ -48,14 +52,14 @@ export function collectDoctor(context: DoctorContext): HostDiagnostics {
   const result: HostDiagnostics = {
     v: 1, generatedAt: (context.now ?? (() => new Date()))().toISOString(), owner,
     readiness: { status, reasonCodes: [...new Set(reasons)].slice(0, 32) },
-    schema: { ...schema, supportedVersion: context.supportedSchemaVersion, writable: !future && !restore && status === "ready" && owner.mode === "runtime" && owner.state === "active" },
+    schema: { ...schema, supportedVersion, writable: !schemaFailure && !restore && status === "ready" && owner.mode === "runtime" && owner.state === "active" },
     providers: (context.providers ?? []).map(({ executable, usage, ...provider }) => ({
       ...provider, ...(executable ? { executableName: basename(executable).replace(/[\x00-\x1f\x7f]/g, "").slice(0, 128) } : {}),
       usage: normalizeUsage(usage),
     })),
     relay: context.relay ?? { status: "unknown" },
   };
-  if (sessionAccess) {
+  if (sessionAccess && !schemaFailure) {
     result.activity = {
       activeTurns: count(context.db, "turns", " WHERE status IN ('queued', 'running', 'waiting_approval', 'interrupting')"),
       unknownTurns: count(context.db, "turns", " WHERE status = 'outcome_unknown'"),

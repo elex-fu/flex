@@ -415,7 +415,8 @@ export function createHostServer(options: HostServerOptions): HostServer {
   }));
 
   let stopPromise: Promise<void> | undefined;
-  const closeTransports = () => app.close();
+  let transportClosePromise: Promise<void> | undefined;
+  const closeTransports = () => transportClosePromise ??= app.close();
   const registerClose = options.lifecycle?.registerTransportShutdown?.bind(options.lifecycle) ?? options.orchestrator.registerTransportShutdown?.bind(options.orchestrator);
   const unregisterClose = registerClose?.(closeTransports);
   app.addHook("onClose", async () => { unregisterClose?.(); });

@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { createTestHostOwner } from "../lifecycle/host-owner.js";
 import { openOwned } from "../storage/open-store.js";
+import { CHECKPOINT_SCHEMA_SQL, REVERT_SCHEMA_SQL } from "../storage/migrations/009-checkpoints.js";
 import { SUPPORTED_SCHEMA_VERSION } from "../storage/migrations/schema-version.js";
 import { collectDoctor, normalizeUsage } from "./doctor.js";
 
@@ -39,6 +40,25 @@ describe("sanitized doctor", () => {
       expect(result.schema).toMatchObject({ supportedVersion: SUPPORTED_SCHEMA_VERSION, writable: false });
       expect(result.readiness.reasonCodes).toContain("SCHEMA_INVALID"); expect(result.activity).toBeUndefined();
       expect(store.db.prepare("SELECT 1 FROM sqlite_master WHERE name = 'one_active_timeline_epoch'").get()).toBeUndefined();
+    } finally { store.close(); owner.release(); }
+  });
+
+  it("distinguishes actual checkpoint partial failure and blocked revert gates", () => {
+    const owner = createTestHostOwner(); const store = openOwned({ databasePath: ":memory:", owner });
+    try {
+      const session = store.createSession("/private/workspace"); store.acceptTurn({ authSubjectId: "device", commandId: "command", requestHash: "hash", sessionId: session.id, turnId: "turn", prompt: "work", generation: 1 });
+      store.db.exec(CHECKPOINT_SCHEMA_SQL); store.db.exec(REVERT_SCHEMA_SQL);
+      store.db.prepare(`INSERT INTO checkpoint_captures(checkpoint_id,session_id,workspace_id,phase,status,workspace_ref,index_ref,manifest_json,started_at)
+        VALUES('checkpoint',?,'default','preview','complete','workspace','index','{}','now')`).run(session.id);
+      store.db.prepare(`INSERT INTO checkpoint_preview_plans(plan_id,actor_id,session_id,checkpoint_id,current_checkpoint_id,state,expires_at,plan_json,created_at)
+        VALUES('plan','device',?,'checkpoint','checkpoint','consumed','later','{}','now')`).run(session.id);
+      store.db.prepare(`INSERT INTO checkpoint_revert_operations(operation_id,session_id,actor_id,command_id,plan_id,revision,stage,status,operation_json,created_at,updated_at)
+        VALUES('operation',?,'device','command','plan',1,'partial_failure','blocked','{}','now','now')`).run(session.id);
+      store.db.prepare("INSERT INTO checkpoint_revert_gates VALUES(?,'operation',1,'blocked')").run(session.id);
+      const result = collectDoctor({ db: store.db, supportedSchemaVersion: SUPPORTED_SCHEMA_VERSION, access: { kind: "local" }, owner: { mode: "runtime", state: "active" }, readiness: { status: "ready", reasonCodes: [] } });
+      expect(result.checkpoints).toMatchObject({ available: true, failed: 1 });
+      expect(result.readiness.reasonCodes).toEqual(["CHECKPOINT_REVERT_PARTIAL_FAILURE", "CHECKPOINT_REVERT_INCOMPLETE", "CHECKPOINT_REVERT_BLOCKED"]);
+      expect(result.schema.writable).toBe(false);
     } finally { store.close(); owner.release(); }
   });
 

@@ -42,8 +42,11 @@ export function collectDoctor(context: DoctorContext): HostDiagnostics {
   try { assertSupportedSchema(context.db, supportedVersion); }
   catch (error) { schemaFailure = error instanceof OperationsError && error.code === "SCHEMA_TOO_NEW" ? "SCHEMA_TOO_NEW" : "SCHEMA_INVALID"; }
   const owner = context.owner ?? { mode: "read_only", state: "unverified" };
-  const restore = readRestoreReadinessGate(context.db);
   const reasons = [...(context.readiness?.reasonCodes ?? [])].map(safeCode);
+  let restore: ReturnType<typeof readRestoreReadinessGate>;
+  let invalidRestore = false;
+  try { restore = readRestoreReadinessGate(context.db); }
+  catch { invalidRestore = true; reasons.push("RESTORE_GATE_INVALID"); }
   if (schemaFailure) reasons.push(schemaFailure);
   if (restore) reasons.push(...restore.reasonCodes);
   if (owner.state !== "active") reasons.push("HOST_OWNER_UNVERIFIED");
@@ -52,7 +55,7 @@ export function collectDoctor(context: DoctorContext): HostDiagnostics {
   const result: HostDiagnostics = {
     v: 1, generatedAt: (context.now ?? (() => new Date()))().toISOString(), owner,
     readiness: { status, reasonCodes: [...new Set(reasons)].slice(0, 32) },
-    schema: { ...schema, supportedVersion, writable: !schemaFailure && !restore && status === "ready" && owner.mode === "runtime" && owner.state === "active" },
+    schema: { ...schema, supportedVersion, writable: !schemaFailure && !invalidRestore && !restore && status === "ready" && owner.mode === "runtime" && owner.state === "active" },
     providers: (context.providers ?? []).map(({ executable, usage, ...provider }) => ({
       ...provider, ...(executable ? { executableName: basename(executable).replace(/[\x00-\x1f\x7f]/g, "").slice(0, 128) } : {}),
       usage: normalizeUsage(usage),
@@ -89,6 +92,16 @@ export function collectDoctor(context: DoctorContext): HostDiagnostics {
       result.checkpoints.raced = count(context.db, checkpointTable, " WHERE status = 'raced'");
       result.checkpoints.legacyInexact = count(context.db, checkpointTable, " WHERE status = 'legacy_inexact'");
     }
+    const revertColumns = hasTable(context.db, "checkpoint_revert_operations") ? columns(context.db, "checkpoint_revert_operations") : undefined;
+    if (revertColumns?.has("stage") && revertColumns.has("status")) {
+      const partial = count(context.db, "checkpoint_revert_operations", " WHERE stage = 'partial_failure'");
+      result.checkpoints = { ...result.checkpoints, available: true, failed: (result.checkpoints.failed ?? 0) + partial };
+      if (partial) reasons.push("CHECKPOINT_REVERT_PARTIAL_FAILURE");
+      if (count(context.db, "checkpoint_revert_operations", " WHERE status IN ('blocked','queued','running')")) reasons.push("CHECKPOINT_REVERT_INCOMPLETE");
+    }
+    const revertGateColumns = hasTable(context.db, "checkpoint_revert_gates") ? columns(context.db, "checkpoint_revert_gates") : undefined;
+    if (revertGateColumns?.has("state") && count(context.db, "checkpoint_revert_gates", " WHERE state = 'blocked'")) reasons.push("CHECKPOINT_REVERT_BLOCKED");
+    if (reasons.length) { result.readiness = { status: "blocked", reasonCodes: [...new Set(reasons)].slice(0, 32) }; result.schema.writable = false; }
   }
   // Reconstruct from an allowlisted schema: no prose, paths, account metadata or secrets.
   return HostDiagnosticsSchema.parse(result);

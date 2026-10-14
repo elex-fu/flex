@@ -2,7 +2,7 @@
 
 > 版本：v1.0  
 > 日期：2026-10-14  
-> 状态：待实施  
+> 状态：实施中（完整批次验收见第 19 节）
 > 对照基线：Flyx 当前工作树，Paseo 710851ccb，T3 Code 4ba4871af  
 > 对应方案：[能力差异与优化技术方案](./paseo-t3code-comparison-and-optimization-technical-design.md)
 
@@ -791,3 +791,48 @@ B01–B05 来自前一轮定向复现，本轮增加 B06–B09。当前已有构
 | 客户端 | [FlyxClient](/Users/lex/play/flyx/packages/client-core/src/client.ts)、[Supervisor](/Users/lex/play/flyx/packages/client-core/src/connection-supervisor.ts)、[SyncEngine](/Users/lex/play/flyx/packages/client-core/src/sync-engine.ts)、[Outbox](/Users/lex/play/flyx/packages/client-core/src/command-outbox.ts) | T3 domain/transport 分层；Paseo replica 生命周期 |
 | Web | [useHost](/Users/lex/play/flyx/apps/mvp-web/src/use-host.ts)、[timeline](/Users/lex/play/flyx/apps/mvp-web/src/timeline.ts)、[app](/Users/lex/play/flyx/apps/mvp-web/src/app.tsx) | 组件只订阅副本，手机交互与大内容视图 |
 | Git 与验证 | [GitService](/Users/lex/play/flyx/apps/mvp-host/src/git/git-service.ts)、[matrix](/Users/lex/play/flyx/scripts/compatibility/run-matrix.mjs)、[start-host](/Users/lex/play/flyx/scripts/start-host.sh) | T3 hidden ref/candidate 思路；独立实际版本证据 |
+
+## 19 实施记录
+
+本节记录已集成的代码与验证结果。局部测试通过、模块已提交、端到端接通和发布验收分别记录；尚未取得真实 Provider 或手机证据的能力仍保持未验收。
+
+开发分支：`codex/flyx-optimization`；远程：`https://github.com/elex-fu/flex`。用户已批准源码基线及后续任务提交推送。基线提交 `63599da` 保存原有工作树，排除了运行数据目录。
+
+| 批次 | 当前状态 | 已集成提交 / 验证 | 剩余验收 |
+| --- | --- | --- | --- |
+| R01 | 已完成并推送 | `4a46642`：Git 19、Timeline 14；`5eddded`：清洁副本 build、生产/测试类型检查、产品与 fixture 检查通过 | 后续批次继续沿用统一验证入口；浏览器仅发现 24 用例，尚未执行 |
+| R02 | 已完成并推送 | `866e407`：Host 192 通过、5 明确跳过；`49ac8ce`：内部运行绑定脱敏，相关 16 用例与类型检查通过 | R03 接入真实 owner，R05/R06 接入持久 attempt；真实 Provider 契约随 R15 验收 |
+| R03 | 所有权基础已集成并推送 | `bdd21d6`、`ad9b0f0`、`ff5c2dc`、`4ab9e49`、`f67181d`：原 owner、只读打开、显式恢复维护、004→006 迁移/重开检查 | 原 Host 硬崩溃的恢复入口补齐；原路径 lease 后续接 worktree |
+| R04 | 开发中 | 进程 journal、分块 JSONL 预算、operation registry、关闭状态机 | Adapter/入口接通、有序关库与进程树停止证明 |
+| R05 | 原子引擎已集成并推送 | `5c34c20`、`3e5a4c5`：owner/lease 接入、命令故障矩阵和冻结旧版本迁移 fixture | 其它批次继续使用同一原子提交入口 |
+| R06 | 核心已集成，生产钩子补齐中 | `5ec7a3c`：持久 Worker、独立控制通道、原始派发绑定；独立 87 用例通过 | checkpoint、泛化 operation、关闭流程与多 Session 合并验收 |
+| R07 | 恢复模块已集成并推送，入口接通中 | `698a448`：只读回执 8 用例；`e4bf372`：Native binding、证据和恢复 CAS | Host/RPC/离线崩溃恢复与真实 Native 证据 |
+| R08 | 模块已集成并推送，生产链路已接通 | `7e37d45`、`f67181d`、`59d7616`：正文引用、权限、006 SQL 和严格响应预算 | 最终 Web/原生大内容入口与整体回归 |
+| R09 | 生产链路已集成，合并验收中 | `bbf31d8`、`f4bfcf7`、`59d7616`：固定水位、epoch、万级历史、Direct/Relay 与磁盘重开 | 多 Session/Interaction 投影及最终浏览器验收 |
+| R10 | 共享核心已集成 | `da7f23f`：SessionReplica、能力协商、引用校验、React canonical 分流 | Web 操作入口接通及多 Session DTO 合并 |
+| R11 | 开发与验证中 | Workspace/Provider/Session catalog、007 与离线导入 | 多 Session、legacy 固定路由、共享 Store 与运行时关闭 |
+| R12 | 共享核心已集成 | `1f26299`：平台信号、runtime 归属、缓存/草稿/本机清除；与 R10 合并后 95 客户端用例及严格类型检查通过 | Web 草稿和本机清除入口、真实后台恢复 |
+| R13 | 模块已集成，生产入口接通中 | `54e8ae0`：reservation、delivery、Question、审批卡片和受控原生映射；独立 42 Host 用例通过 | 008 激活、RPC/ingestion 接通与真实答案回传 |
+| R14 | 模块已集成，执行钩子接通中 | `916e3b2`：独立 index/workspace checkpoint、原始文件捕获、精确 Diff 和预览 | 已提交终态及停止证明之后的 after capture；UI 与恢复操作 |
+| R15 | 模块及版本验证已集成，入口接通中 | `82096b9`、`3790ecb`、`ac5988b`：doctor、备份恢复、固定产物、实际握手及真实 schema6 验证 | CLI/恢复 gate、双 Provider 与真机 |
+| R16 | 开发与验证中 | 分阶段 revert journal、受控文件/index 恢复和安全点 | 各外部状态域、partial failure、真实 Provider rewind |
+| R17 | 独立模块已提交，待集成 | worktree 持久操作、原路径 lease 与隔离并发 | Catalog/Worker/RPC 接通、同 checkout 防冲突及生命周期 |
+| R18 | attention 模块已集成，Expo 平台验证中 | `a27a056`：最小提醒事实/队列、过期点击核对；Expo 复用共同核心 | 010 激活、推送入口、安全凭据/deep link、真机网络与后台恢复 |
+
+当前仍为开发分支，M1/M2/M3 均未宣称发布完成。整套方案完成前，必须逐项核对第 18 节的退出条件，包括确定性故障、真实 Provider 和真机证据。
+
+2026-10-15 已集成基础的合并验证：Host 570 用例通过、5 个真实 Provider 用例明确跳过；client-core 101 用例、Web 26 用例通过，Host/client/Web 严格类型检查及 Host 构建通过。Host 测试使用本机临时监听和测试数据，禁用真实 Provider。后续生产端口、007–010 激活、多 Session 和原生平台提交继续进行独立合并验收，不能据此宣称完整十八批次已交付。
+
+## 20 客户端范围与交付优先级
+
+客户端工作主要集中在 R10、R12 和 R18。R11 的 Session 选择、R13 的审批/问答、R14 的 Diff、R16/R17 的恢复和 worktree 操作另有界面配套，因此不能将三个批次理解成全部客户端工作。客户端核心负责数据一致性和可靠发送，Web 与 Expo 复用这套机制；原生平台适配另行实现存储、生命周期、网络和配对。
+
+| 范围 | 当前必要性 | 首版交付边界 | 直接收益 |
+| --- | --- | --- | --- |
+| R10 能力协商与 SessionReplica | M1 必须完成 | 固定水位分页、引用校验、跨 Session 迟到响应隔离、缓存与权威状态分离 | 大历史可用；切换会话不会串数据；大响应不会断连接 |
+| R12 Runtime、草稿和 Outbox | 日常使用必须完成 | 应用持有连接；组件只订阅；持久化命令后清草稿；后台恢复不重复发送；本机清除 | 刷新与短暂断网可恢复；输入不因存储失败丢失；未知结果可以核对 |
+| Web 功能闭环 | M1/M2 的主要入口 | Session 选择、Timeline、审批/问答、Diff 与恢复状态及回执查询 | Host 新能力能够实际操作与验收 |
+| Expo 平台与最小界面 | 保持 M3；移动需求明确时有价值 | 安全凭据、普通正文 SQLite、配对/deep link、AppState/NetInfo、最小会话与交互界面 | 为手机访问复用共同核心，验证平台差异 |
+| 完整原生 UI 与额外体验 | 可延后 | 完整导航、复杂通知设置、语音和更多视图另排 | 主要改善使用体验；不作为 Host 可靠性验收的前提 |
+
+开发优先级是共享核心与 Web 端到端闭环，再进行 Expo 最小平台验收。原生代码和模拟平台测试通过仅说明实现可继续集成；真机网络、凭据与后台恢复尚须实际证据。SecureStore 保护短凭据，普通 SQLite 的正文缓存不宣称已经加密。提醒点击后重新读取当前状态，不能直接提交过期动作；未知命令始终核对原回执，不能因为重新连上而自动重发。

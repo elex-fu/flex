@@ -94,8 +94,8 @@ describe("Host outbound Relay supervisor", () => {
   });
 
   it("reconnects after a 30-second half-open control socket with a strictly newer generation", async () => {
-    const { sockets, supervisor } = await setup();
     vi.useFakeTimers();
+    const { sockets, supervisor } = await setup();
     const control = sockets[0]!;
     control.open(); registration(control);
     await vi.advanceTimersByTimeAsync(10_000);
@@ -118,8 +118,9 @@ describe("Host outbound Relay supervisor", () => {
   });
 
   it("counts only valid traffic for liveness and answers Relay heartbeat requests", async () => {
-    const { sockets, supervisor } = await setup();
+    // Own the startup deadline and heartbeat with one clock; fake clearTimeout cannot cancel a real timer.
     vi.useFakeTimers();
+    const { sockets, supervisor } = await setup();
     const control = sockets[0]!;
     control.open(); registration(control);
     await vi.advanceTimersByTimeAsync(10_000);
@@ -135,8 +136,8 @@ describe("Host outbound Relay supervisor", () => {
   });
 
   it("syncs pending clients after reconnect and replaces an incomplete old-generation handshake", async () => {
-    const { sockets, supervisor } = await setup();
     vi.useFakeTimers();
+    const { sockets, supervisor } = await setup();
     const control = sockets[0]!;
     const id = "client_connection_001";
     control.open(); registration(control, [id]);
@@ -158,6 +159,7 @@ describe("Host outbound Relay supervisor", () => {
   });
 
   it("preserves an already secure data channel when the control connection resumes", async () => {
+    vi.useFakeTimers();
     const { sockets, supervisor, onConnection, hostStaticKey, route } = await setup();
     const control = sockets[0]!;
     const id = "client_connection_001";
@@ -172,7 +174,6 @@ describe("Host outbound Relay supervisor", () => {
     handshake.readMessage(data.sent.find((frame): frame is Uint8Array => typeof frame !== "string")!);
     const session = handshake.finish();
     try {
-      vi.useFakeTimers();
       control.serverClose();
       await vi.advanceTimersByTimeAsync(500);
       await vi.waitFor(() => expect(sockets).toHaveLength(3));
@@ -198,8 +199,8 @@ describe("Host outbound Relay supervisor", () => {
   });
 
   it("isolates a failed data channel and never retries a disconnected client", async () => {
-    const { sockets, supervisor } = await setup();
     vi.useFakeTimers();
+    const { sockets, supervisor } = await setup();
     const control = sockets[0]!;
     const id = "client_connection_001";
     control.open(); registration(control, [id, "client_connection_002"]);

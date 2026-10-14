@@ -15,8 +15,9 @@ export class LegacySessionFacade {
     const snapshot=this.registry.store.getSnapshot(this.sessionId);if(!snapshot)throw new CatalogError("SESSION_NOT_FOUND");
     const {workspacePath:_path,createdAt:_created,updatedAt:_updated,providerSessionId:_native,baselineHead:_head,baselineDirty:_dirty,baselineStatus:_status,baselineCapturedAt:_captured,...session}=snapshot.session;
     const active=snapshot.activeTurn;
-    const {authSubjectId:_actor,providerSessionId:_nativeTurn,attemptId:_attempt,nativeTurnId:_nativeId,...turn}=active??{};
-    return {session:{...session,workspaceId:"default" as const},...(active?{activeTurn:turn}:{}),pendingApprovals:snapshot.pendingApprovals};
+    if(!active)return {session:{...session,workspaceId:"default" as const},pendingApprovals:snapshot.pendingApprovals};
+    const {authSubjectId:_actor,providerSessionId:_nativeTurn,attemptId:_attempt,nativeTurnId:_nativeId,...turn}=active;
+    return {session:{...session,workspaceId:"default" as const},activeTurn:turn,pendingApprovals:snapshot.pendingApprovals};
   }
   /** Compatibility session.create was always a read; preserve that contract. */
   create(){return this.publicSnapshot();}

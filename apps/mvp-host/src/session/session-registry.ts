@@ -22,7 +22,7 @@ export type SessionRegistryOptions<R extends SessionRuntime> = {
   runtimeFactory:(context:SessionRuntimeContext)=>Promise<R>|R;
   publish?:(event:SessionEvent)=>void;
 };
-type Entry<R> = {runtime?:R;loading?:Promise<R>;closing?:Promise<RuntimeCloseReport>;unsubscribe?:()=>void;cancelLoad:boolean};
+type Entry<R> = {runtime?:R;runtimeId?:string;loading?:Promise<R>;closing?:Promise<RuntimeCloseReport>;unsubscribe?:()=>void;cancelLoad:boolean};
 const stopped:RuntimeCloseReport={closed:true,producerStopped:true,clean:true,state:"stopped",stopped:true,recoveryRequired:false};
 
 /** Persistent Session routing; history queries never call runtimeFactory. */
@@ -111,7 +111,8 @@ export class SessionRegistry<R extends SessionRuntime=SessionRuntime> {
     }catch(error){return Promise.reject(error);}
     entry.cancelLoad=false;
     const captured=entry;
-    const loading=Promise.resolve().then(()=>this.options.runtimeFactory({...resolved,store:this.store,owner:this.options.owner,runtimeId:randomUUID(),ownsStore:false,recoverOnStart:false})).then((runtime)=>{
+    const runtimeId=randomUUID();captured.runtimeId=runtimeId;
+    const loading=Promise.resolve().then(()=>this.options.runtimeFactory({...resolved,store:this.store,owner:this.options.owner,runtimeId,ownsStore:false,recoverOnStart:false})).then((runtime)=>{
       captured.runtime=runtime;
       if(runtime.sessionId!==sessionId)throw new CatalogError("RUNTIME_SESSION_MISMATCH");
       if(captured.cancelLoad||this.shuttingDown)throw new CatalogError("RUNTIME_CLOSING",undefined,true);
@@ -124,9 +125,9 @@ export class SessionRegistry<R extends SessionRuntime=SessionRuntime> {
     }).catch(async(error:unknown)=>{
       if(captured.runtime&&!captured.closing) {
         const report=await this.stop(captured.runtime).catch(()=>({closed:false,producerStopped:false,clean:false,state:"recovery_required" as const}));
-        if(report.clean){captured.unsubscribe?.();delete captured.unsubscribe;delete captured.runtime;this.catalog.setResidency(sessionId,"unloaded");}
+        if(report.clean){captured.unsubscribe?.();delete captured.unsubscribe;delete captured.runtime;delete captured.runtimeId;this.catalog.setResidency(sessionId,"unloaded");}
         else this.catalog.setResidency(sessionId,"blocked");
-      } else if(!captured.closing) this.catalog.setResidency(sessionId,this.options.owner.retainedReason?"blocked":"unloaded");
+      } else if(!captured.closing) this.catalog.setResidency(sessionId,this.options.owner.retainedReason||this.catalog.requireSession(sessionId).residency==="blocked"?"blocked":"unloaded");
       throw error;
     }).finally(()=>{if(captured.loading===loading)delete captured.loading;});
     captured.loading=loading;
@@ -149,7 +150,7 @@ export class SessionRegistry<R extends SessionRuntime=SessionRuntime> {
       const report=runtime?await this.stop(runtime,deadlineMs):prior.residency==="unloaded"||hadLoading?stopped:{closed:false,producerStopped:false,clean:false,state:"recovery_required" as const};
       const base=this.store.getSession(sessionId) as {recoveryState?:string}|undefined;
       const clean=report.clean&&report.producerStopped&&!this.store.getActiveTurn(sessionId)&&base?.recoveryState!=="blocked";
-      if(clean){captured.unsubscribe?.();delete captured.unsubscribe;delete captured.runtime;this.catalog.setResidency(sessionId,"unloaded");return report;}
+      if(clean){captured.unsubscribe?.();delete captured.unsubscribe;delete captured.runtime;delete captured.runtimeId;this.catalog.setResidency(sessionId,"unloaded");return report;}
       this.catalog.setResidency(sessionId,"blocked");
       return {...report,clean:false,state:"recovery_required" as const,recoveryRequired:true};
     }).catch((error:unknown)=>{this.catalog.setResidency(sessionId,"blocked");throw error;}).finally(()=>{if(captured.closing===closing)delete captured.closing;});
@@ -159,7 +160,7 @@ export class SessionRegistry<R extends SessionRuntime=SessionRuntime> {
   async closeRuntimeCommand(command:CatalogCommand,input:unknown,deadlineMs?:number):Promise<CatalogCommit> {
     const parsed=ChangeSessionStatusV2Schema.parse(input);
     const knownUnloaded=this.catalog.requireSession(parsed.sessionId).residency==="unloaded"&&!this.entries.get(parsed.sessionId)?.runtime&&!this.entries.get(parsed.sessionId)?.loading;
-    const runtimeId=this.loaded(parsed.sessionId)?.runtimeId;
+    const runtimeId=this.loaded(parsed.sessionId)?.runtimeId??this.entries.get(parsed.sessionId)?.runtimeId;
     const begun=this.catalog.beginRuntimeClose(command,parsed,{ownerId:this.options.owner.ownerId,ownerGeneration:this.options.owner.generation,resourceKeys:this.options.owner.resourceKeys,...(runtimeId?{runtimeId}:{})});
     this.publish(begun.events);
     if(begun.reused)return {summary:begun.summary,events:begun.events,reused:true};

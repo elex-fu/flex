@@ -7,10 +7,11 @@
     "start": "expo start --offline",
     "ios": "expo run:ios",
     "android": "expo run:android",
-    "build": "expo export --platform all --output-dir dist",
+    "build": "expo export --platform all --source-maps --output-dir dist",
     "typecheck": "tsc --noEmit",
     "typecheck:tests": "tsc --noEmit -p tsconfig.test.json",
-    "test": "vitest run"
+    "test": "vitest run",
+    "verify:export": "node scripts/verify-native-export.cjs"
   },
   "dependencies": {
     "@flyx/client-core": "workspace:*",

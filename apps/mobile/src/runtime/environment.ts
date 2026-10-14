@@ -1,6 +1,6 @@
 import { AttentionClient, FlyxClient, HostRuntimeRegistry, ClientError, DraftStore, revalidateAttentionRoute } from "@flyx/client-core";
 import type { AttentionRouteResolution } from "@flyx/client-core";
-import { InteractionSchema } from "@flyx/mvp-protocol";
+import { InteractionSchema, SESSION_CATALOG_CAPABILITY } from "@flyx/mvp-protocol";
 import { z } from "zod";
 import { Platform } from "react-native";
 import * as Linking from "expo-linking";
@@ -8,7 +8,7 @@ import * as Notifications from "expo-notifications";
 import { expoFetchImplementation, expoPlatformSignals, nativeFetch, nativeSocketFactory, openExpoStore } from "../platform/expo";
 import { pairNativeDirect } from "../platform/transport";
 import { parseNativePairing } from "../platform/pairing";
-import { readSessionSnapshot } from "./session";
+import { nativeSessionClient, readSessionSnapshot } from "./session";
 import type { NativeClientStore } from "../platform/store";
 
 export class MobileEnvironment {
@@ -64,7 +64,7 @@ export class MobileEnvironment {
       getSession: async (hostId, sessionId) => {
         await this.selectHost(hostId); const client = this.registry.get(hostId);
         await client.selectSession(sessionId);
-        const snapshot = await client.request<unknown>("session.getSnapshot", { sessionId });
+        const snapshot = client.supportsCapability(SESSION_CATALOG_CAPABILITY) ? await nativeSessionClient(client).getSnapshot({ sessionId }) : await client.request<unknown>("session.getSnapshot", { sessionId });
         const parsed = readSessionSnapshot(snapshot, sessionId);
         return { id: parsed.sessionId, ...(parsed.activeTurnId ? { activeTurnId: parsed.activeTurnId } : {}) };
       },

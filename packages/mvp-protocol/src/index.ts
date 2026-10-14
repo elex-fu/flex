@@ -138,3 +138,5 @@ export * from "./recovery-api.js";
 export * from "./checkpoint-api.js";
 export * from "./diagnostics.js";
 export * from "./interaction-api.js";
+
+export * from "./attention-api.js";

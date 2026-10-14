@@ -17,3 +17,6 @@ export * from "./host-runtime-registry.js";
 
 export * from "./session-replica.js";
 export * from "./timeline-reconciler.js";
+export * from "./attention-route.js";
+
+export * from "./attention-client.js";

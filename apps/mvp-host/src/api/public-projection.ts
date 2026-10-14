@@ -9,6 +9,7 @@ type GitStatus = Awaited<ReturnType<SessionOrchestrator["gitStatus"]>>;
 type GitDiff = Awaited<ReturnType<SessionOrchestrator["gitDiff"]>>;
 
 const PATH_KEYS = new Set(["cwd", "path", "filePath", "file_path", "targetPath", "target_path", "workspacePath", "workspace_path", "workspace", "directory"]);
+const PRIVATE_RUNTIME_KEYS = new Set(["dispatchContext", "providerSessionId", "nativeSessionId", "nativeTurnId", "nativeItemId"]);
 
 /** The identical projection is used by HTTP, Direct WS and encrypted Relay RPC. */
 export function publicValue(value: unknown, workspace: string, key?: string): unknown {
@@ -22,7 +23,7 @@ export function publicValue(value: unknown, workspace: string, key?: string): un
   }
   if (Array.isArray(value)) return value.map((item) => publicValue(item, workspace));
   if (value && typeof value === "object") {
-    return Object.fromEntries(Object.entries(value).map(([childKey, childValue]) => [childKey, publicValue(childValue, workspace, childKey)]));
+    return Object.fromEntries(Object.entries(value).filter(([childKey]) => !PRIVATE_RUNTIME_KEYS.has(childKey)).map(([childKey, childValue]) => [childKey, publicValue(childValue, workspace, childKey)]));
   }
   return value;
 }

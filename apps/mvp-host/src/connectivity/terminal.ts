@@ -1,3 +1,4 @@
+import { parseRecoveryCommand, type RecoveryCliCommand } from "./recovery-cli.js";
 import { createHash } from "node:crypto";
 import { createInterface } from "node:readline/promises";
 
@@ -74,9 +75,11 @@ async function askTerminal(prompt: string, signal: AbortSignal): Promise<string>
 }
 
 export type HostCommand = { kind: "start" | "help" | "devices-list" | "devices-revoke-all" | "identity-show" | "identity-rotate" }
-  | { kind: "devices-revoke"; deviceId: string };
+  | { kind: "devices-revoke"; deviceId: string } | RecoveryCliCommand;
 
 export function parseHostCommand(args: readonly string[]): HostCommand {
+  const recovery = parseRecoveryCommand(args);
+  if (recovery) return recovery;
   if (!args.length || args.length === 1 && args[0] === "start") return { kind: "start" };
   if (args.length === 1 && ["help", "--help", "-h"].includes(args[0]!)) return { kind: "help" };
   if (args.length === 2 && args[0] === "devices" && args[1] === "list") return { kind: "devices-list" };

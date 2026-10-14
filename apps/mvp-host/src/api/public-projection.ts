@@ -1,5 +1,6 @@
 import { basename, isAbsolute, relative, sep } from "node:path";
 import { OrchestratorError, type SessionOrchestrator } from "../session/orchestrator.js";
+import { RecoveryError } from "../storage/recovery-store.js";
 import { ContentError } from "../content/content-store.js";
 import { FrameBudgetError } from "../content/frame-budget.js";
 import { TimelineError } from "../timeline/contracts.js";
@@ -62,6 +63,7 @@ export function toRpcError(error: unknown, fallbackCode = "INTERNAL_ERROR") {
   if (error instanceof TimelineError) return { code: error.code, message: error.message, retryable: error.retryable };
   if (error instanceof OrchestratorError) return { code: error.code, message: error.message, retryable: error.retryable };
   if (error instanceof ContentError || error instanceof FrameBudgetError) return { code: error.code, message: error.message, retryable: false };
+  if (error instanceof RecoveryError) return { code: error.code, message: error.code, retryable: error.code === "RECOVERY_EVIDENCE_STALE" };
   if (error instanceof AccessError) return { code: error.code, message: error.message, retryable: false };
   // Typed access/identity failures contain deliberately public codes; never expose raw OS/SDK messages.
   if (error instanceof Error && "code" in error && typeof error.code === "string" && /^(?:ACCESS_|DEVICE_|LEASE_|IDENTITY_|PAIRING_|SCOPE_|PROTOCOL_|HOST_IDENTITY_)/.test(error.code)) {

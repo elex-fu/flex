@@ -24,6 +24,7 @@ import { CommandEngine, hashCommandRequest } from "../orchestration/command-engi
 import { decideAcceptTurn, decideApprovalReservation, decideInterrupt } from "../orchestration/decider.js";
 import { ExecutionWorker, type ExecutionWorkerOptions, type OperationIntentHandler } from "../orchestration/execution-worker.js";
 import { ProviderIngestion } from "../orchestration/provider-ingestion.js";
+import { createHostRecovery, type HostRecovery, type HostRecoveryOptions } from "./host-recovery.js";
 import { RuntimeRegistry } from "../provider/runtime-registry.js";
 import type { CommandRequest, ExecutionIntentRow } from "../orchestration/command-contract.js";
 import type { ProviderControlOutcome, ProviderOutcome } from "../provider/types.js";
@@ -76,6 +77,7 @@ export type OrchestratorOptions = {
   /** Commits an R07 runtime gate without rewriting a known Provider terminal. */
   onExecutionBlocked?: (intent: ExecutionIntentRow, reason: string) => void;
   assertWriteReady?: () => void;
+  recovery?: Pick<HostRecoveryOptions, "resolveResource" | "processInspector" | "inspectBoundary" | "inspectWorkspace" | "codexReader" | "supersedeInteractions" | "companionEvents">;
   runtimeId?: string;
   owner?: HostOwnerHandle;
   store?: SqliteStore;
@@ -124,6 +126,7 @@ export class SessionOrchestrator {
   readonly worker: ExecutionWorker;
   readonly runtimes: RuntimeRegistry;
   readonly ingestion: ProviderIngestion;
+  readonly recovery: HostRecovery;
   private readonly listeners = new Set<SessionEventListener>();
   private commandTail: Promise<unknown> = Promise.resolve();
   private eventTail: Promise<void> = Promise.resolve();
@@ -240,6 +243,27 @@ export class SessionOrchestrator {
     }
     this.runtimes = new RuntimeRegistry({ drainIngestion: () => this.ingestion.drain() });
     this.runtimes.register(this.runtimeId, this.adapter);
+    this.recovery = createHostRecovery({ store: this.store, owner: this.owner, sessionId: this.session.id, workspace: this.workspace,
+      provider: this.session.provider, ...options.recovery, canReleaseWorkspace: this.canReleaseWorkspace,
+      onCommit: (events) => events.forEach((event) => this.notify(event)),
+      onBlocked: (context) => { this.runtimes.retainBinding(context); this.activeWorkspaceLease?.retain("producer_stop_unverified"); this.owner.retain("producer_stop_unverified"); },
+      reconcileRuntime: (context, native) => {
+        if (!this.runtimes.matches(context)) return;
+        if (native.state === "not_dispatched") {
+          const evidence = { kind: "not-dispatched" as const };
+          this.runtimes.reconcileVerified(context, native.status === "cancelled" ? { status: "cancelled", evidence } : { status: "failed", error: "Original user operation was not dispatched", evidence });
+          return;
+        }
+        const evidence = { kind: "native-terminal" as const, sourceId: native.evidence.sourceId };
+        this.runtimes.reconcileVerified(context, native.status === "completed" ? { status: "completed", providerSessionId: native.nativeSessionId, evidence }
+          : native.status === "cancelled" ? { status: "cancelled", providerSessionId: native.nativeSessionId, evidence }
+          : { status: "failed", providerSessionId: native.nativeSessionId, error: native.error ?? "Original native Turn failed", evidence });
+      },
+      reconcileStoppedRuntime: (context, evidence) => {
+        if (this.runtimes.matches(context)) this.runtimes.reconcileStopped(context, evidence);
+      },
+      afterRecovery: (operation, evidenceId) => this.releaseRecoveredOwnership(operation, evidenceId),
+    });
     this.ingestion = new ProviderIngestion({
       admit: (event) => this.admitAdapterEvent(event),
       handle: (event) => this.handleAdapterEvent(event),
@@ -269,7 +293,14 @@ export class SessionOrchestrator {
       onStartOutcome: (intent, outcome) => this.settleTurn(intent, outcome),
       onControlResult: (intent, outcome) => this.settleControl(intent, outcome),
       drainIngestion: () => this.ingestion.drain(),
-      failed: (error) => { if (error instanceof Error && !/^(DEVICE_|SCOPE_|PRE_DISPATCH_|DISPATCH_)/.test(error.message)) this.degraded = true; },
+      failed: (error, intent) => {
+        if (this.closed || !this.store.db.open) return;
+        if (intent?.dispatchContext && intent.turnId && ["completed", "failed", "cancelled"].includes(this.store.getTurn(intent.turnId)?.status ?? "")) {
+          this.markExecutionBlocked(intent, "after_terminal_operation_unverified");
+          options.onExecutionBlocked?.(intent, "after_terminal_operation_unverified");
+        }
+        if (error instanceof Error && !/^(DEVICE_|SCOPE_|PRE_DISPATCH_|DISPATCH_)/.test(error.message)) this.degraded = true;
+      },
     });
     this.lifecycle = new HostLifecycle({
       stopAdmission: () => { this.closed = true; this.worker.stopAdmission(); },
@@ -458,6 +489,7 @@ export class SessionOrchestrator {
         return this.commandEngine.commitRequest<StartTurnResponse>(request, () => { throw new Error("RECEIPT_DISAPPEARED"); }).result;
       }
       if (this.degraded) throw new OrchestratorError("HOST_DEGRADED", "Host event persistence is degraded; restart the Host before starting a new Turn", true);
+      this.recovery.assertAdmission();
       const current = this.snapshot();
       if (current.session.activityState !== "idle" || current.activeTurn) {
         throw new OrchestratorError("TURN_BUSY", "The current session already has an active turn", true);
@@ -472,7 +504,8 @@ export class SessionOrchestrator {
         await this.ensureBaseline();
         const accepted = this.commandEngine.commitRequest(request, (facts, clock) => {
           this.assertWritable(); this.worker.assertAdmission("start_turn");
-          return decideAcceptTurn(facts, request, { prompt }, clock);
+          this.recovery.assertAdmission();
+          return decideAcceptTurn(facts, request, { prompt, turnId: leaseOperationId }, clock);
         });
         if (accepted.reused) { lease.release(); this.activeWorkspaceLease = undefined; return accepted.result; }
         return accepted.result;
@@ -488,7 +521,7 @@ export class SessionOrchestrator {
     return this.enqueueCommand(async () => {
       const request = this.commandRequest(authSubjectId, commandId, "session.interrupt", {}, targetRequest);
       return this.commandEngine.commitRequest(request, (facts, clock) => {
-        this.assertWritable(); this.worker.assertAdmission("control");
+        this.assertWritable(); this.recovery.assertAdmission(); this.worker.assertAdmission("control");
         return decideInterrupt(facts, request, clock);
       }).result;
     });
@@ -498,7 +531,7 @@ export class SessionOrchestrator {
     return this.enqueueCommand(async () => {
       const request = this.commandRequest(authSubjectId, commandId, "approval.respond", { approvalId, action }, targetRequest);
       return this.commandEngine.commitRequest(request, (facts, clock) => {
-        this.assertWritable(); this.worker.assertAdmission("control");
+        this.assertWritable(); this.recovery.assertAdmission(); this.worker.assertAdmission("control");
         return decideApprovalReservation(facts, request, { approvalId, action }, clock);
       }, { approvalId }).result;
     });
@@ -567,6 +600,7 @@ export class SessionOrchestrator {
   private retainExecution(intent: ExecutionIntentRow, reason: string): void {
     this.activeWorkspaceLease?.retain(reason); this.owner.retain(reason);
     if (intent.dispatchContext) this.runtimes.retainBinding(intent.dispatchContext);
+    this.markExecutionBlocked(intent, reason);
     const blocked = this.onExecutionBlocked?.(intent, reason) as unknown;
     if (blocked && typeof (blocked as { then?: unknown }).then === "function") {
       void Promise.resolve(blocked).catch(() => undefined);
@@ -703,9 +737,11 @@ export class SessionOrchestrator {
     if ("itemId" in event) event = { ...event, nativeItemId: event.itemId, itemId: `provider-${target.id}-${event.itemId}` };
     switch (event.kind) {
       case "session_init":
+        this.recovery.recordNativeEvent(event);
         this.commit("provider.session.init", event, { turnId: target.id, turnStatus: target.status, providerSessionId: event.providerSessionId, timeline: { itemId: `system-session-${target.id}`, kind: "system", status: "info", content: { message: `${providerDisplayName(event.provider)} session initialized`, provider: event.provider, providerSessionId: event.providerSessionId, model: event.model, runtimeVersion: event.runtimeVersion } } });
         return;
       case "native_binding":
+        this.recovery.recordNativeEvent(event);
         this.commit("provider.turn.bound", event, { turnId: target.id, turnStatus: target.status, providerSessionId: event.nativeSessionId });
         return;
       case "assistant_delta": {
@@ -838,9 +874,90 @@ export class SessionOrchestrator {
 
   private commit(type: string, payload: unknown, options: Parameters<SqliteStore["commitEvent"]>[3] = {}): SessionEvent {
     this.owner.assertActive();
-    const event = this.store.commitEvent(this.session.id, type, payload, options);
+    const context = options.turnId ? this.dispatchContexts.get(options.turnId)
+      ?? this.recovery.recovery.target(this.session.id, options.turnId).context : undefined;
+    let blocked = false;
+    let marker: SessionEvent | undefined;
+    const event = this.store.db.transaction(() => {
+      if (context && options.turnStatus && ["completed", "failed", "cancelled"].includes(options.turnStatus)) blocked = this.recovery.protectTerminal(context);
+      const terminal = this.store.commitEvent(this.session.id, type, payload, blocked ? { ...options, activityState: "outcome_unknown" } : options);
+      if (context && (blocked || options.turnStatus === "outcome_unknown")) {
+        const session = this.store.getSession(this.session.id)!;
+        marker = this.store.commitEvent(this.session.id, "session.recovery.blocked", { turnId: context.flyxTurnId,
+          attemptId: context.attemptId, recoveryRevision: session.recoveryRevision, reason: blocked ? "producer_stop_unverified" : "turn_outcome_unknown" });
+      }
+      return terminal;
+    })();
     this.notify(event);
+    if (marker) this.notify(marker);
+    if (context && blocked) this.recovery.retained(context);
     return event;
+  }
+
+  /** A capture/cleanup failure blocks execution without changing a known business result. */
+  markExecutionBlocked(intent: ExecutionIntentRow, reason: string): void {
+    if (this.closed || !this.store.db.open) return;
+    const context = intent.dispatchContext;
+    if (!context || !intent.turnId || context.flyxTurnId !== intent.turnId || context.sessionId !== this.session.id
+      || context.hostOwnerId !== this.owner.ownerId || context.hostOwnerGeneration !== this.owner.generation || !this.runtimes.matches(context)) return;
+    this.owner.assertActive();
+    const publicReason = /^[a-zA-Z0-9_]{1,128}$/.test(reason) ? reason : "execution_cleanup_unverified";
+    let event: SessionEvent | undefined;
+    let matched = false;
+    this.store.db.transaction(() => {
+      const target = this.recovery.recovery.target(context.sessionId, context.flyxTurnId, context.attemptId);
+      const currentGeneration = (this.store.db.prepare("SELECT COALESCE(MAX(generation),0) AS generation FROM turns WHERE session_id=?")
+        .get(context.sessionId) as { generation: number }).generation;
+      if (target.turn.generation !== context.runtimeGeneration || currentGeneration !== context.runtimeGeneration || target.context && !sameDispatchContext(target.context, context)
+        || target.session.activeTurnId && target.session.activeTurnId !== target.turn.id) return;
+      matched = true;
+      const latest = this.store.db.prepare("SELECT payload_json FROM session_events WHERE session_id=? AND type='session.recovery.blocked' ORDER BY sequence DESC LIMIT 1")
+        .get(this.session.id) as { payload_json: string } | undefined;
+      const previous = latest ? JSON.parse(latest.payload_json) as { turnId?: string; attemptId?: string; reason?: string } : undefined;
+      if (target.session.recoveryState === "blocked" && previous?.turnId === context.flyxTurnId && previous.attemptId === context.attemptId && previous.reason === publicReason) return;
+      this.store.db.prepare("UPDATE sessions SET active_turn_id=?, recovery_state='blocked', activity_state='outcome_unknown', recovery_revision=recovery_revision+1 WHERE id=?")
+        .run(context.flyxTurnId, context.sessionId);
+      const current = this.store.getSession(context.sessionId)!;
+      event = this.store.commitEvent(context.sessionId, "session.recovery.blocked", { turnId: context.flyxTurnId, attemptId: context.attemptId,
+        reason: publicReason, recoveryRevision: current.recoveryRevision });
+    })();
+    if (!matched) return;
+    if (event) this.notify(event);
+    this.runtimes.retainBinding(context);
+    this.recovery.retained(context);
+  }
+
+  private releaseRecoveredOwnership(operation: import("@flyx/mvp-protocol").RecoveryOperation, evidenceId: string): void {
+    if (operation.gate !== "released") return;
+    try {
+      if (this.activeWorkspaceLease) {
+        const proof = this.recovery.recovery.releaseProof(evidenceId, [this.activeWorkspaceLease.resourceKey]);
+        if (!proof) throw new Error("RECOVERY_RELEASE_PROOF_INVALID");
+        this.activeWorkspaceLease.clearRetention(proof, this.recovery.recovery.verifyReleaseProof);
+        this.activeWorkspaceLease.release(); this.activeWorkspaceLease = undefined;
+      }
+      if (this.owner.retainedReason) {
+        const proof = this.recovery.recovery.releaseProof(evidenceId, this.owner.resourceKeys);
+        if (!proof) throw new Error("RECOVERY_RELEASE_PROOF_INVALID");
+        this.owner.clearRetention(proof, this.recovery.recovery.verifyReleaseProof);
+      }
+    } catch {
+      // An unlock failure must remain a durable admission gate as well as a file lock.
+      let marker: SessionEvent | undefined;
+      this.store.db.transaction(() => {
+        const changed = this.store.db.prepare(`UPDATE sessions SET recovery_state='blocked', activity_state='outcome_unknown',
+          active_turn_id=?, recovery_revision=recovery_revision+1 WHERE id=? AND active_turn_id IS NULL AND recovery_revision=?`)
+          .run(operation.turnId, operation.sessionId, operation.recoveryRevision);
+        if (changed.changes) marker = this.store.commitEvent(operation.sessionId, "session.recovery.blocked", { turnId: operation.turnId, reason: "retained_resource_release_unverified",
+          recoveryRevision: operation.recoveryRevision + 1 });
+      })();
+      if (marker) {
+        this.notify(marker);
+        const original = this.recovery.recovery.target(operation.sessionId, operation.turnId, operation.attemptId).context;
+        if (original) this.recovery.retained(original);
+      }
+      throw new OrchestratorError("RECOVERY_RELEASE_PROOF_INVALID", "Recovered execution remains blocked until retained ownership is verified");
+    }
   }
 
   /**

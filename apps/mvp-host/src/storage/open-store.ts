@@ -48,7 +48,7 @@ export function upgradeForRecoveryMaintenance<T>(owner: HostOwnerHandle, db: Dat
   pureMetadataMigration: (connection: Database.Database) => T): T {
   assertHostOwner(owner);
   owner.assertStorePath(db.name);
-  if (!owner.recoveryOnly || owner.mode !== "maintenance" || db.readonly || !owner.retainedReason) {
+  if (!owner.recoveryOnly || owner.mode !== "maintenance" || db.readonly) {
     throw new Error("A held retained recovery-maintenance writer is required for metadata upgrade");
   }
   const retained = owner.retainedReason;

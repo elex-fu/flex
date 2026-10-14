@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { FrameSchema, ClientHelloV2Schema, ApplicationFrameSchema, BOUNDED_CONTENT_CAPABILITY, TIMELINE_PROJECTION_CAPABILITY } from "@flyx/mvp-protocol";
+import { FrameSchema, ClientHelloV2Schema, ApplicationFrameSchema, BOUNDED_CONTENT_CAPABILITY, TIMELINE_PROJECTION_CAPABILITY, RecoveryCapability } from "@flyx/mvp-protocol";
 import { z } from "zod";
 import { OrchestratorError, type SessionOrchestrator } from "../session/orchestrator.js";
 import { DeviceRegistry } from "../auth/device-registry.js";
@@ -53,8 +53,8 @@ export class ConnectionGateway {
   private readonly capabilities: string[];
   constructor(private readonly options: ConnectionGatewayOptions) {
     this.contentStore = options.contentStore ?? options.orchestrator.views?.content;
-    this.capabilities = [...CAPABILITIES, ...(this.contentStore ? [BOUNDED_CONTENT_CAPABILITY] : []), ...(options.orchestrator.views?.ready(options.orchestrator.sessionId) ? [TIMELINE_PROJECTION_CAPABILITY] : [])];
-    this.dispatcher = new RpcDispatcher({ ...options, ...(this.contentStore ? { contentStore: this.contentStore } : {}) });
+    this.capabilities = [...CAPABILITIES, RecoveryCapability, ...(this.contentStore ? [BOUNDED_CONTENT_CAPABILITY] : []), ...(options.orchestrator.views?.ready(options.orchestrator.sessionId) ? [TIMELINE_PROJECTION_CAPABILITY] : [])];
+    this.dispatcher = new RpcDispatcher({ ...options, recovery: options.orchestrator.recovery, ...(this.contentStore ? { contentStore: this.contentStore } : {}) });
   }
 
   close(code = 1001, reason = "HOST_SHUTDOWN"): void { for (const stop of this.connections) stop(code, reason); }

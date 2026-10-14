@@ -20,3 +20,5 @@ export * from "./timeline-reconciler.js";
 export * from "./attention-route.js";
 
 export * from "./attention-client.js";
+
+export * from "./recovery-client.js";

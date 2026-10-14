@@ -1,9 +1,10 @@
 import { randomUUID } from "node:crypto";
 import type { RecoveryEvidence, RecoveryInspectPayload, RecoveryOperation, SessionEvent } from "@flyx/mvp-protocol";
 import type { NativeHandle, NativeTurnObservation } from "../provider/native-history.js";
+import type { PlannedEvent } from "../orchestration/command-contract.js";
 import type { SqliteStore } from "../storage/db.js";
 import { RecoveryError, RecoveryStore, digest } from "../storage/recovery-store.js";
-import type { ExecutionRecoveryObservation, RecoveryCommandInput, RecoveryTarget, StoredRecoveryEvidence } from "../storage/recovery-store.js";
+import type { ExecutionRecoveryObservation, RecoveryCommandInput, RecoveryTarget, StoredRecoveryEvidence, NotDispatchedRecoveryOutcome } from "../storage/recovery-store.js";
 
 export type RecoveryServiceOptions = {
   store: SqliteStore;
@@ -15,6 +16,9 @@ export type RecoveryServiceOptions = {
   id?: () => string;
   evidenceTtlMs?: number;
   onCommit?: (events: readonly SessionEvent[]) => void;
+  /** Recheck the original command actor before admission and after asynchronous inspection. */
+  assertCommandAuthorized?: (input: RecoveryCommandInput) => void;
+  companionEvents?: (sessionId: string, turnId: string, reason: string) => PlannedEvent[];
 };
 
 /** Result recovery and execution release are separate, evidence-bound operations. */
@@ -25,7 +29,7 @@ export class RecoveryService {
   private readonly evidenceTtlMs: number;
   private readonly running = new Map<string, { hash: string; result: Promise<RecoveryOperation> }>();
   constructor(private readonly options: RecoveryServiceOptions) {
-    this.recovery = new RecoveryStore(options.store);
+    this.recovery = new RecoveryStore(options.store, { ...(options.companionEvents ? { companionEvents: options.companionEvents } : {}) });
     this.now = options.now ?? (() => new Date().toISOString());
     this.id = options.id ?? randomUUID;
     this.evidenceTtlMs = Math.max(1, Math.min(60_000, options.evidenceTtlMs ?? 30_000));
@@ -41,7 +45,8 @@ export class RecoveryService {
       observedAt, expiresAt: new Date(Date.parse(observedAt) + this.evidenceTtlMs).toISOString(),
       processState: observed.execution.state, workspaceState: observed.execution.workspaceState, nativeState: observed.native.state,
       ...(observed.native.state === "terminal" ? { nativeOutcome: observed.native.status } : {}),
-      nextSteps: ["inspect", ...(observed.native.state === "terminal" ? ["reconcile" as const] : []),
+      ...(observed.committedOutcome ? { committedOutcome: { status: observed.committedOutcome.status, source: "not-dispatched" as const } } : {}),
+      nextSteps: ["inspect", ...(observed.native.state === "terminal" || observed.committedOutcome && this.canRelease(observed.execution) ? ["reconcile" as const] : []),
         ...(this.canRelease(observed.execution) && target.session.activeTurnId === target.turn.id && target.turn.status === "outcome_unknown"
           && observed.native.state !== "terminal" ? ["acknowledge" as const] : []),
         ...(!this.canRelease(observed.execution) ? ["local_inspection" as const] : [])],
@@ -71,6 +76,7 @@ export class RecoveryService {
   }
 
   private async perform(input: RecoveryCommandInput, action: "reconcile" | "acknowledge", hash: string): Promise<RecoveryOperation> {
+    this.options.assertCommandAuthorized?.(input);
     const marked = this.recovery.beginOperation(input, action, hash, this.now());
     if (marked.operation.result) return marked.operation.result;
     this.options.onCommit?.(marked.events);
@@ -79,11 +85,12 @@ export class RecoveryService {
     try {
       const { target, evidence } = this.recovery.validateEvidence(input, this.now());
       const observed = await this.observe(target);
-      if (digest(observed.execution) !== digest(evidence.execution) || digest(observed.native) !== digest(evidence.native)) {
+      if (digest(observed.execution) !== digest(evidence.execution) || digest(observed.native) !== digest(evidence.native) || digest(observed.committedOutcome ?? null) !== digest(evidence.committedOutcome ?? null)) {
         throw new RecoveryError("RECOVERY_EVIDENCE_STALE");
       }
+      this.options.assertCommandAuthorized?.(input);
       const release = this.canRelease(observed.execution);
-      if (action === "reconcile" && observed.native.state !== "terminal"
+      if (action === "reconcile" && observed.native.state !== "terminal" && !(observed.committedOutcome && release)
         || action === "acknowledge" && (!release || observed.native.state === "terminal")) {
         const blocked = this.recovery.failOperation(journal, "RECOVERY_BLOCKED", this.now());
         this.options.onCommit?.(blocked.events);
@@ -103,13 +110,14 @@ export class RecoveryService {
     }
   }
 
-  private async observe(target: RecoveryTarget): Promise<{ execution: ExecutionRecoveryObservation; native: NativeTurnObservation }> {
+  private async observe(target: RecoveryTarget): Promise<{ execution: ExecutionRecoveryObservation; native: NativeTurnObservation; committedOutcome?: NotDispatchedRecoveryOutcome }> {
     const [execution, native] = await Promise.allSettled([
       this.options.inspectExecution ? this.options.inspectExecution(target) : Promise.resolve(defaultExecutionObservation(target)),
       target.nativeHandle && this.options.inspectNative ? this.options.inspectNative(target.nativeHandle) : Promise.resolve<NativeTurnObservation>({ state: "unknown", reason: "native_history_inspection_unavailable" }),
     ]);
     return {
       execution: this.normalizeExecution(target, execution.status === "fulfilled" ? execution.value : { state: "unknown", workspaceState: "unknown", reason: "process_inspection_failed" }),
+      ...(target.committedOutcome ? { committedOutcome: target.committedOutcome } : {}),
       native: this.normalizeNative(target, native.status === "fulfilled" ? native.value : { state: "unknown", reason: "native_history_read_failed" }),
     };
   }

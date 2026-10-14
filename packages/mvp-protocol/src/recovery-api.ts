@@ -28,6 +28,7 @@ export const RecoveryEvidenceSchema = z.object({
   workspaceState: z.enum(["clear", "held", "unknown"]),
   nativeState: z.enum(["terminal", "running", "unknown"]),
   nativeOutcome: z.enum(["completed", "failed", "cancelled"]).optional(),
+  committedOutcome: z.object({ status: z.enum(["failed", "cancelled"]), source: z.literal("not-dispatched") }).strict().optional(),
   nextSteps: z.array(z.enum(["inspect", "reconcile", "acknowledge", "local_inspection"])).max(4),
 }).strict();
 
@@ -47,3 +48,10 @@ export type RecoveryReconcilePayload = z.infer<typeof RecoveryReconcilePayloadSc
 export type RecoveryAcknowledgePayload = z.infer<typeof RecoveryAcknowledgePayloadSchema>;
 export type RecoveryEvidence = z.infer<typeof RecoveryEvidenceSchema>;
 export type RecoveryOperation = z.infer<typeof RecoveryOperationSchema>;
+
+export type RecoveryRpcContract = {
+  "session.recovery.inspect": { payload: RecoveryInspectPayload; response: RecoveryEvidence };
+  "session.recovery.reconcile": { payload: RecoveryReconcilePayload; response: RecoveryOperation };
+  "session.recovery.acknowledge": { payload: RecoveryAcknowledgePayload; response: RecoveryOperation };
+};
+export type RecoveryRpcMethod = keyof RecoveryRpcContract;

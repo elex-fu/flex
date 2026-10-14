@@ -1,5 +1,6 @@
 import { z } from "zod";
-import { BOUNDED_CONTENT_CAPABILITY, ContentChunkRequestSchema, TIMELINE_PROJECTION_CAPABILITY, OpenViewRequestSchema, TimelinePageRequestSchema, TimelineSubscribeRequestSchema, TimelineUnsubscribeRequestSchema, type OpenViewRequest, type TimelinePageRequest, type TimelineSubscribeRequest } from "@flyx/mvp-protocol";
+import { BOUNDED_CONTENT_CAPABILITY, RecoveryCapability, RecoveryInspectPayloadSchema, RecoveryReconcilePayloadSchema, RecoveryAcknowledgePayloadSchema, ContentChunkRequestSchema, TIMELINE_PROJECTION_CAPABILITY, OpenViewRequestSchema, TimelinePageRequestSchema, TimelineSubscribeRequestSchema, TimelineUnsubscribeRequestSchema, type OpenViewRequest, type TimelinePageRequest, type TimelineSubscribeRequest } from "@flyx/mvp-protocol";
+import type { HostRecovery } from "../session/host-recovery.js";
 import type { ContentStore } from "../content/content-store.js";
 import type { TimelineLeaseOwner } from "../timeline/contracts.js";
 import type { FrameBudget } from "../content/frame-budget.js";
@@ -35,6 +36,7 @@ export interface RpcContext {
 
 export interface RpcDispatcherOptions {
   contentStore?: ContentStore;
+  recovery?: HostRecovery;
   orchestrator: SessionOrchestrator;
   bootstrap(): unknown;
   descriptor(): unknown;
@@ -43,6 +45,11 @@ export interface RpcDispatcherOptions {
 /** Transport independent business dispatch. The Provider never receives a transport. */
 export class RpcDispatcher {
   constructor(private readonly options: RpcDispatcherOptions) {}
+
+  private recovery(context: RpcContext): HostRecovery {
+    if (!context.capabilities?.has(RecoveryCapability) || !this.options.recovery) throw new OrchestratorError("CAPABILITY_REQUIRED", "Session recovery capability is required");
+    return this.options.recovery;
+  }
 
   async dispatch(frame: RpcRequest, context: RpcContext): Promise<unknown> {
     context.assertAuthorized(frame.method);
@@ -63,6 +70,26 @@ export class RpcDispatcher {
       case "timeline.getPage": requireViews(); if (!context.timelinePage) throw new OrchestratorError("CAPABILITY_REQUIRED", "Host views are unavailable"); return context.timelinePage(TimelinePageRequestSchema.parse(frame.payload));
       case "timeline.subscribe": requireViews(); if (!context.timelineSubscribe) throw new OrchestratorError("CAPABILITY_REQUIRED", "Host views are unavailable"); return context.timelineSubscribe(TimelineSubscribeRequestSchema.parse(frame.payload));
       case "timeline.unsubscribe": requireViews(); if (!context.timelineUnsubscribe) throw new OrchestratorError("CAPABILITY_REQUIRED", "Host views are unavailable"); return context.timelineUnsubscribe(TimelineUnsubscribeRequestSchema.parse(frame.payload).subscriptionId);
+      case "session.recovery.inspect": {
+        const recovery = this.recovery(context);
+        const payload = RecoveryInspectPayloadSchema.parse(frame.payload);
+        checkSession(payload.sessionId);
+        return recovery.inspect(payload);
+      }
+      case "session.recovery.reconcile": {
+        const recovery = this.recovery(context);
+        const payload = RecoveryReconcilePayloadSchema.parse(frame.payload);
+        checkSession(payload.sessionId);
+        const { attemptId, ...request } = payload;
+        return recovery.reconcile({ ...request, ...(attemptId ? { attemptId } : {}), authSubjectId: context.subjectId, commandId: commandId() });
+      }
+      case "session.recovery.acknowledge": {
+        const recovery = this.recovery(context);
+        const payload = RecoveryAcknowledgePayloadSchema.parse(frame.payload);
+        checkSession(payload.sessionId);
+        const { attemptId, ...request } = payload;
+        return recovery.acknowledge({ ...request, ...(attemptId ? { attemptId } : {}), authSubjectId: context.subjectId, commandId: commandId() });
+      }
       case "host.bootstrap": return this.options.bootstrap();
       case "host.getDescriptor": return this.options.descriptor();
       case "host.getSnapshot":

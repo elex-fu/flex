@@ -71,13 +71,15 @@ describe("production Orchestrator worker path", () => {
     expect(f.calls).toHaveLength(phase === "native_terminal" ? 1 : 0);
     expect(f.host.workspaceLease).toBe(lease); expect(release).not.toHaveBeenCalled(); expect(retain).toHaveBeenCalledWith("producer_stop_unverified");
     expect(f.host.owner.retainedReason).toBe("producer_stop_unverified");
-    await expect(f.host.startTurn("device", "second", "another prompt")).rejects.toMatchObject({ code: "WORKSPACE_BUSY" });
+    expect(f.host.snapshot().session).toMatchObject({ activeTurnId: accepted.turnId, recoveryState: "blocked", activityState: "outcome_unknown" });
+    expect(lease.operationId).toBe(accepted.turnId);
+    await expect(f.host.startTurn("device", "second", "another prompt")).rejects.toMatchObject({ code: "RECOVERY_BLOCKED" });
   });
   it("retains an unproven Provider outcome and rejects a new Turn without releasing the checkout", async () => {
     const f = setup(); await f.host.startTurn("device", "command", "prompt"); await f.host.worker.drainDispatch();
     const lease = f.host.workspaceLease!; const release = vi.spyOn(lease, "release"); const retain = vi.spyOn(lease, "retain");
     f.outcome.release({ status: "outcome_unknown", error: "stdio ended after possible send", evidence: { kind: "unknown", reason: "stdio ended after possible send" } });
     expect(await f.host.worker.drainOperations()).toBe(true); expect(f.host.snapshot().session.activityState).toBe("outcome_unknown"); expect(f.host.workspaceLease).toBe(lease); expect(release).not.toHaveBeenCalled(); expect(retain).toHaveBeenCalledWith("turn_outcome_unverified");
-    await expect(f.host.startTurn("device", "new-command", "new prompt")).rejects.toMatchObject({ code: "TURN_BUSY" }); expect(f.calls).toHaveLength(1);
+    await expect(f.host.startTurn("device", "new-command", "new prompt")).rejects.toMatchObject({ code: "RECOVERY_BLOCKED" }); expect(f.calls).toHaveLength(1);
   });
 });

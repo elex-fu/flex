@@ -8,6 +8,7 @@ import { createPairingConfirmation, parseHostCommand, type HostCommand } from ".
 import { getHostIdentityMirror, loadOrCreateHostIdentity, publicHostIdentity, rotateHostIdentity, type HostIdentityFileV1 } from "./identity/host-identity.js";
 import { createHostServer } from "./server.js";
 import { SessionOrchestrator } from "./session/orchestrator.js";
+import { runOfflineRecovery } from "./connectivity/recovery-cli.js";
 import { SqliteStore } from "./storage/db.js";
 import { HostOwnerLock, assertWorkspacePrivacy, canonicalPath } from "./lifecycle/host-owner.js";
 import { openForMaintenance, openForManagement, openOwned, openReadOnly } from "./storage/open-store.js";
@@ -21,6 +22,8 @@ async function main(): Promise<void> {
   const command = parseHostCommand(process.argv.slice(2));
   if (command.kind === "help") {
     console.log("Flyx Host: start | devices list | devices revoke <deviceId> | devices revoke-all | identity show | identity rotate");
+    console.log("Recovery: recovery inspect <sessionId> <turnId> [--attempt <attemptId>] [--upgrade-metadata]");
+    console.log("Recovery write: recovery reconcile|acknowledge <sessionId> <turnId> <evidenceId> <recoveryRevision> <commandId> [--attempt <attemptId>] [--acknowledge-unknown]");
     console.log("Select the existing Host using FLYX_DB and FLYX_IDENTITY_DIR. Key rotation requires confirmation in a local terminal.");
     return;
   }
@@ -29,6 +32,10 @@ async function main(): Promise<void> {
   const defaultDatabase = provider === "codex" ? ".flyx/mvp-codex.sqlite" : ".flyx/mvp.sqlite";
   const databasePath = resolve(process.env.FLYX_DB ?? resolve(process.cwd(), defaultDatabase));
   const identityDirectory = resolve(process.env.FLYX_IDENTITY_DIR ?? join(dirname(databasePath), "identity"));
+  if (command.kind === "recovery") {
+    console.log(JSON.stringify(await runOfflineRecovery(command, { databasePath, identityDirectory }), null, 2));
+    return;
+  }
   if (command.kind !== "start") {
     // Read-only commands never migrate, initialize identity or recover leases.
     // Revocation is the sole live local write, through an existing schema and

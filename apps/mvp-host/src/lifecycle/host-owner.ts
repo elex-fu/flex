@@ -177,6 +177,7 @@ function readRecord(path: string): { record: OwnerRecord; stat: Stats } {
 /** Shared by Host owner and checkout lease; every mutation uses the guard. */
 export class ExclusiveFileLock {
   private released = false;
+  private recoveryCleared = false;
   private readonly identity: Stats;
 
   private constructor(readonly path: string, private readonly fd: number, private readonly record: OwnerRecord,
@@ -234,7 +235,7 @@ export class ExclusiveFileLock {
     });
   }
 
-  static acquireRetainedForMaintenance(options: { directory: string; resourceKey: string; inspector: ProcessInspector }): ExclusiveFileLock {
+  static acquireRetainedForMaintenance(options: { directory: string; resourceKey: string; inspector: ProcessInspector; allowUnretainedCrash?: true }): ExclusiveFileLock {
     const directory = privateCoordinationDirectory(options.directory);
     const path = join(directory, `${createHash("sha256").update(options.resourceKey).digest("hex")}.owner`);
     const guardPath = `${path}.maintenance`;
@@ -250,7 +251,7 @@ export class ExclusiveFileLock {
       writeSync(guardFd, JSON.stringify({ v: 1, maintenanceId: heldGuard.maintenanceId, resourceKey: options.resourceKey, process: options.inspector.currentIdentity() }));
       fsyncSync(guardFd);
       const current = readRecord(path);
-      if (!current.record.retainedReason || current.record.resourceKey !== options.resourceKey) {
+      if ((!current.record.retainedReason && !options.allowUnretainedCrash) || current.record.resourceKey !== options.resourceKey) {
         throw new HostOwnershipError("OWNER_RECOVERY_REQUIRED", "Recovery maintenance requires the exact retained owner resource.");
       }
       const inspected = options.inspector.inspect(current.record.process);
@@ -362,6 +363,7 @@ export class ExclusiveFileLock {
       verifyRecovery(current.record, { proof, verifyProof });
       this.assertActive(); // The verifier must not replace the checked lock.
       delete this.record.retainedReason;
+      this.recoveryCleared = true;
       this.record.recoveryEvidence = { evidenceId: proof.evidenceId, turnId: proof.turnId, attemptId: proof.attemptId, reconciledAt: new Date().toISOString() };
       ftruncateSync(this.fd, 0);
       writeSync(this.fd, JSON.stringify(this.record), 0, "utf8");
@@ -371,6 +373,7 @@ export class ExclusiveFileLock {
 
   release(): void {
     if (this.released) return;
+    if (this.heldGuard && !this.recoveryCleared) throw new HostOwnershipError("OWNER_RECOVERY_REQUIRED", "Held crash recovery cannot release original ownership without committed stop evidence.");
     if (this.record.retainedReason) throw new HostOwnershipError("OWNER_RECOVERY_REQUIRED", "Host owner must remain in place until retained execution is reconciled.");
     try {
       this.withGuard(() => {
@@ -418,7 +421,7 @@ export class HostOwnerLock {
     const resourceKeys = [`db:${databasePath}`, `identity:${identityDirectory}`].sort();
     const locks: ExclusiveFileLock[] = [];
     try {
-      for (const resourceKey of resourceKeys) locks.push(ExclusiveFileLock.acquireRetainedForMaintenance({ directory: coordinationDirectory, resourceKey, inspector: options.inspector ?? new SystemProcessInspector() }));
+      for (const resourceKey of resourceKeys) locks.push(ExclusiveFileLock.acquireRetainedForMaintenance({ directory: coordinationDirectory, resourceKey, inspector: options.inspector ?? new SystemProcessInspector(), allowUnretainedCrash: true }));
       const first = locks[0]!.ownership();
       if (locks.some((lock) => lock.ownership().ownerId !== first.ownerId || lock.ownership().ownerGeneration !== first.ownerGeneration)) {
         throw new HostOwnershipError("HOST_OWNER_UNKNOWN", "Retained DB and identity resources belong to different Host invocations.");
@@ -430,6 +433,7 @@ export class HostOwnerLock {
     const original = locks[0]!.ownership();
     let retainedReason: string | undefined = original.retainedReason;
     let closed = false;
+    let recoveryAuthorized = false;
     const handle: RecoveryMaintenanceOwnerHandle = {
       ownerId: original.ownerId, generation: original.ownerGeneration, databasePath, identityDirectory, coordinationDirectory,
       mode: "maintenance", recoveryOnly: true, resourceKeys: Object.freeze(resourceKeys), get retainedReason() { return retainedReason; },
@@ -446,11 +450,12 @@ export class HostOwnerLock {
         const cachedVerifier: OwnershipRecoveryVerifier = (_, context) => verified.some((originalContext) =>
           JSON.stringify(originalContext) === JSON.stringify(context));
         locks.forEach((lock) => lock.clearRetention(proof, cachedVerifier));
+        recoveryAuthorized = true;
         retainedReason = undefined;
       },
       release: () => {
         if (closed) return;
-        if (retainedReason) throw new HostOwnershipError("OWNER_RECOVERY_REQUIRED", "Recovery maintenance cannot release retained ownership without committed stop evidence.");
+        if (!recoveryAuthorized || retainedReason) throw new HostOwnershipError("OWNER_RECOVERY_REQUIRED", "Recovery maintenance cannot release original ownership without committed stop evidence.");
         const failures: unknown[] = [];
         for (const lock of [...locks].reverse()) { try { lock.release(); } catch (error) { failures.push(error); } }
         closed = true;

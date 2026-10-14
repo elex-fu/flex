@@ -1,5 +1,7 @@
 import Database from "better-sqlite3";
 import { randomUUID } from "node:crypto";
+import { HostOwnerLock, assertHostOwner, canonicalPath, createTestHostOwner, type HostOwnerHandle } from "../lifecycle/host-owner.js";
+import { inspectSchema, StoreSchemaError, validateV3Schema } from "./migrations/schema-version.js";
 import type { ProviderId, RpcError, Session, SessionEvent, TimelineItem, Turn } from "@flyx/mvp-protocol";
 
 export type SessionRow = Session & {
@@ -174,11 +176,6 @@ export type AccessAuditEvent = {
 };
 
 const SCHEMA = `
-PRAGMA journal_mode = WAL;
-PRAGMA synchronous = FULL;
-PRAGMA foreign_keys = ON;
-PRAGMA busy_timeout = 5000;
-
 CREATE TABLE IF NOT EXISTS schema_migrations (
   version INTEGER PRIMARY KEY,
   applied_at TEXT NOT NULL
@@ -363,17 +360,71 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+export type SqliteStoreOptions = {
+  mode?: "owned" | "readonly" | "maintenance" | "management" | "test-fixture";
+  owner?: HostOwnerHandle;
+};
+
 export class SqliteStore {
   readonly db: Database.Database;
+  readonly mode: NonNullable<SqliteStoreOptions["mode"]>;
+  private readonly ownerHandle: HostOwnerHandle | undefined;
+  private readonly releaseOwnerOnClose: boolean;
 
-  constructor(filePath = ":memory:") {
-    this.db = new Database(filePath);
-    this.db.exec(SCHEMA);
-    this.migrateSchema();
+  constructor(filePath = ":memory:", options: SqliteStoreOptions = {}) {
+    // Preserve legacy file-backed unit fixtures which intentionally open two
+    // raw stores to exercise SQLite CAS. Every file-backed Orchestrator still
+    // supplies a real owner, including under Vitest.
+    this.mode = options.mode ?? (filePath !== ":memory:" && process.env.NODE_ENV === "test" ? "test-fixture" : "owned");
+    if (this.mode === "test-fixture" && process.env.NODE_ENV !== "test") throw new Error("Raw file-backed fixtures are only allowed under NODE_ENV=test");
+    const isWriter = this.mode === "owned" || this.mode === "maintenance";
+    this.ownerHandle = isWriter ? options.owner ?? (filePath === ":memory:" ? createTestHostOwner() : HostOwnerLock.acquire({ databasePath: filePath, mode: this.mode === "maintenance" ? "maintenance" : "host" })) : undefined;
+    this.releaseOwnerOnClose = isWriter && !options.owner;
+    try {
+      if (this.ownerHandle) {
+        assertHostOwner(this.ownerHandle);
+        this.ownerHandle.assertStorePath(filePath);
+        if (this.mode === "maintenance" && this.ownerHandle.mode !== "maintenance") throw new Error("Offline maintenance owner required");
+      }
+      const connectionPath = this.ownerHandle?.databasePath ?? (filePath === ":memory:" ? filePath : canonicalPath(filePath));
+      this.db = new Database(connectionPath, { readonly: this.mode === "readonly", fileMustExist: this.mode === "readonly" || this.mode === "management", timeout: this.mode === "management" ? 1_000 : 5_000 });
+      try {
+        this.ownerHandle?.assertStorePath(connectionPath);
+        const schema = inspectSchema(this.db);
+        if (this.mode === "readonly" || this.mode === "management") {
+          if (this.mode === "management" && schema.version < 3) throw new StoreSchemaError("SCHEMA_INVALID", "Local revocation requires the current schema; migrate the offline Host first.");
+          return;
+        }
+        this.ownerHandle?.assertActive();
+        // journal_mode cannot change within a transaction. The version gate
+        // above runs before this or any other writable SQLite operation.
+        this.db.pragma("journal_mode = WAL");
+        this.db.pragma("synchronous = FULL");
+        this.db.pragma("foreign_keys = ON");
+        this.db.transaction(() => {
+          this.db.exec(SCHEMA);
+          this.migrateSchema();
+          validateV3Schema(this.db);
+        })();
+      } catch (error) {
+        this.db.close();
+        throw error;
+      }
+    } catch (error) {
+      if (this.releaseOwnerOnClose) this.ownerHandle?.release();
+      throw error;
+    }
+  }
+
+  /** Business write admission; management connection only permits its local revocation path. */
+  assertWriterOwner(): void {
+    if (this.mode === "readonly" || this.mode === "management") throw new Error("HOST_OWNER_REQUIRED");
+    this.ownerHandle?.assertActive();
   }
 
   close(): void {
-    this.db.close();
+    if (this.db.open) this.db.close();
+    if (this.releaseOwnerOnClose) this.ownerHandle?.release();
   }
 
   /**
@@ -383,6 +434,9 @@ export class SqliteStore {
    * rows get an empty subject and are handled conservatively by recovery.
    */
   private migrateSchema(): void {
+    // Baseline and all compatible SQL-only migrations share the writer's
+    // transaction. No version marker can survive a failed migration.
+    this.db.prepare("INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (1, ?)").run(now());
     const columns = this.db.prepare("PRAGMA table_info(turns)").all() as Array<{ name: string }>;
     if (!columns.some((column) => column.name === "auth_subject_id")) {
       this.db.exec("ALTER TABLE turns ADD COLUMN auth_subject_id TEXT NOT NULL DEFAULT ''");

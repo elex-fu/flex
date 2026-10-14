@@ -1,8 +1,12 @@
 import { createHash, randomUUID } from "node:crypto";
-import { realpathSync } from "node:fs";
+import { mkdirSync, realpathSync } from "node:fs";
+import { dirname } from "node:path";
 import type { Bootstrap, SessionEvent, TimelineItem } from "@flyx/mvp-protocol";
 import { ProtocolVersion } from "@flyx/mvp-protocol";
 import { ClaudeAdapter } from "../claude/adapter.js";
+import { HostOwnerLock, assertHostOwner, assertWorkspacePrivacy, createTestHostOwner, type HostOwnerHandle } from "../lifecycle/host-owner.js";
+import { openOwned } from "../storage/open-store.js";
+import { WorkspaceLease } from "../workspace/workspace-lease.js";
 import { CodexAdapter } from "../codex/adapter.js";
 import type { AdapterEvent, DispatchContext, ProviderAdapter, ProviderId } from "../provider/types.js";
 import { dispatchContextForTurn } from "../provider/types.js";
@@ -41,14 +45,21 @@ export type OrchestratorOptions = {
   databasePath?: string;
   provider?: ProviderId;
   adapter?: ProviderAdapter;
-  owner?: { readonly ownerId: string; readonly generation: number };
   runtimeId?: string;
+  owner?: HostOwnerHandle;
+  store?: SqliteStore;
+  identityDirectory?: string;
+  coordinationDirectory?: string;
+  privateDirectories?: readonly string[];
 };
 
 const MAX_PROMPT_BYTES = 16 * 1024;
 
 export class SessionOrchestrator {
   readonly store: SqliteStore;
+  readonly owner: HostOwnerHandle;
+  private activeWorkspaceLease: WorkspaceLease | undefined;
+  private closed = false;
   readonly workspace: string;
   readonly git: GitService;
   readonly adapter: ProviderAdapter;
@@ -66,39 +77,69 @@ export class SessionOrchestrator {
   constructor(options: OrchestratorOptions) {
     const canonicalWorkspace = realpathSync(options.workspace);
     const provider = options.adapter?.provider ?? options.provider ?? "claude";
-    this.store = new SqliteStore(options.databasePath ?? ":memory:");
-    const existingSession = this.store.getCurrentSession();
-    if (existingSession && existingSession.workspacePath !== canonicalWorkspace) {
-      this.store.close();
-      throw new OrchestratorError("WORKSPACE_MISMATCH", "Persisted session belongs to a different configured workspace");
-    }
-    if (existingSession && existingSession.provider !== provider) {
-      this.store.close();
-      throw new OrchestratorError(
-        "PROVIDER_MISMATCH",
-        `Persisted session uses ${existingSession.provider}; configure a separate FLYX_DB before switching to ${provider}`,
-      );
-    }
-    this.workspace = canonicalWorkspace;
-    this.session = existingSession ?? this.store.createSession(canonicalWorkspace, provider);
-    this.hostOwnerId = options.owner?.ownerId ?? randomUUID();
-    this.hostOwnerGeneration = options.owner?.generation ?? 1;
-    this.runtimeId = options.runtimeId ?? `${provider}:${this.session.id}`;
-    this.store.recoverActiveTurns();
-    this.git = new GitService(canonicalWorkspace);
+    const databasePath = options.databasePath ?? options.owner?.databasePath ?? ":memory:";
+    if (options.store && !options.owner) throw new Error("An injected Store requires its verified owner handle");
+    this.owner = options.owner ?? (databasePath === ":memory:" ? createTestHostOwner() : HostOwnerLock.acquire({
+      databasePath,
+      ...(options.identityDirectory ? { identityDirectory: options.identityDirectory } : {}),
+      ...(options.coordinationDirectory ? { coordinationDirectory: options.coordinationDirectory } : {}),
+    }));
+    let openedStore: SqliteStore | undefined;
     try {
+      assertHostOwner(this.owner);
+      this.owner.assertStorePath(databasePath);
+      if (databasePath !== ":memory:") {
+        assertWorkspacePrivacy(canonicalWorkspace, [dirname(this.owner.databasePath),
+          ...(this.owner.identityDirectory ? [this.owner.identityDirectory] : []),
+          ...(this.owner.coordinationDirectory ? [this.owner.coordinationDirectory] : []),
+          ...(options.privateDirectories ?? [])]);
+        mkdirSync(dirname(this.owner.databasePath), { recursive: true, mode: 0o700 });
+      }
+      this.store = openedStore = options.store ?? openOwned({ databasePath, owner: this.owner });
+      this.owner.assertStorePath(this.store.db.name);
+      const existingSession = this.store.getCurrentSession();
+      if (existingSession && existingSession.workspacePath !== canonicalWorkspace) {
+        throw new OrchestratorError("WORKSPACE_MISMATCH", "Persisted session belongs to a different configured workspace");
+      }
+      if (existingSession && existingSession.provider !== provider) {
+        throw new OrchestratorError(
+          "PROVIDER_MISMATCH",
+          `Persisted session uses ${existingSession.provider}; configure a separate FLYX_DB before switching to ${provider}`,
+        );
+      }
+      this.workspace = canonicalWorkspace;
+      this.session = existingSession ?? this.store.createSession(canonicalWorkspace, provider);
+      this.hostOwnerId = this.owner.ownerId;
+      this.hostOwnerGeneration = this.owner.generation;
+      this.runtimeId = options.runtimeId ?? `${provider}:${this.session.id}`;
+      this.store.recoverActiveTurns();
+      this.git = new GitService(canonicalWorkspace);
       this.adapter = options.adapter ?? (provider === "codex"
         ? new CodexAdapter({ workspace: canonicalWorkspace, onEvent: (event) => this.enqueueAdapterEvent(event) })
         : new ClaudeAdapter({ workspace: canonicalWorkspace, onEvent: (event) => this.enqueueAdapterEvent(event) }));
     } catch (error) {
-      this.store.close();
+      // The Store is only assigned after ownership has been proven. A second
+      // Host therefore cannot reach migration, recovery, or provider creation.
+      openedStore?.close();
+      this.owner.release();
       throw error;
     }
   }
 
+  get workspaceLease(): WorkspaceLease | undefined { return this.activeWorkspaceLease; }
+
   close(): void {
+    if (this.closed) return;
+    this.closed = true;
     this.adapter.close?.();
+    const active = this.store.getActiveTurn(this.session.id);
+    if (active || this.activeWorkspaceLease) {
+      // R04's async drain will release after proving the producer stopped.
+      this.activeWorkspaceLease?.retain("producer_stop_unverified");
+      this.owner.retain("producer_stop_unverified");
+    }
     this.store.close();
+    if (!this.owner.retainedReason) this.owner.release();
   }
 
   get sessionId(): string {
@@ -197,20 +238,38 @@ export class SessionOrchestrator {
       if (current.session.activityState !== "idle" || current.activeTurn) {
         throw new OrchestratorError("TURN_BUSY", "The current session already has an active turn", true);
       }
-      await this.ensureBaseline();
       const turnId = randomUUID();
-      const accepted = this.store.acceptTurn({
-        authSubjectId,
-        sessionId: this.session.id,
-        turnId,
-        commandId,
-        requestHash,
-        prompt,
-        generation: this.nextRuntimeGeneration(),
-      });
-      accepted.events.forEach((event) => this.notify(event));
-      void this.executeTurn(accepted.turn, authSubjectId);
-      return accepted.receipt.response as StartTurnResponse;
+      let lease: WorkspaceLease;
+      try { lease = WorkspaceLease.acquire({ workspace: this.workspace, owner: this.owner, operationId: turnId }); }
+      catch (error) { throw new OrchestratorError("WORKSPACE_BUSY", error instanceof Error ? error.message : "Workspace is owned by another write task", true); }
+      this.activeWorkspaceLease = lease;
+      try {
+        await this.ensureBaseline();
+        const accepted = this.store.acceptTurn({
+          authSubjectId,
+          sessionId: this.session.id,
+          turnId,
+          commandId,
+          requestHash,
+          prompt,
+          generation: this.nextRuntimeGeneration(),
+        });
+        accepted.events.forEach((event) => this.notify(event));
+        void this.executeTurn(accepted.turn, authSubjectId).finally(() => {
+          const latest = this.store.db.open ? this.store.getTurn(turnId) : undefined;
+          if (!this.degraded && latest && ["completed", "failed", "cancelled"].includes(latest.status)) {
+            lease.release();
+            if (this.activeWorkspaceLease === lease) this.activeWorkspaceLease = undefined;
+          } else {
+            lease.retain("turn_outcome_unverified");
+          }
+        }).catch(() => { this.degraded = true; });
+        return accepted.receipt.response as StartTurnResponse;
+      } catch (error) {
+        lease.release();
+        if (this.activeWorkspaceLease === lease) this.activeWorkspaceLease = undefined;
+        throw error;
+      }
     });
   }
 
@@ -577,6 +636,7 @@ export class SessionOrchestrator {
   }
 
   private commit(type: string, payload: unknown, options: Parameters<SqliteStore["commitEvent"]>[3] = {}): SessionEvent {
+    this.owner.assertActive();
     const event = this.store.commitEvent(this.session.id, type, payload, options);
     this.notify(event);
     return event;
@@ -662,7 +722,11 @@ export class SessionOrchestrator {
   }
 
   private enqueueCommand<T>(fn: () => Promise<T>): Promise<T> {
-    const next = this.commandTail.then(fn);
+    const next = this.commandTail.then(() => {
+      if (this.closed) throw new OrchestratorError("HOST_DRAINING", "Host is closed to new commands", true);
+      this.owner.assertActive();
+      return fn();
+    });
     this.commandTail = next.then(() => undefined, () => undefined);
     return next;
   }
@@ -671,6 +735,7 @@ export class SessionOrchestrator {
     if (this.store.getSessionBaseline(this.session.id)) return Promise.resolve();
     if (!this.baselinePromise) {
       this.baselinePromise = this.git.status().then((status) => {
+        this.owner.assertActive();
         this.store.setSessionBaseline(this.session.id, { ...(status.head ? { head: status.head } : {}), dirty: status.dirty, files: status.files });
       }).catch((error) => {
         this.baselinePromise = undefined;

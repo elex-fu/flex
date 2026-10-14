@@ -9,6 +9,8 @@ import { getHostIdentityMirror, loadOrCreateHostIdentity, publicHostIdentity, ro
 import { createHostServer } from "./server.js";
 import { SessionOrchestrator } from "./session/orchestrator.js";
 import { SqliteStore } from "./storage/db.js";
+import { HostOwnerLock, assertWorkspacePrivacy, canonicalPath } from "./lifecycle/host-owner.js";
+import { openForMaintenance, openForManagement, openOwned, openReadOnly } from "./storage/open-store.js";
 
 await main().catch((error: unknown) => {
   console.error(error instanceof Error ? error.message : "Host startup failed");
@@ -27,64 +29,90 @@ async function main(): Promise<void> {
   const defaultDatabase = provider === "codex" ? ".flyx/mvp-codex.sqlite" : ".flyx/mvp.sqlite";
   const databasePath = resolve(process.env.FLYX_DB ?? resolve(process.cwd(), defaultDatabase));
   const identityDirectory = resolve(process.env.FLYX_IDENTITY_DIR ?? join(dirname(databasePath), "identity"));
-  const connectivity = command.kind === "start" ? await resolveConnectivityConfig(parseConnectivityConfig()) : undefined;
-  await mkdir(dirname(databasePath), { recursive: true });
-  // Management commands inspect the store without constructing an orchestrator:
-  // opening a provider session would otherwise recover another Host's turns.
-  const bootstrapStore = new SqliteStore(databasePath);
-  let identity: HostIdentityFileV1;
-  try {
-    identity = await loadOrCreateHostIdentity({ directory: identityDirectory, expectedMirror: bootstrapStore.getHostIdentityMirror() ?? null });
-    bootstrapStore.setHostIdentityMirror(getHostIdentityMirror(identity));
-    if (command.kind !== "start") {
-      await manageHost(command, bootstrapStore, identity, identityDirectory);
-      return;
+  if (command.kind !== "start") {
+    // Read-only commands never migrate, initialize identity or recover leases.
+    // Revocation is the sole live local write, through an existing schema and
+    // bounded synchronous transaction. Identity rotation requires offline owner.
+    const owner = command.kind === "identity-rotate"
+      ? HostOwnerLock.acquire({ databasePath, identityDirectory, mode: "maintenance" }) : undefined;
+    let store: SqliteStore | undefined;
+    try {
+      if (owner) {
+        await stat(owner.databasePath); // Rotation cannot silently create a Host.
+        store = openForMaintenance({ databasePath: owner.databasePath, owner });
+      } else {
+        store = command.kind === "devices-revoke" || command.kind === "devices-revoke-all"
+          ? openForManagement(databasePath) : openReadOnly(databasePath);
+      }
+      const mirror = store.getHostIdentityMirror();
+      if (!mirror) throw new Error("Host has no persisted identity; initialize it through owned Host startup.");
+      const directory = owner?.identityDirectory ?? canonicalPath(identityDirectory);
+      const identity = await loadOrCreateHostIdentity({ directory, expectedMirror: mirror });
+      await manageHost(command, store, identity, directory);
+    } finally {
+      store?.close();
+      owner?.release();
     }
-  } finally {
-    bootstrapStore.close();
+    return;
   }
-  await assertFixtureWorkspace(workspace);
-  const orchestrator = new SessionOrchestrator({ workspace, databasePath, provider });
-  const pairingConfirmation = createPairingConfirmation();
+
+  // Acquisition precedes schema, identity, recovery and provider preflight.
+  const owner = HostOwnerLock.acquire({ databasePath, identityDirectory });
+  let store: SqliteStore | undefined;
+  let orchestrator: SessionOrchestrator | undefined;
+  let pairingConfirmation: ReturnType<typeof createPairingConfirmation> | undefined;
   let server: ReturnType<typeof createHostServer> | undefined;
   try {
-    if (process.env.FLYX_SKIP_PREFLIGHT !== "1") {
+    assertWorkspacePrivacy(workspace, [dirname(owner.databasePath), owner.identityDirectory!, owner.coordinationDirectory!]);
+    await assertFixtureWorkspace(workspace);
+    await mkdir(dirname(owner.databasePath), { recursive: true, mode: 0o700 });
+    store = openOwned({ databasePath: owner.databasePath, owner });
+    const identity = await loadOrCreateHostIdentity({ directory: owner.identityDirectory!, expectedMirror: store.getHostIdentityMirror() ?? null });
+    store.setHostIdentityMirror(getHostIdentityMirror(identity));
+    const connectivity = await resolveConnectivityConfig(parseConnectivityConfig());
+    orchestrator = new SessionOrchestrator({ workspace, databasePath: owner.databasePath, provider, owner, store });
+    pairingConfirmation = createPairingConfirmation();
+    if (process.env.FLYX_SKIP_PREFLIGHT !== "1" && process.env.NODE_ENV !== "test") {
       const status = await orchestrator.adapter.preflight();
       console.log(`${providerName(status.provider)} preflight passed: ${status.transport} ${status.adapterVersion}, runtime ${status.runtimeVersion}`);
     }
-    server = createHostServer({ orchestrator, pairingConfirmation, identity, connectivity: connectivity!,
+    server = createHostServer({ orchestrator, pairingConfirmation, identity, identityDirectory: owner.identityDirectory!, connectivity,
       ...(process.env.FLYX_WEB_ROOT ? { webRoot: process.env.FLYX_WEB_ROOT } : {}) });
     const address = await server.start();
     console.log(`Flyx MVP Host listening at ${address}`);
     console.log(`Workspace: ${workspace}`);
     console.log(`Provider: ${providerName(provider)}`);
     console.log(`Host: ${identity.hostId} (${identity.fingerprint})`);
-    console.log(`Connectivity: ${connectivity!.mode}${connectivity!.publicBaseUrl ? ` — ${connectivity!.publicBaseUrl}` : ""}`);
-    let shuttingDown = false;
+    console.log(`Connectivity: ${connectivity.mode}${connectivity.publicBaseUrl ? ` — ${connectivity.publicBaseUrl}` : ""}`);
+    let shutdownPromise: Promise<void> | undefined;
     const runningServer = server;
-    const shutdown = async () => {
-      if (shuttingDown) return;
-      shuttingDown = true;
-      pairingConfirmation.close();
+    const confirmation = pairingConfirmation;
+    const shutdown = () => shutdownPromise ??= (async () => {
+      confirmation.close();
       try { await runningServer.stop(); }
-      finally { process.exit(0); }
-    };
+      catch (error) {
+        process.exitCode = 1;
+        console.error(error instanceof Error ? error.message : "Host shutdown failed");
+      }
+    })();
     process.once("SIGINT", () => void shutdown());
     process.once("SIGTERM", () => void shutdown());
     if (process.stdout.isTTY) {
-      if (connectivity!.publicBaseUrl || connectivity!.allowInsecureHttp) {
+      if (connectivity.publicBaseUrl || connectivity.allowInsecureHttp) {
         await printPairingUrl("Direct pairing", server.getPairingUrl());
       } else {
         console.log("For phone pairing, configure Tailscale Serve and restart with FLYX_CONNECTIVITY_MODE=tailscale.");
       }
-      const relayPairingUrl = server.getRelayPairingUrl(connectivity!.hostedAppUrl);
+      const relayPairingUrl = server.getRelayPairingUrl(connectivity.hostedAppUrl);
       if (relayPairingUrl) await printPairingUrl("Relay pairing", relayPairingUrl);
     } else {
       console.log("Pairing links are shown only in a local terminal. Interactive pairing confirmation is required by default.");
     }
   } catch (error) {
-    pairingConfirmation.close();
-    if (server) await server.stop(); else orchestrator.close();
+    pairingConfirmation?.close();
+    if (server) await server.stop();
+    else if (orchestrator) orchestrator.close();
+    else { store?.close(); owner.release(); }
     throw error;
   }
 }
@@ -95,11 +123,12 @@ async function manageHost(command: HostCommand, store: SqliteStore, identity: Ho
     if (command.kind === "devices-list") {
       console.log(JSON.stringify(devices.listDevices(), null, 2));
     } else if (command.kind === "devices-revoke") {
-      const revoked = devices.revokeFromLocal(command.deviceId);
+      const revoked = store.db.transaction(() => devices.revokeFromLocal(command.deviceId))();
       if (!revoked) throw new Error("Device does not exist or is already revoked on this Host");
       console.log(`Revoked device ${command.deviceId}; its active connections will close.`);
     } else if (command.kind === "devices-revoke-all") {
-      console.log(`Revoked ${devices.revokeAllFromLocal()} devices and invalidated active pairing grants.`);
+      const count = store.db.transaction(() => devices.revokeAllFromLocal())();
+      console.log(`Revoked ${count} devices and invalidated active pairing grants.`);
     } else if (command.kind === "identity-show") {
       console.log(JSON.stringify(publicHostIdentity(identity), null, 2));
     } else if (command.kind === "identity-rotate") {

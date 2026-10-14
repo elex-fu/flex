@@ -142,7 +142,20 @@ export class AttentionStore {
   }
   private projectEvent(event: SessionEvent, commit: AttentionCommit): void {
     const payload = record(event.payload);
-    const reconciledStatus = event.type === "turn.reconciled" ? record(payload.outcome).status : undefined;
+    const r07Reconciled = event.type === "turn.recovery.reconciled";
+    const reconciledStatus = event.type === "turn.reconciled" ? record(payload.outcome).status : r07Reconciled ? payload.turnStatus : undefined;
+    if (r07Reconciled) {
+      const native = record(payload.nativeEvidence), evidence = record(native.evidence);
+      if (!["completed", "failed", "cancelled"].includes(String(reconciledStatus)) || native.state !== "terminal" || native.status !== reconciledStatus
+        || evidence.kind !== "native-terminal" || typeof evidence.sourceId !== "string" || !evidence.sourceId) throw new AttentionError("ATTENTION_SOURCE_MISMATCH");
+      const turn = typeof payload.turnId === "string" ? this.db.prepare("SELECT session_id,status,attempt_id FROM turns WHERE id=?").get(payload.turnId) as { session_id: string; status: string; attempt_id: string | null } | undefined : undefined;
+      if (!turn || turn.session_id !== event.sessionId || turn.status !== reconciledStatus || payload.attemptId !== undefined && turn.attempt_id !== payload.attemptId) throw new AttentionError("ATTENTION_SOURCE_MISMATCH");
+    }
+    const r07Blocked = ["turn.recovery.reconciled", "turn.recovery.acknowledged", "recovery.operation.failed"].includes(event.type) && payload.gate === "blocked";
+    if (event.type === "turn.recovery.acknowledged" || event.type === "recovery.operation.failed") {
+      const turn = typeof payload.turnId === "string" ? this.db.prepare("SELECT session_id,status,attempt_id FROM turns WHERE id=?").get(payload.turnId) as { session_id: string; status: string; attempt_id: string | null } | undefined : undefined;
+      if (!turn || turn.session_id !== event.sessionId || payload.attemptId !== undefined && turn.attempt_id !== payload.attemptId || event.type === "turn.recovery.acknowledged" && (payload.outcomePreserved !== "outcome_unknown" || payload.turnStatus !== "outcome_unknown" || turn.status !== "outcome_unknown")) throw new AttentionError("ATTENTION_SOURCE_MISMATCH");
+    }
     for (const [type, key] of [["interaction.requested", "interactionId"], ["approval.requested", "approvalId"], ["turn.completed", "turnId"]])
       if (event.type === type && typeof payload[key!] !== "string")
         throw new AttentionError("ATTENTION_SOURCE_MISMATCH");
@@ -204,14 +217,14 @@ export class AttentionStore {
       kind = "completion";
       turnId = payload.turnId;
       version = integer(turn.generation);
-      const first = this.db.prepare("SELECT occurred_at FROM session_events WHERE session_id=? AND (type='turn.completed' OR (type='turn.reconciled' AND json_extract(payload_json,'$.outcome.status')='completed')) AND json_extract(payload_json,'$.turnId')=? ORDER BY sequence LIMIT 1").get(event.sessionId, turnId) as {
+      const first = this.db.prepare("SELECT occurred_at FROM session_events WHERE session_id=? AND (type='turn.completed' OR (type='turn.reconciled' AND json_extract(payload_json,'$.outcome.status')='completed') OR (type='turn.recovery.reconciled' AND json_extract(payload_json,'$.turnStatus')='completed')) AND json_extract(payload_json,'$.turnId')=? ORDER BY sequence LIMIT 1").get(event.sessionId, turnId) as {
         occurred_at: string | null;
       };
       if (first?.occurred_at)
         expiry = Date.parse(first.occurred_at) + this.budgets.retentionMs;
       this.supersedeTurnInteractions(turnId, event.occurredAt);
     }
-    else if (["session.recovery.required", "session.recovery.blocked", "host.event_persist_failed", "execution.control.unknown"].includes(event.type) || reconciledStatus === "outcome_unknown") {
+    else if (["session.recovery.required", "session.recovery.blocked", "host.event_persist_failed", "execution.control.unknown"].includes(event.type) || reconciledStatus === "outcome_unknown" || r07Blocked) {
       const session = this.db.prepare("SELECT * FROM sessions WHERE id=?").get(event.sessionId) as Record<string, unknown> | undefined;
       if (!session)
         throw new AttentionError("ATTENTION_SOURCE_MISMATCH");
@@ -233,23 +246,30 @@ export class AttentionStore {
           turnId = undefined;
       }
     }
-    else if ((["turn.failed", "turn.cancelled"].includes(event.type) || ["failed", "cancelled"].includes(String(reconciledStatus))) && typeof payload.turnId === "string") {
+    else if ((["turn.failed", "turn.cancelled"].includes(event.type) || ["failed", "cancelled"].includes(String(reconciledStatus)) || event.type === "turn.recovery.acknowledged") && typeof payload.turnId === "string") {
       this.supersedeTurnInteractions(payload.turnId, event.occurredAt);
     }
-    if (!kind || expiry <= Date.parse(event.occurredAt))
-      return;
-    const id = hash([this.hostId, kind, event.sessionId, turnId ?? null, interactionId ?? null, version]);
-    if (this.get(id))
-      return;
-    this.expire(event.occurredAt);
-    if (this.count("attention_facts") >= this.budgets.maxFacts)
-      throw new AttentionError("ATTENTION_BUDGET_EXCEEDED");
-    if (!Number.isFinite(expiry))
-      throw new AttentionError("ATTENTION_SOURCE_MISMATCH");
-    const expiresAt = new Date(expiry).toISOString();
-    AttentionRouteSchema.parse({ v: 1, hostId: this.hostId, attentionId: id, sessionId: event.sessionId, ...(turnId ? { turnId } : {}), ...(interactionId ? { interactionId } : {}), version, expiresAt });
-    this.db.prepare("INSERT INTO attention_facts(id,host_id,session_id,turn_id,interaction_id,version,kind,source_event_id,source_commit_id,source_sequence,created_at,expires_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)").run(id, this.hostId, event.sessionId, turnId ?? null, interactionId ?? null, version, kind, event.id, commit.id, event.sequence, event.occurredAt, expiresAt);
+    if (!kind) return;
+    const facts = [{ kind, version, expiry }];
+    // A native terminal outcome does not prove the original process tree stopped.
+    if (kind === "completion" && r07Blocked) {
+      const session = this.db.prepare("SELECT activity_state,recovery_state,recovery_revision FROM sessions WHERE id=?").get(event.sessionId) as { activity_state: string; recovery_state: string; recovery_revision: number } | undefined;
+      if (!session || session.recovery_state !== "blocked") throw new AttentionError("ATTENTION_SOURCE_MISMATCH");
+      facts.push({ kind: "recovery_blocked", version: integer(session.recovery_revision), expiry: Date.parse(event.occurredAt) + this.budgets.retentionMs });
+    }
+    for (const fact of facts) {
+      if (!Number.isFinite(fact.expiry)) throw new AttentionError("ATTENTION_SOURCE_MISMATCH");
+      if (fact.expiry <= Date.parse(event.occurredAt)) continue;
+      const id = hash([this.hostId, fact.kind, event.sessionId, turnId ?? null, interactionId ?? null, fact.version]);
+      if (this.get(id)) continue;
+      this.expire(event.occurredAt);
+      if (this.count("attention_facts") >= this.budgets.maxFacts) throw new AttentionError("ATTENTION_BUDGET_EXCEEDED");
+      const expiresAt = new Date(fact.expiry).toISOString();
+      AttentionRouteSchema.parse({ v: 1, hostId: this.hostId, attentionId: id, sessionId: event.sessionId, ...(turnId ? { turnId } : {}), ...(interactionId ? { interactionId } : {}), version: fact.version, expiresAt });
+      this.db.prepare("INSERT INTO attention_facts(id,host_id,session_id,turn_id,interaction_id,version,kind,source_event_id,source_commit_id,source_sequence,created_at,expires_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)").run(id, this.hostId, event.sessionId, turnId ?? null, interactionId ?? null, fact.version, fact.kind, event.id, commit.id, event.sequence, event.occurredAt, expiresAt);
+    }
   }
+
   private supersedeInteraction(id: string, version: number, status: string, now: string): void {
     this.db.prepare("UPDATE attention_facts SET superseded_at=? WHERE interaction_id=? AND superseded_at IS NULL AND (version<>? OR ?<>'pending')").run(now, id, version, status);
     this.db.prepare("UPDATE attention_deliveries SET state='cancelled',result_code='ATTENTION_SUPERSEDED',updated_at=? WHERE state IN ('pending','unavailable') AND attention_id IN (SELECT id FROM attention_facts WHERE interaction_id=? AND superseded_at IS NOT NULL)").run(now, id);

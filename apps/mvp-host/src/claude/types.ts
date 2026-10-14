@@ -1,6 +1,8 @@
 export type {
   AdapterEvent,
   AdapterEventHandler,
+  AdapterEventPayload,
+  DispatchContext,
   AdapterStatus,
   ApprovalAction,
   ApprovalRequest,
@@ -8,3 +10,5 @@ export type {
   ProviderId,
   TurnOutcome,
 } from "../provider/types.js";
+
+export { dispatchContextForTurn, fenceAdapterEvent } from "../provider/types.js";

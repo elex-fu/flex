@@ -5,9 +5,10 @@ import { resolve } from "node:path";
 import { ClaudeAdapter } from "./adapter.js";
 import type { AdapterEvent } from "./types.js";
 
+const realIt = process.env.RUN_REAL_CLAUDE_FLOW === "1" ? it : it.skip;
+
 describe("Claude Agent SDK approval/tool flow", () => {
-  it("can approve a real fixture edit and observe the test result", async () => {
-    if (process.env.RUN_REAL_CLAUDE_FLOW !== "1") return;
+  realIt("can approve a real fixture edit and observe the test result", async () => {
     const source = resolve(process.cwd(), "../../packages/claude-fixtures");
     const workspace = await mkdtemp(resolve(tmpdir(), "flyx-claude-flow-"));
     await cp(source, workspace, { recursive: true, filter: (path) => !path.includes("node_modules") && !path.includes(".git") });

@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import type { Bootstrap } from "@flyx/mvp-protocol";
 
 export type ProviderId = Bootstrap["provider"];
@@ -15,13 +16,24 @@ export type ApprovalRequest = {
   createdAt: string;
 };
 
+/** The Engine fixes this identity before any Provider preparation or call. */
+export type DispatchContext = Readonly<{
+  hostOwnerId: string;
+  hostOwnerGeneration: number;
+  sessionId: string;
+  flyxTurnId: string;
+  runtimeId: string;
+  runtimeGeneration: number;
+  attemptId: string;
+}>;
+
 type AdapterEventEnvelope = {
-  /**
-   * Monotonically increasing fencing token for a provider query. Late events
-   * from an older query cannot mutate a newer Flyx turn.
-   */
-  generation?: number;
-  turnId?: string;
+  /** Every Provider callback carries its immutable Engine dispatch identity. */
+  dispatchContext: DispatchContext;
+  /** Compatibility aliases of the Engine context, never Adapter counters. */
+  generation: number;
+  turnId: string;
+  nativeItemId?: string;
 };
 
 export type AdapterEvent =
@@ -34,6 +46,7 @@ export type AdapterEvent =
       model: string;
       tools: string[];
     }
+    | { kind: "native_binding"; nativeSessionId: string; nativeTurnId: string }
     | { kind: "assistant_delta"; itemId: string; text: string }
     | { kind: "assistant_message"; itemId: string; text: string; aborted?: boolean }
     | {
@@ -80,6 +93,33 @@ export type AdapterEvent =
     | { kind: "turn_cancelled"; reason: string }
   ) & AdapterEventEnvelope;
 
+type DistributiveOmit<T, K extends PropertyKey> = T extends unknown ? Omit<T, K> : never;
+export type AdapterEventPayload = DistributiveOmit<AdapterEvent, keyof AdapterEventEnvelope>;
+
+/** Snapshot caller-owned values so asynchronous callbacks keep their original fence. */
+export function dispatchContextForTurn(turnId: string, context?: DispatchContext): DispatchContext {
+  const value = context ?? {
+    hostOwnerId: "standalone",
+    hostOwnerGeneration: 1,
+    sessionId: "standalone",
+    flyxTurnId: turnId,
+    runtimeId: `standalone:${turnId}`,
+    runtimeGeneration: 1,
+    attemptId: randomUUID(),
+  };
+  if (value.flyxTurnId !== turnId
+    || ![value.hostOwnerId, value.sessionId, value.flyxTurnId, value.runtimeId, value.attemptId].every((part) => typeof part === "string" && part.length > 0)
+    || !Number.isSafeInteger(value.hostOwnerGeneration) || value.hostOwnerGeneration < 1
+    || !Number.isSafeInteger(value.runtimeGeneration) || value.runtimeGeneration < 1) {
+    throw new Error("INVALID_DISPATCH_CONTEXT");
+  }
+  return Object.freeze({ ...value });
+}
+
+export function fenceAdapterEvent(context: DispatchContext, event: AdapterEventPayload): AdapterEvent {
+  return { ...event, dispatchContext: context, generation: context.runtimeGeneration, turnId: context.flyxTurnId };
+}
+
 export type AdapterEventHandler = (event: AdapterEvent) => void;
 
 export type AdapterStatus = {
@@ -103,7 +143,7 @@ export interface ProviderAdapter {
   readonly workspace: string;
   status(): Promise<AdapterStatus>;
   preflight(): Promise<AdapterStatus>;
-  runTurn(turnId: string, prompt: string, resumeSessionId?: string): Promise<TurnOutcome>;
+  runTurn(turnId: string, prompt: string, resumeSessionId?: string, context?: DispatchContext): Promise<TurnOutcome>;
   interrupt(reason?: string): Promise<"accepted" | "already_terminal" | "unavailable">;
   respondApproval(approvalId: string, action: ApprovalAction): boolean;
   close?(): void;

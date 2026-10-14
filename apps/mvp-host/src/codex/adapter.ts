@@ -4,7 +4,8 @@ import { realpath, stat } from "node:fs/promises";
 import { isAbsolute, relative, resolve } from "node:path";
 import { promisify } from "node:util";
 import type {
-  AdapterEvent,
+  AdapterEventPayload,
+  DispatchContext,
   AdapterEventHandler,
   AdapterStatus,
   ApprovalAction,
@@ -12,6 +13,7 @@ import type {
   ProviderAdapter,
   TurnOutcome,
 } from "../provider/types.js";
+import { dispatchContextForTurn, fenceAdapterEvent } from "../provider/types.js";
 import {
   StdioAppServerClient,
   type AppServerClient,
@@ -29,6 +31,7 @@ const MAX_MESSAGE_BYTES = 1024 * 1024;
 const TURN_TIMEOUT_MS = 15 * 60 * 1000;
 const INTERRUPT_CONFIRM_TIMEOUT_MS = 5_000;
 const MAX_DISCOVERED_INTEGRATIONS = 512;
+const MAX_TRACKED_REQUEST_IDS = 4096;
 const FORBIDDEN_ITEM_TYPES = new Set([
   "collabAgentToolCall",
   "dynamicToolCall",
@@ -72,9 +75,6 @@ const APP_SERVER_SECURITY_ARGS = [
   "--listen", "stdio://",
 ] as const;
 
-type DistributiveOmit<T, K extends PropertyKey> = T extends unknown ? Omit<T, Extract<K, keyof T>> : never;
-type UnfencedAdapterEvent = DistributiveOmit<AdapterEvent, "generation" | "turnId">;
-
 type PendingApproval = {
   rpcId: JsonRpcId;
   toolUseId: string;
@@ -82,11 +82,15 @@ type PendingApproval = {
 
 type ActiveTurn = {
   turnId: string;
-  generation: number;
+  context: DispatchContext;
   threadId: string;
+  client?: AppServerClient;
+  starting: boolean;
+  deferred: Array<{ notification: AppServerNotification } | { request: AppServerRequest }>;
   codexTurnId?: string;
   pending: Map<string, PendingApproval>;
   pendingByRpcId: Map<string, string>;
+  unambiguousRequestIds: Set<string>;
   assistantText: Map<string, string>;
   toolOutput: Map<string, string>;
   items: Map<string, JsonObject>;
@@ -123,8 +127,8 @@ export class CodexAdapter implements ProviderAdapter {
   private runtimePolicyPromise: Promise<JsonObject> | undefined;
   private loadedThreadId: string | undefined;
   private readonly unexpectedMcpThreads = new Map<string, string>();
+  private readonly observedRequestIds = new Set<string>();
   private active: ActiveTurn | undefined;
-  private generation = 0;
   private runtimeVersion = "unknown";
 
   constructor(options: CodexAdapterOptions) {
@@ -175,27 +179,21 @@ export class CodexAdapter implements ProviderAdapter {
     return status;
   }
 
-  async runTurn(turnId: string, prompt: string, resumeSessionId?: string): Promise<TurnOutcome> {
+  async runTurn(turnId: string, prompt: string, resumeSessionId?: string, context?: DispatchContext): Promise<TurnOutcome> {
     if (this.active) throw new Error("CODEX_TURN_BUSY");
-    const client = await this.ensureClient();
-    let threadId: string;
-    try {
-      threadId = await this.loadThread(client, resumeSessionId);
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      this.emitUnfenced({ kind: "turn_failed", subtype: "thread_start_failed", errors: [truncate(message, MAX_OUTPUT_BYTES)] });
-      return { status: "failed", ...(resumeSessionId ? { providerSessionId: resumeSessionId } : {}), error: message };
-    }
-
-    const generation = ++this.generation;
+    const dispatchContext = dispatchContextForTurn(turnId, context);
     let settle!: (outcome: TurnOutcome) => void;
     const completion = new Promise<TurnOutcome>((resolvePromise) => { settle = resolvePromise; });
+    // Install the dispatch identity before client/thread preparation can fail.
     const active: ActiveTurn = {
       turnId,
-      generation,
-      threadId,
+      context: dispatchContext,
+      threadId: resumeSessionId ?? "",
+      starting: false,
+      deferred: [],
       pending: new Map(),
       pendingByRpcId: new Map(),
+      unambiguousRequestIds: new Set(),
       assistantText: new Map(),
       toolOutput: new Map(),
       items: new Map(),
@@ -206,19 +204,35 @@ export class CodexAdapter implements ProviderAdapter {
       resolve: settle,
     };
     this.active = active;
-    this.emit({
+    let client: AppServerClient;
+    try {
+      client = await this.ensureClient();
+      active.client = client;
+    } catch (error) {
+      this.failStart(active, "client_start_failed", error);
+      return completion;
+    }
+    try {
+      active.threadId = await this.loadThread(client, resumeSessionId);
+      if (this.client !== client) throw new Error("Codex app-server exited during thread preparation");
+    } catch (error) {
+      this.failStart(active, "thread_start_failed", error);
+      return completion;
+    }
+    if (active.terminal || this.active !== active) return completion;
+    this.emit(active, {
       kind: "session_init",
       provider: this.provider,
-      providerSessionId: threadId,
+      providerSessionId: active.threadId,
       runtimeVersion: this.runtimeVersion,
       model: this.model ?? "configured-default",
       tools: ["commandExecution", "fileChange"],
     });
     active.timer = setTimeout(() => void this.timeoutTurn(active), this.turnTimeoutMs);
-
+    active.starting = true;
     try {
       const response = await client.request<JsonObject>("turn/start", {
-        threadId,
+        threadId: active.threadId,
         input: [{ type: "text", text: prompt }],
         cwd: this.workspace,
         approvalPolicy: "on-request",
@@ -226,16 +240,29 @@ export class CodexAdapter implements ProviderAdapter {
         ...(this.model ? { model: this.model } : {}),
         ...(this.effort ? { effort: this.effort } : {}),
       });
-      const returnedTurn = isRecord(response.turn) ? response.turn : {};
-      if (typeof returnedTurn.id === "string") active.codexTurnId = returnedTurn.id;
-    } catch (error) {
-      if (!active.terminal) {
-        const message = error instanceof Error ? error.message : String(error);
-        this.emit({ kind: "turn_failed", subtype: "turn_start_failed", errors: [truncate(message, MAX_OUTPUT_BYTES)] });
-        this.finish(active, { status: "failed", providerSessionId: threadId, error: message });
+      if (!active.terminal && this.active === active) {
+        const returnedTurn = isRecord(response.turn) ? response.turn : {};
+        if (typeof returnedTurn.id !== "string" || !returnedTurn.id) throw new Error("Codex app-server returned no turn id");
+        active.codexTurnId = returnedTurn.id;
+        active.starting = false;
+        this.emit(active, { kind: "native_binding", nativeSessionId: active.threadId, nativeTurnId: returnedTurn.id });
+        for (const callback of active.deferred.splice(0)) {
+          if (active.terminal) break;
+          if ("notification" in callback) this.handleNotification(client, callback.notification);
+          else this.handleRequest(client, callback.request);
+        }
       }
+    } catch (error) {
+      this.failStart(active, "turn_start_failed", error);
     }
     return completion;
+  }
+
+  private failStart(active: ActiveTurn, subtype: string, error: unknown): void {
+    if (active.terminal) return;
+    const message = error instanceof Error ? error.message : String(error);
+    this.emit(active, { kind: "turn_failed", subtype, errors: [truncate(message, MAX_OUTPUT_BYTES)] });
+    this.finish(active, { status: "failed", ...(active.threadId ? { providerSessionId: active.threadId } : {}), error: message });
   }
 
   async interrupt(reason = "user_interrupt"): Promise<"accepted" | "already_terminal" | "unavailable"> {
@@ -247,14 +274,15 @@ export class CodexAdapter implements ProviderAdapter {
     active.interruptRequested = true;
     try {
       await this.client.request("turn/interrupt", { threadId: active.threadId, turnId: active.codexTurnId }, 10_000);
+      if (active.terminal || this.active !== active) return "already_terminal";
       active.interruptTimer = setTimeout(() => {
         if (this.active !== active || active.terminal) return;
-        this.emit({ kind: "diagnostic", code: "INTERRUPT_UNCONFIRMED", message: `Codex did not report a terminal state after interrupt`, details: { reason } });
+        this.emit(active, { kind: "diagnostic", code: "INTERRUPT_UNCONFIRMED", message: `Codex did not report a terminal state after interrupt`, details: { reason } });
         this.finish(active, { status: "outcome_unknown", providerSessionId: active.threadId, error: "Codex interrupt was not confirmed" });
       }, INTERRUPT_CONFIRM_TIMEOUT_MS);
       return "accepted";
     } catch (error) {
-      this.emit({ kind: "diagnostic", code: "INTERRUPT_FAILED", message: error instanceof Error ? error.message : String(error) });
+      this.emit(active, { kind: "diagnostic", code: "INTERRUPT_FAILED", message: error instanceof Error ? error.message : String(error) });
       return "unavailable";
     }
   }
@@ -265,8 +293,8 @@ export class CodexAdapter implements ProviderAdapter {
     if (!active || !pending || !this.client) return false;
     if (!this.client.respond(pending.rpcId, { decision: action === "allow_once" ? "accept" : "decline" })) return false;
     active.pending.delete(approvalId);
-    active.pendingByRpcId.delete(String(pending.rpcId));
-    this.emit({ kind: "approval_resolved", approvalId, toolUseId: pending.toolUseId, action });
+    active.pendingByRpcId.delete(rpcIdKey(pending.rpcId));
+    this.emit(active, { kind: "approval_resolved", approvalId, toolUseId: pending.toolUseId, action });
     return true;
   }
 
@@ -276,6 +304,7 @@ export class CodexAdapter implements ProviderAdapter {
     this.runtimePolicyPromise = undefined;
     this.loadedThreadId = undefined;
     this.unexpectedMcpThreads.clear();
+    this.observedRequestIds.clear();
   }
 
   private async ensureClient(): Promise<AppServerClient> {
@@ -285,11 +314,12 @@ export class CodexAdapter implements ProviderAdapter {
     }
     let client!: AppServerClient;
     client = this.clientFactory({
-      onNotification: (notification) => this.handleNotification(notification),
-      onRequest: (request) => this.handleRequest(request),
+      onNotification: (notification) => this.handleNotification(client, notification),
+      onRequest: (request) => this.handleRequest(client, request),
       onExit: (error) => this.handleExit(client, error),
     });
     this.client = client;
+    this.observedRequestIds.clear();
     try {
       await client.start();
       return client;
@@ -395,7 +425,8 @@ export class CodexAdapter implements ProviderAdapter {
     };
   }
 
-  private handleNotification(notification: AppServerNotification): void {
+  private handleNotification(client: AppServerClient, notification: AppServerNotification): void {
+    if (this.client !== client) return;
     if (notification.method === "mcpServer/startupStatus/updated") {
       const threadId = stringValue(notification.params.threadId, "unknown-thread");
       const name = stringValue(notification.params.name, "unknown-MCP");
@@ -405,7 +436,7 @@ export class CodexAdapter implements ProviderAdapter {
         const active = this.active;
         if (active?.threadId === threadId && !active.terminal) {
           this.unexpectedMcpThreads.delete(threadId);
-          this.emit({ kind: "diagnostic", code: "CODEX_SECURITY_POLICY_FAILED", message: `Unexpected MCP server started: ${name}` });
+          this.emit(active, { kind: "diagnostic", code: "CODEX_SECURITY_POLICY_FAILED", message: `Unexpected MCP server started: ${name}` });
           this.finish(active, {
             status: "outcome_unknown",
             providerSessionId: active.threadId,
@@ -421,25 +452,34 @@ export class CodexAdapter implements ProviderAdapter {
       return;
     }
     const active = this.active;
-    if (!active) return;
+    if (!active || active.client !== client || active.terminal) return;
     const { method, params } = notification;
-    if (typeof params.threadId === "string" && params.threadId !== active.threadId) return;
-    if (typeof params.turnId === "string") {
-      if (active.codexTurnId && params.turnId !== active.codexTurnId) return;
-      active.codexTurnId = params.turnId;
+    // A resumed thread is shared by many Turns. Bind callbacks using the
+    // native Turn returned by this dispatch, including nested terminal IDs.
+    const turn = isRecord(params.turn) ? params.turn : {};
+    const nativeTurnId = typeof params.turnId === "string" ? params.turnId : typeof turn.id === "string" ? turn.id : undefined;
+    if (params.threadId !== active.threadId) return;
+    if (method === "serverRequest/resolved") {
+      if (nativeTurnId !== undefined && nativeTurnId !== active.codexTurnId) return;
+      // A request ID is a native fence only while it has one known origin
+      // on this client. Reused IDs require an explicit native Turn ID.
+      if (nativeTurnId === undefined && !active.unambiguousRequestIds.has(rpcIdKey(params.requestId))) return;
+    } else {
+      if (!nativeTurnId) return;
+      if (active.starting && !active.codexTurnId) {
+        this.deferCallback(active, { notification });
+        return;
+      }
+      if (nativeTurnId !== active.codexTurnId) return;
     }
-    if (method === "turn/started") {
-      const turn = isRecord(params.turn) ? params.turn : {};
-      if (typeof turn.id === "string") active.codexTurnId = turn.id;
-      return;
-    }
+    if (method === "turn/started") return;
     if (method === "item/agentMessage/delta") {
       const itemId = stringValue(params.itemId, `assistant-${active.turnId}`);
       const delta = stringValue(params.delta, "");
       if (!delta) return;
       const appended = appendWithinLimit(active.assistantText.get(itemId) ?? "", delta, MAX_MESSAGE_BYTES);
       active.assistantText.set(itemId, appended.next);
-      if (appended.text) this.emit({ kind: "assistant_delta", itemId, text: appended.text });
+      if (appended.text) this.emit(active, { kind: "assistant_delta", itemId, text: appended.text });
       return;
     }
     if (method === "item/commandExecution/outputDelta") {
@@ -447,7 +487,7 @@ export class CodexAdapter implements ProviderAdapter {
       const delta = stringValue(params.delta, "");
       const output = truncate((active.toolOutput.get(itemId) ?? "") + delta, MAX_OUTPUT_BYTES);
       active.toolOutput.set(itemId, output);
-      if (delta) this.emit({ kind: "tool_progress", itemId, toolUseId: itemId, output });
+      if (delta) this.emit(active, { kind: "tool_progress", itemId, toolUseId: itemId, output });
       return;
     }
     if (method === "item/started" || method === "item/completed") {
@@ -458,19 +498,19 @@ export class CodexAdapter implements ProviderAdapter {
     if (method === "serverRequest/resolved") {
       const requestId = params.requestId;
       if (typeof requestId !== "string" && typeof requestId !== "number") return;
-      const approvalId = active.pendingByRpcId.get(String(requestId));
+      const approvalId = active.pendingByRpcId.get(rpcIdKey(requestId));
       if (!approvalId) return;
       const pending = active.pending.get(approvalId);
       active.pending.delete(approvalId);
-      active.pendingByRpcId.delete(String(requestId));
-      if (pending) this.emit({ kind: "approval_resolved", approvalId, toolUseId: pending.toolUseId, action: "aborted" });
+      active.pendingByRpcId.delete(rpcIdKey(requestId));
+      if (pending) this.emit(active, { kind: "approval_resolved", approvalId, toolUseId: pending.toolUseId, action: "aborted" });
       return;
     }
     if (method === "error") {
       const error = isRecord(params.error) ? params.error : {};
       const message = truncate(stringValue(error.message, "Codex turn error"), MAX_OUTPUT_BYTES);
       if (params.willRetry !== true) active.errors.push(message);
-      this.emit({ kind: "diagnostic", code: "CODEX_TURN_ERROR", message, details: { willRetry: params.willRetry === true } });
+      this.emit(active, { kind: "diagnostic", code: "CODEX_TURN_ERROR", message, details: { willRetry: params.willRetry === true } });
       return;
     }
     if (method === "turn/completed") this.handleTurnCompleted(active, params);
@@ -480,7 +520,7 @@ export class CodexAdapter implements ProviderAdapter {
     const id = stringValue(item.id, `item-${active.turnId}`);
     const type = stringValue(item.type, "unknown");
     if (FORBIDDEN_ITEM_TYPES.has(type)) {
-      this.emit({ kind: "diagnostic", code: "CODEX_SECURITY_POLICY_FAILED", message: `Forbidden Codex item type: ${type}` });
+      this.emit(active, { kind: "diagnostic", code: "CODEX_SECURITY_POLICY_FAILED", message: `Forbidden Codex item type: ${type}` });
       this.finish(active, {
         status: "outcome_unknown",
         providerSessionId: active.threadId,
@@ -499,37 +539,44 @@ export class CodexAdapter implements ProviderAdapter {
       const text = truncate(stringValue(item.text, active.assistantText.get(id) ?? ""), MAX_MESSAGE_BYTES);
       active.assistantText.set(id, text);
       active.lastAssistantText = text;
-      this.emit({ kind: "assistant_message", itemId: id, text });
+      this.emit(active, { kind: "assistant_message", itemId: id, text });
       return;
     }
     if (type === "plan") {
-      if (completed) this.emit({ kind: "assistant_message", itemId: `plan-${id}`, text: truncate(stringValue(item.text, ""), MAX_MESSAGE_BYTES) });
+      if (completed) this.emit(active, { kind: "assistant_message", itemId: `plan-${id}`, text: truncate(stringValue(item.text, ""), MAX_MESSAGE_BYTES) });
       return;
     }
     const descriptor = toolDescriptor(type, item, this.workspace);
     if (!descriptor) return;
     if (!completed) {
-      this.emit({ kind: "tool_started", itemId: id, toolUseId: id, toolName: descriptor.name, input: descriptor.input });
+      this.emit(active, { kind: "tool_started", itemId: id, toolUseId: id, toolName: descriptor.name, input: descriptor.input });
       return;
     }
     const status = stringValue(item.status, "completed");
     const output = descriptor.output;
     if (status === "failed" || status === "declined") {
-      this.emit({ kind: "tool_completed", itemId: id, toolUseId: id, error: truncate(output || status, MAX_OUTPUT_BYTES) });
+      this.emit(active, { kind: "tool_completed", itemId: id, toolUseId: id, error: truncate(output || status, MAX_OUTPUT_BYTES) });
     } else {
-      this.emit({ kind: "tool_completed", itemId: id, toolUseId: id, ...(output ? { output: truncate(output, MAX_OUTPUT_BYTES) } : {}) });
+      this.emit(active, { kind: "tool_completed", itemId: id, toolUseId: id, ...(output ? { output: truncate(output, MAX_OUTPUT_BYTES) } : {}) });
     }
   }
 
-  private handleRequest(request: AppServerRequest): void {
+  private handleRequest(client: AppServerClient, request: AppServerRequest): void {
+    if (this.client !== client) return;
     const active = this.active;
-    if (!active || (typeof request.params.threadId === "string" && request.params.threadId !== active.threadId)) {
-      this.client?.respondError(request.id, -32602, "No matching active Flyx turn");
+    if (active && active.client === client && !active.terminal && active.starting && !active.codexTurnId
+      && request.params.threadId === active.threadId && typeof request.params.turnId === "string") {
+      this.deferCallback(active, { request });
+      return;
+    }
+    if (!active || active.client !== client || active.terminal || request.params.threadId !== active.threadId
+      || !active.codexTurnId || request.params.turnId !== active.codexTurnId) {
+      client.respondError(request.id, -32602, "No matching active Flyx turn");
       return;
     }
     if (request.method !== "item/commandExecution/requestApproval" && request.method !== "item/fileChange/requestApproval") {
       this.client?.respondError(request.id, -32601, "Flyx MVP does not support this interactive request");
-      this.emit({ kind: "diagnostic", code: "UNSUPPORTED_CODEX_REQUEST", message: `Unsupported Codex request: ${request.method}` });
+      this.emit(active, { kind: "diagnostic", code: "UNSUPPORTED_CODEX_REQUEST", message: `Unsupported Codex request: ${request.method}` });
       return;
     }
     const toolUseId = stringValue(request.params.itemId, `codex-request-${String(request.id)}`);
@@ -540,7 +587,7 @@ export class CodexAdapter implements ProviderAdapter {
     const sourceItem = active.items.get(toolUseId);
     if (!approvalRequestIsInsideWorkspace(request.params, sourceItem, this.workspace)) {
       this.client?.respond(request.id, { decision: "decline" });
-      this.emit({ kind: "diagnostic", code: "CODEX_APPROVAL_OUTSIDE_WORKSPACE", message: "Codex requested access outside the configured workspace" });
+      this.emit(active, { kind: "diagnostic", code: "CODEX_APPROVAL_OUTSIDE_WORKSPACE", message: "Codex requested access outside the configured workspace" });
       return;
     }
     const rawInput = isCommand
@@ -567,9 +614,14 @@ export class CodexAdapter implements ProviderAdapter {
       cwd: ".",
       createdAt: new Date().toISOString(),
     };
+    const requestKey = rpcIdKey(request.id);
+    if (!this.observedRequestIds.has(requestKey) && this.observedRequestIds.size < MAX_TRACKED_REQUEST_IDS) {
+      this.observedRequestIds.add(requestKey);
+      active.unambiguousRequestIds.add(requestKey);
+    }
     active.pending.set(approvalId, { rpcId: request.id, toolUseId });
-    active.pendingByRpcId.set(String(request.id), approvalId);
-    this.emit({ kind: "approval_requested", request: approval });
+    active.pendingByRpcId.set(requestKey, approvalId);
+    this.emit(active, { kind: "approval_requested", request: approval });
   }
 
   private handleTurnCompleted(active: ActiveTurn, params: JsonObject): void {
@@ -578,18 +630,18 @@ export class CodexAdapter implements ProviderAdapter {
     const status = stringValue(turn.status, "failed");
     if (status === "completed") {
       const result = active.lastAssistantText || "Codex turn completed";
-      this.emit({ kind: "turn_completed", result, costUsd: 0, numTurns: 1, terminalReason: status });
+      this.emit(active, { kind: "turn_completed", result, costUsd: 0, numTurns: 1, terminalReason: status });
       this.finish(active, { status: "completed", providerSessionId: active.threadId });
       return;
     }
     if (status === "interrupted") {
-      this.emit({ kind: "turn_cancelled", reason: active.interruptRequested ? "interrupt_confirmed" : "codex_interrupted" });
+      this.emit(active, { kind: "turn_cancelled", reason: active.interruptRequested ? "interrupt_confirmed" : "codex_interrupted" });
       this.finish(active, { status: "cancelled", providerSessionId: active.threadId });
       return;
     }
     const turnError = isRecord(turn.error) ? turn.error : {};
     const message = stringValue(turnError.message, active.errors.join("; ") || `Codex turn ended with status ${status}`);
-    this.emit({ kind: "turn_failed", subtype: stringValue(turnError.codexErrorInfo, "codex_failed"), errors: [truncate(message, MAX_OUTPUT_BYTES)], terminalReason: status });
+    this.emit(active, { kind: "turn_failed", subtype: stringValue(turnError.codexErrorInfo, "codex_failed"), errors: [truncate(message, MAX_OUTPUT_BYTES)], terminalReason: status });
     this.finish(active, { status: "failed", providerSessionId: active.threadId, error: message });
   }
 
@@ -600,16 +652,16 @@ export class CodexAdapter implements ProviderAdapter {
     this.loadedThreadId = undefined;
     this.unexpectedMcpThreads.clear();
     const active = this.active;
-    if (!active || active.terminal) return;
-    this.emit({ kind: "diagnostic", code: "CODEX_APP_SERVER_EXITED", message: truncate(error.message, MAX_OUTPUT_BYTES) });
+    if (!active || active.terminal || !active.starting && !active.codexTurnId) return;
+    this.emit(active, { kind: "diagnostic", code: "CODEX_APP_SERVER_EXITED", message: truncate(error.message, MAX_OUTPUT_BYTES) });
     this.finish(active, { status: "outcome_unknown", providerSessionId: active.threadId, error: error.message });
   }
 
   private async timeoutTurn(active: ActiveTurn): Promise<void> {
     if (this.active !== active || active.terminal) return;
     const interrupted = await this.interrupt("turn_timeout");
-    if (interrupted === "accepted") return;
-    this.emit({ kind: "diagnostic", code: "TURN_TIMEOUT", message: "Codex turn timed out and could not be interrupted" });
+    if (interrupted === "accepted" || this.active !== active || active.terminal) return;
+    this.emit(active, { kind: "diagnostic", code: "TURN_TIMEOUT", message: "Codex turn timed out and could not be interrupted" });
     this.finish(active, { status: "outcome_unknown", providerSessionId: active.threadId, error: "Codex turn timed out" });
   }
 
@@ -619,22 +671,29 @@ export class CodexAdapter implements ProviderAdapter {
     if (active.timer) clearTimeout(active.timer);
     if (active.interruptTimer) clearTimeout(active.interruptTimer);
     for (const [approvalId, pending] of active.pending) {
-      this.emit({ kind: "approval_resolved", approvalId, toolUseId: pending.toolUseId, action: "aborted" });
+      this.emit(active, { kind: "approval_resolved", approvalId, toolUseId: pending.toolUseId, action: "aborted" });
     }
     active.pending.clear();
     active.pendingByRpcId.clear();
+    active.unambiguousRequestIds.clear();
+    active.deferred.length = 0;
     if (this.active === active) this.active = undefined;
     active.resolve(outcome);
   }
 
-  private emit(event: UnfencedAdapterEvent): void {
-    const active = this.active;
-    this.onEvent?.({ ...event, ...(active ? { generation: active.generation, turnId: active.turnId } : {}) } as AdapterEvent);
+  private deferCallback(active: ActiveTurn, callback: ActiveTurn["deferred"][number]): void {
+    if (active.deferred.length >= 1024) {
+      this.emit(active, { kind: "diagnostic", code: "CODEX_NATIVE_BINDING_OVERFLOW", message: "Codex did not bind a native Turn before its callback buffer filled" });
+      this.finish(active, { status: "outcome_unknown", providerSessionId: active.threadId, error: "Codex native Turn binding was not confirmed" });
+      return;
+    }
+    active.deferred.push(callback);
   }
 
-  private emitUnfenced(event: AdapterEvent): void {
-    this.onEvent?.(event);
+  private emit(active: ActiveTurn, event: AdapterEventPayload): void {
+    this.onEvent?.(fenceAdapterEvent(active.context, event));
   }
+
 }
 
 function toolDescriptor(type: string, item: JsonObject, workspace: string): { name: string; input: JsonObject; output: string } | undefined {
@@ -777,4 +836,8 @@ function stringValue(value: unknown, fallback: string): string {
 
 function isRecord(value: unknown): value is JsonObject {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function rpcIdKey(value: unknown): string {
+  return `${typeof value}:${String(value)}`;
 }

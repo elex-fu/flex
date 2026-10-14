@@ -16,12 +16,15 @@ import {
 import type {
   AdapterEvent,
   AdapterEventHandler,
+  AdapterEventPayload,
+  DispatchContext,
   AdapterStatus,
   ApprovalAction,
   ApprovalRequest,
   ProviderAdapter,
   TurnOutcome,
 } from "./types.js";
+import { dispatchContextForTurn, fenceAdapterEvent } from "./types.js";
 
 const execFile = promisify(execFileCallback);
 const require = createRequire(import.meta.url);
@@ -46,7 +49,7 @@ type PendingApproval = {
 
 type ActiveQuery = {
   turnId: string;
-  generation: number;
+  context: DispatchContext;
   query: Query;
   providerSessionId?: string;
   pending: Map<string, PendingApproval>;
@@ -76,7 +79,6 @@ export class ClaudeAdapter implements ProviderAdapter {
   private readonly maxBudgetUsd: number;
   private readonly workspaceRealpathPromise: Promise<string>;
   private active: ActiveQuery | undefined;
-  private generation = 0;
 
   constructor(options: ClaudeAdapterOptions) {
     this.workspace = options.workspace;
@@ -96,12 +98,9 @@ export class ClaudeAdapter implements ProviderAdapter {
         const result = await execFile(pathOverride, ["--version"], { timeout: 5_000 });
         runtimeVersion = result.stdout.trim() || result.stderr.trim() || "unknown";
       } catch (error) {
-        this.emit({
-          kind: "diagnostic",
-          code: "CLAUDE_EXECUTABLE_UNAVAILABLE",
-          message: "The configured Claude executable could not be inspected.",
-          details: error instanceof Error ? error.message : String(error),
-        });
+        // status has no Turn dispatch identity; surface inspection failures
+        // through its result rather than emitting an unfenced callback.
+        throw new Error(`CLAUDE_EXECUTABLE_UNAVAILABLE: ${error instanceof Error ? error.message : String(error)}`);
       }
     }
     return {
@@ -149,12 +148,12 @@ export class ClaudeAdapter implements ProviderAdapter {
     return this.active?.turnId;
   }
 
-  async runTurn(turnId: string, prompt: string, resumeSessionId?: string): Promise<TurnOutcome> {
+  async runTurn(turnId: string, prompt: string, resumeSessionId?: string, context?: DispatchContext): Promise<TurnOutcome> {
     if (this.active) throw new Error("CLAUDE_TURN_BUSY");
-    const generation = ++this.generation;
+    const dispatchContext = dispatchContextForTurn(turnId, context);
     const active: ActiveQuery = {
       turnId,
-      generation,
+      context: dispatchContext,
       query: undefined as never,
       pending: new Map(),
       interruptRequested: false,
@@ -169,14 +168,13 @@ export class ClaudeAdapter implements ProviderAdapter {
     };
     this.active = active;
 
-    const options = this.buildOptions(active, resumeSessionId);
     let resultMessage: Extract<SDKMessage, { type: "result" }> | undefined;
     let iteratorError: unknown;
 
     try {
-      active.query = query({ prompt, options });
+      active.query = query({ prompt, options: this.buildOptions(active, resumeSessionId) });
       active.timer = setTimeout(() => {
-        void this.interrupt("turn_timeout");
+        if (this.active === active) void this.interrupt("turn_timeout");
       }, TURN_TIMEOUT_MS);
       try {
         for await (const message of active.query) {
@@ -190,6 +188,7 @@ export class ClaudeAdapter implements ProviderAdapter {
     } catch (error) {
       iteratorError = error;
     } finally {
+      active.resultSeen = true;
       if (active.timer) clearTimeout(active.timer);
       this.cleanupApprovals(active, "aborted");
     }
@@ -198,7 +197,7 @@ export class ClaudeAdapter implements ProviderAdapter {
     if (resultMessage) {
       active.resultSeen = true;
       if (active.sessionIdChanged) {
-        this.emit({
+        this.emit(active, {
           kind: "turn_failed",
           subtype: "session_id_changed",
           errors: ["Claude reported more than one session id for one Flyx Turn"],
@@ -216,13 +215,13 @@ export class ClaudeAdapter implements ProviderAdapter {
       // to the phone as a generic provider failure.
       if (active.interruptRequested && active.interruptAcknowledged
         && (resultMessage.terminal_reason === "aborted_tools" || resultMessage.terminal_reason === "aborted_streaming")) {
-        this.emit({ kind: "turn_cancelled", reason: resultMessage.terminal_reason });
+        this.emit(active, { kind: "turn_cancelled", reason: resultMessage.terminal_reason });
         this.clearActive(active);
         return { status: "cancelled", ...(providerSessionId ? { providerSessionId } : {}) };
       }
       if (resultMessage.subtype === "success") {
         if (/not logged in|please run \/login/i.test(resultMessage.result)) {
-          this.emit({ kind: "turn_failed", subtype: "auth_required", errors: ["Claude Code is not authenticated for this Host"] });
+          this.emit(active, { kind: "turn_failed", subtype: "auth_required", errors: ["Claude Code is not authenticated for this Host"] });
           this.clearActive(active);
           return {
             status: "failed",
@@ -230,7 +229,7 @@ export class ClaudeAdapter implements ProviderAdapter {
             error: "Claude Code is not authenticated for this Host",
           };
         }
-        this.emit({
+        this.emit(active, {
           kind: "turn_completed",
           result: truncate(resultMessage.result, MAX_TOOL_OUTPUT_BYTES),
           costUsd: resultMessage.total_cost_usd,
@@ -240,7 +239,7 @@ export class ClaudeAdapter implements ProviderAdapter {
         this.clearActive(active);
         return { status: "completed", providerSessionId: providerSessionId ?? "" };
       }
-      this.emit({
+      this.emit(active, {
         kind: "turn_failed",
         subtype: resultMessage.subtype,
         errors: resultMessage.errors.map((error) => truncate(error, MAX_TOOL_OUTPUT_BYTES)),
@@ -259,14 +258,14 @@ export class ClaudeAdapter implements ProviderAdapter {
     // surface that boundary as an iterator error; the absence of a result,
     // not the error wording, is what distinguishes it from a failed Turn.
     if (active.interruptRequested && active.interruptAcknowledged && !active.interruptTimedOut) {
-      this.emit({ kind: "turn_cancelled", reason: "interrupt_confirmed" });
+      this.emit(active, { kind: "turn_cancelled", reason: "interrupt_confirmed" });
       this.clearActive(active);
       return { status: "cancelled", ...(providerSessionId ? { providerSessionId } : {}) };
     }
 
     const message = iteratorError instanceof Error ? iteratorError.message : "stream_ended_without_result";
     if (active.interruptTimedOut) {
-      this.emit({ kind: "diagnostic", code: "INTERRUPT_UNCONFIRMED", message });
+      this.emit(active, { kind: "diagnostic", code: "INTERRUPT_UNCONFIRMED", message });
       this.clearActive(active);
       return {
         status: "outcome_unknown",
@@ -274,7 +273,7 @@ export class ClaudeAdapter implements ProviderAdapter {
         error: message,
       };
     }
-    this.emit({ kind: "turn_failed", subtype: "stream_ended_without_result", errors: [message] });
+    this.emit(active, { kind: "turn_failed", subtype: "stream_ended_without_result", errors: [message] });
     this.clearActive(active);
     return {
       status: "failed",
@@ -296,7 +295,7 @@ export class ClaudeAdapter implements ProviderAdapter {
       setTimeout(() => {
         if (this.active === active && !active.resultSeen) {
           active.interruptTimedOut = true;
-          this.emit({
+          this.emit(active, {
             kind: "diagnostic",
             code: "INTERRUPT_UNCONFIRMED",
             message: `Claude did not reach a terminal state within ${INTERRUPT_CONFIRM_TIMEOUT_MS}ms`,
@@ -307,7 +306,7 @@ export class ClaudeAdapter implements ProviderAdapter {
       }, INTERRUPT_CONFIRM_TIMEOUT_MS);
       return "accepted";
     } catch (error) {
-      this.emit({
+      this.emit(active, {
         kind: "diagnostic",
         code: "INTERRUPT_FAILED",
         message: error instanceof Error ? error.message : String(error),
@@ -322,7 +321,7 @@ export class ClaudeAdapter implements ProviderAdapter {
     if (!active || !pending) return false;
     active.pending.delete(approvalId);
     pending.cleanup();
-    this.emit({
+    this.emit(active, {
       kind: "approval_resolved",
       approvalId,
       toolUseId: pending.request.toolUseId,
@@ -387,7 +386,7 @@ export class ClaudeAdapter implements ProviderAdapter {
       // Claude login; the small explicit auth list covers the supported local
       // account/API modes without turning this into an environment passthrough.
       env: restrictedEnvironment(),
-      canUseTool: this.canUseTool,
+      canUseTool: ((toolName, input, toolOptions) => this.canUseTool(active, toolName, input, toolOptions)) as CanUseTool,
       hooks: {
         PreToolUse: [
           {
@@ -430,9 +429,8 @@ export class ClaudeAdapter implements ProviderAdapter {
     return { continue: true };
   };
 
-  private readonly canUseTool: CanUseTool = async (toolName, input, options) => {
-    const active = this.active;
-    if (!active) return { behavior: "deny", message: "No active Flyx turn" };
+  private readonly canUseTool = async (active: ActiveQuery, toolName: Parameters<CanUseTool>[0], input: Parameters<CanUseTool>[1], options: Parameters<CanUseTool>[2]): Promise<PermissionResult> => {
+    if (this.active !== active || active.resultSeen) return { behavior: "deny", message: "No active Flyx turn" };
     if (!SAFE_TOOLS.includes(toolName as (typeof SAFE_TOOLS)[number])) {
       return { behavior: "deny", message: "Tool is disabled by Flyx MVP" };
     }
@@ -444,6 +442,9 @@ export class ClaudeAdapter implements ProviderAdapter {
       if (candidate && !(await this.isInsideWorkspace(candidate))) {
         return { behavior: "deny", message: "Workspace path is outside the configured root" };
       }
+    }
+    if (this.active !== active || active.resultSeen || options.signal.aborted) {
+      return { behavior: "deny", message: "No active Flyx turn" };
     }
     if (["Read", "Glob", "Grep"].includes(toolName)) {
       return { behavior: "allow", updatedInput: input, updatedPermissions: [] };
@@ -464,19 +465,19 @@ export class ClaudeAdapter implements ProviderAdapter {
       cwd: ".",
       createdAt: new Date().toISOString(),
     };
-    this.emit({ kind: "approval_requested", request });
+    this.emit(active, { kind: "approval_requested", request });
     return new Promise<PermissionResult>((resolve, reject) => {
       const timeout = setTimeout(() => {
         active.pending.delete(approvalId);
         cleanup();
-        this.emit({ kind: "approval_resolved", approvalId, toolUseId: options.toolUseID, action: "expired" });
+        this.emit(active, { kind: "approval_resolved", approvalId, toolUseId: options.toolUseID, action: "expired" });
         resolve({ behavior: "deny", message: "Flyx approval expired" });
       }, 10 * 60 * 1000);
       const abortHandler = () => {
         active.pending.delete(approvalId);
         clearTimeout(timeout);
         cleanup();
-        this.emit({ kind: "approval_resolved", approvalId, toolUseId: options.toolUseID, action: "aborted" });
+        this.emit(active, { kind: "approval_resolved", approvalId, toolUseId: options.toolUseID, action: "aborted" });
         reject(new Error("Flyx approval aborted"));
       };
       const cleanup = () => options.signal.removeEventListener("abort", abortHandler);
@@ -502,12 +503,12 @@ export class ClaudeAdapter implements ProviderAdapter {
     if (message.session_id) {
       if (active.providerSessionId && active.providerSessionId !== message.session_id) {
         active.sessionIdChanged = true;
-        this.emit({ kind: "diagnostic", code: "SESSION_ID_CHANGED", message: "Claude reported more than one session id" });
+        this.emit(active, { kind: "diagnostic", code: "SESSION_ID_CHANGED", message: "Claude reported more than one session id" });
       }
       active.providerSessionId = message.session_id;
     }
     if (message.type === "system" && message.subtype === "init") {
-      this.emit({
+      this.emit(active, {
         kind: "session_init",
         provider: this.provider,
         providerSessionId: message.session_id,
@@ -532,7 +533,7 @@ export class ClaudeAdapter implements ProviderAdapter {
     if (message.type === "tool_progress") {
       const toolUseId = message.tool_use_id;
       const itemId = active.toolItems.get(toolUseId) ?? `tool-${toolUseId}`;
-      this.emit({
+      this.emit(active, {
         kind: "tool_progress",
         itemId,
         toolUseId,
@@ -541,7 +542,7 @@ export class ClaudeAdapter implements ProviderAdapter {
       return undefined;
     }
     if (message.type === "system" && message.subtype === "permission_denied") {
-      this.emit({
+      this.emit(active, {
         kind: "diagnostic",
         code: "PERMISSION_DENIED",
         message: message.message,
@@ -568,7 +569,7 @@ export class ClaudeAdapter implements ProviderAdapter {
         const itemId = `tool-${block.id}`;
         active.toolItems.set(block.id, itemId);
         const input = isRecord(block.input) ? sanitizeRecordForDisplay(block.input, this.workspace) : {};
-        this.emit({ kind: "tool_started", itemId, toolUseId: block.id, toolName: block.name, input });
+        this.emit(active, { kind: "tool_started", itemId, toolUseId: block.id, toolName: block.name, input });
       }
       return;
     }
@@ -580,7 +581,7 @@ export class ClaudeAdapter implements ProviderAdapter {
         if (!active.assistantTruncated.has(itemId)) {
           const appended = appendWithinLimit(previous, delta.text, MAX_ASSISTANT_MESSAGE_BYTES);
           active.assistantText.set(itemId, appended.next);
-          if (appended.text) this.emit({ kind: "assistant_delta", itemId, text: appended.text });
+          if (appended.text) this.emit(active, { kind: "assistant_delta", itemId, text: appended.text });
           if (appended.truncated) active.assistantTruncated.add(itemId);
         }
       }
@@ -602,12 +603,12 @@ export class ClaudeAdapter implements ProviderAdapter {
       if (value.type === "text" && typeof value.text === "string") {
         const rawId = typeof message.message.id === "string" ? message.message.id : message.uuid;
         const itemId = index === 0 ? `assistant-${rawId}` : `assistant-${rawId}-${index}`;
-        this.emit({ kind: "assistant_message", itemId, text: truncate(value.text, 1024 * 1024), ...(message.aborted ? { aborted: true } : {}) });
+        this.emit(active, { kind: "assistant_message", itemId, text: truncate(value.text, 1024 * 1024), ...(message.aborted ? { aborted: true } : {}) });
       }
       if (value.type === "tool_use" && typeof value.id === "string" && typeof value.name === "string") {
         const itemId = active.toolItems.get(value.id) ?? `tool-${value.id}`;
         active.toolItems.set(value.id, itemId);
-        this.emit({ kind: "tool_started", itemId, toolUseId: value.id, toolName: value.name, input: isRecord(value.input) ? sanitizeRecordForDisplay(value.input, this.workspace) : {} });
+        this.emit(active, { kind: "tool_started", itemId, toolUseId: value.id, toolName: value.name, input: isRecord(value.input) ? sanitizeRecordForDisplay(value.input, this.workspace) : {} });
       }
     });
   }
@@ -620,7 +621,7 @@ export class ClaudeAdapter implements ProviderAdapter {
       const itemId = active.toolItems.get(value.tool_use_id) ?? `tool-${value.tool_use_id}`;
       const output = typeof value.content === "string" ? value.content : JSON.stringify(value.content ?? "");
       const isError = value.is_error === true;
-      this.emit({
+      this.emit(active, {
         kind: "tool_completed",
         itemId,
         toolUseId: value.tool_use_id,
@@ -634,7 +635,7 @@ export class ClaudeAdapter implements ProviderAdapter {
       active.pending.delete(approvalId);
       pending.cleanup();
       pending.reject(new Error(`Flyx approval ${action}`));
-      this.emit({ kind: "approval_resolved", approvalId, toolUseId: pending.request.toolUseId, action });
+      this.emit(active, { kind: "approval_resolved", approvalId, toolUseId: pending.request.toolUseId, action });
     }
   }
 
@@ -642,13 +643,8 @@ export class ClaudeAdapter implements ProviderAdapter {
     if (this.active === active) this.active = undefined;
   }
 
-  private emit(event: AdapterEvent): void {
-    const active = this.active;
-    if (active && event.generation === undefined) {
-      this.onEvent?.({ ...event, generation: active.generation, turnId: active.turnId });
-      return;
-    }
-    this.onEvent?.(event);
+  private emit(active: ActiveQuery, event: AdapterEventPayload): void {
+    this.onEvent?.(fenceAdapterEvent(active.context, event));
   }
 
   private async isInsideWorkspace(candidate: string): Promise<boolean> {

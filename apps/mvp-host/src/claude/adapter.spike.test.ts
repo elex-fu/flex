@@ -3,9 +3,10 @@ import { resolve } from "node:path";
 import { ClaudeAdapter } from "./adapter.js";
 import type { AdapterEvent } from "./types.js";
 
+const realIt = process.env.RUN_REAL_CLAUDE_SPIKE === "1" ? it : it.skip;
+
 describe("Claude Agent SDK P0 contract", () => {
-  it("runs a real no-tool query and exposes a structured terminal event", async () => {
-    if (process.env.RUN_REAL_CLAUDE_SPIKE !== "1") return;
+  realIt("runs a real no-tool query and exposes a structured terminal event", async () => {
     const events: AdapterEvent[] = [];
     const adapter = new ClaudeAdapter({
       workspace: resolve(process.cwd(), "../../packages/claude-fixtures"),

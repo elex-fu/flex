@@ -9,19 +9,27 @@ import type {
   JsonObject,
   JsonRpcId,
 } from "./app-server-client.js";
-import type { AdapterEvent } from "../provider/types.js";
+import type { AdapterEvent, DispatchContext } from "../provider/types.js";
 
 class FakeAppServerClient implements AppServerClient {
   readonly requests: Array<{ method: string; params: JsonObject }> = [];
   readonly responses: Array<{ id: JsonRpcId; result?: JsonObject; error?: { code: number; message: string } }> = [];
   closed = false;
+  nativeTurnSequence = 0;
+  readonly failures = new Map<string, number>();
+  turnStart: (() => Promise<JsonObject>) | undefined;
 
-  constructor(readonly handlers: AppServerClientHandlers) {}
+  constructor(readonly handlers: AppServerClientHandlers, readonly startClient: () => void = () => {}) {}
 
-  async start(): Promise<void> {}
+  async start(): Promise<void> { this.startClient(); }
 
   async request<T = JsonObject>(method: string, params: JsonObject = {}): Promise<T> {
     this.requests.push({ method, params });
+    const failures = this.failures.get(method) ?? 0;
+    if (failures > 0) {
+      this.failures.set(method, failures - 1);
+      throw new Error(`injected ${method} failure`);
+    }
     if (method === "config/read") {
       return {
         config: {
@@ -33,7 +41,10 @@ class FakeAppServerClient implements AppServerClient {
     if (method === "account/read") return { account: { type: "chatgpt" }, requiresOpenaiAuth: true } as T;
     if (method === "thread/start") return { thread: { id: "codex-thread-new" } } as T;
     if (method === "thread/resume") return { thread: { id: params.threadId } } as T;
-    if (method === "turn/start") return { turn: { id: "codex-turn-1", status: "inProgress", items: [] } } as T;
+    if (method === "turn/start") {
+      if (this.turnStart) return await this.turnStart() as T;
+      return { turn: { id: `codex-turn-${++this.nativeTurnSequence}`, status: "inProgress", items: [] } } as T;
+    }
     return {} as T;
   }
 
@@ -72,15 +83,19 @@ afterEach(() => {
   while (adapters.length) adapters.pop()!.close();
 });
 
-function setup() {
+function setup(options: { startFailures?: number; requestFailure?: string } = {}) {
   const events: AdapterEvent[] = [];
   let client: FakeAppServerClient | undefined;
+  let startFailures = options.startFailures ?? 0;
   const adapter = new CodexAdapter({
     workspace: resolve(process.cwd(), "../../packages/claude-fixtures"),
     executable: process.execPath,
     onEvent: (event) => events.push(event),
     clientFactory: (handlers) => {
-      client = new FakeAppServerClient(handlers);
+      client = new FakeAppServerClient(handlers, () => {
+        if (startFailures > 0) { startFailures -= 1; throw new Error("injected client startup failure"); }
+      });
+      if (options.requestFailure) client.failures.set(options.requestFailure, 1);
       return client;
     },
   });
@@ -245,4 +260,113 @@ describe("CodexAdapter", () => {
     expect(state.client.closed).toBe(true);
     expect(state.events).toContainEqual(expect.objectContaining({ kind: "diagnostic", code: "CODEX_SECURITY_POLICY_FAILED" }));
   });
+});
+
+function context(turnId: string, generation: number): DispatchContext {
+  return { hostOwnerId: "test-owner", hostOwnerGeneration: 7, sessionId: "flyx-session", flyxTurnId: turnId,
+    runtimeId: "test-runtime", runtimeGeneration: generation, attemptId: `attempt-${generation}` };
+}
+
+function complete(client: FakeAppServerClient, turnId: string, text = "complete", threadId = "codex-thread-new"): void {
+  const scope = { threadId, turnId };
+  client.notification("item/agentMessage/delta", { ...scope, itemId: "reused-item", delta: text });
+  client.notification("item/completed", { ...scope, item: { type: "agentMessage", id: "reused-item", text } });
+  client.notification("turn/completed", { threadId, turn: { id: turnId, status: "completed", items: [] } });
+}
+
+describe("Codex Engine dispatch fence", () => {
+  it.each(["client", "thread", "turn"])("fences %s preparation/start failure and the next successful streamed Turn", async (stage) => {
+    const state = setup(stage === "client" ? { startFailures: 1 } : { requestFailure: stage === "thread" ? "thread/start" : "turn/start" });
+    const firstContext = context("failed-turn", 41);
+    await expect(state.adapter.runTurn(firstContext.flyxTurnId, "first", undefined, firstContext)).resolves.toMatchObject({ status: "failed" });
+    expect(state.events.some((event) => event.kind === "turn_failed")).toBe(true);
+    expect(state.events.every((event) => event.turnId === "failed-turn" && event.generation === 41 && JSON.stringify(event.dispatchContext) === JSON.stringify(firstContext))).toBe(true);
+    const secondContext = context("successful-turn", 42);
+    const next = state.adapter.runTurn(secondContext.flyxTurnId, "second", undefined, secondContext);
+    await waitFor(() => state.client.requests.some((request) => request.method === "turn/start") && state.events.some((event) => event.kind === "native_binding"));
+    complete(state.client, "codex-turn-1", "second reply");
+    await expect(next).resolves.toMatchObject({ status: "completed" });
+    const events = state.events.filter((event) => event.turnId === secondContext.flyxTurnId);
+    expect(events.map((event) => event.kind)).toEqual(["session_init", "native_binding", "assistant_delta", "assistant_message", "turn_completed"]);
+    expect(events.every((event) => event.generation === 42 && JSON.stringify(event.dispatchContext) === JSON.stringify(secondContext))).toBe(true);
+  });
+
+  it("rejects late native messages, nested terminal IDs and approval requests on a resumed thread", async () => {
+    const state = setup();
+    const first = state.adapter.runTurn("first-turn", "first", "shared-thread", context("first-turn", 4));
+    await waitFor(() => state.events.some((event) => event.kind === "native_binding"));
+    complete(state.client, "codex-turn-1", "first", "shared-thread");
+    await first;
+    const second = state.adapter.runTurn("second-turn", "second", "shared-thread", context("second-turn", 5));
+    await waitFor(() => state.events.some((event) => event.kind === "native_binding" && event.turnId === "second-turn"));
+    const before = state.events.length;
+    state.client.notification("item/agentMessage/delta", { threadId: "shared-thread", turnId: "codex-turn-1", itemId: "reused-item", delta: "late" });
+    state.client.notification("item/agentMessage/delta", { threadId: "shared-thread", itemId: "reused-item", delta: "unbound" });
+    state.client.notification("turn/completed", { threadId: "shared-thread", turn: { id: "codex-turn-1", status: "failed" } });
+    state.client.serverRequest(99, "item/commandExecution/requestApproval", { threadId: "shared-thread", turnId: "codex-turn-1", itemId: "reused-item", command: "echo late" });
+    expect(state.events).toHaveLength(before);
+    expect(state.client.responses).toContainEqual({ id: 99, error: { code: -32602, message: "No matching active Flyx turn" } });
+    complete(state.client, "codex-turn-2", "second", "shared-thread");
+    await expect(second).resolves.toMatchObject({ status: "completed" });
+    expect(state.events.filter((event) => event.kind === "assistant_delta").map((event) => event.text)).toEqual(["first", "second"]);
+  });
+
+  it("waits for the start response to associate early callbacks with its native Turn", async () => {
+    const state = setup();
+    const first = state.adapter.runTurn("first-turn", "first", "shared-thread", context("first-turn", 8));
+    await waitFor(() => state.events.some((event) => event.kind === "native_binding"));
+    complete(state.client, "codex-turn-1", "first", "shared-thread");
+    await first;
+    let release!: (response: JsonObject) => void;
+    const response = new Promise<JsonObject>((resolveResponse) => { release = resolveResponse; });
+    state.client.turnStart = () => response;
+    const mutableContext = { ...context("second-turn", 9) };
+    const second = state.adapter.runTurn("second-turn", "second", "shared-thread", mutableContext);
+    mutableContext.runtimeGeneration = 999;
+    await waitFor(() => state.client.requests.filter((request) => request.method === "turn/start").length === 2);
+    complete(state.client, "codex-turn-1", "late", "shared-thread");
+    complete(state.client, "codex-turn-2", "early second", "shared-thread");
+    expect(state.events.filter((event) => event.turnId === "second-turn").map((event) => event.kind)).toEqual(["session_init"]);
+    release({ turn: { id: "codex-turn-2" } });
+    await expect(second).resolves.toMatchObject({ status: "completed" });
+    const events = state.events.filter((event) => event.turnId === "second-turn");
+    expect(events.every((event) => event.generation === 9 && event.dispatchContext?.runtimeGeneration === 9)).toBe(true);
+    expect(events.find((event) => event.kind === "assistant_message")).toMatchObject({ text: "early second" });
+    expect(events.some((event) => event.kind === "assistant_message" && event.text === "late")).toBe(false);
+  });
+
+  it("ignores old client callbacks even if a replacement reuses the same native IDs", async () => {
+    const state = setup();
+    const first = state.adapter.runTurn("first-turn", "first", undefined, context("first-turn", 11));
+    await waitFor(() => state.events.some((event) => event.kind === "native_binding"));
+    const oldClient = state.client;
+    oldClient.exit();
+    await expect(first).resolves.toMatchObject({ status: "outcome_unknown" });
+    const second = state.adapter.runTurn("second-turn", "second", undefined, context("second-turn", 12));
+    await waitFor(() => state.events.some((event) => event.kind === "native_binding" && event.turnId === "second-turn"));
+    complete(oldClient, "codex-turn-1", "old client");
+    complete(state.client, "codex-turn-1", "new client");
+    await expect(second).resolves.toMatchObject({ status: "completed" });
+    expect(state.events.find((event) => event.kind === "assistant_message")).toMatchObject({ text: "new client", generation: 12 });
+  });
+});
+
+
+it("requires native Turn binding when a resumed runtime reuses an approval RPC ID", async () => {
+  const state = setup();
+  const first = state.adapter.runTurn("first-approval-turn", "first", "shared-thread", context("first-approval-turn", 21));
+  await waitFor(() => state.events.some((event) => event.kind === "native_binding"));
+  state.client.serverRequest(91, "item/commandExecution/requestApproval", { threadId: "shared-thread", turnId: "codex-turn-1", itemId: "same-tool", command: "echo first" });
+  complete(state.client, "codex-turn-1", "first", "shared-thread");
+  await first;
+  const second = state.adapter.runTurn("second-approval-turn", "second", "shared-thread", context("second-approval-turn", 22));
+  await waitFor(() => state.events.some((event) => event.kind === "native_binding" && event.turnId === "second-approval-turn"));
+  state.client.serverRequest(91, "item/commandExecution/requestApproval", { threadId: "shared-thread", turnId: "codex-turn-2", itemId: "same-tool", command: "echo second" });
+  const before = state.events.length;
+  state.client.notification("serverRequest/resolved", { threadId: "shared-thread", requestId: 91 });
+  expect(state.events).toHaveLength(before);
+  state.client.notification("serverRequest/resolved", { threadId: "shared-thread", turnId: "codex-turn-2", requestId: 91 });
+  expect(state.events.at(-1)).toMatchObject({ kind: "approval_resolved", turnId: "second-approval-turn", generation: 22 });
+  complete(state.client, "codex-turn-2", "second", "shared-thread");
+  await second;
 });

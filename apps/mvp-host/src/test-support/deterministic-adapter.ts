@@ -1,5 +1,6 @@
 import type {
-  AdapterEvent,
+  AdapterEventPayload,
+  DispatchContext,
   AdapterEventHandler,
   AdapterStatus,
   ApprovalAction,
@@ -8,6 +9,7 @@ import type {
   ProviderId,
   TurnOutcome,
 } from "../provider/types.js";
+import { dispatchContextForTurn, fenceAdapterEvent } from "../provider/types.js";
 
 /**
  * Deterministic replacement for `ClaudeAdapter` used by browser E2E runs and
@@ -96,7 +98,6 @@ const DEFAULT_SCENARIOS: DeterministicScenario[] = [
   },
 ];
 
-type DistributiveOmit<T, K extends keyof never> = T extends unknown ? Omit<T, K> : never;
 type PendingDeterministicApproval = {
   request: ApprovalRequest;
   settle: (action: ApprovalAction | "aborted") => void;
@@ -104,7 +105,7 @@ type PendingDeterministicApproval = {
 
 type ActiveDeterministicTurn = {
   turnId: string;
-  generation: number;
+  context: DispatchContext;
   cancelled: boolean;
   terminal: boolean;
   pending: Map<string, PendingDeterministicApproval>;
@@ -117,7 +118,6 @@ export class DeterministicAdapter implements ProviderAdapter {
   private readonly onEvent: AdapterEventHandler | undefined;
   private readonly scenarios = new Map<string, DeterministicScenario>();
   private active: ActiveDeterministicTurn | undefined;
-  private generation = 0;
 
   constructor(options: { workspace: string; provider?: ProviderId; onEvent?: AdapterEventHandler; scenarios?: DeterministicScenario[] }) {
     this.workspace = options.workspace;
@@ -159,29 +159,37 @@ export class DeterministicAdapter implements ProviderAdapter {
     return this.status();
   }
 
-  async runTurn(turnId: string, prompt: string): Promise<TurnOutcome> {
+  async runTurn(turnId: string, prompt: string, _resumeSessionId?: string, context?: DispatchContext): Promise<TurnOutcome> {
     if (this.active && !this.active.terminal) {
       return { status: "failed", error: "deterministic adapter already has an active turn" };
     }
-    const generation = ++this.generation;
-    const active: ActiveDeterministicTurn = { turnId, generation, cancelled: false, terminal: false, pending: new Map(), wake: undefined };
+    const dispatchContext = dispatchContextForTurn(turnId, context);
+    const active: ActiveDeterministicTurn = { turnId, context: dispatchContext, cancelled: false, terminal: false, pending: new Map(), wake: undefined };
     this.active = active;
-    const scenario = this.selectScenario(prompt);
+    let scenario: DeterministicScenario;
+    try {
+      scenario = this.selectScenario(prompt);
+    } catch (error) {
+      active.terminal = true;
+      const message = error instanceof Error ? error.message : String(error);
+      this.emit(active, { kind: "turn_failed", subtype: "scenario_unavailable", errors: [message] });
+      return { status: "failed", error: message };
+    }
 
-    this.emit({ kind: "session_init", provider: this.provider, providerSessionId: PROVIDER_SESSION_ID, runtimeVersion: "deterministic", model: "deterministic", tools: ["Read", "Bash"] });
+    this.emit(active, { kind: "session_init", provider: this.provider, providerSessionId: PROVIDER_SESSION_ID, runtimeVersion: "deterministic", model: "deterministic", tools: ["Read", "Bash"] });
 
     let index = 0;
     for (const step of scenario.steps) {
       if (active.cancelled) break;
       if (step.kind === "text") {
         const itemId = `det-text-${turnId}-${index}`;
-        for (const half of splitText(step.text)) this.emit({ kind: "assistant_delta", itemId, text: half });
-        this.emit({ kind: "assistant_message", itemId, text: step.text });
+        for (const half of splitText(step.text)) this.emit(active, { kind: "assistant_delta", itemId, text: half });
+        this.emit(active, { kind: "assistant_message", itemId, text: step.text });
       } else if (step.kind === "delay") {
         if (!(await this.sleep(active, step.ms))) break;
       } else if (step.kind === "fail") {
         active.terminal = true;
-        this.emit({ kind: "turn_failed", subtype: "deterministic_failure", errors: [step.error] });
+        this.emit(active, { kind: "turn_failed", subtype: "deterministic_failure", errors: [step.error] });
         return { status: "failed", providerSessionId: PROVIDER_SESSION_ID, error: step.error };
       } else {
         const completed = await this.runToolStep(active, turnId, step, index);
@@ -192,11 +200,11 @@ export class DeterministicAdapter implements ProviderAdapter {
 
     active.terminal = true;
     if (active.cancelled) {
-      this.emit({ kind: "turn_cancelled", reason: "deterministic_interrupt" });
+      this.emit(active, { kind: "turn_cancelled", reason: "deterministic_interrupt" });
       return { status: "cancelled", providerSessionId: PROVIDER_SESSION_ID };
     }
     const result = scenario.result ?? "deterministic result";
-    this.emit({ kind: "turn_completed", result, costUsd: scenario.costUsd ?? 0.01, numTurns: scenario.numTurns ?? 1 });
+    this.emit(active, { kind: "turn_completed", result, costUsd: scenario.costUsd ?? 0.01, numTurns: scenario.numTurns ?? 1 });
     return { status: "completed", providerSessionId: PROVIDER_SESSION_ID };
   }
 
@@ -208,7 +216,7 @@ export class DeterministicAdapter implements ProviderAdapter {
   ): Promise<boolean> {
     const toolUseId = `det-tool-${turnId}-${index}`;
     const itemId = toolUseId;
-    this.emit({ kind: "tool_started", itemId, toolUseId, toolName: step.toolName, input: step.input ?? {} });
+    this.emit(active, { kind: "tool_started", itemId, toolUseId, toolName: step.toolName, input: step.input ?? {} });
 
     if (step.approval) {
       const approvalId = `det-approval-${turnId}-${index}`;
@@ -223,19 +231,19 @@ export class DeterministicAdapter implements ProviderAdapter {
         cwd: this.workspace,
         createdAt: new Date().toISOString(),
       };
-      this.emit({ kind: "approval_requested", request });
+      this.emit(active, { kind: "approval_requested", request });
       const action = await this.waitForApproval(active, request);
       if (active.cancelled) return false;
       if (action !== "allow_once") {
-        this.emit({ kind: "tool_completed", itemId, toolUseId, error: "denied by user" });
+        this.emit(active, { kind: "tool_completed", itemId, toolUseId, error: "denied by user" });
         return true;
       }
     }
 
     if (step.durationMs && !(await this.sleep(active, step.durationMs))) return false;
     if (active.cancelled) return false;
-    if (step.output) this.emit({ kind: "tool_progress", itemId, toolUseId, output: step.output });
-    this.emit(step.error
+    if (step.output) this.emit(active, { kind: "tool_progress", itemId, toolUseId, output: step.output });
+    this.emit(active, step.error
       ? { kind: "tool_completed", itemId, toolUseId, error: step.error }
       : { kind: "tool_completed", itemId, toolUseId, ...(step.output ? { output: step.output } : {}) });
     return true;
@@ -275,7 +283,7 @@ export class DeterministicAdapter implements ProviderAdapter {
     active.cancelled = true;
     for (const [approvalId, pending] of [...active.pending.entries()]) {
       active.pending.delete(approvalId);
-      this.emit({ kind: "approval_resolved", approvalId, toolUseId: pending.request.toolUseId, action: "aborted" });
+      this.emit(active, { kind: "approval_resolved", approvalId, toolUseId: pending.request.toolUseId, action: "aborted" });
       pending.settle("aborted");
     }
     active.wake?.();
@@ -287,18 +295,13 @@ export class DeterministicAdapter implements ProviderAdapter {
     const pending = active?.pending.get(approvalId);
     if (!active || !pending) return false;
     active.pending.delete(approvalId);
-    this.emit({ kind: "approval_resolved", approvalId, toolUseId: pending.request.toolUseId, action });
+    this.emit(active, { kind: "approval_resolved", approvalId, toolUseId: pending.request.toolUseId, action });
     pending.settle(action);
     return true;
   }
 
-  private emit(event: DistributiveOmit<AdapterEvent, "generation" | "turnId">): void {
-    const active = this.active;
-    const envelope = {
-      ...event,
-      ...(active ? { generation: active.generation, turnId: active.turnId } : {}),
-    } as AdapterEvent;
-    this.onEvent?.(envelope);
+  private emit(active: ActiveDeterministicTurn, event: AdapterEventPayload): void {
+    this.onEvent?.(fenceAdapterEvent(active.context, event));
   }
 }
 

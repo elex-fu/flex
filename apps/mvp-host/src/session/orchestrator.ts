@@ -4,7 +4,8 @@ import type { Bootstrap, SessionEvent, TimelineItem } from "@flyx/mvp-protocol";
 import { ProtocolVersion } from "@flyx/mvp-protocol";
 import { ClaudeAdapter } from "../claude/adapter.js";
 import { CodexAdapter } from "../codex/adapter.js";
-import type { AdapterEvent, ProviderAdapter, ProviderId } from "../provider/types.js";
+import type { AdapterEvent, DispatchContext, ProviderAdapter, ProviderId } from "../provider/types.js";
+import { dispatchContextForTurn } from "../provider/types.js";
 import { GitService, type GitDiff, type GitStatus } from "../git/git-service.js";
 import {
   SqliteStore,
@@ -40,6 +41,8 @@ export type OrchestratorOptions = {
   databasePath?: string;
   provider?: ProviderId;
   adapter?: ProviderAdapter;
+  owner?: { readonly ownerId: string; readonly generation: number };
+  runtimeId?: string;
 };
 
 const MAX_PROMPT_BYTES = 16 * 1024;
@@ -52,7 +55,10 @@ export class SessionOrchestrator {
   private readonly listeners = new Set<SessionEventListener>();
   private commandTail: Promise<unknown> = Promise.resolve();
   private eventTail: Promise<void> = Promise.resolve();
-  private generation = 0;
+  private readonly hostOwnerId: string;
+  private readonly hostOwnerGeneration: number;
+  private readonly runtimeId: string;
+  private readonly dispatchContexts = new Map<string, DispatchContext>();
   private degraded = false;
   private baselinePromise: Promise<void> | undefined;
   private readonly session: SessionRow;
@@ -75,6 +81,9 @@ export class SessionOrchestrator {
     }
     this.workspace = canonicalWorkspace;
     this.session = existingSession ?? this.store.createSession(canonicalWorkspace, provider);
+    this.hostOwnerId = options.owner?.ownerId ?? randomUUID();
+    this.hostOwnerGeneration = options.owner?.generation ?? 1;
+    this.runtimeId = options.runtimeId ?? `${provider}:${this.session.id}`;
     this.store.recoverActiveTurns();
     this.git = new GitService(canonicalWorkspace);
     try {
@@ -197,7 +206,7 @@ export class SessionOrchestrator {
         commandId,
         requestHash,
         prompt,
-        generation: ++this.generation,
+        generation: this.nextRuntimeGeneration(),
       });
       accepted.events.forEach((event) => this.notify(event));
       void this.executeTurn(accepted.turn, authSubjectId);
@@ -325,15 +334,28 @@ export class SessionOrchestrator {
   }
 
   private async executeTurn(turn: TurnRow, authSubjectId: string): Promise<void> {
+    const context = dispatchContextForTurn(turn.id, {
+      hostOwnerId: this.hostOwnerId,
+      hostOwnerGeneration: this.hostOwnerGeneration,
+      sessionId: turn.sessionId,
+      flyxTurnId: turn.id,
+      runtimeId: this.runtimeId,
+      runtimeGeneration: turn.generation,
+      // Until execution intents persist attempts (R05/R06), the immutable
+      // durable Turn identity fixes the single permitted dispatch attempt.
+      attemptId: `${turn.id}:${turn.generation}`,
+    });
+    this.dispatchContexts.set(turn.id, context);
     this.commit("turn.started", { turnId: turn.id }, { activityState: "running", turnId: turn.id, turnStatus: "running" });
     const session = this.store.getSession(this.session.id);
     let outcome: Awaited<ReturnType<ProviderAdapter["runTurn"]>>;
     try {
-      outcome = await this.adapter.runTurn(turn.id, turn.prompt, session?.providerSessionId);
+      outcome = await this.adapter.runTurn(turn.id, turn.prompt, session?.providerSessionId, context);
     } catch (error) {
       outcome = { status: "failed", error: error instanceof Error ? error.message : String(error) };
     }
     await this.eventTail;
+    this.dispatchContexts.delete(turn.id);
     const latest = this.store.getTurn(turn.id);
     const finalResponse = { turnId: turn.id, ...outcome };
     const receiptUpdate = this.receiptUpdateForTurn(turn.id, outcomeToReceiptState(outcome.status), finalResponse);
@@ -397,46 +419,46 @@ export class SessionOrchestrator {
   }
 
   private async handleAdapterEvent(event: AdapterEvent): Promise<void> {
+    const context = event.dispatchContext;
+    if (!context || event.turnId !== context.flyxTurnId || event.generation !== context.runtimeGeneration) return;
+    const expected = this.dispatchContexts.get(context.flyxTurnId);
+    if (!expected || !sameDispatchContext(expected, context)) return;
+    const target = this.store.getTurn(context.flyxTurnId);
     const current = this.store.getActiveTurn(this.session.id);
-    const eventTurnId = event.turnId ?? (event.kind === "approval_requested" ? event.request.turnId : undefined);
-    const target = eventTurnId ? this.store.getTurn(eventTurnId) : current;
-
-    // SDK callbacks are delivered asynchronously.  A query can emit a late
-    // message after its terminal event while the next Turn is already
-    // running.  The adapter's generation/turn fence makes that message
-    // harmless; older test adapters that do not provide a fence retain the
-    // original single-active-turn behaviour.
-    if (event.generation !== undefined) {
-      if (!target || target.generation !== event.generation) return;
-      if (current && current.id !== target.id) return;
-      if (["completed", "failed", "cancelled", "outcome_unknown"].includes(target.status)) return;
-    }
-    const turnId = eventTurnId ?? target?.id;
-    if (!turnId && event.kind !== "diagnostic" && event.kind !== "session_init") return;
-    const resolvedTurnId = turnId ?? "";
+    if (!target || target.sessionId !== context.sessionId || target.generation !== context.runtimeGeneration
+      || current?.id !== target.id || ["completed", "failed", "cancelled", "outcome_unknown"].includes(target.status)) return;
+    if (event.kind === "approval_requested" && event.request.turnId !== target.id) return;
+    if (event.kind === "approval_resolved" && this.store.getApproval(event.approvalId)?.turnId !== target.id) return;
+    const resolvedTurnId = target.id;
+    // Native Item IDs can be reused by a resumed runtime. Keep separate
+    // projections per Flyx Turn while preserving the source ID for recovery.
+    if ("itemId" in event) event = { ...event, nativeItemId: event.itemId, itemId: `provider-${target.id}-${event.itemId}` };
     switch (event.kind) {
       case "session_init":
-        this.commit("provider.session.init", event, { providerSessionId: event.providerSessionId, timeline: { itemId: `system-session-${event.providerSessionId}`, kind: "system", status: "info", content: { message: `${providerDisplayName(event.provider)} session initialized`, provider: event.provider, providerSessionId: event.providerSessionId, model: event.model, runtimeVersion: event.runtimeVersion } } });
+        this.commit("provider.session.init", event, { turnId: target.id, turnStatus: target.status, providerSessionId: event.providerSessionId, timeline: { itemId: `system-session-${target.id}`, kind: "system", status: "info", content: { message: `${providerDisplayName(event.provider)} session initialized`, provider: event.provider, providerSessionId: event.providerSessionId, model: event.model, runtimeVersion: event.runtimeVersion } } });
+        return;
+      case "native_binding":
+        this.commit("provider.turn.bound", event, { turnId: target.id, turnStatus: target.status, providerSessionId: event.nativeSessionId });
         return;
       case "assistant_delta": {
         const text = this.mergeText(resolvedTurnId, event.itemId, event.text);
-        this.commit("assistant.message.delta", { turnId: resolvedTurnId, itemId: event.itemId, text: event.text }, { turnId: resolvedTurnId, timeline: { itemId: event.itemId, kind: "assistant_message", status: "streaming", content: { turnId: resolvedTurnId, itemId: event.itemId, text } } });
+        this.commit("assistant.message.delta", { ...event, turnId: resolvedTurnId }, { turnId: resolvedTurnId, timeline: { itemId: event.itemId, kind: "assistant_message", status: "streaming", content: { turnId: resolvedTurnId, itemId: event.itemId, text } } });
         return;
       }
       case "assistant_message":
-        this.commit("assistant.message.completed", { turnId: resolvedTurnId, ...event }, { turnId: resolvedTurnId, timeline: { itemId: event.itemId, kind: "assistant_message", status: event.aborted ? "aborted" : "completed", content: { turnId: resolvedTurnId, itemId: event.itemId, text: event.text, ...(event.aborted ? { aborted: true } : {}) } } });
+        this.commit("assistant.message.completed", { ...event, turnId: resolvedTurnId }, { turnId: resolvedTurnId, timeline: { itemId: event.itemId, kind: "assistant_message", status: event.aborted ? "aborted" : "completed", content: { turnId: resolvedTurnId, itemId: event.itemId, text: event.text, ...(event.aborted ? { aborted: true } : {}) } } });
         return;
       case "tool_started":
-        this.commit("tool.call.started", { turnId: resolvedTurnId, ...event }, { turnId: resolvedTurnId, timeline: { itemId: event.itemId, kind: "tool_call", status: "running", content: { turnId: resolvedTurnId, toolUseId: event.toolUseId, toolName: event.toolName, input: event.input } } });
+        this.commit("tool.call.started", { ...event, turnId: resolvedTurnId }, { turnId: resolvedTurnId, timeline: { itemId: event.itemId, kind: "tool_call", status: "running", content: { turnId: resolvedTurnId, toolUseId: event.toolUseId, toolName: event.toolName, input: event.input } } });
         return;
       case "tool_progress": {
         const item = this.store.getTimelineItem(this.session.id, event.itemId);
-        this.commit("tool.call.progress", { turnId: resolvedTurnId, ...event }, { turnId: resolvedTurnId, timeline: { itemId: event.itemId, kind: "tool_call", status: "running", content: { ...(isRecord(item?.content) ? item.content : {}), output: event.output } } });
+        this.commit("tool.call.progress", { ...event, turnId: resolvedTurnId }, { turnId: resolvedTurnId, timeline: { itemId: event.itemId, kind: "tool_call", status: "running", content: { ...(isRecord(item?.content) ? item.content : {}), output: event.output } } });
         return;
       }
       case "tool_completed": {
         const item = this.store.getTimelineItem(this.session.id, event.itemId);
-        this.commit("tool.call.completed", { turnId: resolvedTurnId, ...event }, { turnId: resolvedTurnId, timeline: { itemId: event.itemId, kind: "tool_call", status: event.error ? "failed" : "completed", content: { ...(isRecord(item?.content) ? item.content : {}), ...(event.output ? { output: event.output } : {}), ...(event.error ? { error: event.error } : {}) } } });
+        this.commit("tool.call.completed", { ...event, turnId: resolvedTurnId }, { turnId: resolvedTurnId, timeline: { itemId: event.itemId, kind: "tool_call", status: event.error ? "failed" : "completed", content: { ...(isRecord(item?.content) ? item.content : {}), ...(event.output ? { output: event.output } : {}), ...(event.error ? { error: event.error } : {}) } } });
         return;
       }
       case "approval_requested": {
@@ -446,7 +468,7 @@ export class SessionOrchestrator {
         // Turn back to waiting_approval.
         if (this.store.getApproval(request.approvalId)) return;
         const approval: ApprovalRow = { approvalId: request.approvalId, sessionId: this.session.id, turnId: request.turnId, toolUseId: request.toolUseId, version: 0, status: "pending", request, createdAt: request.createdAt };
-        this.commit("approval.requested", { ...request, itemId: `approval-${request.approvalId}`, status: "pending" }, { activityState: "waiting_approval", turnId: request.turnId, turnStatus: "waiting_approval", approval, timeline: { itemId: `approval-${request.approvalId}`, kind: "approval", status: "pending", content: { ...request, status: "pending" } } });
+        this.commit("approval.requested", { ...event, ...request, itemId: `approval-${request.approvalId}`, status: "pending" }, { activityState: "waiting_approval", turnId: request.turnId, turnStatus: "waiting_approval", approval, timeline: { itemId: `approval-${request.approvalId}`, kind: "approval", status: "pending", content: { ...request, status: "pending" } } });
         return;
       }
       case "approval_resolved": {
@@ -464,7 +486,7 @@ export class SessionOrchestrator {
               const status = event.action === "allow_once" || event.action === "deny" ? "resolved" : event.action;
               const content = { ...resolved.request, approvalId: event.approvalId, status, action: event.action };
               return {
-                payload: { ...content, turnId: resolvedTurnId, itemId: `approval-${event.approvalId}`, ...event },
+                payload: { ...content, ...event, turnId: resolvedTurnId, itemId: `approval-${event.approvalId}` },
                 options: {
                   activityState: stillPending ? "waiting_approval" : "running",
                   turnId: resolved.turnId,
@@ -485,7 +507,7 @@ export class SessionOrchestrator {
       }
       case "turn_completed": {
         const controlReceipts = this.controlReceiptUpdatesForTurn(resolvedTurnId, "completed");
-        this.commit("turn.completed", { turnId: resolvedTurnId, itemId: `result-${resolvedTurnId}`, ...event }, {
+        this.commit("turn.completed", { ...event, turnId: resolvedTurnId, itemId: `result-${resolvedTurnId}` }, {
           activityState: "idle",
           turnId: resolvedTurnId,
           turnStatus: "completed",
@@ -509,7 +531,7 @@ export class SessionOrchestrator {
       }
       case "turn_failed": {
         const controlReceipts = this.controlReceiptUpdatesForTurn(resolvedTurnId, "failed");
-        this.commit("turn.failed", { turnId: resolvedTurnId, itemId: `error-${resolvedTurnId}`, ...event }, {
+        this.commit("turn.failed", { ...event, turnId: resolvedTurnId, itemId: `error-${resolvedTurnId}` }, {
           activityState: "idle",
           turnId: resolvedTurnId,
           turnStatus: "failed",
@@ -531,7 +553,7 @@ export class SessionOrchestrator {
       }
       case "turn_cancelled": {
         const controlReceipts = this.controlReceiptUpdatesForTurn(resolvedTurnId, "cancelled");
-        this.commit("turn.cancelled", { turnId: resolvedTurnId, itemId: `result-${resolvedTurnId}`, ...event }, {
+        this.commit("turn.cancelled", { ...event, turnId: resolvedTurnId, itemId: `result-${resolvedTurnId}` }, {
           activityState: "idle",
           turnId: resolvedTurnId,
           turnStatus: "cancelled",
@@ -544,6 +566,14 @@ export class SessionOrchestrator {
         return;
       }
     }
+  }
+
+  private nextRuntimeGeneration(): number {
+    const row = this.store.db.prepare("SELECT MAX(generation) AS generation FROM turns WHERE session_id = ?")
+      .get(this.session.id) as { generation: number | null };
+    const generation = (row.generation ?? 0) + 1;
+    if (!Number.isSafeInteger(generation)) throw new OrchestratorError("GENERATION_EXHAUSTED", "Provider generation exhausted");
+    return generation;
   }
 
   private commit(type: string, payload: unknown, options: Parameters<SqliteStore["commitEvent"]>[3] = {}): SessionEvent {
@@ -681,4 +711,14 @@ function outcomeToReceiptState(status: string): "completed" | "failed" | "cancel
 
 function providerDisplayName(provider: ProviderId): string {
   return provider === "codex" ? "Codex" : "Claude";
+}
+
+function sameDispatchContext(expected: DispatchContext, actual: DispatchContext): boolean {
+  return expected.hostOwnerId === actual.hostOwnerId
+    && expected.hostOwnerGeneration === actual.hostOwnerGeneration
+    && expected.sessionId === actual.sessionId
+    && expected.flyxTurnId === actual.flyxTurnId
+    && expected.runtimeId === actual.runtimeId
+    && expected.runtimeGeneration === actual.runtimeGeneration
+    && expected.attemptId === actual.attemptId;
 }

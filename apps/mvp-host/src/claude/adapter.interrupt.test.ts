@@ -5,9 +5,10 @@ import { resolve } from "node:path";
 import { ClaudeAdapter } from "./adapter.js";
 import type { AdapterEvent } from "./types.js";
 
+const realIt = process.env.RUN_REAL_INTERRUPT === "1" ? it : it.skip;
+
 describe("Claude Agent SDK interrupt contract", () => {
-  it("does not report cancellation before the query reaches a terminal state", async () => {
-    if (process.env.RUN_REAL_INTERRUPT !== "1") return;
+  realIt("does not report cancellation before the query reaches a terminal state", async () => {
     const source = resolve(process.cwd(), "../../packages/claude-fixtures");
     const workspace = await mkdtemp(resolve(tmpdir(), "flyx-claude-interrupt-"));
     await cp(source, workspace, { recursive: true });

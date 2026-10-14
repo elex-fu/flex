@@ -898,10 +898,21 @@ export class SessionOrchestrator {
     const event = this.store.db.transaction(() => {
       if (context && options.turnStatus && ["completed", "failed", "cancelled"].includes(options.turnStatus)) blocked = this.recovery.protectTerminal(context);
       const terminal = options.turnId && options.turnStatus && ["completed", "failed", "cancelled", "outcome_unknown"].includes(options.turnStatus);
-      const committed = this.store.commitCommand({ sessionId: this.session.id, build: () => ({ result: undefined,
-        events: [ ...(terminal ? this.interactionEvents?.companionEvents(this.session.id, options.turnId!, type) ?? [] : []),
-          { type, payload, options: blocked ? { ...options, activityState: "outcome_unknown" } : options } ],
-      }) })!;
+      const committed = this.store.commitCommand({ sessionId: this.session.id, build: (facts) => {
+        const legacyApprovals = terminal && !this.interactionEvents
+          ? facts.pendingApprovals.filter((approval) => approval.turnId === options.turnId) : [];
+        if (legacyApprovals.length) this.store.supersedePendingApprovals(this.session.id, options.turnId!);
+        return { result: undefined,
+          events: [
+            ...legacyApprovals.map((approval) => ({ type: "approval.superseded", payload: { approvalId: approval.approvalId,
+              turnId: approval.turnId, status: "superseded", version: approval.version + 1, reason: "turn_terminal" },
+              options: { timeline: { itemId: `approval-${approval.approvalId}`, kind: "approval" as const, status: "superseded",
+                content: { ...approval.request, approvalId: approval.approvalId, turnId: approval.turnId, status: "superseded", reason: "turn_terminal" } } } })),
+            ...(terminal ? this.interactionEvents?.companionEvents(this.session.id, options.turnId!, type) ?? [] : []),
+            { type, payload, options: blocked ? { ...options, activityState: "outcome_unknown" } : options },
+          ],
+        };
+      } })!;
       published.push(...committed.events);
       if (context && (blocked || options.turnStatus === "outcome_unknown")) {
         const session = this.store.getSession(this.session.id)!;

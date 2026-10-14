@@ -7,6 +7,42 @@ import type { AdapterEventPayload, AdapterStatus, DispatchContext, ProviderAdapt
 import { fenceAdapterEvent } from "../provider/types.js";
 import { SessionOrchestrator } from "./orchestrator.js";
 
+it.each(["completed", "outcome_unknown"] as const)("retires legacy pending approvals in the same committed terminal batch (%s)", async (status) => {
+  const workspace = resolve(process.cwd(), "../../packages/claude-fixtures");
+  let context!: DispatchContext; let finish!: (outcome: ProviderOutcome) => void;
+  const outcome = new Promise<ProviderOutcome>((yes) => { finish = yes; });
+  const adapter: ProviderAdapter = { provider: "claude", workspace,
+    status: async () => { throw new Error("No Provider status call"); }, preflight: async () => { throw new Error("No paid preflight"); },
+    runTurn: async (_id, _prompt, _resume, fixed) => { context = fixed!; return outcome; }, interrupt: async () => "unavailable", respondApproval: () => false };
+  const host = new SessionOrchestrator({ workspace, adapter, canReleaseWorkspace: () => true });
+  try {
+    const accepted = await host.startTurn("fixture-actor", "legacy-start", "task"); await host.worker.drainDispatch();
+    host.ingestAdapterEvent(fenceAdapterEvent(context, { kind: "approval_requested", request: { approvalId: "legacy-pending",
+      turnId: accepted.turnId, toolUseId: "legacy-tool", toolName: "Bash", input: { command: "fixture" }, cwd: workspace,
+      createdAt: new Date().toISOString() } }));
+    await host.ingestion.drain(); expect(host.snapshot().pendingApprovals).toHaveLength(1);
+    finish(status === "completed" ? { status, providerSessionId: "fixture-native", evidence: { kind: "native-terminal", sourceId: "fixture-result" } }
+      : { status, error: "DISPATCH_OUTCOME_UNPROVEN", evidence: { kind: "unknown", reason: "DISPATCH_OUTCOME_UNPROVEN" } });
+    await host.worker.drainOperations();
+    expect(host.store.getApproval("legacy-pending")).toMatchObject({ status: "superseded", version: 1 });
+    expect(host.snapshot().pendingApprovals).toEqual([]);
+    expect(host.store.getTimelineItem(host.sessionId, "approval-legacy-pending")?.status).toBe("superseded");
+    const rows = host.store.db.prepare("SELECT type,commit_id FROM session_events WHERE session_id=? AND type IN ('approval.superseded','turn.reconciled') ORDER BY sequence")
+      .all(host.sessionId) as Array<{ type: string; commit_id: string }>;
+    expect(rows.map((row) => row.type)).toEqual(["approval.superseded", "turn.reconciled"]);
+    expect(rows[0]!.commit_id).toBe(rows[1]!.commit_id);
+    expect(host.store.getCommandReceipt("fixture-actor", "legacy-start")?.state).toBe(status);
+    if (status === "outcome_unknown") {
+      expect(host.snapshot().session.recoveryState).toBe("blocked");
+      await expect(host.respondApproval("fixture-actor", "late-answer", "legacy-pending", "allow_once")).rejects.toMatchObject({ code: "RECOVERY_BLOCKED" });
+      expect(host.store.getCommandReceipt("fixture-actor", "late-answer")).toBeUndefined();
+    }
+  } finally {
+    finish({ status: "outcome_unknown", error: "fixture cleanup", evidence: { kind: "unknown", reason: "fixture cleanup" } });
+    await host.worker.drainOperations(); await host.closeAndWait();
+  }
+});
+
 it("the actual Orchestrator ingests fenced native bindings before terminal and retains a visible gate for unproved descendants", async () => {
   const workspace = resolve(process.cwd(), "../../packages/claude-fixtures");
   let context: DispatchContext | undefined;

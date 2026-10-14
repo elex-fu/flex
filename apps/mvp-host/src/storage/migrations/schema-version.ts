@@ -1,6 +1,7 @@
 import type Database from "better-sqlite3";
+import { validateCommandExecutionSchema } from "./004-command-execution.js";
 
-export const SUPPORTED_SCHEMA_VERSION = 3;
+export const SUPPORTED_SCHEMA_VERSION = 4;
 
 export class StoreSchemaError extends Error {
   constructor(readonly code: "FUTURE_SCHEMA" | "SCHEMA_INVALID", message: string) {
@@ -107,6 +108,12 @@ export function inspectSchema(db: Database.Database, options: { maximumVersion?:
   }
   const version = rows.length ? Number(rows.at(-1)!.version) : 0;
   if (version > maximumVersion) throw new StoreSchemaError("FUTURE_SCHEMA", `Database schema ${version} is newer than supported schema ${maximumVersion}; no changes were made.`);
-  if (version >= 3 && options.validateCurrent !== false) validateV3Schema(db);
+  if (options.validateCurrent !== false) {
+    if (version >= 3) validateV3Schema(db);
+    if (version >= 4) {
+      try { validateCommandExecutionSchema(db); }
+      catch { throw new StoreSchemaError("SCHEMA_INVALID", "Declared command execution schema is incomplete; offline repair is required."); }
+    }
+  }
   return { version, empty: tables.length === 0, legacy: version < 3 };
 }

@@ -3,8 +3,13 @@ import { randomUUID } from "node:crypto";
 import { HostOwnerLock, assertHostOwner, canonicalPath, createTestHostOwner, type HostOwnerHandle } from "../lifecycle/host-owner.js";
 import { inspectSchema, StoreSchemaError, validateV3Schema } from "./migrations/schema-version.js";
 import type { ProviderId, RpcError, Session, SessionEvent, TimelineItem, Turn } from "@flyx/mvp-protocol";
+import { applyCommandExecutionMigration } from "./migrations/004-command-execution.js";
+import { ExecutionStore, toExecutionIntent, type RawExecutionIntent } from "./execution-store.js";
+import { decideAcceptTurn } from "../orchestration/decider.js";
+import type { ApprovalDeliveryUpdate, CommandCommit, CommandFacts, CommandPlan, EventCommitRow, ExecutionIntentInput, ExecutionIntentRow, ExecutionIntentUpdate, NewTurn, RequestFormatVersion } from "../orchestration/command-contract.js";
 
 export type SessionRow = Session & {
+  revision: number;
   workspacePath: string;
   baselineHead?: string;
   baselineDirty?: boolean;
@@ -23,6 +28,8 @@ export type TurnRow = Turn & {
    */
   authSubjectId?: string;
   providerSessionId?: string;
+  attemptId?: string;
+  nativeTurnId?: string;
   requestHash: string;
   generation: number;
   createdAt: string;
@@ -55,6 +62,10 @@ export type CommandReceiptRow = {
   commandId: string;
   method: string;
   requestHash: string;
+  requestFormatVersion?: RequestFormatVersion;
+  targetSessionId?: string;
+  commitId?: string;
+  sourceSequence?: number;
   state: CommandReceiptState;
   response: unknown;
   createdAt: string;
@@ -84,6 +95,9 @@ export type EventCommitOptions = {
   commandReceipt?: CommandReceiptUpdate | undefined;
   /** Same invariant when one domain transition settles multiple commands. */
   commandReceipts?: CommandReceiptUpdate[];
+  executionIntentUpdates?: ExecutionIntentUpdate[];
+  approvalDelivery?: ApprovalDeliveryUpdate;
+  nativeTurnId?: string;
 };
 
 export type CommandReceiptUpdate = {
@@ -93,6 +107,9 @@ export type CommandReceiptUpdate = {
   response: unknown;
   /** Refuse to update a receipt belonging to a different request. */
   requestHash?: string;
+  method?: string;
+  requestFormatVersion?: RequestFormatVersion;
+  targetSessionId?: string;
   /** Missing receipts are corruption for normal terminal events. */
   required?: boolean;
 };
@@ -370,6 +387,8 @@ export class SqliteStore {
   readonly mode: NonNullable<SqliteStoreOptions["mode"]>;
   private readonly ownerHandle: HostOwnerHandle | undefined;
   private readonly releaseOwnerOnClose: boolean;
+  private readonly projectionHooks = new Set<(sessionId: string, event: SessionEvent, options: EventCommitOptions) => void>();
+  private readonly commitHooks = new Set<(events: readonly SessionEvent[], commit: EventCommitRow) => void>();
 
   constructor(filePath = ":memory:", options: SqliteStoreOptions = {}) {
     // Preserve legacy file-backed unit fixtures which intentionally open two
@@ -466,6 +485,7 @@ export class SqliteStore {
     this.db.exec("CREATE INDEX IF NOT EXISTS auth_sessions_device ON auth_sessions(device_id)");
     this.db.prepare("INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (2, ?)").run(now());
     this.db.prepare("INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (3, ?)").run(now());
+    applyCommandExecutionMigration(this.db);
   }
 
   private upsertTimelineInternal(sessionId: string, input: TimelineUpsert, updatedAt: string): void {
@@ -504,7 +524,7 @@ export class SqliteStore {
     );
   }
 
-  createSession(workspacePath: string, provider: ProviderId = "claude", id = randomUUID()): SessionRow {
+  createSession(workspacePath: string, provider: ProviderId = "claude", id: string = randomUUID()): SessionRow {
     const timestamp = now();
     this.db.prepare(`
       INSERT INTO sessions (id, workspace_id, workspace_path, provider, status, activity_state, head_sequence, created_at, updated_at)
@@ -593,67 +613,143 @@ export class SqliteStore {
     return this.getTurn(input.turnId)!;
   }
 
-  acceptTurn(input: {
-    authSubjectId: string;
-    sessionId: string;
-    turnId: string;
-    commandId: string;
-    requestHash: string;
-    prompt: string;
-    generation: number;
-  }): AcceptedTurn {
-    const timestamp = now();
-    const transaction = this.db.transaction(() => {
-      const session = this.db.prepare("SELECT id, head_sequence FROM sessions WHERE id = ?")
-        .get(input.sessionId) as { id: string; head_sequence: number } | undefined;
-      if (!session) throw new Error("SESSION_NOT_FOUND");
-      const active = this.db.prepare(`
-        SELECT id FROM turns WHERE session_id = ?
-          AND status IN ('queued', 'running', 'waiting_approval', 'interrupting', 'outcome_unknown') LIMIT 1
-      `).get(input.sessionId) as { id: string } | undefined;
-      if (active) throw new Error("TURN_BUSY");
-      this.db.prepare(`
-        INSERT INTO turns (id, session_id, auth_subject_id, command_id, request_hash, status, prompt, generation, created_at)
-        VALUES (?, ?, ?, ?, ?, 'queued', ?, ?, ?)
-      `).run(input.turnId, input.sessionId, input.authSubjectId, input.commandId, input.requestHash, input.prompt, input.generation, timestamp);
+  /** Synchronous extensions share this connection and the command rollback boundary. */
+  registerProjectionHook(hook: (sessionId: string, event: SessionEvent, options: EventCommitOptions) => void): () => void {
+    this.projectionHooks.add(hook);
+    return () => this.projectionHooks.delete(hook);
+  }
 
-      const first = this.appendEventInternal(input.sessionId, "user.message.created", {
-        turnId: input.turnId,
-        itemId: `user-${input.turnId}`,
-        text: input.prompt,
-      }, timestamp);
-      this.upsertTimelineInternal(input.sessionId, {
-        itemId: `user-${input.turnId}`,
-        kind: "user_message",
-        status: "completed",
-        content: { turnId: input.turnId, text: input.prompt },
-      }, timestamp);
-      const second = this.appendEventInternal(input.sessionId, "turn.requested", {
-        turnId: input.turnId,
-        commandId: input.commandId,
-      }, timestamp);
-      const response = { turnId: input.turnId, status: "accepted" };
-      this.db.prepare(`
-        INSERT INTO command_receipts (auth_subject_id, command_id, method, request_hash, state, response_json, created_at, updated_at)
-        VALUES (?, ?, 'session.startTurn', ?, 'accepted', ?, ?, ?)
-      `).run(input.authSubjectId, input.commandId, input.requestHash, json(response), timestamp, timestamp);
-      this.db.prepare("UPDATE sessions SET activity_state = 'running', updated_at = ? WHERE id = ?")
-        .run(timestamp, input.sessionId);
-      return {
-        turn: this.getTurn(input.turnId)!,
-        receipt: this.getCommandReceipt(input.authSubjectId, input.commandId)!,
-        events: [first, second],
-      } satisfies AcceptedTurn;
-    });
-    return transaction() as AcceptedTurn;
+  registerCommitHook(hook: (events: readonly SessionEvent[], commit: EventCommitRow) => void): () => void {
+    this.commitHooks.add(hook);
+    return () => this.commitHooks.delete(hook);
+  }
+
+  /**
+   * The single synchronous Event/Projection/Receipt/Intent boundary. Facts are
+   * read after BEGIN; a caller with an expected revision gets an explicit CAS
+   * conflict and must build a fresh decision from new durable facts.
+   */
+  commitCommand<T>(input: {
+    sessionId?: string;
+    approvalId?: string;
+    expectedRevision?: number;
+    occurredAt?: string;
+    commitId?: string;
+    build: (facts: CommandFacts) => CommandPlan<T> | undefined;
+  }): CommandCommit<T> | undefined {
+    this.assertWriterOwner();
+    const timestamp = input.occurredAt ?? now();
+    return this.db.transaction(() => {
+      this.assertWriterOwner();
+      const snapshot = input.sessionId ? this.getSnapshot(input.sessionId) : undefined;
+      if (input.sessionId && !snapshot) throw new Error("SESSION_NOT_FOUND");
+      const execution = new ExecutionStore(this);
+      const facts: CommandFacts = {
+        ...(snapshot ? { session: snapshot.session } : {}),
+        ...(snapshot?.activeTurn ? { activeTurn: snapshot.activeTurn } : {}),
+        pendingApprovals: snapshot?.pendingApprovals ?? [],
+        ...(input.approvalId && this.getApproval(input.approvalId) ? { approval: this.getApproval(input.approvalId)! } : {}),
+        ...(input.approvalId && execution.reservation(input.approvalId) ? { reservation: execution.reservation(input.approvalId)! } : {}),
+        runtimeGeneration: input.sessionId ? (this.db.prepare("SELECT COALESCE(MAX(generation), 0) AS generation FROM turns WHERE session_id = ?").get(input.sessionId) as { generation: number }).generation : 0,
+        intents: input.sessionId ? (this.db.prepare("SELECT * FROM execution_intents WHERE session_id = ? AND state <> 'settled' ORDER BY source_sequence, ordinal, id").all(input.sessionId) as RawExecutionIntent[]).map(toExecutionIntent) : [],
+      };
+      const plan = input.build(facts);
+      assertSynchronous(plan);
+      if (!plan) return undefined;
+      const hasWrites = [plan.events, plan.turns, plan.receipts, plan.receiptUpdates, plan.intents, plan.intentUpdates,
+        plan.approvalResolutions, plan.approvalReservations, plan.approvalDeliveries].some((values) => values?.length);
+      if (!hasWrites) return { result: plan.result, events: [], intents: [] };
+      const sessionId = input.sessionId;
+      const expectedRevision = input.expectedRevision ?? plan.expectedRevision ?? facts.session?.revision;
+      if (sessionId) {
+        const changed = this.db.prepare("UPDATE sessions SET revision = revision + 1, updated_at = ? WHERE id = ? AND revision = ?")
+          .run(timestamp, sessionId, expectedRevision);
+        if (changed.changes !== 1) throw new Error("SESSION_REVISION_CONFLICT");
+      } else if (plan.events?.length || plan.turns?.length || plan.intents?.length) {
+        throw new Error("SESSION_REQUIRED");
+      }
+      for (const turn of plan.turns ?? []) {
+        if (turn.sessionId !== sessionId) throw new Error("RESOURCE_SCOPE_MISMATCH");
+        this.insertTurnInternal(turn, timestamp);
+      }
+      for (const resolution of plan.approvalResolutions ?? []) {
+        const approval = this.getApproval(resolution.approvalId);
+        if (!approval || approval.sessionId !== sessionId || !this.resolveApprovalInternal(resolution.approvalId, resolution.expectedVersion, resolution.action, timestamp)) {
+          throw new Error("APPROVAL_VERSION_CONFLICT");
+        }
+      }
+      let boundary: EventCommitRow | undefined;
+      if (plan.events?.length) {
+        if (!sessionId || !facts.session) throw new Error("SESSION_REQUIRED");
+        boundary = { id: input.commitId ?? randomUUID(), sessionId, firstSequence: facts.session.headSequence + 1,
+          lastSequence: facts.session.headSequence + plan.events.length };
+        this.db.prepare("INSERT INTO event_commits (id, session_id, first_sequence, last_sequence) VALUES (?, ?, ?, ?)")
+          .run(boundary.id, sessionId, boundary.firstSequence, boundary.lastSequence);
+      }
+      const events = (plan.events ?? []).map((event) => this.appendEventWithProjectionInternal(
+        sessionId!, event.type, event.payload, event.options ?? {}, timestamp, boundary!.id, event.id,
+      ));
+      const sourceSequence = events.at(-1)?.sequence;
+      for (const receipt of plan.receipts ?? []) {
+        if (receipt.targetSessionId && receipt.targetSessionId !== sessionId) throw new Error("RESOURCE_SCOPE_MISMATCH");
+        this.insertCommandReceiptInternal({ ...receipt,
+          ...(boundary ? { commitId: boundary.id, sourceSequence: boundary.lastSequence } : {}),
+        }, timestamp);
+      }
+      for (const receipt of plan.receiptUpdates ?? []) this.updateCommandReceiptInternal(receipt, timestamp, boundary?.id, sourceSequence);
+      const intents: ExecutionIntentRow[] = [];
+      for (const intent of plan.intents ?? []) {
+        if (!boundary || intent.sessionId !== sessionId) throw new Error("EXECUTION_INTENT_SOURCE_REQUIRED");
+        const offset = intent.sourceEventOffset ?? events.length - 1;
+        const source = events[offset];
+        if (!source) throw new Error("EXECUTION_INTENT_SOURCE_REQUIRED");
+        this.insertExecutionIntentInternal(intent, source.sequence, boundary.id, timestamp);
+        intents.push(execution.get(intent.id)!);
+      }
+      for (const update of plan.intentUpdates ?? []) this.updateExecutionIntentInternal(update, timestamp);
+      for (const reservation of plan.approvalReservations ?? []) {
+        const changed = this.db.prepare(`UPDATE approvals SET version = version + 1
+          WHERE approval_id = ? AND session_id = ? AND status = 'pending' AND version = ?
+            AND NOT EXISTS (SELECT 1 FROM approval_reservations WHERE approval_id = ?)`)
+          .run(reservation.approvalId, sessionId, reservation.expectedVersion, reservation.approvalId);
+        if (changed.changes !== 1) throw new Error("INTERACTION_RESPONDING");
+        this.db.prepare(`INSERT INTO approval_reservations (approval_id, auth_subject_id, command_id, intent_id, expected_version, action, state, created_at, updated_at)
+          VALUES (?, ?, ?, ?, ?, ?, 'accepted', ?, ?)`).run(reservation.approvalId, reservation.authSubjectId,
+          reservation.commandId, reservation.intentId, reservation.expectedVersion, reservation.action, timestamp, timestamp);
+      }
+      for (const delivery of plan.approvalDeliveries ?? []) this.updateApprovalDeliveryInternal(delivery, timestamp);
+      if (boundary) for (const hook of this.commitHooks) assertSynchronous(hook(events, boundary));
+      return { result: plan.result, events, intents,
+        ...(sessionId ? { sessionRevision: expectedRevision! + 1 } : {}), ...(boundary ? { commitId: boundary.id } : {}) };
+    })();
+  }
+
+  private insertTurnInternal(input: NewTurn, timestamp: string): void {
+    this.db.prepare(`INSERT INTO turns (id, session_id, auth_subject_id, command_id, request_hash, status, prompt, generation, attempt_id, created_at)
+      VALUES (?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?)`).run(input.turnId, input.sessionId, input.authSubjectId ?? "",
+      input.commandId, input.requestHash, input.prompt, input.generation, input.attemptId ?? null, timestamp);
+  }
+
+  acceptTurn(input: {
+    authSubjectId: string; sessionId: string; turnId: string; commandId: string; requestHash: string; prompt: string;
+    generation: number; attemptId?: string; requestFormatVersion?: RequestFormatVersion;
+  }): AcceptedTurn {
+    const request = { authSubjectId: input.authSubjectId, commandId: input.commandId, method: "session.startTurn",
+      requestHash: input.requestHash, requestFormatVersion: input.requestFormatVersion ?? 1, targetSessionId: input.sessionId };
+    const committed = this.commitCommand({ sessionId: input.sessionId,
+      build: (facts) => decideAcceptTurn(facts, request, input, { now, id: randomUUID }) })!;
+    return { turn: this.getTurn(input.turnId)!, receipt: this.getCommandReceipt(input.authSubjectId, input.commandId)!, events: committed.events };
   }
 
   commitEvent(sessionId: string, type: string, payload: unknown, options: EventCommitOptions = {}): SessionEvent {
-    const occurredAt = now();
-    const transaction = this.db.transaction(() => {
-      return this.appendEventWithProjectionInternal(sessionId, type, payload, options, occurredAt);
-    });
-    return transaction() as SessionEvent;
+    const committed = this.commitCommand({ sessionId, build: () => ({ result: undefined, events: [{ type, payload, options }] }) })!;
+    return committed.events[0]!;
+  }
+
+  listEventCommits(sessionId: string, after = 0, upTo?: number): EventCommitRow[] {
+    return (this.db.prepare("SELECT * FROM event_commits WHERE session_id = ? AND last_sequence > ? AND last_sequence <= ? ORDER BY first_sequence")
+      .all(sessionId, after, upTo ?? this.getSession(sessionId)?.headSequence ?? 0) as Array<{ id: string; session_id: string; first_sequence: number; last_sequence: number }>)
+      .map((row) => ({ id: row.id, sessionId: row.session_id, firstSequence: row.first_sequence, lastSequence: row.last_sequence }));
   }
 
   /**
@@ -668,16 +764,18 @@ export class SqliteStore {
     payload: unknown,
     options: EventCommitOptions,
     occurredAt: string,
+    commitId?: string,
+    suppliedEventId?: string,
   ): SessionEvent {
     const row = this.db.prepare("SELECT head_sequence FROM sessions WHERE id = ?")
       .get(sessionId) as { head_sequence: number } | undefined;
     if (!row) throw new Error("SESSION_NOT_FOUND");
     const sequence = row.head_sequence + 1;
-    const eventId = randomUUID();
+    const eventId = suppliedEventId ?? randomUUID();
     this.db.prepare(`
-      INSERT INTO session_events (id, session_id, sequence, type, payload_json, occurred_at)
-      VALUES (?, ?, ?, ?, ?, ?)
-    `).run(eventId, sessionId, sequence, type, json(payload), occurredAt);
+      INSERT INTO session_events (id, session_id, sequence, type, payload_json, occurred_at, commit_id)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `).run(eventId, sessionId, sequence, type, json(payload), occurredAt, commitId ?? null);
     if (options.timeline) this.upsertTimelineInternal(sessionId, options.timeline, occurredAt);
     if (options.providerSessionId) {
       this.db.prepare("UPDATE sessions SET provider_session_id = ?, updated_at = ? WHERE id = ?")
@@ -694,24 +792,29 @@ export class SqliteStore {
       this.db.prepare(`
         UPDATE turns SET status = ?,
           started_at = CASE WHEN ? = 'running' AND started_at IS NULL THEN ? ELSE started_at END,
-          finished_at = COALESCE(?, finished_at), provider_session_id = COALESCE(?, provider_session_id)
-        WHERE id = ?
-      `).run(options.turnStatus, options.turnStatus, occurredAt, finished, options.providerSessionId ?? null, options.turnId);
+          finished_at = COALESCE(?, finished_at), provider_session_id = COALESCE(?, provider_session_id), native_turn_id = COALESCE(?, native_turn_id)
+        WHERE id = ? AND session_id = ?
+      `).run(options.turnStatus, options.turnStatus, occurredAt, finished, options.providerSessionId ?? null, options.nativeTurnId ?? null, options.turnId, sessionId);
     }
     if (options.approval) this.insertApprovalInternal(options.approval);
-    if (options.commandReceipt) this.updateCommandReceiptInternal(options.commandReceipt, occurredAt);
+    if (options.commandReceipt) this.updateCommandReceiptInternal(options.commandReceipt, occurredAt, commitId, sequence);
     for (const receipt of options.commandReceipts ?? []) {
-      this.updateCommandReceiptInternal(receipt, occurredAt);
+      this.updateCommandReceiptInternal(receipt, occurredAt, commitId, sequence);
     }
     // Host-restart recovery has a stronger, explicit receipt update below
     // (including reason=host_restart); do not let the generic terminal helper
     // consume that accepted control receipt first.
     if (type !== "session.recovery.required" && options.turnId && options.turnStatus && ["completed", "failed", "cancelled", "outcome_unknown"].includes(options.turnStatus)) {
-      this.finalizeInterruptReceiptsInternal(sessionId, options.turnId, options.turnStatus, occurredAt);
+      this.finalizeInterruptReceiptsInternal(sessionId, options.turnId, options.turnStatus, occurredAt, commitId, sequence);
+      this.finalizeTurnIntentsInternal(sessionId, options.turnId, options.turnStatus, occurredAt);
     }
     this.db.prepare("UPDATE sessions SET head_sequence = ?, updated_at = ? WHERE id = ?")
       .run(sequence, occurredAt, sessionId);
-    return { id: eventId, sessionId, sequence, type, payload, occurredAt } satisfies SessionEvent;
+    for (const update of options.executionIntentUpdates ?? []) this.updateExecutionIntentInternal(update, occurredAt);
+    if (options.approvalDelivery) this.updateApprovalDeliveryInternal(options.approvalDelivery, occurredAt);
+    const event = { id: eventId, sessionId, sequence, type, payload, occurredAt } satisfies SessionEvent;
+    for (const hook of this.projectionHooks) assertSynchronous(hook(sessionId, event, options));
+    return event;
   }
 
   upsertTimeline(sessionId: string, input: TimelineUpsert): TimelineItem {
@@ -788,40 +891,21 @@ export class SqliteStore {
     };
     receipt?: Omit<CommandReceiptUpdate, "required"> & { method: string; requestHash: string };
   }): ApprovalResolutionCommit | undefined {
-    const resolvedAt = now();
-    const transaction = this.db.transaction(() => {
-      const current = this.getApproval(input.approvalId);
-      if (!current || current.sessionId !== input.event.sessionId) return undefined;
-      const resolved = this.resolveApprovalInternal(input.approvalId, input.expectedVersion, input.action, resolvedAt);
-      if (!resolved) return undefined;
-      const pending = this.db.prepare(`
-        SELECT * FROM approvals
-        WHERE session_id = ? AND turn_id = ? AND status = 'pending'
-        ORDER BY created_at ASC
-      `).all(resolved.sessionId, resolved.turnId) as RawApproval[];
-      const built = input.event.build(resolved, pending.map(toApproval));
-      const event = this.appendEventWithProjectionInternal(
-        input.event.sessionId,
-        input.event.type,
-        built.payload,
-        built.options ?? {},
-        resolvedAt,
-      );
-      let receipt: CommandReceiptRow | undefined;
-      if (input.receipt) {
-        this.insertCommandReceiptInternal({
-          authSubjectId: input.receipt.authSubjectId,
-          commandId: input.receipt.commandId,
-          method: input.receipt.method,
-          requestHash: input.receipt.requestHash,
-          state: input.receipt.state,
-          response: input.receipt.response,
-        }, resolvedAt);
-        receipt = this.getCommandReceipt(input.receipt.authSubjectId, input.receipt.commandId);
-      }
-      return { approval: resolved, event, ...(receipt ? { receipt } : {}) } satisfies ApprovalResolutionCommit;
-    });
-    return transaction() as ApprovalResolutionCommit | undefined;
+    const committed = this.commitCommand({ sessionId: input.event.sessionId, approvalId: input.approvalId, build: (facts) => {
+      const current = facts.approval;
+      if (!current || current.sessionId !== input.event.sessionId || current.status !== "pending" || current.version !== input.expectedVersion) return undefined;
+      const resolved: ApprovalRow = { ...current, status: "resolved", action: input.action, version: current.version + 1, resolvedAt: now() };
+      const pending = facts.pendingApprovals.filter((approval) => approval.approvalId !== input.approvalId && approval.turnId === resolved.turnId);
+      const built = input.event.build(resolved, pending);
+      assertSynchronous(built);
+      return { result: resolved, approvalResolutions: [{ approvalId: input.approvalId, expectedVersion: input.expectedVersion, action: input.action }],
+        events: [{ type: input.event.type, payload: built.payload, options: built.options ?? {} }],
+        ...(input.receipt ? { receipts: [{ ...input.receipt, requestFormatVersion: input.receipt.requestFormatVersion ?? 1, targetSessionId: input.event.sessionId }] } : {}),
+      };
+    } });
+    if (!committed) return undefined;
+    const receipt = input.receipt ? this.getCommandReceipt(input.receipt.authSubjectId, input.receipt.commandId) : undefined;
+    return { approval: this.getApproval(input.approvalId)!, event: committed.events[0]!, ...(receipt ? { receipt } : {}) };
   }
 
   private resolveApprovalInternal(
@@ -912,7 +996,7 @@ export class SqliteStore {
           pendingApprovalIds: pending.map((approval) => approval.approval_id),
           message: recoveryMessage,
         };
-        this.appendEventWithProjectionInternal(row.session_id, "session.recovery.required", recoveryPayload, {
+        this.commitEvent(row.session_id, "session.recovery.required", recoveryPayload, {
           activityState: "outcome_unknown",
           turnId: row.id,
           turnStatus: "outcome_unknown",
@@ -924,7 +1008,8 @@ export class SqliteStore {
               ...recoveryPayload,
             },
           },
-        }, timestamp);
+        });
+        this.finalizeTurnIntentsInternal(row.session_id, row.id, "outcome_unknown", timestamp);
 
         // New Turns carry the exact auth subject, so only that receipt is
         // transitioned.  A legacy row has no subject; update a receipt only
@@ -1006,8 +1091,8 @@ export class SqliteStore {
     timestamp: string,
   ): void {
     this.db.prepare(`
-      INSERT INTO command_receipts (auth_subject_id, command_id, method, request_hash, state, response_json, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO command_receipts (auth_subject_id, command_id, method, request_hash, state, response_json, created_at, updated_at, target_session_id, request_format_version, commit_id, source_sequence)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       input.authSubjectId,
       input.commandId,
@@ -1017,49 +1102,54 @@ export class SqliteStore {
       json(input.response),
       timestamp,
       timestamp,
+      input.targetSessionId ?? null,
+      input.requestFormatVersion ?? 1,
+      input.commitId ?? null,
+      input.sourceSequence ?? null,
     );
   }
 
-  private updateCommandReceiptInternal(input: CommandReceiptUpdate, timestamp: string): void {
+  private updateCommandReceiptInternal(input: CommandReceiptUpdate, timestamp: string, commitId?: string, sourceSequence?: number): void {
     const existing = this.db.prepare(`
-      SELECT request_hash FROM command_receipts WHERE auth_subject_id = ? AND command_id = ?
-    `).get(input.authSubjectId, input.commandId) as { request_hash: string } | undefined;
+      SELECT request_hash, method, request_format_version, target_session_id FROM command_receipts WHERE auth_subject_id = ? AND command_id = ?
+    `).get(input.authSubjectId, input.commandId) as { request_hash: string; method: string; request_format_version: number; target_session_id: string | null } | undefined;
     if (!existing) {
       if (input.required) throw new Error("COMMAND_RECEIPT_NOT_FOUND");
       return;
     }
-    if (input.requestHash && existing.request_hash !== input.requestHash) {
+    if ((input.requestHash && existing.request_hash !== input.requestHash)
+      || (input.method && existing.method !== input.method)
+      || (input.requestFormatVersion && existing.request_format_version !== input.requestFormatVersion)
+      || (input.targetSessionId && existing.target_session_id && existing.target_session_id !== input.targetSessionId)) {
       throw new Error("COMMAND_ID_REUSED");
     }
     this.db.prepare(`
-      UPDATE command_receipts SET state = ?, response_json = ?, updated_at = ?
+      UPDATE command_receipts SET state = ?, response_json = ?, updated_at = ?, commit_id = COALESCE(?, commit_id), source_sequence = COALESCE(?, source_sequence)
       WHERE auth_subject_id = ? AND command_id = ?
-    `).run(input.state, json(input.response), timestamp, input.authSubjectId, input.commandId);
+    `).run(input.state, json(input.response), timestamp, commitId ?? null, sourceSequence ?? null, input.authSubjectId, input.commandId);
+    if (input.state !== "accepted") this.finalizeCommandIntentsInternal(input, timestamp);
   }
 
   putCommandReceipt(input: Omit<CommandReceiptRow, "createdAt" | "updatedAt">): CommandReceiptRow {
-    const timestamp = now();
-    const transaction = this.db.transaction(() => {
-      const existing = this.getCommandReceipt(input.authSubjectId, input.commandId);
-      if (!existing) {
-        this.insertCommandReceiptInternal(input, timestamp);
-      } else {
-        if (existing.method !== input.method || existing.requestHash !== input.requestHash) {
-          throw new Error("COMMAND_ID_REUSED");
-        }
-        this.db.prepare(`
-          UPDATE command_receipts SET state = ?, response_json = ?, updated_at = ?
-          WHERE auth_subject_id = ? AND command_id = ?
-        `).run(input.state, json(input.response), timestamp, input.authSubjectId, input.commandId);
-      }
-    });
-    transaction();
+    const existing = this.getCommandReceipt(input.authSubjectId, input.commandId);
+    const sessionId = input.targetSessionId ?? existing?.targetSessionId;
+    this.commitCommand({ ...(sessionId ? { sessionId } : {}), build: () => {
+      if (!existing) return { result: undefined, receipts: [input] };
+      if (existing.method !== input.method || existing.requestHash !== input.requestHash
+        || (existing.requestFormatVersion ?? 1) !== (input.requestFormatVersion ?? 1)
+        || (input.targetSessionId && existing.targetSessionId && input.targetSessionId !== existing.targetSessionId)) throw new Error("COMMAND_ID_REUSED");
+      return { result: undefined, receiptUpdates: [{ authSubjectId: input.authSubjectId, commandId: input.commandId,
+        requestHash: input.requestHash, method: input.method, requestFormatVersion: input.requestFormatVersion ?? 1,
+        state: input.state, response: input.response, required: true }] };
+    } });
     return this.getCommandReceipt(input.authSubjectId, input.commandId)!;
   }
 
   updateCommandReceipt(authSubjectId: string, commandId: string, state: CommandReceiptState, response: unknown): CommandReceiptRow {
-    const timestamp = now();
-    this.updateCommandReceiptInternal({ authSubjectId, commandId, state, response, required: true }, timestamp);
+    const existing = this.getCommandReceipt(authSubjectId, commandId);
+    this.commitCommand({ ...(existing?.targetSessionId ? { sessionId: existing.targetSessionId } : {}), build: () => ({
+      result: undefined, receiptUpdates: [{ authSubjectId, commandId, state, response, required: true }],
+    }) });
     return this.getCommandReceipt(authSubjectId, commandId)!;
   }
 
@@ -1254,6 +1344,13 @@ export class SqliteStore {
         throw new Error("COMMAND_ID_REUSED");
       }
       if (current) {
+        // Referenced intents/reservations migrate to the already existing
+        // stable receipt before removing the old namespace. Ordinal conflicts
+        // reject the whole bind instead of losing a durable operation.
+        this.db.prepare("UPDATE execution_intents SET auth_subject_id = ? WHERE auth_subject_id = ? AND command_id = ?")
+          .run(deviceId, authSessionId, row.command_id);
+        this.db.prepare("UPDATE approval_reservations SET auth_subject_id = ? WHERE auth_subject_id = ? AND command_id = ?")
+          .run(deviceId, authSessionId, row.command_id);
         this.db.prepare("DELETE FROM command_receipts WHERE auth_subject_id = ? AND command_id = ?")
           .run(authSessionId, row.command_id);
       } else {
@@ -1312,18 +1409,57 @@ export class SqliteStore {
       }));
   }
 
-  private appendEventInternal(sessionId: string, type: string, payload: unknown, occurredAt: string): SessionEvent {
-    const row = this.db.prepare("SELECT head_sequence FROM sessions WHERE id = ?")
-      .get(sessionId) as { head_sequence: number } | undefined;
-    if (!row) throw new Error("SESSION_NOT_FOUND");
-    const event = { id: randomUUID(), sessionId, sequence: row.head_sequence + 1, type, payload, occurredAt } satisfies SessionEvent;
-    this.db.prepare(`
-      INSERT INTO session_events (id, session_id, sequence, type, payload_json, occurred_at)
-      VALUES (?, ?, ?, ?, ?, ?)
-    `).run(event.id, sessionId, event.sequence, type, json(payload), occurredAt);
-    this.db.prepare("UPDATE sessions SET head_sequence = ?, updated_at = ? WHERE id = ?")
-      .run(event.sequence, occurredAt, sessionId);
-    return event;
+  private insertExecutionIntentInternal(input: ExecutionIntentInput, sourceSequence: number, commitId: string, timestamp: string): void {
+    const receipt = this.getCommandReceipt(input.authSubjectId, input.commandId);
+    if (!receipt || receipt.requestHash !== input.requestHash || receipt.requestFormatVersion !== (input.requestFormatVersion ?? 1)
+      || receipt.targetSessionId !== input.sessionId) throw new Error("EXECUTION_INTENT_REQUEST_MISMATCH");
+    if (input.turnId) {
+      const turn = this.getTurn(input.turnId);
+      if (!turn || turn.sessionId !== input.sessionId || turn.generation !== input.runtimeGeneration
+        || (turn.attemptId && turn.attemptId !== input.attemptId)) throw new Error("EXECUTION_INTENT_FENCE_MISMATCH");
+    }
+    this.db.prepare(`INSERT INTO execution_intents (id, session_id, turn_id, auth_subject_id, command_id, ordinal, actor_kind, kind,
+      resource_id, payload_json, request_hash, request_format_version, source_sequence, commit_id, runtime_generation, attempt_id, state, native_request_id, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)`).run(input.id, input.sessionId,
+      input.turnId ?? null, input.authSubjectId, input.commandId, input.ordinal, input.actorKind, input.kind, input.resourceId,
+      json(input.payload), input.requestHash, input.requestFormatVersion ?? 1, sourceSequence, commitId, input.runtimeGeneration,
+      input.attemptId, input.nativeRequestId ?? null, timestamp, timestamp);
+  }
+
+  private updateExecutionIntentInternal(input: ExecutionIntentUpdate, timestamp: string): void {
+    const current = new ExecutionStore(this).get(input.id);
+    if (!current || !input.expectedStates.includes(current.state)) throw new Error("EXECUTION_INTENT_STATE_CONFLICT");
+    if ((input.attemptId && input.attemptId !== current.attemptId)
+      || (input.runtimeGeneration !== undefined && input.runtimeGeneration !== current.runtimeGeneration)) throw new Error("EXECUTION_INTENT_FENCE_MISMATCH");
+    const allowed: Record<string, readonly string[]> = {
+      pending: ["claimed", "settled"], claimed: ["dispatching", "settled", "outcome_unknown"],
+      dispatching: ["acknowledged", "settled", "outcome_unknown"], acknowledged: ["settled", "outcome_unknown"],
+      outcome_unknown: ["settled"], settled: [],
+    };
+    if (!allowed[current.state]?.includes(input.state)) throw new Error("EXECUTION_INTENT_TRANSITION_INVALID");
+    this.db.prepare(`UPDATE execution_intents SET state = ?, claim_owner_id = COALESCE(?, claim_owner_id),
+      claim_owner_generation = COALESCE(?, claim_owner_generation), native_request_id = COALESCE(?, native_request_id),
+      result_code = ?, result_json = ?, updated_at = ? WHERE id = ? AND state = ?`).run(input.state,
+      input.claimOwnerId ?? null, input.claimOwnerGeneration ?? null, input.nativeRequestId ?? null,
+      input.resultCode ?? null, input.result === undefined ? null : json(input.result), timestamp, input.id, current.state);
+  }
+
+  private updateApprovalDeliveryInternal(input: ApprovalDeliveryUpdate, timestamp: string): void {
+    const changed = this.db.prepare(`UPDATE approval_reservations SET state = ?, updated_at = ?
+      WHERE approval_id = ? AND auth_subject_id = ? AND command_id = ?`).run(input.state, timestamp, input.approvalId, input.authSubjectId, input.commandId);
+    if (changed.changes !== 1) throw new Error("INTERACTION_RESERVATION_NOT_FOUND");
+  }
+
+  private finalizeCommandIntentsInternal(input: CommandReceiptUpdate, timestamp: string): void {
+    this.db.prepare(`UPDATE execution_intents SET state = ?, result_code = ?, result_json = ?, updated_at = ?
+      WHERE auth_subject_id = ? AND command_id = ? AND state <> 'settled'`).run(
+      input.state === "outcome_unknown" ? "outcome_unknown" : "settled", input.state, json(input.response), timestamp, input.authSubjectId, input.commandId);
+  }
+
+  private finalizeTurnIntentsInternal(sessionId: string, turnId: string, status: Turn["status"], timestamp: string): void {
+    this.db.prepare(`UPDATE execution_intents SET state = ?, result_code = ?, result_json = ?, updated_at = ?
+      WHERE session_id = ? AND turn_id = ? AND state <> 'settled'`).run(status === "outcome_unknown" ? "outcome_unknown" : "settled", status,
+      json({ turnId, status }), timestamp, sessionId, turnId);
   }
 
   private finalizeInterruptReceiptsInternal(
@@ -1331,6 +1467,8 @@ export class SqliteStore {
     turnId: string,
     turnStatus: Turn["status"],
     timestamp: string,
+    commitId?: string,
+    sourceSequence?: number,
   ): void {
     const rows = this.db.prepare(`
       SELECT auth_subject_id, command_id, response_json
@@ -1350,10 +1488,8 @@ export class SqliteStore {
         : turnStatus === "cancelled"
           ? "cancelled"
           : "already_terminal";
-      this.db.prepare(`
-        UPDATE command_receipts SET state = ?, response_json = ?, updated_at = ?
-        WHERE auth_subject_id = ? AND command_id = ? AND state = 'accepted'
-      `).run(state, json({ ...response, status: responseStatus }), timestamp, row.auth_subject_id, row.command_id);
+      this.updateCommandReceiptInternal({ authSubjectId: row.auth_subject_id, commandId: row.command_id,
+        state, response: { ...response, status: responseStatus }, required: true }, timestamp, commitId, sourceSequence);
     }
   }
 }
@@ -1361,16 +1497,16 @@ export class SqliteStore {
 type RawSession = {
   id: string; workspace_id: "default"; workspace_path: string; provider: ProviderId; provider_session_id: string | null;
   baseline_head: string | null; baseline_dirty: number | null; baseline_status_json: string | null; baseline_captured_at: string | null;
-  status: Session["status"]; activity_state: Session["activityState"]; head_sequence: number; created_at: string; updated_at: string;
+  status: Session["status"]; activity_state: Session["activityState"]; head_sequence: number; revision: number; created_at: string; updated_at: string;
 };
 type RawTurn = {
   id: string; session_id: string; auth_subject_id: string; command_id: string; request_hash: string; status: Turn["status"]; prompt: string;
-  provider_session_id: string | null; generation: number; started_at: string | null; finished_at: string | null; created_at: string;
+  provider_session_id: string | null; attempt_id: string | null; native_turn_id: string | null; generation: number; started_at: string | null; finished_at: string | null; created_at: string;
 };
 type RawEvent = { id: string; session_id: string; sequence: number; type: string; payload_json: string; occurred_at: string };
 type RawTimeline = { session_id: string; item_id: string; kind: TimelineItem["kind"]; status: string; revision: number; content_json: string; updated_at: string };
 type RawApproval = { approval_id: string; session_id: string; turn_id: string; tool_use_id: string; version: number; status: ApprovalStatus; action: string | null; request_json: string; created_at: string; resolved_at: string | null };
-type RawReceipt = { auth_subject_id: string; command_id: string; method: string; request_hash: string; state: CommandReceiptState; response_json: string; created_at: string; updated_at: string };
+type RawReceipt = { target_session_id: string | null; request_format_version: 1 | 2; commit_id: string | null; source_sequence: number | null; auth_subject_id: string; command_id: string; method: string; request_hash: string; state: CommandReceiptState; response_json: string; created_at: string; updated_at: string };
 type RawAuthSession = { id: string; expires_at: string; revoked_at: string | null; device_id: string | null };
 type RawPairingGrant = { id: string; host_id: string | null; requested_scopes: string | null; expires_at: string; approved_at: string | null; consumed_at: string | null; device_id: string | null };
 type RawDevice = {
@@ -1441,6 +1577,7 @@ function toSession(row: RawSession): SessionRow {
     status: row.status,
     activityState: row.activity_state,
     headSequence: row.head_sequence,
+    revision: row.revision,
     workspacePath: row.workspace_path,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
@@ -1451,6 +1588,8 @@ function toTurn(row: RawTurn): TurnRow {
   return {
     id: row.id,
     sessionId: row.session_id,
+    ...(row.attempt_id ? { attemptId: row.attempt_id } : {}),
+    ...(row.native_turn_id ? { nativeTurnId: row.native_turn_id } : {}),
     ...(row.auth_subject_id ? { authSubjectId: row.auth_subject_id } : {}),
     commandId: row.command_id,
     status: row.status,
@@ -1493,6 +1632,10 @@ function toReceipt(row: RawReceipt): CommandReceiptRow {
     commandId: row.command_id,
     method: row.method,
     requestHash: row.request_hash,
+    requestFormatVersion: row.request_format_version,
+    ...(row.target_session_id ? { targetSessionId: row.target_session_id } : {}),
+    ...(row.commit_id ? { commitId: row.commit_id } : {}),
+    ...(row.source_sequence !== null ? { sourceSequence: row.source_sequence } : {}),
     state: row.state,
     response: parse(row.response_json),
     createdAt: row.created_at,
@@ -1509,4 +1652,10 @@ export function asRpcError(error: unknown, fallbackCode = "INTERNAL_ERROR"): Rpc
     message: error instanceof Error ? error.message : String(error),
     retryable: false,
   };
+}
+
+function assertSynchronous(value: unknown): void {
+  if (typeof value === "object" && value !== null && "then" in value && typeof value.then === "function") {
+    throw new Error("SYNCHRONOUS_COMMIT_REQUIRED");
+  }
 }

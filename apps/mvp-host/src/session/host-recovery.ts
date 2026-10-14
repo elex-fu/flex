@@ -52,7 +52,7 @@ export type HostRecoveryOptions = {
   reconcileRuntime?: (context: DispatchContext, native: RecoveredRuntimeOutcome) => void;
   reconcileStoppedRuntime?: (context: DispatchContext, evidence: StoppedRuntimeRecoveryEvidence) => void;
   afterRecovery?: (operation: RecoveryOperation, evidenceId: string) => void;
-  assertCommandAuthorized?: (input: RecoveryCommandInput) => void;
+  assertCommandAuthorized?: (input: RecoveryCommandInput) => void | (() => void);
   companionEvents?: (sessionId: string, turnId: string, reason: string) => PlannedEvent[];
 };
 
@@ -161,10 +161,10 @@ export class HostRecovery {
     });
   }
 
-  private authorizeCommand(input: RecoveryCommandInput): void {
+  private authorizeCommand(input: RecoveryCommandInput): void | (() => void) {
     this.assertOpen();
     this.options.owner.assertActive();
-    if (this.options.assertCommandAuthorized) { this.options.assertCommandAuthorized(input); return; }
+    if (this.options.assertCommandAuthorized) return this.options.assertCommandAuthorized(input);
     if (this.options.owner.recoveryOnly && input.authSubjectId === `local-recovery:${this.options.owner.ownerId}`) return;
     const actor = this.options.store.getDevice(input.authSubjectId);
     if (!actor || actor.revokedAt || actor.expiresAt && actor.expiresAt <= new Date().toISOString()) throw new RecoveryError("DEVICE_REVOKED");

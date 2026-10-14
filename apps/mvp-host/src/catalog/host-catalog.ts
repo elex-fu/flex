@@ -11,6 +11,7 @@ import { LegacySessionFacade } from "../session/legacy-session-facade.js";
 import { SessionOrchestrator, OrchestratorError, type OrchestratorOptions, type StartTurnResponse, type ControlResponse } from "../session/orchestrator.js";
 import { assertReceiptRequest, type CommandRequest } from "../orchestration/command-contract.js";
 import { hashCommandRequest } from "../orchestration/command-engine.js";
+import { digest } from "../storage/recovery-store.js";
 import { HostViews, type ViewInteractionReader, type ViewResource } from "../timeline/host-views.js";
 import { publicValue, publicEvent, publicGitDiff } from "../api/public-projection.js";
 import type { RpcContext, RpcRequest } from "../api/rpc-dispatcher.js";
@@ -223,9 +224,14 @@ export class HostCatalog {
             throw new CatalogError("RESTORE_EXTERNAL_STATE_UNVERIFIED");
     }
     private assertActor(subjectId: string, scope: CatalogAccessScope): void {
-        this.owner.assertActive();
         if (this.closed)
             throw new CatalogError("HOST_CLOSED");
+        this.assertActorFacts(subjectId, scope);
+    }
+    private assertActorFacts(subjectId: string, scope: CatalogAccessScope): void {
+        if (!this.store.db.open)
+            throw new CatalogError("HOST_CLOSED");
+        this.owner.assertActive();
         const mirror = this.store.getHostIdentityMirror();
         const device = this.store.getDevice(subjectId);
         if (!mirror || !device || device.hostId !== mirror.hostId || device.revokedAt || device.expiresAt && device.expiresAt <= new Date().toISOString())
@@ -238,6 +244,27 @@ export class HostCatalog {
         const target = this.registry.resolve(sessionId);
         const result = this.options.assertSessionAccess?.(subjectId, target, scope) as unknown;
         syncAssertion(result);
+    }
+    /** Capture while open; only this admitted call may recheck current SQL authority during drain. */
+    captureSessionAuthorization(subjectId: string, sessionId: string, scope: CatalogAccessScope): () => void {
+        this.assertActorSession(subjectId, sessionId, scope);
+        const db = this.store.db;
+        const ownerId = this.owner.ownerId;
+        const ownerGeneration = this.owner.generation;
+        const identity = authorizationIdentity(this.registry.resolve(sessionId));
+        return () => {
+            // Logical Catalog close denies new admission, while a captured
+            // continuation still checks fresh authority on the original Store.
+            if (!db.open || this.store.db !== db)
+                throw new CatalogError("HOST_CLOSED");
+            if (this.owner.ownerId !== ownerId || this.owner.generation !== ownerGeneration)
+                throw new CatalogError("HOST_OWNER_CHANGED");
+            this.assertActorFacts(subjectId, scope);
+            const current = this.registry.resolve(sessionId);
+            if (authorizationIdentity(current) !== identity)
+                throw new CatalogError("SESSION_BINDING_CHANGED");
+            syncAssertion(this.options.assertSessionAccess?.(subjectId, current, scope) as unknown);
+        };
     }
     private target(context: CatalogRpcContext, sessionId: string, scope: CatalogAccessScope): ResolvedSession {
         this.assertActorSession(context.subjectId, sessionId, scope);
@@ -657,4 +684,13 @@ async function withinDeadline<T>(work: Promise<T>, deadline: number): Promise<{
         if (timer)
             clearTimeout(timer);
     }
+}
+
+function authorizationIdentity(target: ResolvedSession): string {
+    const { session, workspace, providerInstance } = target;
+    return digest({ sessionId: session.sessionId, workspaceId: session.workspaceId, provider: session.provider,
+        providerInstanceId: session.providerInstanceId, canonicalRoot: workspace.canonicalRoot, checkoutRoot: workspace.worktreeRoot,
+        checkoutKey: workspace.checkoutKey, repositoryId: workspace.repositoryId, kind: workspace.kind,
+        executable: providerInstance.executable, configuration: providerInstance.config, policyVersion: providerInstance.policyVersion,
+        policyCapabilities: [...providerInstance.policyCapabilities].sort() });
 }

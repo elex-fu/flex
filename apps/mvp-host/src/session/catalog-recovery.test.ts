@@ -331,3 +331,55 @@ describe("recovery continuation fences", () => {
     expect(after).not.toHaveBeenCalled(); expect(supersede).not.toHaveBeenCalled();
   });
 });
+
+
+describe("admitted recovery authorization during Catalog drain", () => {
+  it.each(["reconcile", "acknowledge"] as const)("completes an admitted deferred %s after logical close while denying new requests", async (action) => {
+    let closing = false; let reads = 0; let workspaceReads = 0; let release!: () => void;
+    const barrier = new Promise<void>((yes) => { release = yes; });
+    const request = vi.fn(async (_method: string, params: unknown) => { if (++reads === 2) await barrier; const id = (params as { threadId: string }).threadId;
+      return { thread: { id, turns: [{ id: id.replace("native-session:", "native-turn:"), status: "completed" }] } }; });
+    const f = await fixture({ assertRecoveryAdmission: () => { if (closing) throw new Error("HOST_DRAINING"); },
+      ...(action === "reconcile" ? { verifiedManifestForInstance: manifest, existingCodexReader: (target: CatalogRecoveryIdentity) => existingReader(target, { request: request as unknown as AppServerClient["request"] }) } : {}),
+      processInspector: inspector, inspectWorkspace: async () => { if (++workspaceReads === 2 && action === "acknowledge") await barrier; return "clear"; } });
+    const original = f.unknown(); if (action === "acknowledge") f.recordProcess(original.context);
+    const bound = f.bindings.recoveryForSession(f.codex)!; const evidence = await bound.inspect(original);
+    const input = { ...original, authSubjectId: "writer", commandId: `admitted-${action}`, evidenceId: evidence.evidenceId, expectedRecoveryRevision: evidence.recoveryRevision };
+    const pending = action === "reconcile" ? bound.reconcile(input) : bound.acknowledge({ ...input, acknowledgeUnknown: true });
+    await new Promise<void>((yes) => setImmediate(yes));
+    expect(bound.recovery.operationForCommand("writer", input.commandId)?.phase).toBe("checking");
+    closing = true; await f.host.closeAndWait(100); expect(f.store.db.open).toBe(true); expect(f.host.ready).toBe(false);
+    expect(() => f.host.assertActorSession("writer", f.codex, "session:write")).toThrow("HOST_CLOSED");
+    const draining = f.bindings.shutdownService.drain(Date.now() + 500);
+    await expect(bound.inspect(original)).rejects.toMatchObject({ code: "RECOVERY_DRAINING" });
+    await expect(bound.reconcile({ ...input, commandId: "new-during-close" })).rejects.toMatchObject({ code: "RECOVERY_DRAINING" });
+    expect(f.store.getCommandReceipt("writer", "new-during-close")).toBeUndefined();
+    release(); const result = await pending; expect(await draining).toBe(true);
+    expect(result).toMatchObject({ state: "completed", turnStatus: action === "reconcile" ? "completed" : "outcome_unknown", gate: action === "reconcile" ? "blocked" : "released" });
+    expect(f.store.getCommandReceipt("writer", input.commandId)?.state).toBe("completed");
+    expect(f.store.getTurn(original.turnId)?.status).toBe(action === "reconcile" ? "completed" : "outcome_unknown");
+    expect(f.store.getSession(f.codex)?.recoveryState).toBe(action === "reconcile" ? "blocked" : "idle");
+    expect(f.store.getCommandReceipt("writer", original.start)?.state).toBe(action === "reconcile" ? "completed" : "outcome_unknown");
+    expect(f.runtimeFactory).not.toHaveBeenCalled(); expect(f.runTurn).not.toHaveBeenCalled();
+  });
+
+  it.each(["revoked", "grant", "scope"])("freshly denies %s authority after an admitted command awaits through logical close", async (changed) => {
+    let reads = 0; let release!: () => void; const barrier = new Promise<void>((yes) => { release = yes; });
+    const request = vi.fn(async (_method: string, params: unknown) => { if (++reads === 2) await barrier; const id = (params as { threadId: string }).threadId;
+      return { thread: { id, turns: [{ id: id.replace("native-session:", "native-turn:"), status: "completed" }] } }; });
+    const f = await fixture({ verifiedManifestForInstance: manifest, existingCodexReader: (target) => existingReader(target, { request: request as unknown as AppServerClient["request"] }) });
+    const original = f.unknown(); const bound = f.bindings.recoveryForSession(f.codex)!; const evidence = await bound.inspect(original);
+    const originalReceipt = f.store.getCommandReceipt("writer", original.start);
+    const pending = bound.reconcile({ ...original, authSubjectId: "writer", commandId: `admitted-denied-${changed}`, evidenceId: evidence.evidenceId, expectedRecoveryRevision: evidence.recoveryRevision });
+    const denied = expect(pending).rejects.toMatchObject({ code: changed === "revoked" ? "DEVICE_REVOKED" : changed === "scope" ? "SCOPE_REQUIRED" : "FORBIDDEN" });
+    await new Promise<void>((yes) => setImmediate(yes)); await f.host.closeAndWait(100);
+    const draining = f.bindings.shutdownService.drain(Date.now() + 500);
+    if (changed === "revoked") f.store.db.prepare("UPDATE devices SET revoked_at='2026-10-15T00:00:00Z' WHERE id='writer'").run();
+    if (changed === "scope") f.store.db.prepare("UPDATE devices SET scopes_json='[\"session:read\"]' WHERE id='writer'").run();
+    if (changed === "grant") f.denied.add(`writer:${f.codex}`);
+    release(); await denied; expect(await draining).toBe(true);
+    expect(f.store.getCommandReceipt("writer", `admitted-denied-${changed}`)?.state).toBe("failed");
+    expect(f.store.getCommandReceipt("writer", original.start)).toEqual(originalReceipt);
+    expect(f.store.getTurn(original.turnId)?.status).toBe("outcome_unknown"); expect(f.store.getSession(f.codex)?.recoveryState).toBe("blocked");
+  });
+});

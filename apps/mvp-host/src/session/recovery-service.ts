@@ -16,8 +16,8 @@ export type RecoveryServiceOptions = {
   id?: () => string;
   evidenceTtlMs?: number;
   onCommit?: (events: readonly SessionEvent[]) => void;
-  /** Recheck the original command actor before admission and after asynchronous inspection. */
-  assertCommandAuthorized?: (input: RecoveryCommandInput) => void;
+  /** Capture a per-call recheck; legacy void hooks run again after asynchronous inspection. */
+  assertCommandAuthorized?: (input: RecoveryCommandInput) => void | (() => void);
   companionEvents?: (sessionId: string, turnId: string, reason: string) => PlannedEvent[];
 };
 
@@ -97,9 +97,11 @@ export class RecoveryService {
     return result;
   }
 
-  private async perform(input: RecoveryCommandInput, action: "reconcile" | "acknowledge", hash: string): Promise<RecoveryOperation> {
+  private async perform(request: RecoveryCommandInput, action: "reconcile" | "acknowledge", hash: string): Promise<RecoveryOperation> {
+    const input = Object.freeze({ ...request });
     this.assertOpen();
-    this.options.assertCommandAuthorized?.(input);
+    const continuation = this.options.assertCommandAuthorized?.(input);
+    if (continuation !== undefined && typeof continuation !== "function") throw new RecoveryError("SYNCHRONOUS_RECOVERY_AUTHORIZATION_REQUIRED");
     this.assertOpen();
     const marked = this.recovery.beginOperation(input, action, hash, this.now());
     if (marked.operation.result) return marked.operation.result;
@@ -114,7 +116,8 @@ export class RecoveryService {
       if (digest(observed.execution) !== digest(evidence.execution) || digest(observed.native) !== digest(evidence.native) || digest(observed.committedOutcome ?? null) !== digest(evidence.committedOutcome ?? null)) {
         throw new RecoveryError("RECOVERY_EVIDENCE_STALE");
       }
-      this.options.assertCommandAuthorized?.(input);
+      const rechecked = continuation ? continuation() : this.options.assertCommandAuthorized?.(input);
+      if (rechecked !== undefined) throw new RecoveryError("SYNCHRONOUS_RECOVERY_AUTHORIZATION_REQUIRED");
       this.assertOpen();
       const release = this.canRelease(observed.execution);
       if (action === "reconcile" && observed.native.state !== "terminal" && !(observed.committedOutcome && release)

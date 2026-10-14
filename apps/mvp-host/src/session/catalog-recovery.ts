@@ -281,11 +281,18 @@ export class CatalogRecoveryBindings {
       checkoutRoot: identity.checkoutRoot,
       resolveResource,
       assertCommandAuthorized: (input: RecoveryCommandInput) => {
-        this.assertIdentity(identity);
-        if (input.sessionId !== identity.sessionId) throw new RecoveryError("SESSION_NOT_FOUND");
-        if (versionsSnapshot && versionsSnapshot !== digest(this.versions(identity))) throw new RecoveryError("RECOVERY_EVIDENCE_STALE");
-        try { this.options.catalog.assertActorSession(input.authSubjectId, identity.sessionId, "session:write"); }
-        catch (error) { throw new RecoveryError(error instanceof Error && "code" in error && typeof error.code === "string" ? error.code : "FORBIDDEN"); }
+        const assertOriginal = () => {
+          this.assertIdentity(identity);
+          if (input.sessionId !== identity.sessionId) throw new RecoveryError("SESSION_NOT_FOUND");
+          if (versionsSnapshot && versionsSnapshot !== digest(this.versions(identity))) throw new RecoveryError("RECOVERY_EVIDENCE_STALE");
+        };
+        const denied = (error: unknown): never => { throw new RecoveryError(error instanceof Error && "code" in error && typeof error.code === "string" ? error.code : "FORBIDDEN"); };
+        assertOriginal();
+        let continuation: () => void;
+        try { continuation = this.options.catalog.captureSessionAuthorization(input.authSubjectId, identity.sessionId, "session:write"); }
+        catch (error) { return denied(error); }
+        // Captured separately for each perform. No future RPC inherits this authority.
+        return () => { assertOriginal(); try { continuation(); } catch (error) { denied(error); } };
       },
       codexReader: (handle) => selected?.context === digest(handle.context) ? selected.reader.client : undefined,
       inspectWorkspace: async (target) => {

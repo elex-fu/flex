@@ -369,3 +369,38 @@ describe("production Host catalog binding", () => {
         expect(store.db.prepare("SELECT name,sql FROM sqlite_master ORDER BY name").all()).toEqual(before);
     });
 });
+
+
+describe("admitted Catalog authorization continuations", () => {
+    it("captures only while open and rechecks exact current SQL authority during logical close", async () => {
+        const grants = vi.fn((_subject: string, target: { session: { sessionId: string } }, scope: string) => { expect(target.session.sessionId).toBe(sessionId); expect(scope).toBe("session:write"); });
+        let sessionId = ""; const f = await fixture({ assertSessionAccess: grants }); sessionId = f.host.legacySessionId;
+        const continuation = f.host.captureSessionAuthorization("writer", sessionId, "session:write");
+        await f.host.closeAndWait(100); expect(f.store.db.open).toBe(true); expect(f.host.ready).toBe(false);
+        expect(() => f.host.assertActorSession("writer", sessionId, "session:write")).toThrow("HOST_CLOSED");
+        expect(() => f.host.captureSessionAuthorization("writer", sessionId, "session:write")).toThrow("HOST_CLOSED");
+        expect(() => continuation()).not.toThrow(); expect(grants).toHaveBeenCalledTimes(2);
+        expect(f.runtimeFactory).not.toHaveBeenCalled();
+    });
+
+    it.each(["revoked", "expired", "scope", "host", "grant", "resource"])("denies current %s changes through an already captured continuation", async (changed) => {
+        let allowed = true; const grant = vi.fn(() => { if (!allowed) throw Object.assign(new Error("Grant revoked"), { code: "FORBIDDEN" }); });
+        const f = await fixture({ assertSessionAccess: grant }); const id = f.host.legacySessionId;
+        const continuation = f.host.captureSessionAuthorization("writer", id, "session:write"); await f.host.closeAndWait(100);
+        if (changed === "revoked") f.store.db.prepare("UPDATE devices SET revoked_at='2026-10-15T00:00:00Z' WHERE id='writer'").run();
+        if (changed === "expired") f.store.db.prepare("UPDATE devices SET expires_at='2020-01-01T00:00:00Z' WHERE id='writer'").run();
+        if (changed === "scope") f.store.db.prepare("UPDATE devices SET scopes_json='[\"session:read\"]' WHERE id='writer'").run();
+        if (changed === "host") f.store.db.prepare("UPDATE devices SET host_id='different-host' WHERE id='writer'").run();
+        if (changed === "grant") allowed = false;
+        if (changed === "resource") f.host.catalog.putProvider({ ...f.host.catalog.provider("instance-claude")!, config: { ...f.host.catalog.provider("instance-claude")!.config, model: "different" } });
+        expect(() => continuation()).toThrow(changed === "grant" ? "Grant revoked" : changed === "scope" ? "SCOPE_REQUIRED" : changed === "resource" ? "SESSION_BINDING_CHANGED" : "DEVICE_REVOKED");
+        expect(f.runtimeFactory).not.toHaveBeenCalled();
+    });
+
+    it("checks Store-open and owner-current guards before any continuation SQL", async () => {
+        const f = await fixture(); const continuation = f.host.captureSessionAuthorization("writer", f.host.legacySessionId, "session:write");
+        await f.host.closeAndWait(100); f.owner.release(); const sql = vi.spyOn(f.store.db, "prepare");
+        expect(() => continuation()).toThrow(expect.objectContaining({ code: "HOST_OWNER_LOST" })); expect(sql).not.toHaveBeenCalled();
+        f.store.close(); expect(() => continuation()).toThrow("HOST_CLOSED"); expect(sql).not.toHaveBeenCalled();
+    });
+});

@@ -274,3 +274,43 @@ describe("evidence-bound original execution recovery", () => {
   });
 
 });
+
+
+describe("per-perform recovery authorization capture", () => {
+  it("captures once per perform, snapshots the command, and never reuses a continuation across commands", async () => {
+    const f = fixture(); const checked: string[] = []; const captured: string[] = [];
+    const service = new RecoveryService({ store: f.store, now: () => new Date(clockStart).toISOString(), inspectExecution: async () => stopped(), inspectNative: async () => terminal(),
+      assertCommandAuthorized: (input) => { captured.push(input.commandId); return () => { checked.push(input.commandId); }; } });
+    const inspect = () => service.inspect({ sessionId: f.session.id, turnId: f.context.flyxTurnId, attemptId: f.context.attemptId });
+    const evidence = await inspect(); const request = f.input(evidence, "first-capture"); const pending = service.reconcile(request);
+    request.commandId = "mutated-command"; request.authSubjectId = "mutated-actor";
+    await expect(pending).resolves.toMatchObject({ state: "completed", gate: "released" });
+    const fresh = await inspect(); await service.reconcile(f.input(fresh, "second-capture"));
+    expect(captured).toEqual(["first-capture", "second-capture"]); expect(checked).toEqual(captured);
+    expect(f.store.getCommandReceipt("device", "first-capture")?.state).toBe("completed");
+    expect(f.store.getCommandReceipt("mutated-actor", "mutated-command")).toBeUndefined();
+  });
+
+  it("keeps legacy void authorization hooks fresh after asynchronous observation", async () => {
+    const f = fixture(); const authorize = vi.fn(() => {});
+    const service = new RecoveryService({ store: f.store, now: () => new Date(clockStart).toISOString(), inspectExecution: async () => stopped(), inspectNative: async () => terminal(), assertCommandAuthorized: authorize });
+    const evidence = await service.inspect({ sessionId: f.session.id, turnId: f.context.flyxTurnId, attemptId: f.context.attemptId });
+    await service.reconcile(f.input(evidence)); expect(authorize).toHaveBeenCalledTimes(2);
+  });
+
+  it("rejects an asynchronous captured continuation before terminal or gate settlement", async () => {
+    const f = fixture(); const service = new RecoveryService({ store: f.store, now: () => new Date(clockStart).toISOString(), inspectExecution: async () => stopped(), inspectNative: async () => terminal(),
+      assertCommandAuthorized: () => (() => Promise.resolve()) as () => void });
+    const evidence = await service.inspect({ sessionId: f.session.id, turnId: f.context.flyxTurnId, attemptId: f.context.attemptId });
+    await expect(service.reconcile(f.input(evidence))).rejects.toMatchObject({ code: "SYNCHRONOUS_RECOVERY_AUTHORIZATION_REQUIRED" });
+    expect(f.store.getCommandReceipt("device", "recovery-command")?.state).toBe("failed");
+    expect(f.store.getTurn(f.context.flyxTurnId)?.status).toBe("outcome_unknown"); expect(f.store.getSession(f.session.id)?.recoveryState).toBe("blocked");
+  });
+
+  it("rejects asynchronous authorization hooks before accepting any marker", async () => {
+    const f = fixture(); const service = new RecoveryService({ store: f.store, assertCommandAuthorized: (() => Promise.resolve()) as () => void });
+    const evidence = await f.inspect(); const sql = vi.spyOn(f.store.db, "prepare");
+    await expect(service.reconcile(f.input(evidence))).rejects.toMatchObject({ code: "SYNCHRONOUS_RECOVERY_AUTHORIZATION_REQUIRED" });
+    expect(sql).not.toHaveBeenCalled(); sql.mockRestore(); expect(f.store.getCommandReceipt("device", "recovery-command")).toBeUndefined();
+  });
+});

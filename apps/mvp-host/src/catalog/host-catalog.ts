@@ -32,6 +32,8 @@ export interface CatalogExecutionRuntime {
     readonly requestFormatVersions: readonly number[];
     readonly interactionRpcPort?: InteractionRpcPort | undefined;
     closeAndWait(deadlineMs?: number): Promise<RuntimeCloseReport>;
+    /** Idempotent synchronous fence of callbacks and journals, with no SQL or stop claim. */
+    sealBeforeStoreClose(): void;
     subscribe(listener: (event: SessionEvent) => void): () => void;
     startTurn(actor: string, commandId: string, prompt: string, request?: CommandRequest): Promise<StartTurnResponse>;
     interrupt(actor: string, commandId: string, request?: CommandRequest): Promise<ControlResponse>;
@@ -105,6 +107,9 @@ export class HostCatalog {
     private readonly ownsViews: boolean;
     private readonly interactionReader: CatalogInteractionReader | undefined;
     private closed = false;
+    private runtimeCompletionsSealed = false;
+    private storeSealed = false;
+    private readonly sealedRuntimes = new WeakSet<CatalogExecutionRuntime>();
     private closing: Promise<RuntimeCloseReport[]> | undefined;
     private readonly preparing = new Map<string, {
         context: SessionRuntimeContext;
@@ -118,7 +123,7 @@ export class HostCatalog {
         validateCatalogSchema(options.store.db);
         if (options.runtimeCloseDeadlineMs !== undefined && (!Number.isSafeInteger(options.runtimeCloseDeadlineMs) || options.runtimeCloseDeadlineMs < 1 || options.runtimeCloseDeadlineMs > 60000))
             throw new CatalogError("CATALOG_CONFIGURATION_INVALID");
-        this.registry = new SessionRegistry(catalog, workspaces, providers, { owner: options.owner, runtimeFactory: (context) => this.loadRuntime(context) });
+        this.registry = new SessionRegistry(catalog, workspaces, providers, { owner: options.owner, runtimeFactory: (context) => this.loadRuntime(context), sealRuntime: (runtime) => this.sealRuntime(runtime) });
         this.legacy = new LegacySessionFacade(this.registry);
         this.legacyHost = new CatalogLegacyHost(this);
         this.interactionReader = CatalogInteractionReader.isAvailable(this.store) ? new CatalogInteractionReader(this.store, (id) => { this.owner.assertActive(); this.registry.resolve(id); }) : undefined;
@@ -185,6 +190,7 @@ export class HostCatalog {
             }
             if (!this.runtimeMatches(runtime, context))
                 throw new CatalogError("CATALOG_RUNTIME_BINDING_INVALID");
+            this.sealRuntime(runtime);
             this.preparing.set(context.session.sessionId, { context, runtime });
             if (this.closed)
                 throw new CatalogError("HOST_CLOSING");
@@ -199,8 +205,10 @@ export class HostCatalog {
         catch (error) {
             if (runtime) {
                 // A foreign runtime is not ours to stop, and an owning facade could close the shared writer.
-                const report = this.runtimeMatches(runtime, context) ? await runtime.closeAndWait().catch(() => undefined) : undefined;
-                if (!report?.clean || !report.producerStopped) {
+                const matches = this.runtimeMatches(runtime, context);
+                if (matches) this.sealRuntime(runtime);
+                const report = matches ? await runtime.closeAndWait().catch(() => undefined) : undefined;
+                if (!this.runtimeCompletionsSealed && (!report?.clean || !report.producerStopped)) {
                     this.catalog.setResidency(context.session.sessionId, "blocked");
                     this.owner.retain("Catalog runtime preparation has unverified process cleanup");
                 }
@@ -213,7 +221,7 @@ export class HostCatalog {
         }
     }
     private runtimeMatches(runtime: CatalogExecutionRuntime, context: SessionRuntimeContext): boolean {
-        return runtime.sessionId === context.session.sessionId && runtime.runtimeId === context.runtimeId && runtime.store === this.store && runtime.owner === this.owner && !runtime.ownsStore && !runtime.recoverOnStart && runtime.requestFormatVersions?.includes(2) === true;
+        return runtime.sessionId === context.session.sessionId && runtime.runtimeId === context.runtimeId && runtime.store === this.store && runtime.owner === this.owner && !runtime.ownsStore && !runtime.recoverOnStart && runtime.requestFormatVersions?.includes(2) === true && typeof runtime.sealBeforeStoreClose === "function";
     }
     private assertRestoreReady(): void {
         if (this.options.restoreWriteReady) {
@@ -557,6 +565,8 @@ export class HostCatalog {
             && operation.runtimeId === pending.context.runtimeId && operation.ownerContext.ownerId === this.owner.ownerId && operation.ownerContext.ownerGeneration === this.owner.generation)
             void pending.runtime.closeAndWait(duration).catch(() => undefined);
         const result = await withinDeadline(closing, Date.now() + duration);
+        if (this.runtimeCompletionsSealed)
+            throw new CatalogError("HOST_CLOSING", undefined, true);
         if (result.ok)
             return result.value;
         if ("error" in result)
@@ -571,6 +581,26 @@ export class HostCatalog {
         this.owner.retain("Runtime close exceeded its deadline without verified stop proof");
         return settled;
     }
+    private sealRuntimeCompletions(): void {
+        this.runtimeCompletionsSealed = true;
+        this.registry.sealRuntimeCompletions();
+    }
+    private sealRuntime(runtime: CatalogExecutionRuntime): void {
+        if (!this.storeSealed || this.sealedRuntimes.has(runtime)) return;
+        this.sealedRuntimes.add(runtime);
+        runtime.sealBeforeStoreClose();
+    }
+    /** Final Host-owned fence. Logical close still permits admitted Recovery SQL/events. */
+    sealBeforeStoreClose(): void {
+        this.closed = true;
+        this.storeSealed = true;
+        this.sealRuntimeCompletions();
+        const errors: unknown[] = [];
+        try { this.registry.sealBeforeStoreClose(); } catch (error) { errors.push(error); }
+        for (const { runtime } of this.preparing.values())
+            try { this.sealRuntime(runtime); } catch (error) { errors.push(error); }
+        if (errors.length) throw new AggregateError(errors, "Catalog runtime Store fence failed");
+    }
     closeAndWait(deadlineMs = 5000): Promise<RuntimeCloseReport[]> {
         if (this.closing)
             return this.closing;
@@ -578,15 +608,19 @@ export class HostCatalog {
         const duration = Number.isFinite(deadlineMs) ? Math.max(0, Math.min(deadlineMs, 60000)) : 5000;
         const deadline = Date.now() + duration;
         this.closing = (async () => {
+            if (this.storeSealed) return [unknownClose()];
             for (const { runtime } of this.preparing.values())
                 void runtime.closeAndWait(duration).catch(() => undefined);
             const stopped = await withinDeadline(this.registry.closeAll(duration), deadline);
+            this.sealRuntimeCompletions();
+            if (this.storeSealed) return [unknownClose()];
             const reports = stopped.ok ? stopped.value : [unknownClose()];
             for (const session of this.catalog.allSessions())
                 if (session.residency !== "unloaded" && !reports.some((report) => !report.clean))
                     reports.push(unknownClose());
             for (const service of this.options.globalServices ?? []) {
                 const drained = await withinDeadline(Promise.resolve().then(() => service.drain(Math.max(0, deadline - Date.now()))), deadline);
+                if (this.storeSealed) return [...reports, unknownClose()];
                 try {
                     service.seal?.();
                 }
@@ -599,6 +633,7 @@ export class HostCatalog {
                 }
                 if (service.close) {
                     const closed = await withinDeadline(Promise.resolve().then(() => service.close!()), deadline);
+                    if (this.storeSealed) return [...reports, unknownClose()];
                     if (!closed.ok)
                         reports.push(unknownClose());
                 }

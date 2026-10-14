@@ -12,6 +12,8 @@ export interface SessionRuntime {
   readonly sessionId:string;
   readonly runtimeId?:string;
   closeAndWait(deadlineMs?:number):Promise<RuntimeCloseReport>;
+  /** Synchronous callback/journal fence; it must not claim that producers stopped. */
+  sealBeforeStoreClose?():void;
   subscribe?(listener:(event:SessionEvent)=>void):()=>void;
 }
 export type ResolvedSession = {session:CatalogSession;workspace:WorkspaceRecord;providerInstance:ProviderInstanceRecord};
@@ -20,19 +22,26 @@ export type SessionRegistryOptions<R extends SessionRuntime> = {
   owner:HostOwnerHandle;
   /** Factory exceptions must finish their own managed-process cleanup. */
   runtimeFactory:(context:SessionRuntimeContext)=>Promise<R>|R;
+  /** Trusted Host fence shared with still-preparing runtimes. It must perform no SQL. */
+  sealRuntime?(runtime:R):void;
   publish?:(event:SessionEvent)=>void;
 };
 type Entry<R> = {runtime?:R;runtimeId?:string;loading?:Promise<R>;closing?:Promise<RuntimeCloseReport>;unsubscribe?:()=>void;cancelLoad:boolean};
 const stopped:RuntimeCloseReport={closed:true,producerStopped:true,clean:true,state:"stopped",stopped:true,recoveryRequired:false};
+const unknownClose=():RuntimeCloseReport=>({closed:false,producerStopped:false,clean:false,state:"recovery_required",stopped:false,recoveryRequired:true});
 
 /** Persistent Session routing; history queries never call runtimeFactory. */
 export class SessionRegistry<R extends SessionRuntime=SessionRuntime> {
   private readonly entries=new Map<string,Entry<R>>();
   private readonly listeners=new Map<string,Set<(event:SessionEvent)=>void>>();
   private shuttingDown=false;
+  private runtimeCompletionsSealed=false;
+  private publicationsSealed=false;
+  private readonly sealedRuntimes=new WeakSet<R>();
   constructor(readonly catalog:CatalogStore,readonly workspaces:WorkspaceRegistry,readonly providers:ProviderInstanceRegistry,private readonly options:SessionRegistryOptions<R>) {}
   get store(){return this.catalog.store;}
   resolve(sessionId:string):ResolvedSession {
+    this.assertStoreReadable();
     const session=this.catalog.requireSession(sessionId);
     const workspace=this.catalog.workspace(session.workspaceId);
     const providerInstance=this.catalog.provider(session.providerInstanceId);
@@ -41,12 +50,14 @@ export class SessionRegistry<R extends SessionRuntime=SessionRuntime> {
   }
   /** Business/FS admission is distinct from the pure persisted read relation. */
   assertExecutionResources(sessionId:string):ResolvedSession {
+    if(this.shuttingDown)throw new CatalogError("HOST_CLOSING");
     this.store.assertWriterOwner();this.options.owner.assertActive();
     if(this.options.owner.mode==="maintenance")throw new CatalogError("HOST_MAINTENANCE_ONLY");
     const resolved=this.resolve(sessionId);
     return {...resolved,workspace:this.workspaces.require(resolved.workspace.workspaceId),providerInstance:this.providers.requireExecution(resolved.providerInstance.providerInstanceId)};
   }
   private executionTarget(sessionId:string):ResolvedSession {
+    if(this.shuttingDown)throw new CatalogError("HOST_CLOSING");
     this.store.assertWriterOwner();
     const resolved=this.resolve(sessionId);
     if(resolved.session.status!=="active")throw new CatalogError("SESSION_ARCHIVED");
@@ -60,6 +71,7 @@ export class SessionRegistry<R extends SessionRuntime=SessionRuntime> {
   }
   get(sessionId:string):SessionSummaryV2{return publicSessionSummary(this.resolve(sessionId).session);}
   list(input:unknown={}):ListSessionsV2Response {
+    this.assertStoreReadable();
     const parsed=ListSessionsV2Schema.parse(input);
     if(parsed.workspaceId&&!this.catalog.workspace(parsed.workspaceId))throw new CatalogError("WORKSPACE_NOT_FOUND");
     const options={includeArchived:parsed.includeArchived,limit:parsed.limit,...(parsed.workspaceId?{workspaceId:parsed.workspaceId}:{}),...(parsed.afterSessionId?{afterSessionId:parsed.afterSessionId}:{})};
@@ -87,10 +99,42 @@ export class SessionRegistry<R extends SessionRuntime=SessionRuntime> {
   }
   /** Call only after the shared Engine commit, never from a transaction hook. */
   publishCommittedEvents(events:readonly SessionEvent[]):void {
+    if(this.publicationsSealed)return;
     for(const event of events) {
-      for(const listener of this.listeners.get(event.sessionId)??[])try{listener(event);}catch{/* Replay repairs delivery. */}
+      if(this.publicationsSealed)return;
+      for(const listener of this.listeners.get(event.sessionId)??[]) {
+        if(this.publicationsSealed)return;
+        try{listener(event);}catch{/* Replay repairs delivery. */}
+      }
+      if(this.publicationsSealed)return;
       try{this.options.publish?.(event);}catch{/* Facts are already durable. */}
     }
+  }
+  /** Stop late load/close settlement while admitted Recovery can still read/publish. */
+  sealRuntimeCompletions():void {
+    this.shuttingDown=true;
+    this.runtimeCompletionsSealed=true;
+    for(const entry of this.entries.values())entry.cancelLoad=true;
+  }
+  /** Trusted final fence, called synchronously before the shared Store can close. */
+  sealBeforeStoreClose():void {
+    this.sealRuntimeCompletions();
+    this.publicationsSealed=true;
+    this.listeners.clear();
+    const errors:unknown[]=[];
+    for(const entry of this.entries.values()) {
+      try{entry.unsubscribe?.();}catch(error){errors.push(error);}
+      delete entry.unsubscribe;
+      if(entry.runtime)try{this.sealRuntime(entry.runtime);}catch(error){errors.push(error);}
+    }
+    if(errors.length)throw new AggregateError(errors,"Session runtime publication fence failed");
+  }
+  private assertStoreReadable():void {if(this.publicationsSealed)throw new CatalogError("HOST_CLOSED");}
+  private sealRuntime(runtime:R):void {
+    if(!this.publicationsSealed||this.sealedRuntimes.has(runtime))return;
+    this.sealedRuntimes.add(runtime);
+    if(this.options.sealRuntime)this.options.sealRuntime(runtime);
+    else runtime.sealBeforeStoreClose?.();
   }
   requestContext(sessionId:string) {
     const {session}=this.resolve(sessionId);
@@ -122,22 +166,29 @@ export class SessionRegistry<R extends SessionRuntime=SessionRuntime> {
     entry.cancelLoad=false;
     const captured=entry;
     const runtimeId=randomUUID();captured.runtimeId=runtimeId;
-    const loading=Promise.resolve().then(()=>this.options.runtimeFactory({...resolved,store:this.store,owner:this.options.owner,runtimeId,ownsStore:false,recoverOnStart:false})).then((runtime)=>{
+    const loading=Promise.resolve().then(()=>{
+      if(captured.cancelLoad||this.shuttingDown)throw new CatalogError("RUNTIME_CLOSING",undefined,true);
+      return this.options.runtimeFactory({...resolved,store:this.store,owner:this.options.owner,runtimeId,ownsStore:false,recoverOnStart:false});
+    }).then((runtime)=>{
       captured.runtime=runtime;
+      this.sealRuntime(runtime);
       if(runtime.sessionId!==sessionId)throw new CatalogError("RUNTIME_SESSION_MISMATCH");
       if(captured.cancelLoad||this.shuttingDown)throw new CatalogError("RUNTIME_CLOSING",undefined,true);
       const current=this.executionTarget(sessionId);
       if(current.session.workspaceId!==resolved.session.workspaceId||current.session.providerInstanceId!==resolved.session.providerInstanceId)throw new CatalogError("SESSION_BINDING_CHANGED");
       this.catalog.setResidency(sessionId,"loaded");
-      const unsubscribe=runtime.subscribe?.((event)=>{if(event.sessionId===sessionId)this.publishCommittedEvents([event]);});
+      const unsubscribe=runtime.subscribe?.((event)=>{if(!this.runtimeCompletionsSealed&&event.sessionId===sessionId)this.publishCommittedEvents([event]);});
       if(unsubscribe)captured.unsubscribe=unsubscribe;
       return runtime;
     }).catch(async(error:unknown)=>{
-      if(captured.runtime&&!captured.closing) {
+      if(captured.runtime&&(!captured.closing||this.runtimeCompletionsSealed)) {
+        this.sealRuntime(captured.runtime);
         const report=await this.stop(captured.runtime).catch(()=>({closed:false,producerStopped:false,clean:false,state:"recovery_required" as const}));
-        if(report.clean){captured.unsubscribe?.();delete captured.unsubscribe;delete captured.runtime;delete captured.runtimeId;this.catalog.setResidency(sessionId,"unloaded");}
-        else this.catalog.setResidency(sessionId,"blocked");
-      } else if(!captured.closing) this.catalog.setResidency(sessionId,this.options.owner.retainedReason||this.catalog.requireSession(sessionId).residency==="blocked"?"blocked":"unloaded");
+        if(!this.runtimeCompletionsSealed) {
+          if(report.clean){captured.unsubscribe?.();delete captured.unsubscribe;delete captured.runtime;delete captured.runtimeId;this.catalog.setResidency(sessionId,"unloaded");}
+          else this.catalog.setResidency(sessionId,"blocked");
+        }
+      } else if(!captured.closing&&!this.runtimeCompletionsSealed) this.catalog.setResidency(sessionId,this.options.owner.retainedReason||this.catalog.requireSession(sessionId).residency==="blocked"?"blocked":"unloaded");
       throw error;
     }).finally(()=>{if(captured.loading===loading)delete captured.loading;});
     captured.loading=loading;
@@ -147,6 +198,7 @@ export class SessionRegistry<R extends SessionRuntime=SessionRuntime> {
   private stop(runtime:R,deadlineMs?:number):Promise<RuntimeCloseReport> {return runtime.closeAndWait(deadlineMs);}
   /** Lifecycle close. The business command below first journals its accepted effect. */
   closeRuntime(sessionId:string,deadlineMs?:number):Promise<RuntimeCloseReport> {
+    if(this.runtimeCompletionsSealed)return Promise.resolve(unknownClose());
     const prior=this.resolve(sessionId).session;
     let entry=this.entries.get(sessionId);if(!entry){entry={cancelLoad:false};this.entries.set(sessionId,entry);}
     if(entry.closing)return entry.closing;
@@ -156,14 +208,16 @@ export class SessionRegistry<R extends SessionRuntime=SessionRuntime> {
     const captured=entry;
     const closing=Promise.resolve().then(async()=>{
       if(captured.loading)await captured.loading.catch(()=>undefined);
+      if(this.runtimeCompletionsSealed)return unknownClose();
       const runtime=captured.runtime;
       const report=runtime?await this.stop(runtime,deadlineMs):prior.residency==="unloaded"||hadLoading?stopped:{closed:false,producerStopped:false,clean:false,state:"recovery_required" as const};
+      if(this.runtimeCompletionsSealed)return unknownClose();
       const base=this.store.getSession(sessionId) as {recoveryState?:string}|undefined;
       const clean=report.clean&&report.producerStopped&&!this.store.getActiveTurn(sessionId)&&base?.recoveryState!=="blocked";
       if(clean){captured.unsubscribe?.();delete captured.unsubscribe;delete captured.runtime;delete captured.runtimeId;this.catalog.setResidency(sessionId,"unloaded");return report;}
       this.catalog.setResidency(sessionId,"blocked");
       return {...report,clean:false,state:"recovery_required" as const,recoveryRequired:true};
-    }).catch((error:unknown)=>{this.catalog.setResidency(sessionId,"blocked");throw error;}).finally(()=>{if(captured.closing===closing)delete captured.closing;});
+    }).catch((error:unknown)=>{if(this.runtimeCompletionsSealed)return unknownClose();this.catalog.setResidency(sessionId,"blocked");throw error;}).finally(()=>{if(captured.closing===closing)delete captured.closing;});
     captured.closing=closing;
     return closing;
   }
@@ -177,9 +231,11 @@ export class SessionRegistry<R extends SessionRuntime=SessionRuntime> {
     if(begun.reused)return {summary:begun.summary,events:begun.events,reused:true};
     let proved=false;
     try {proved=knownUnloaded||(await this.closeRuntime(parsed.sessionId,deadlineMs)).clean;}catch {/* Pending stop remains an explicit durable unknown. */}
+    if(this.runtimeCompletionsSealed)throw new CatalogError("HOST_CLOSING",undefined,true);
     const settled=this.catalog.settleRuntimeClose(begun.operation.id,proved);this.publish(settled.events);return {summary:settled.summary,events:settled.events,reused:settled.reused};
   }
   createNew(command:CatalogCommand,input:unknown):CatalogCommit {
+    if(this.shuttingDown)throw new CatalogError("HOST_CLOSING");
     const parsed=CreateSessionV2Schema.parse(input);
     const result=this.catalog.create(command,parsed,{workspace:this.workspaces.require(parsed.workspaceId),provider:this.providers.requireExecution(parsed.providerInstanceId)});
     this.publish(result.events);return result;

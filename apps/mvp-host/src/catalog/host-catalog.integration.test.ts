@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { BOUNDED_CONTENT_CAPABILITY, SESSION_CATALOG_CAPABILITY, TIMELINE_PROJECTION_CAPABILITY, CatalogMutationResponseSchema, SessionSnapshotV2Schema, type SessionEvent, type CatalogMutationResponse } from "@flyx/mvp-protocol";
-import { createTestHostOwner } from "../lifecycle/host-owner.js";
+import { createTestHostOwner, HostOwnerLock } from "../lifecycle/host-owner.js";
 import { openOwned } from "../storage/open-store.js";
 import { SqliteStore } from "../storage/db.js";
 import { FROZEN_V6_SCHEMA } from "../test-support/frozen-v6-schema.js";
@@ -39,6 +39,7 @@ class EngineRuntime implements CatalogExecutionRuntime {
     readonly listeners = new Set<(event: SessionEvent) => void>();
     readonly engine: CommandEngine;
     readonly closeAndWait = vi.fn(async () => clean);
+    readonly sealBeforeStoreClose = vi.fn();
     constructor(readonly context: SessionRuntimeContext) {
         this.store = context.store;
         this.owner = context.owner;
@@ -59,15 +60,17 @@ class EngineRuntime implements CatalogExecutionRuntime {
         return this.engine.commitRequest(request, () => ({ result, receipts: [{ ...request, state: "completed", response: result }] })).result;
     });
 }
-async function fixture(options: Partial<HostCatalogOptions> = {}, withInteractions = false, actualDefault = false) {
+async function fixture(options: Partial<HostCatalogOptions> = {}, withInteractions = false, actualDefault = false, fileBacked = false) {
     const root = realpathSync(mkdtempSync(join(tmpdir(), "flyx-host-catalog-")));
     roots.push(root);
     const checkout = join(root, "checkout");
     const providerRoot = join(checkout, "app");
     mkdirSync(providerRoot, { recursive: true });
     execFileSync("git", ["init", "--quiet", checkout]);
-    const owner = createTestHostOwner();
-    const store = openOwned({ databasePath: ":memory:", owner });
+    const databasePath = fileBacked ? join(root, "data", "host.sqlite") : ":memory:";
+    if (fileBacked) mkdirSync(join(root, "data", "identity"), { recursive: true, mode: 0o700 });
+    const owner = fileBacked ? HostOwnerLock.acquire({ databasePath, identityDirectory: join(root, "data", "identity"), coordinationDirectory: join(root, "coordination") }) : createTestHostOwner();
+    const store = openOwned({ databasePath, owner });
     cleanup.push(() => { if (store.db.open)
         store.close(); try {
         owner.release();
@@ -359,6 +362,125 @@ describe("production Host catalog binding", () => {
         expect(await closing).toContainEqual(expect.objectContaining({ clean: false, state: "recovery_required" }));
         expect(f.host.capabilities()).toEqual([]);
         expect(f.store.db.open).toBe(true);
+    });
+    it("fences late successful stop settlement at the Catalog deadline while admitted Recovery remains available", async () => {
+        const f = await fixture({}, false, false, true);
+        const id = f.host.legacySessionId;
+        const runtime = await f.host.registry.ensureLoaded(id) as EngineRuntime;
+        const stop = barrier<RuntimeCloseReport>();
+        runtime.closeAndWait.mockImplementation(() => stop.promise);
+        const listener = vi.fn();
+        f.host.registry.subscribe(id, listener);
+        const event = f.host.registry.readEvents(id).events[0]!;
+        expect(await f.host.closeAndWait(5)).toContainEqual(expect.objectContaining({ clean: false, producerStopped: false }));
+        expect(f.host.catalog.requireSession(id).residency).toBe("closing");
+        const residency = vi.spyOn(f.host.catalog, "setResidency");
+        stop.resolve(clean);
+        await tick();
+        expect(residency).not.toHaveBeenCalled();
+        expect(f.host.registry.resolve(id).session.residency).toBe("closing");
+        for (const callback of runtime.listeners) callback(event);
+        expect(listener).not.toHaveBeenCalled();
+        f.host.registry.publishCommittedEvents([event]);
+        expect(listener).toHaveBeenCalledOnce();
+        f.host.sealBeforeStoreClose();
+        f.host.sealBeforeStoreClose();
+        expect(runtime.sealBeforeStoreClose).toHaveBeenCalledOnce();
+        f.host.registry.publishCommittedEvents([event]);
+        expect(listener).toHaveBeenCalledOnce();
+        expect(f.owner.retainedReason).toBe("Catalog shutdown has unverified Session or service work");
+        f.owner.assertActive();
+        expect(() => f.owner.release()).toThrow("retained");
+    });
+    it("fences a factory result returned after shared Store closure without any late SQL or publication", async () => {
+        const gate = barrier<CatalogExecutionRuntime>();
+        let captured!: SessionRuntimeContext;
+        const f = await fixture({ runtimeFactory: (context) => { captured = context; return gate.promise; } });
+        const id = f.host.legacySessionId;
+        const listener = vi.fn();
+        f.host.registry.subscribe(id, listener);
+        const event = f.host.registry.readEvents(id).events[0]!;
+        const loading = f.host.registry.ensureLoaded(id);
+        const rejected = expect(loading).rejects.toMatchObject({ code: "HOST_CLOSING" });
+        await tick();
+        const runtime = new EngineRuntime(captured);
+        runtime.closeAndWait.mockImplementation(async () => { expect(runtime.sealBeforeStoreClose).toHaveBeenCalledOnce(); return clean; });
+        expect(await f.host.closeAndWait(5)).toContainEqual(expect.objectContaining({ clean: false }));
+        expect(f.host.catalog.requireSession(id).residency).toBe("closing");
+        const sql = vi.spyOn(f.store.db, "prepare");
+        f.host.sealBeforeStoreClose();
+        f.store.close();
+        const residency = vi.spyOn(f.host.catalog, "setResidency");
+        gate.resolve(runtime);
+        await rejected;
+        await tick();
+        f.host.registry.publishCommittedEvents([event]);
+        expect(sql).not.toHaveBeenCalled();
+        expect(residency).not.toHaveBeenCalled();
+        expect(listener).not.toHaveBeenCalled();
+        expect(runtime.closeAndWait).toHaveBeenCalledOnce();
+        expect(runtime.sealBeforeStoreClose).toHaveBeenCalledOnce();
+    });
+    it("guards the Catalog close continuation when the final fence overtakes its own deadline", async () => {
+        const f = await fixture();
+        const runtime = await f.host.registry.ensureLoaded(f.host.legacySessionId) as EngineRuntime;
+        const stop = barrier<RuntimeCloseReport>();
+        runtime.closeAndWait.mockImplementation(() => stop.promise);
+        const closing = f.host.closeAndWait(5000);
+        await tick();
+        f.host.sealBeforeStoreClose();
+        f.store.close();
+        const sql = vi.spyOn(f.store.db, "prepare");
+        stop.resolve(clean);
+        expect(await closing).toContainEqual(expect.objectContaining({ clean: false, producerStopped: false }));
+        expect(sql).not.toHaveBeenCalled();
+        expect(runtime.sealBeforeStoreClose).toHaveBeenCalledOnce();
+    });
+    it("leaves the accepted runtime-close journal unchanged when its stop proof arrives after the final fence", async () => {
+        const f = await fixture({ runtimeCloseDeadlineMs: 5000 });
+        const id = f.host.legacySessionId;
+        const runtime = await f.host.registry.ensureLoaded(id) as EngineRuntime;
+        const stop = barrier<RuntimeCloseReport>();
+        runtime.closeAndWait.mockImplementation(() => stop.promise);
+        const command = f.rpc("session.closeRuntime", { sessionId: id, expectedRevision: f.host.registry.get(id).revision }, "late-command");
+        const rejected = expect(command).rejects.toMatchObject({ code: "HOST_CLOSING" });
+        await tick();
+        expect(await f.host.closeAndWait(5)).toContainEqual(expect.objectContaining({ clean: false }));
+        expect(f.store.getCommandReceipt("writer", "late-command")?.state).toBe("accepted");
+        expect(f.host.catalog.runtimeCloseForSession(id)?.state).toBe("accepted");
+        expect(f.host.catalog.requireSession(id).residency).toBe("closing");
+        f.host.sealBeforeStoreClose();
+        f.store.close();
+        const sql = vi.spyOn(f.store.db, "prepare");
+        const settlement = vi.spyOn(f.host.catalog, "settleRuntimeClose");
+        stop.resolve(clean);
+        await rejected;
+        expect(sql).not.toHaveBeenCalled();
+        expect(settlement).not.toHaveBeenCalled();
+    });
+    it("fences actual late native preparation before closing SQL and never invokes paid preflight", async () => {
+        const prepared = barrier<NativeBoundaryAssessment>();
+        const started = barrier<void>();
+        const preflight = vi.spyOn(ClaudeAdapter.prototype, "preflight").mockImplementation(async () => { throw new Error("Paid preflight forbidden"); });
+        const f = await fixture({ runtimeOptions: () => ({ nativeBoundaryFactory: async () => { started.resolve(); return prepared.promise; } }) }, false, true);
+        const loading = f.host.registry.ensureLoaded(f.host.legacySessionId);
+        const rejected = expect(loading).rejects.toThrow();
+        await started.promise;
+        try {
+            expect(await f.host.closeAndWait(5)).toContainEqual(expect.objectContaining({ clean: false }));
+            f.host.sealBeforeStoreClose();
+            f.store.close();
+            const sql = vi.spyOn(f.store.db, "prepare");
+            prepared.resolve({ ready: false, code: "NATIVE_BOUNDARY_BACKEND_UNAVAILABLE", summary: { ready: false, code: "NATIVE_BOUNDARY_BACKEND_UNAVAILABLE", platform: process.platform } });
+            await rejected;
+            await tick();
+            expect(sql).not.toHaveBeenCalled();
+            expect(preflight).not.toHaveBeenCalled();
+        } finally {
+            prepared.resolve({ ready: false, code: "NATIVE_BOUNDARY_BACKEND_UNAVAILABLE", summary: { ready: false, code: "NATIVE_BOUNDARY_BACKEND_UNAVAILABLE", platform: process.platform } });
+            await rejected;
+            preflight.mockRestore();
+        }
     });
     it("does not advertise or install007 until the central runner declares its validated shape", async () => {
         const owner = createTestHostOwner();

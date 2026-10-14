@@ -25,6 +25,7 @@ class FakeRuntime {
   closeGate=deferred<RuntimeCloseReport>();
   constructor(readonly sessionId:string,readonly runtimeId:string){}
   closeAndWait=vi.fn(async()=>{this.closeCalls++;return this.closeGate.promise;});
+  sealBeforeStoreClose=vi.fn();
   startTurn=vi.fn(async()=>({turnId:this.sessionId,status:"accepted" as const}));
   interrupt=vi.fn(async()=>({status:"accepted"}));
   respondApproval=vi.fn(async()=>({status:"accepted"}));
@@ -97,6 +98,55 @@ describe("Session catalog and lazy runtime routing",()=>{
     f.registry.archive({authSubjectId:"primary-device",commandId:"archive"},{sessionId:session.sessionId,expectedRevision:f.registry.get(session.sessionId).revision});
     await expect(f.registry.ensureLoaded(session.sessionId)).rejects.toMatchObject({code:"SESSION_ARCHIVED"});
     expect(f.registry.readSnapshot(session.sessionId).session.status).toBe("archived");expect(f.runtimeFactory).toHaveBeenCalledTimes(1);
+  });
+  it("cancels a queued factory before it starts when shutdown seals runtime completion",async()=>{
+    const f=await fixture();const session=f.create("one");
+    const loading=f.registry.ensureLoaded(session.sessionId);const rejected=expect(loading).rejects.toMatchObject({code:"RUNTIME_CLOSING"});
+    const closing=f.registry.closeAll();f.registry.sealRuntimeCompletions();
+    await rejected;expect(await closing).toContainEqual(expect.objectContaining({clean:false,producerStopped:false}));
+    expect(f.runtimeFactory).not.toHaveBeenCalled();expect(f.catalog.requireSession(session.sessionId).residency).toBe("closing");
+  });
+  it("fences a late factory before cleanup and performs no SQL or delivery after Store closure",async()=>{
+    const load=deferred<FakeRuntime>();const f=await fixture(()=>load.promise);const session=f.create("one");
+    const listener=vi.fn();f.registry.subscribe(session.sessionId,listener);const event=f.registry.readEvents(session.sessionId).events[0]!;
+    const loading=f.registry.ensureLoaded(session.sessionId);const rejected=expect(loading).rejects.toMatchObject({code:"RUNTIME_CLOSING"});await tick();
+    const closing=f.registry.closeAll();await tick();expect(f.catalog.requireSession(session.sessionId).residency).toBe("closing");
+    f.registry.sealBeforeStoreClose();f.registry.sealBeforeStoreClose();f.store.close();
+    const sql=vi.spyOn(f.store.db,"prepare");const residency=vi.spyOn(f.catalog,"setResidency");
+    const runtime=new FakeRuntime(session.sessionId,"late");runtime.closeAndWait.mockImplementation(async()=>{expect(runtime.sealBeforeStoreClose).toHaveBeenCalledTimes(1);return clean;});
+    load.resolve(runtime);await rejected;
+    expect(await closing).toContainEqual(expect.objectContaining({clean:false,producerStopped:false,state:"recovery_required"}));
+    f.registry.publishCommittedEvents([event]);expect(listener).not.toHaveBeenCalled();expect(sql).not.toHaveBeenCalled();expect(residency).not.toHaveBeenCalled();
+    expect(runtime.closeAndWait).toHaveBeenCalledTimes(1);expect(()=>f.registry.resolve(session.sessionId)).toThrow("HOST_CLOSED");expect(sql).not.toHaveBeenCalled();
+  });
+  it("fences a late factory rejection without attempting failed-load SQL repair",async()=>{
+    const load=deferred<FakeRuntime>();const f=await fixture(()=>load.promise);const session=f.create("one");
+    const loading=f.registry.ensureLoaded(session.sessionId);const rejected=expect(loading).rejects.toThrow("late failure");await tick();
+    const closing=f.registry.closeAll();await tick();f.registry.sealBeforeStoreClose();f.store.close();
+    const sql=vi.spyOn(f.store.db,"prepare");const residency=vi.spyOn(f.catalog,"setResidency");
+    load.reject(new Error("late failure"));await rejected;expect(await closing).toContainEqual(expect.objectContaining({clean:false}));
+    expect(sql).not.toHaveBeenCalled();expect(residency).not.toHaveBeenCalled();
+  });
+  it("preserves close journals after a deadline fence while admitted Recovery still reads and publishes",async()=>{
+    const f=await fixture();const session=f.create("one");const runtime=await f.registry.ensureLoaded(session.sessionId);
+    runtime.closeGate=deferred<RuntimeCloseReport>();const listener=vi.fn();f.registry.subscribe(session.sessionId,listener);
+    const command={authSubjectId:"primary-device",commandId:"close-deadline"};
+    const closing=f.registry.closeRuntimeCommand(command,{sessionId:session.sessionId,expectedRevision:session.revision});const rejected=expect(closing).rejects.toMatchObject({code:"HOST_CLOSING"});await tick();
+    const event=f.registry.readEvents(session.sessionId).events[0]!;const residency=vi.spyOn(f.catalog,"setResidency");const settlement=vi.spyOn(f.catalog,"settleRuntimeClose");
+    f.registry.sealRuntimeCompletions();runtime.closeGate.resolve(clean);await rejected;
+    expect(residency).not.toHaveBeenCalled();expect(settlement).not.toHaveBeenCalled();
+    expect(f.catalog.requireSession(session.sessionId).residency).toBe("closing");expect(f.store.getCommandReceipt(command.authSubjectId,command.commandId)?.state).toBe("accepted");
+    listener.mockClear();f.registry.publishCommittedEvents([event]);expect(listener).toHaveBeenCalledOnce();expect(f.registry.resolve(session.sessionId).session.sessionId).toBe(session.sessionId);
+    await expect(f.registry.ensureLoaded(session.sessionId)).rejects.toMatchObject({code:"HOST_CLOSING"});
+    f.registry.sealBeforeStoreClose();f.registry.publishCommittedEvents([event]);expect(listener).toHaveBeenCalledOnce();expect(runtime.sealBeforeStoreClose).toHaveBeenCalledOnce();
+  });
+  it.each(["resolve","reject"] as const)("never changes residency or publishes when a runtime stop finishes with %s after the final Store seal",async(outcome)=>{
+    const f=await fixture();const session=f.create("one");const runtime=await f.registry.ensureLoaded(session.sessionId);runtime.closeGate=deferred<RuntimeCloseReport>();
+    const closing=f.registry.closeRuntime(session.sessionId);await tick();expect(runtime.closeCalls).toBe(1);
+    const sql=vi.spyOn(f.store.db,"prepare");f.registry.sealBeforeStoreClose();f.store.close();const residency=vi.spyOn(f.catalog,"setResidency");
+    if(outcome==="resolve")runtime.closeGate.resolve(clean);else runtime.closeGate.reject(new Error("late stop failure"));
+    expect(await closing).toMatchObject({clean:false,producerStopped:false,state:"recovery_required"});
+    expect(sql).not.toHaveBeenCalled();expect(residency).not.toHaveBeenCalled();expect(runtime.sealBeforeStoreClose).toHaveBeenCalledOnce();
   });
   it("clears only a failed load's own Promise and permits a clean retry",async()=>{
     const f=await fixture();const session=f.create("one");f.runtimeFactory.mockRejectedValueOnce(new Error("local factory rejected before spawning"));

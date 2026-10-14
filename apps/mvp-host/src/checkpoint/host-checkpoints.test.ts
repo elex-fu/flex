@@ -15,10 +15,13 @@ import { SessionRegistry } from "../session/session-registry.js";
 import { CatalogStore } from "../storage/catalog-store.js";
 import { ExecutionStore } from "../storage/execution-store.js";
 import { openOwned } from "../storage/open-store.js";
+import { SqliteStore } from "../storage/db.js";
+import { FROZEN_V6_SCHEMA } from "../test-support/frozen-v6-schema.js";
+import { inspectSchema, SUPPORTED_SCHEMA_VERSION } from "../storage/migrations/schema-version.js";
 import { applyCatalogMigration } from "../storage/migrations/007-catalog.js";
 import { applyInteractionMigration } from "../storage/migrations/008-interactions.js";
-import { applyCheckpointSchema, applyRevertSchema } from "../storage/migrations/009-checkpoints.js";
-import { HostViews, applyViewsMigration } from "../timeline/host-views.js";
+import { applyWorkspaceHistoryMigration } from "../storage/migrations/009-workspace-history.js";
+import { HostViews } from "../timeline/host-views.js";
 import { TimelineBackfill } from "../timeline/backfill.js";
 import { WorkspaceRegistry } from "../workspace/workspace-registry.js";
 import { WorkspaceLease } from "../workspace/workspace-lease.js";
@@ -36,8 +39,6 @@ async function fixture(input: { revert?: boolean; verified?: boolean; helper?: s
   const root = await temporaryRepository(); cleanups.push(() => removeFixture(root));
   const owner = createTestHostOwner(), store = openOwned({ databasePath: ":memory:", owner });
   cleanups.push(() => { store.close(); owner.release(); });
-  applyViewsMigration(store, owner); applyCatalogMigration(store.db); applyInteractionMigration(store.db); applyCheckpointSchema(store.db); applyRevertSchema(store.db);
-  store.db.prepare("INSERT INTO schema_migrations(version,applied_at) VALUES(9,?)").run(new Date().toISOString());
   const catalog = new CatalogStore(store); cleanups.push(() => catalog.dispose());
   const workspaces = new WorkspaceRegistry(catalog, { owner }); await workspaces.registerLocal({ workspaceId: "workspace-1", root });
   const providers = new ProviderInstanceRegistry(catalog); providers.registerLocal({ providerInstanceId: "provider-1", provider: "codex", executable: process.execPath });
@@ -114,13 +115,36 @@ async function fixture(input: { revert?: boolean; verified?: boolean; helper?: s
 }
 
 describe("owned checkpoint production factory and RPC", () => {
-  it("validates 008/009 without schema writes and preserves basic Diff when native/helper support is unavailable", async () => {
+  it("uses the owned schema-10 migration path and validates readiness without schema writes", async () => {
     const f = await fixture(); const before = f.store.db.prepare("SELECT sql FROM sqlite_master ORDER BY name").all();
+    expect(SUPPORTED_SCHEMA_VERSION).toBe(10); expect(inspectSchema(f.store.db).version).toBe(SUPPORTED_SCHEMA_VERSION);
+    expect(f.store.db.prepare("SELECT version FROM schema_migrations ORDER BY version").all()).toEqual(Array.from({ length: 10 }, (_, index) => ({ version: index + 1 })));
+    const validationOnly = await createHostCheckpoints(f.options); cleanups.push(() => validationOnly.seal());
     const support = await f.host.capabilitiesForSession(f.session.sessionId, "device-1");
     expect(support).toEqual({ capabilities: [CHECKPOINT_DIFF_CAPABILITY], diff: true, preview: true, workspaceRestore: false, nativeRewind: false, unsupportedReason: "REVERT_UNAVAILABLE" }); expect(f.runtimeFactory).not.toHaveBeenCalled();
     expect(f.store.db.prepare("SELECT sql FROM sqlite_master ORDER BY name").all()).toEqual(before);
-    f.store.db.prepare("DELETE FROM schema_migrations WHERE version=9").run(); await expect(createHostCheckpoints(f.options)).rejects.toMatchObject({ code: "CHECKPOINT_SCHEMA_NOT_READY" });
-    expect(f.store.db.prepare("SELECT sql FROM sqlite_master ORDER BY name").all()).toEqual(before);
+  });
+  for (const version of [7, 8] as const) it(`rejects genuinely absent checkpoint schema at version ${version}, then accepts the real migration`, async () => {
+    const owner = createTestHostOwner();
+    const store = new SqliteStore(":memory:", { mode: "test-fixture", fixtureSchema: FROZEN_V6_SCHEMA }); cleanups.push(() => { store.close(); owner.release(); });
+    applyCatalogMigration(store.db); if (version === 8) applyInteractionMigration(store.db);
+    expect(inspectSchema(store.db).version).toBe(version);
+    expect(store.db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'checkpoint_%'").all()).toEqual([]);
+    const catalog = new CatalogStore(store); cleanups.push(() => catalog.dispose());
+    const workspaces = new WorkspaceRegistry(catalog, { owner }), providers = new ProviderInstanceRegistry(catalog);
+    const runtimeFactory = vi.fn(() => { throw new Error("No legacy Provider launch"); });
+    const registry = new SessionRegistry(catalog, workspaces, providers, { owner, runtimeFactory });
+    const views = new HostViews(store, owner, { resolveResource: () => undefined }); cleanups.push(() => views.close());
+    const contextUnavailable = () => { throw new Error("No legacy runtime/lease facts"); };
+    const options: HostCheckpointsOptions = { store, owner, registry, workspaces, views, authorizeSession: contextUnavailable, runtimeState: contextUnavailable, leaseForContext: contextUnavailable, captureStateFor: contextUnavailable };
+    const before = store.db.prepare("SELECT name,sql FROM sqlite_master ORDER BY name").all();
+    await expect(createHostCheckpoints(options)).rejects.toMatchObject({ code: "CHECKPOINT_SCHEMA_NOT_READY" });
+    expect(store.db.prepare("SELECT name,sql FROM sqlite_master ORDER BY name").all()).toEqual(before); expect(inspectSchema(store.db).version).toBe(version);
+    if (version === 7) applyInteractionMigration(store.db); applyWorkspaceHistoryMigration(store.db);
+    const migrated = store.db.prepare("SELECT name,sql FROM sqlite_master ORDER BY name").all();
+    const host = await createHostCheckpoints(options); cleanups.push(() => host.seal());
+    expect(inspectSchema(store.db).version).toBe(9); expect(store.db.prepare("SELECT name,sql FROM sqlite_master ORDER BY name").all()).toEqual(migrated);
+    expect(runtimeFactory).not.toHaveBeenCalled();
   });
   it("serves stable historical staged/workspace Diff and bounded binary content through the actual shared ContentStore", async () => {
     const f = await fixture(); await stageRaw(f.root, "tracked.txt", "before-index\n"); await writeFile(join(f.root, "tracked.txt"), "before-workspace " + f.root + "\n");
@@ -135,8 +159,13 @@ describe("owned checkpoint production factory and RPC", () => {
     const chunk = f.views.content.getChunk({ sessionId: f.session.sessionId, ref: content.before.contentRef.ref, offset: 0, maxBytes: 512, encoding: "base64" }); expect(chunk.nextOffset).toBe(512);
     const tracked = files.find((file) => file.path === "tracked.txt")!; const text = await f.rpc("checkpoint.getFile", { sessionId: f.session.sessionId, diffId: page.diffId, fileId: tracked.fileId }); expect(JSON.stringify(text)).not.toContain(f.root); expect(JSON.stringify(text)).not.toContain("private-native-id");
     await fixtureGit(f.root, ["commit", "-m", "HEAD moved independently"]); const moved = await userGitState(f.root);
+    const noRuntime = vi.fn(() => { throw new Error("Historical reads have no runtime or lease"); });
+    f.options.runtimeState = noRuntime; f.options.leaseForContext = noRuntime;
+    f.store.db.prepare("UPDATE sessions SET recovery_state='blocked' WHERE id=?").run(f.session.sessionId);
+    f.store.db.prepare("INSERT INTO host_state VALUES('restore_readiness','unverified',?)").run(new Date().toISOString());
     expect(await f.rpc("checkpoint.getDiff", { sessionId: f.session.sessionId, beforeCheckpointId: before.checkpointId, afterCheckpointId: after.checkpointId, limit: 1 })).toEqual(page);
-    expect((await userGitState(f.root)).index).toEqual(moved.index); expect(state.head).not.toBe(moved.head); expect(f.runtimeFactory).not.toHaveBeenCalled();
+    expect(await f.rpc("checkpoint.getFile", { sessionId: f.session.sessionId, diffId: page.diffId, fileId: tracked.fileId })).toEqual(text);
+    expect((await userGitState(f.root)).index).toEqual(moved.index); expect(state.head).not.toBe(moved.head); expect(f.runtimeFactory).not.toHaveBeenCalled(); expect(noRuntime).not.toHaveBeenCalled();
   });
   it("enforces actor/session scope, strict V2 payloads and full envelope budgets without native dispatch", async () => {
     const f = await fixture(); const { target, page } = await f.targetAndPreview();

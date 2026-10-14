@@ -1,5 +1,6 @@
-import { spawn, spawnSync } from "node:child_process";
-import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { spawn, spawnSync, type ChildProcess } from "node:child_process";
+import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { FullConfig } from "@playwright/test";
@@ -14,7 +15,22 @@ function buildWeb(): void {
   if (result.status !== 0) throw new Error("mvp-web build failed; cannot start browser E2E");
 }
 
-function startDeterministicHost(): { child: NodeJS.ChildProcess } {
+function prepareFixtureWorkspace(): string | undefined {
+  if (process.env.FLYX_WORKSPACE) {
+    const root = realpathSync(process.env.FLYX_WORKSPACE);
+    const top = spawnSync("git", ["-C", root, "rev-parse", "--show-toplevel"], { encoding: "utf8" });
+    if (top.status !== 0 || realpathSync(top.stdout.trim()) !== root) throw new Error("FLYX_WORKSPACE must be its own Git fixture root");
+    return undefined;
+  }
+  const temporary = mkdtempSync(resolve(tmpdir(), "flyx-browser-fixture-"));
+  const workspace = resolve(temporary, "workspace");
+  const result = spawnSync(process.execPath, [resolve(repoRoot, "scripts/provision-fixture-workspace.mjs"), workspace], { cwd: repoRoot, stdio: "inherit" });
+  if (result.status !== 0) { rmSync(temporary, { recursive: true, force: true }); throw new Error("Failed to provision isolated E2E fixture"); }
+  process.env.FLYX_WORKSPACE = workspace;
+  return temporary;
+}
+
+function startDeterministicHost(): { child: ChildProcess } {
   const child = spawn(
     "pnpm",
     ["--filter", "@flyx/mvp-host", "exec", "tsx", "src/test-support/e2e-main.ts"],
@@ -34,7 +50,7 @@ function startDeterministicHost(): { child: NodeJS.ChildProcess } {
   return { child };
 }
 
-function waitForHostReady(child: NodeJS.ChildProcess): Promise<{ baseUrl: string; token: string; tokens: string[]; pid?: number }> {
+function waitForHostReady(child: ChildProcess): Promise<{ baseUrl: string; token: string; tokens: string[]; pid?: number }> {
   return new Promise((resolvePromise, rejectPromise) => {
     let buffered = "";
     const timeout = setTimeout(() => {
@@ -58,6 +74,7 @@ function waitForHostReady(child: NodeJS.ChildProcess): Promise<{ baseUrl: string
 
 export default async function globalSetup(_config: FullConfig): Promise<() => Promise<void>> {
   buildWeb();
+  const fixtureTemporary = prepareFixtureWorkspace();
   const { child } = startDeterministicHost();
   const { baseUrl, token, tokens, pid } = await waitForHostReady(child);
   // Env mutations here propagate to every test worker.
@@ -74,7 +91,7 @@ export default async function globalSetup(_config: FullConfig): Promise<() => Pr
     command: "pnpm",
     args: ["--filter", "@flyx/mvp-host", "exec", "tsx", "src/test-support/e2e-main.ts"],
     cwd: repoRoot,
-    env: { FLYX_WEB_ROOT: distRoot, FLYX_E2E_ROOT: resolve(repoRoot, ".flyx-e2e") },
+    env: { FLYX_WEB_ROOT: distRoot, FLYX_E2E_ROOT: resolve(repoRoot, ".flyx-e2e"), FLYX_WORKSPACE: process.env.FLYX_WORKSPACE! },
   });
   // A file-based claim counter survives worker restarts (Playwright recycles
   // the worker after a failed test, which would otherwise reset in-memory
@@ -95,5 +112,6 @@ export default async function globalSetup(_config: FullConfig): Promise<() => Pr
         child.on("exit", () => { clearTimeout(timeout); resolvePromise(); });
       });
     }
+    if (fixtureTemporary) rmSync(fixtureTemporary, { recursive: true, force: true });
   };
 }

@@ -32,3 +32,21 @@ Codex 模式默认只开放命令执行和文件变更，并关闭本机已配�
 与本地 Paseo、T3 Code 的实现差异、引入决策、接口设计和分阶段验收见 [能力差异与优化技术方案](docs/paseo-t3code-comparison-and-optimization-technical-design.md)。
 
 具体函数改造、数据迁移、RPC 契约、18 个实施批次与故障验收见 [分阶段实施方案](docs/flyx-optimization-implementation-plan.md)。
+
+验证入口使用确定性 Provider，不会打开真实 Provider 用例：
+
+```bash
+pnpm install --frozen-lockfile --ignore-scripts
+pnpm -r rebuild better-sqlite3 esbuild
+pnpm build
+pnpm typecheck
+pnpm typecheck:tests
+pnpm test:product
+pnpm test:fixtures
+pnpm verify:clean
+```
+
+`pnpm test` 等同于 `test:product`，先构建本工作树的共享依赖，再运行产品测试。
+`test:fixtures` 必须观察到 retry 夹具的一次预期边界失败；夹具被修好或出现其他失败都会拒绝通过。
+`verify:clean` 在临时副本中排除已有 dist 和 node_modules，执行离线 frozen install、原生重建、构建、两类 typecheck 和测试，并核对构建前后的源码测试发现结果。它保留原工作区的已有构建产物；首次使用前应先安装依赖以填充 pnpm 缓存。
+浏览器用例固定使用 Chromium，由 CI 安装；本地安装命令为 `pnpm --filter @flyx/mvp-web exec playwright install chromium`。

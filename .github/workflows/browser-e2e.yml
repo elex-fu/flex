@@ -28,12 +28,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
-      # packages/claude-fixtures is a nested git repo that is NOT tracked by
-      # the outer repository, so it does not exist after checkout. The
-      # deterministic Host (apps/mvp-host/src/test-support/e2e-main.ts) honours
-      # FLYX_WORKSPACE, so point it at a scratch fixture created below.
-      # NOTE: keep this OUTSIDE <repo>/.flyx-e2e — the E2E host wipes that
-      # directory on every start.
+      # Copy the tracked, deliberately broken fixture into an independent Git
+      # root outside the Host database directory, which E2E startup recreates.
+      RUN_REAL_CLAUDE_SPIKE: "0"
+      RUN_REAL_CLAUDE_FLOW: "0"
+      RUN_REAL_INTERRUPT: "0"
+      RUN_REAL_CODEX_SPIKE: "0"
+      RUN_REAL_CODEX_FLOW: "0"
       FLYX_WORKSPACE: ${{ runner.temp }}/flyx-fixture-workspace
     steps:
       - name: Check out repository
@@ -50,31 +51,20 @@ jobs:
           cache: pnpm
 
       - name: Install dependencies
-        run: pnpm install --frozen-lockfile
+        run: pnpm install --frozen-lockfile --ignore-scripts
 
       # better-sqlite3 is a native module; ensure it matches the CI Node ABI.
       - name: Rebuild better-sqlite3 for the current Node ABI
-        run: pnpm rebuild better-sqlite3
+        run: pnpm -r rebuild better-sqlite3 esbuild
 
       - name: Install Playwright chromium
         run: pnpm --filter @flyx/mvp-web exec playwright install --with-deps chromium
 
-      # The host requires FLYX_WORKSPACE to be an existing Git repository
-      # (see assertFixtureWorkspace in apps/mvp-host/src/main.ts), so create a
-      # clean git dir with an initial commit in $RUNNER_TEMP.
-      - name: Prepare fixture workspace
-        run: |
-          set -Eeuo pipefail
-          git init --initial-branch=main "$FLYX_WORKSPACE"
-          cd "$FLYX_WORKSPACE"
-          git config user.name "flyx-e2e-bot"
-          git config user.email "flyx-e2e-bot@example.invalid"
-          printf '# Flyx E2E fixture workspace\n\nDeterministic-adapter scratch git repo for CI browser E2E.\n' > README.md
-          mkdir -p src
-          printf 'export const answer = 42;\n' > src/answer.ts
-          git add .
-          git commit -m "chore: fixture workspace initial commit"
-          git log --oneline -n 1
+      - name: Build workspace packages
+        run: pnpm build
+
+      - name: Prepare an isolated fixture workspace
+        run: pnpm fixture:prepare "$FLYX_WORKSPACE"
 
       # global-setup builds mvp-web, spawns the deterministic Host and exports
       # FLYX_E2E_BASE_URL / FLYX_E2E_PAIRING_TOKEN for the specs. The env above

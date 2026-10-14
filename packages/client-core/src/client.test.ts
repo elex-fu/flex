@@ -12,6 +12,7 @@ import type { HostProfile, TransportAuthentication } from "./types.js";
 
 async function identity(): Promise<{ descriptor: HostDescriptorV1; profile: HostProfile }> {
   const host = await crypto.subtle.generateKey({ name: "X25519" }, true, ["deriveBits"]);
+  if (!("publicKey" in host)) throw new Error("X25519 must generate a key pair");
   const signing = await crypto.subtle.generateKey({ name: "Ed25519" }, true, ["sign", "verify"]);
   const hostPublicKey = encodeBase64Url(new Uint8Array(await crypto.subtle.exportKey("raw", host.publicKey)));
   const signingPublicKey = encodeBase64Url(new Uint8Array(await crypto.subtle.exportKey("raw", signing.publicKey)));
@@ -29,7 +30,7 @@ async function identity(): Promise<{ descriptor: HostDescriptorV1; profile: Host
     expiresAt: new Date(Date.now() + 60_000).toISOString(),
     nonce: "descriptor-nonce-0001",
   };
-  const signature = encodeBase64Url(new Uint8Array(await crypto.subtle.sign("Ed25519", signing.privateKey, hostDescriptorSigningBytes(unsigned))));
+  const signature = encodeBase64Url(new Uint8Array(await crypto.subtle.sign("Ed25519", signing.privateKey, new Uint8Array(hostDescriptorSigningBytes(unsigned)))));
   return {
     descriptor: { ...unsigned, signature },
     profile: { hostId: unsigned.hostId, label: "Test Host", hostPublicKey, signingPublicKey, fingerprint, endpoints: [{ ...endpoint, availability: "unknown" }] },
@@ -51,9 +52,10 @@ function serve(transport: TestTransport, descriptor: HostDescriptorV1, methods: 
       "session.subscribe": { sessionId: "session-a", afterSequence: 0, headSequence: 0 },
     };
     transport.emit({ type: "response", id: frame.id, ok: true, payload: responses[frame.method] ?? {} });
-    // Reproduce a Host invalidating the lease synchronously with an accepted
-    // access.refresh response. The new credential must win this race.
-    if (rotate && frame.method === "access.refresh") transport.disconnect(1008, "AUTHENTICATION_REQUIRED");
+    // A physical transport delivers the accepted response before its close
+    // event. Close in the next microtask so persistence still overlaps the
+    // lease invalidation without dropping the response before delivery.
+    if (rotate && frame.method === "access.refresh") queueMicrotask(() => transport.disconnect(1008, "AUTHENTICATION_REQUIRED"));
   };
 }
 
@@ -67,7 +69,10 @@ async function configuredClient(authentication: TransportAuthentication, rotate 
   }
   const methods: string[] = [];
   let connections = 0;
-  const client = new FlyxClient({ profile, store, connectTransport: async (_endpoint, generation) => {
+  const client = new FlyxClient({ profile, store, connectTransport: async (endpoint, connectedProfile, generation, signal) => {
+    expect(endpoint.kind).toBe("direct-https");
+    expect(connectedProfile.hostId).toBe(profile.hostId);
+    expect(signal.aborted).toBe(false);
     const transport = new TestTransport(generation, "direct", "device-a", authentication);
     serve(transport, descriptor, methods, rotate && connections === 0);
     connections++;

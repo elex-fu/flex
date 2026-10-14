@@ -181,7 +181,7 @@ describe("Flyx NK/IK secure channel", () => {
   it("does not deliver a partially valid chunked message", async () => {
     const { client, server } = await connect();
     const encrypted = client.encrypt(new Uint8Array(130_000).fill(9));
-    encrypted[encrypted.length - 1] ^= 1;
+    encrypted[encrypted.length - 1] = encrypted[encrypted.length - 1]! ^ 1;
     expect(() => server.decrypt(encrypted)).toThrow("AUTHENTICATION_FAILED");
     expect(server.destroyed).toBe(true);
   });

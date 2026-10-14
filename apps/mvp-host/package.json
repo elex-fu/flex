@@ -10,7 +10,8 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run",
     "test:spike": "vitest run src/claude/adapter.spike.test.ts",
-    "test:codex-spike": "vitest run src/codex/adapter.spike.test.ts"
+    "test:codex-spike": "vitest run src/codex/adapter.spike.test.ts",
+    "typecheck:tests": "tsc -p tsconfig.test.json --noEmit"
   },
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "0.3.220",

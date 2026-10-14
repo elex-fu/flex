@@ -4,7 +4,10 @@
   "private": true,
   "type": "module",
   "exports": {
-    ".": { "types": "./dist/index.d.ts", "import": "./dist/index.js" }
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
   },
   "scripts": {
     "dev": "tsx watch src/main.ts",
@@ -14,7 +17,8 @@
     "test": "vitest run",
     "test:cloudflare:smoke": "tsx src/cloudflare/smoke.ts",
     "deploy:cloudflare": "wrangler deploy",
-    "dev:cloudflare": "wrangler dev"
+    "dev:cloudflare": "wrangler dev",
+    "typecheck:tests": "tsc -p tsconfig.test.json --noEmit"
   },
   "dependencies": {
     "@flyx/mvp-protocol": "workspace:*",

@@ -10,6 +10,7 @@ import { defineConfig } from "@playwright/test";
  */
 export default defineConfig({
   testDir: "./e2e",
+  projects: [{ name: "chromium", use: { browserName: "chromium" } }],
   globalSetup: "./e2e/global-setup.ts",
   timeout: 60_000,
   fullyParallel: false,

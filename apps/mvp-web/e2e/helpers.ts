@@ -45,17 +45,55 @@ export async function pair(page: Page): Promise<string> {
   return token;
 }
 
-/** Send a prompt through the composer. */
-export async function sendPrompt(page: Page, text: string): Promise<void> {
-  await page.locator("textarea").fill(text);
-  await page.getByRole("button", { name: "发送任务" }).click();
-  // The deterministic Turn can finish before the click's state update lands,
-  // so assert durable progress instead of the transient disabled state.
-  await expect(page.locator("article", { hasText: text }).first()).toBeVisible({ timeout: 15_000 });
+export type SubmittedTurn = { commandId: string; turnId: string };
+type StoredCommand = { commandId: string; method: string; createdAt: string; payload?: { prompt?: string }; result?: { turnId?: string } };
+const submittedTurns = new WeakMap<Page, SubmittedTurn>();
+
+/** Read the durable write identity through the same storage used by Direct and Relay. */
+async function storedCommands(page: Page): Promise<StoredCommand[]> {
+  return page.evaluate(() => new Promise<StoredCommand[]>((resolve, reject) => {
+    const open = indexedDB.open("flyx-client-v1", 1);
+    open.onerror = () => reject(open.error);
+    open.onsuccess = () => {
+      const db = open.result;
+      const tx = db.transaction("commands", "readonly");
+      const request = tx.objectStore("commands").getAll();
+      tx.oncomplete = () => { db.close(); resolve(request.result as StoredCommand[]); };
+      tx.onabort = () => { db.close(); reject(tx.error); };
+    };
+  }));
 }
 
-export async function waitForIdle(page: Page): Promise<void> {
-  // The composer textarea is only gated on the session activity state; the
-  // send button is additionally disabled while the prompt box is empty.
+/** Send a prompt and wait for this command's accepted Turn, even for repeated text. */
+export async function sendPrompt(page: Page, text: string): Promise<SubmittedTurn> {
+  const previous = new Set((await storedCommands(page)).map((command) => command.commandId));
+  await page.locator("textarea").fill(text);
+  await page.getByRole("button", { name: "发送任务" }).click();
+  let submitted: SubmittedTurn | undefined;
+  await expect.poll(async () => {
+    const command = (await storedCommands(page)).find((candidate) => !previous.has(candidate.commandId)
+      && candidate.method === "session.startTurn" && candidate.payload?.prompt === text && candidate.result?.turnId);
+    submitted = command?.result?.turnId ? { commandId: command.commandId, turnId: command.result.turnId } : undefined;
+    return submitted;
+  }, { timeout: 15_000, message: "This prompt must have its own durable commandId and accepted turnId" }).toBeTruthy();
+  if (!submitted) throw new Error("Prompt was not accepted");
+  submittedTurns.set(page, submitted);
+  return submitted;
+}
+
+export async function waitForIdle(page: Page, expected?: SubmittedTurn): Promise<void> {
+  let submitted = expected ?? submittedTurns.get(page);
+  if (!submitted) {
+    const command = (await storedCommands(page)).filter((candidate) => candidate.method === "session.startTurn" && candidate.result?.turnId)
+      .sort((a, b) => b.createdAt.localeCompare(a.createdAt))[0];
+    if (command?.result?.turnId) submitted = { commandId: command.commandId, turnId: command.result.turnId };
+  }
+  if (!submitted) throw new Error("waitForIdle requires a submitted command and Turn");
+  const result = JSON.stringify("result-" + submitted.turnId);
+  const error = JSON.stringify("error-" + submitted.turnId);
+  // Assistant completion is not a Turn terminal. Scope this wait to the
+  // committed completed/failed/cancelled card for the command just submitted.
+  await expect(page.locator("article.system.completed[data-item-id=" + result + "], article.system.cancelled[data-item-id=" + result + "], article.error.failed[data-item-id=" + error + "]"))
+    .toBeVisible({ timeout: 30_000 });
   await expect(page.locator("textarea")).toBeEnabled({ timeout: 30_000 });
 }

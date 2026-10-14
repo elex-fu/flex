@@ -1,6 +1,6 @@
 name: Verify
 
-# PR + push to main: install, native rebuild, typecheck, unit/integration tests.
+# PR + push to main: frozen install, native rebuild, build, strict typechecks and tests.
 # Design doc §5.8 (CI、测试报告与失败工件): PR-stage gate for the monorepo.
 on:
   push:
@@ -16,9 +16,15 @@ permissions:
 
 jobs:
   verify:
-    name: Typecheck & Tests
+    name: Build, typecheck & tests
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    env:
+      RUN_REAL_CLAUDE_SPIKE: "0"
+      RUN_REAL_CLAUDE_FLOW: "0"
+      RUN_REAL_INTERRUPT: "0"
+      RUN_REAL_CODEX_SPIKE: "0"
+      RUN_REAL_CODEX_FLOW: "0"
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -34,14 +40,26 @@ jobs:
           cache: pnpm
 
       - name: Install dependencies
-        run: pnpm install --frozen-lockfile
+        run: pnpm install --frozen-lockfile --ignore-scripts
 
       # better-sqlite3 is a native module; ensure it matches the CI Node ABI.
       - name: Rebuild better-sqlite3 for the current Node ABI
-        run: pnpm rebuild better-sqlite3
+        run: pnpm -r rebuild better-sqlite3 esbuild
 
-      - name: Typecheck
+      - name: Build dependency and production packages
+        run: pnpm build
+
+      - name: Typecheck production code
         run: pnpm run typecheck
 
-      - name: Unit & integration tests
-        run: pnpm test
+      - name: Typecheck tests and E2E helpers
+        run: pnpm typecheck:tests
+
+      - name: Product unit & integration tests
+        run: pnpm test:product
+
+      - name: Verify intentionally broken fixture expectations
+        run: pnpm test:fixtures
+
+      - name: Verify a clean workspace copy
+        run: pnpm verify:clean

@@ -27,7 +27,7 @@ test.describe("Host identity and transport-neutral Web", () => {
     expect(locationAtExchange).toBe(`${baseUrl()}/`);
     await page.getByText("连接与设备", { exact: true }).click();
     await expect(page.getByTestId("host-fingerprint")).toHaveAttribute("title", descriptor.fingerprint);
-    await expect(page.getByTestId("security-level")).toContainText("不具备硬件密钥保护");
+    await expect(page.getByTestId("security-level")).toContainText("HttpOnly 浏览器会话。凭据不能由页面脚本直接读取。");
   });
 
   test("Direct bootstrap, snapshot, Timeline and Diff use RPC without business HTTP", async ({ page }) => {

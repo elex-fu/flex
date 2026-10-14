@@ -71,6 +71,8 @@ export interface PendingCommand {
   result?: unknown;
   error?: ClientErrorInfo;
   outcomeUnknown?: boolean;
+  /** Persisted before a mutation crosses the sender boundary. Never infer absence from a missing receipt. */
+  dispatchState?: "not_dispatched" | "possibly_dispatched";
 }
 
 export interface ClientStore {

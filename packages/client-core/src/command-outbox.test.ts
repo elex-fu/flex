@@ -24,10 +24,10 @@ describe("durable command outbox", () => {
     expect(queries).toEqual(["command.getReceipt"]);
     expect(writes).toBe(1);
     expect(await afterRestart.retry("command-one")).toEqual({ turnId: "turn-one" });
-    expect(queries).toHaveLength(1);
+    expect(queries).toHaveLength(2);
   });
 
-  it("does not replay absent receipts on reconnect; explicit retry retains the same ID", async () => {
+  it("never replays a possibly dispatched operation even after an absent receipt", async () => {
     const store = new MemoryClientStore();
     const first = new CommandOutbox(store, "host-a", async () => { throw new ClientError("REQUEST_TIMEOUT", "timeout"); });
     await expect(first.execute("session.interrupt", {}, "command-two")).rejects.toThrow();
@@ -39,8 +39,8 @@ describe("durable command outbox", () => {
     });
     await resumed.reconcile();
     expect(sent).toEqual([]);
-    await resumed.retry("command-two");
-    expect(sent).toEqual(["command-two"]);
+    await expect(resumed.retry("command-two")).rejects.toMatchObject({ code: "OUTCOME_UNKNOWN" });
+    expect(sent).toEqual([]);
   });
 
   it("never retries outcome_unknown even when the user asks to retry", async () => {
@@ -55,7 +55,7 @@ describe("durable command outbox", () => {
     await resumed.reconcile();
     await expect(resumed.retry("command-unknown")).rejects.toMatchObject({ code: "OUTCOME_UNKNOWN" });
     await resumed.reconcile();
-    expect(methods).toEqual(["command.getReceipt"]);
+    expect(methods).toEqual(["command.getReceipt", "command.getReceipt", "command.getReceipt"]);
     expect((await store.getCommand("command-unknown"))?.outcomeUnknown).toBe(true);
   });
 
@@ -81,5 +81,50 @@ describe("durable command outbox", () => {
     await resumed.reconcile();
     await expect(resumed.retry("access-one")).rejects.toMatchObject({ code: "REVIEW_REQUIRED" });
     expect(requests).toBe(0);
+  });
+
+  it("updates accepted and outcome-unknown operations through queries, never mutation replay", async () => {
+    const store = new MemoryClientStore();
+    await new CommandOutbox(store, "host-a", async () => ({ turnId: "turn" })).execute("session.startTurn", { prompt: "one" }, "review");
+    const methods: string[] = [];
+    let state = "outcome_unknown";
+    const outbox = new CommandOutbox(store, "host-a", async (method) => {
+      methods.push(method); return { found: true, method: "session.startTurn", state, response: { turnId: "turn", status: state } };
+    });
+    await outbox.reconcile(); expect((await store.getCommand("review"))?.outcomeUnknown).toBe(true);
+    state = "completed";
+    await outbox.reconcile();
+    expect(await store.getCommand("review")).toMatchObject({ state: "terminal", result: { status: "completed" } });
+    expect((await store.getCommand("review"))?.outcomeUnknown).toBeUndefined();
+    expect(methods).toEqual(["command.getReceipt", "command.getReceipt"]);
+    await expect(outbox.retry("review")).resolves.toMatchObject({ status: "completed" });
+    expect(methods).toHaveLength(2);
+  });
+
+  it("only a durable never-dispatched queued command may be explicitly sent", async () => {
+    const store = new MemoryClientStore();
+    await store.putCommand({ commandId: "draft", hostId: "host-a", method: "session.startTurn", payloadHash: "hash",
+      payload: { prompt: "draft" }, createdAt: new Date().toISOString(), state: "queued", dispatchState: "not_dispatched" });
+    const methods: string[] = [];
+    const outbox = new CommandOutbox(store, "host-a", async (method, _payload, id) => {
+      methods.push(method);
+      if (method === "command.getReceipt") return { found: false };
+      expect(id).toBe("draft"); expect((await store.getCommand(id!))?.dispatchState).toBe("possibly_dispatched");
+      return { status: "accepted" };
+    });
+    await outbox.reconcile(); expect(methods).toEqual(["command.getReceipt"]);
+    await outbox.retry("draft"); expect(methods).toEqual(["command.getReceipt", "command.getReceipt", "session.startTurn"]);
+  });
+
+  it("coalesces receipt queries and keeps ephemeral authorization out of the outbox", async () => {
+    const store = new MemoryClientStore();
+    await new CommandOutbox(store, "host-a", async () => ({})).execute("session.interrupt", {}, "coalesce");
+    let finish!: (receipt: unknown) => void; let count = 0;
+    const outbox = new CommandOutbox(store, "host-a", async () => { count++; return new Promise((resolve) => { finish = resolve; }); });
+    const a = outbox.queryReceipt("coalesce"); const b = outbox.queryReceipt("coalesce");
+    await Promise.resolve(); await Promise.resolve();
+    finish({ found: true, state: "completed" }); await Promise.all([a, b]); expect(count).toBe(1);
+    await expect(outbox.execute("access.refresh", {})).rejects.toMatchObject({ code: "EPHEMERAL_ACCESS_OPERATION" });
+    expect((await store.listCommands("host-a"))).toHaveLength(1);
   });
 });

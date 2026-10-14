@@ -1,5 +1,7 @@
-import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { createInterface, type Interface } from "node:readline";
+import type { ChildProcessWithoutNullStreams } from "node:child_process";
+import { randomUUID } from "node:crypto";
+import { ManagedProcessRegistry, type ProcessStopResult } from "../lifecycle/managed-process-registry.js";
+import { JsonlDecoder } from "./jsonl-decoder.js";
 
 export type JsonRpcId = string | number;
 export type JsonObject = Record<string, unknown>;
@@ -26,6 +28,7 @@ export interface AppServerClient {
   respond(id: JsonRpcId, result: JsonObject): boolean;
   respondError(id: JsonRpcId, code: number, message: string): boolean;
   close(): void;
+  closeAndWait?(deadlineMs?: number): Promise<ProcessStopResult>;
 }
 
 export type AppServerClientFactory = (handlers: AppServerClientHandlers) => AppServerClient;
@@ -47,11 +50,14 @@ const MAX_RPC_LINE_BYTES = 2 * 1024 * 1024;
  */
 export class StdioAppServerClient implements AppServerClient {
   private process: ChildProcessWithoutNullStreams | undefined;
-  private lines: Interface | undefined;
+  private decoder: JsonlDecoder | undefined;
+  private readonly processes: ManagedProcessRegistry;
   private startPromise: Promise<void> | undefined;
+  private closePromise: Promise<ProcessStopResult> | undefined;
   private nextId = 1;
   private readonly pending = new Map<string, PendingRequest>();
   private closed = false;
+  private closing = false;
 
   constructor(
     private readonly options: {
@@ -60,11 +66,20 @@ export class StdioAppServerClient implements AppServerClient {
       env: NodeJS.ProcessEnv;
       args?: readonly string[];
       handlers: AppServerClientHandlers;
+      processes?: ManagedProcessRegistry;
     },
-  ) {}
+  ) {
+    // Direct adapter contract tests can use an isolated registry. Production
+    // supplies the Host-owned durable journal before constructing this peer.
+    this.processes = options.processes ?? new ManagedProcessRegistry({
+      journal: { save() {} },
+      context: () => ({ hostOwnerId: "standalone", hostOwnerGeneration: 0,
+        runtimeId: "standalone", runtimeGeneration: 0, attemptId: randomUUID() }),
+    });
+  }
 
   start(): Promise<void> {
-    if (this.closed) return Promise.reject(new Error("CODEX_APP_SERVER_CLOSED"));
+    if (this.closed || this.closing) return Promise.reject(new Error("CODEX_APP_SERVER_CLOSED"));
     if (!this.startPromise) this.startPromise = this.startInternal();
     return this.startPromise;
   }
@@ -87,24 +102,34 @@ export class StdioAppServerClient implements AppServerClient {
   }
 
   close(): void {
-    if (this.closed) return;
-    this.closed = true;
+    void this.closeAndWait().catch(() => {});
+  }
+
+  closeAndWait(deadlineMs = 5_000): Promise<ProcessStopResult> {
+    this.closing = true;
     this.rejectPending(new Error("CODEX_APP_SERVER_CLOSED"));
-    this.lines?.close();
-    this.process?.kill("SIGTERM");
-    this.process = undefined;
+    this.closePromise ??= this.processes.closeAndWait(deadlineMs).then((result) => {
+      this.closed = true;
+      if (result.stopped) this.process = undefined;
+      return result;
+    });
+    return this.closePromise;
   }
 
   private async startInternal(): Promise<void> {
-    const child = spawn(this.options.executable, this.options.args ?? ["app-server", "--listen", "stdio://"], {
+    const child = this.processes.spawn(this.options.executable, this.options.args ?? ["app-server", "--listen", "stdio://"], {
       cwd: this.options.cwd,
       env: this.options.env,
       stdio: ["pipe", "pipe", "pipe"],
       windowsHide: true,
-    });
+    }) as ChildProcessWithoutNullStreams;
     this.process = child;
-    this.lines = createInterface({ input: child.stdout, crlfDelay: Infinity });
-    this.lines.on("line", (line) => this.handleLine(line));
+    this.decoder = new JsonlDecoder(MAX_RPC_LINE_BYTES, (line) => this.handleLine(line), (error) => {
+      this.handleExit(error);
+      void this.closeAndWait().catch(() => {});
+    });
+    child.stdout.on("data", (chunk: Buffer) => this.decoder?.write(chunk));
+    child.stdout.once("end", () => this.decoder?.end());
     child.stderr.setEncoding("utf8");
     // Always drain stderr so a noisy runtime cannot block. Provider logs may
     // contain local paths, URLs or account metadata, so they are deliberately
@@ -123,7 +148,7 @@ export class StdioAppServerClient implements AppServerClient {
   }
 
   private sendRequest<T>(method: string, params: JsonObject, timeoutMs: number): Promise<T> {
-    if (this.closed || !this.process) return Promise.reject(new Error("CODEX_APP_SERVER_UNAVAILABLE"));
+    if (this.closed || this.closing || !this.process) return Promise.reject(new Error("CODEX_APP_SERVER_UNAVAILABLE"));
     const id = this.nextId++;
     return new Promise<T>((resolve, reject) => {
       const timer = setTimeout(() => {
@@ -145,11 +170,13 @@ export class StdioAppServerClient implements AppServerClient {
   }
 
   private write(message: JsonObject): boolean {
-    if (this.closed || !this.process?.stdin.writable) return false;
+    if (this.closed || this.closing || !this.process?.stdin.writable) return false;
     try {
       // A false return only signals stream backpressure; the frame was still
       // accepted into Node's write buffer and must not be treated as failure.
-      this.process.stdin.write(`${JSON.stringify(message)}\n`);
+      const frame = `${JSON.stringify(message)}\n`;
+      if (Buffer.byteLength(frame, "utf8") > MAX_RPC_LINE_BYTES) return false;
+      this.process.stdin.write(frame);
       return true;
     } catch {
       return false;
@@ -157,17 +184,13 @@ export class StdioAppServerClient implements AppServerClient {
   }
 
   private handleLine(line: string): void {
-    if (Buffer.byteLength(line, "utf8") > MAX_RPC_LINE_BYTES) {
-      this.handleExit(new Error("Codex app-server emitted an oversized JSONL frame"));
-      this.process?.kill("SIGTERM");
-      return;
-    }
+    if (this.closed) return;
     let message: unknown;
     try {
       message = JSON.parse(line);
     } catch {
       this.handleExit(new Error("Codex app-server emitted invalid JSONL"));
-      this.process?.kill("SIGTERM");
+      void this.closeAndWait().catch(() => {});
       return;
     }
     if (!isRecord(message)) return;

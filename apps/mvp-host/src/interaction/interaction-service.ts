@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { InteractionRespondApprovalRequestSchema, QuestionRespondRequestSchema, InteractionSchema, QuestionRequestSchema, validateQuestionAnswers, encodedBytes, type Interaction, type InteractionResponse, type InteractionRespondApprovalRequest, type QuestionRespondRequest, } from "@flyx/mvp-protocol";
 import { CommandEngine, hashCommandRequest } from "../orchestration/command-engine.js";
-import type { CommandPlan, ExecutionIntentRow, PlannedEvent } from "../orchestration/command-contract.js";
+import type { CommandPlan, CommandRequest, ExecutionIntentRow, PlannedEvent } from "../orchestration/command-contract.js";
 import type { ApprovalRow, EventCommitOptions, SqliteStore } from "../storage/db.js";
 import { ExecutionStore } from "../storage/execution-store.js";
 import { InteractionStore, methodMatches } from "./interaction-store.js";
@@ -148,19 +148,22 @@ export class InteractionService {
     return this.respond(authSubjectId, commandId, input, "question.respond");
   }
   /** Old omitted-version requests may read current pending state only before any reservation. */
-  respondLegacyApproval(authSubjectId: string, commandId: string, approvalId: string, action: "allow_once" | "deny"): InteractionResponse {
+  respondLegacyApproval(authSubjectId: string, commandId: string, approvalId: string, action: "allow_once" | "deny", targetRequest?: CommandRequest): InteractionResponse {
     const row = this.interactions.get(approvalId);
     if (!row || row.kind !== "approval")
       throw new Error("APPROVAL_NOT_FOUND");
-    return this.respond(authSubjectId, commandId, { sessionId: row.sessionId, interactionId: row.interactionId, expectedVersion: row.version, action }, "approval.respond");
+    return this.respond(authSubjectId, commandId, { sessionId: row.sessionId, interactionId: row.interactionId, expectedVersion: row.version, action }, "approval.respond", targetRequest);
   }
-  private respond(authSubjectId: string, commandId: string, input: InteractionRespondApprovalRequest | QuestionRespondRequest, method: string): InteractionResponse {
+  private respond(authSubjectId: string, commandId: string, input: InteractionRespondApprovalRequest | QuestionRespondRequest, method: string, targetRequest?: CommandRequest): InteractionResponse {
     const route = this.options.resolveSession(input.sessionId);
     this.requireActor(authSubjectId, this.now());
     const payload = method === "approval.respond" && "action" in input ? { approvalId: input.interactionId, action: input.action } : input;
-    const requestFormatVersion = method === "approval.respond" ? 1 : 2;
-    const requestHash = requestFormatVersion === 2 && this.options.hashRequest ? this.options.hashRequest(method, payload, input.sessionId) : hashCommandRequest(method, payload, requestFormatVersion === 2
-      ? { requestFormatVersion: 2, targetSessionId: input.sessionId, ...(route.workspaceId ? { workspaceId: route.workspaceId } : {}) } : undefined);
+    if (targetRequest && (targetRequest.authSubjectId !== authSubjectId || targetRequest.commandId !== commandId || targetRequest.method !== method
+      || targetRequest.targetSessionId !== input.sessionId || !targetRequest.requestHash || ![1, 2].includes(targetRequest.requestFormatVersion ?? 1)))
+      throw new Error("COMMAND_SCOPE_MISMATCH");
+    const requestFormatVersion = targetRequest?.requestFormatVersion ?? (method === "approval.respond" ? 1 : 2);
+    const requestHash = targetRequest?.requestHash ?? (requestFormatVersion === 2 && this.options.hashRequest ? this.options.hashRequest(method, payload, input.sessionId) : hashCommandRequest(method, payload, requestFormatVersion === 2
+      ? { requestFormatVersion: 2, targetSessionId: input.sessionId, ...(route.workspaceId ? { workspaceId: route.workspaceId } : {}) } : undefined));
     const initial = this.interactions.get(input.interactionId);
     const committed = this.engine.commitRequest({ authSubjectId, commandId, method, requestHash, requestFormatVersion, targetSessionId: input.sessionId }, (facts, clock) => {
       this.requireActor(authSubjectId, clock.now());
@@ -384,6 +387,8 @@ export class InteractionService {
       throw new Error("INTERACTION_SUPERSEDED");
     if (turn.status === "outcome_unknown")
       throw new Error("RECOVERY_BLOCKED");
+    if (["completed", "failed", "cancelled"].includes(turn.status))
+      throw new Error("INTERACTION_SUPERSEDED");
   }
   private assertSameFence(row: InteractionRow, binding: InteractionFence): void {
     if (!row.dispatchContext || (["hostOwnerId", "hostOwnerGeneration", "sessionId", "flyxTurnId", "runtimeId", "runtimeGeneration", "attemptId"] as const).some((key) => row.dispatchContext![key] !== binding.dispatchContext[key]) || row.sessionId !== binding.sessionId || row.turnId !== binding.turnId || row.attemptId !== binding.attemptId || row.runtimeGeneration !== binding.runtimeGeneration || row.runtimeId !== binding.runtimeId)

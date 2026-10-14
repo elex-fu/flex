@@ -1,4 +1,8 @@
 import { z } from "zod";
+/** Typed directory and approval responses; only offered by an activated Host interaction service. */
+export const INTERACTION_CAPABILITY = "typed-interactions-v1";
+/** Additional native structured question response contract; fixtures never enable advertisement. */
+export const STRUCTURED_QUESTION_CAPABILITY = "structured-question-v1";
 export const INTERACTION_MAX_REQUEST_BYTES = 32 * 1024;
 export const INTERACTION_MAX_ANSWER_BYTES = 16 * 1024;
 export const INTERACTION_MAX_QUESTIONS = 4;

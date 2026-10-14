@@ -27,6 +27,7 @@ import { ProviderIngestion } from "../orchestration/provider-ingestion.js";
 import { createHostRecovery, type HostRecovery, type HostRecoveryOptions } from "./host-recovery.js";
 import { RuntimeRegistry } from "../provider/runtime-registry.js";
 import type { CommandRequest, ExecutionIntentRow } from "../orchestration/command-contract.js";
+import type { HostInteractionHooks, InteractionRpcPort } from "../interaction/host-interactions.js";
 import type { ProviderControlOutcome, ProviderOutcome } from "../provider/types.js";
 import { ExecutionStore } from "../storage/execution-store.js";
 import {
@@ -88,6 +89,7 @@ export type OrchestratorOptions = {
   hostViews?: HostViews;
   resolveViewResource?: ViewResourceResolver;
   readViewInteractions?: ViewInteractionReader;
+  interactionEvents?: HostInteractionHooks;
   assertViewSessionAccess?: HostViewsOptions["assertSessionAccess"];
   providerOptions?: { executable?: string; model?: string; environment?: Readonly<Record<string, string>> };
   nativeStateRoots?: readonly string[];
@@ -128,6 +130,7 @@ export class SessionOrchestrator {
   readonly ingestion: ProviderIngestion;
   readonly recovery: HostRecovery;
   private readonly listeners = new Set<SessionEventListener>();
+  private readonly interactionEvents: HostInteractionHooks | undefined;
   private commandTail: Promise<unknown> = Promise.resolve();
   private eventTail: Promise<void> = Promise.resolve();
   private readonly hostOwnerId: string;
@@ -144,6 +147,7 @@ export class SessionOrchestrator {
   private readonly session: SessionRow;
 
   constructor(options: OrchestratorOptions) {
+    this.interactionEvents = options.interactionEvents;
     this.canReleaseWorkspace = options.canReleaseWorkspace ?? ((context) => this.nativeRuntime?.canReleaseWorkspace(context) ?? false);
     this.ownsStore = options.ownsStore ?? true;
     this.recoverOnStart = options.recoverOnStart ?? true;
@@ -225,7 +229,7 @@ export class SessionOrchestrator {
           if (device?.revokedAt || (device?.expiresAt && device.expiresAt <= new Date().toISOString())) {
             throw new OrchestratorError("DEVICE_REVOKED", "Device is no longer authorized");
           }
-          const scope = request.method === "approval.respond" ? "approval:write" : "session:write";
+          const scope = ["approval.respond", "interaction.respondApproval", "question.respond"].includes(request.method) ? "approval:write" : "session:write";
           if (device && !device.scopes.includes(scope)) throw new OrchestratorError("SCOPE_REQUIRED", "Device cannot perform this command");
         },
       });
@@ -337,6 +341,7 @@ export class SessionOrchestrator {
   }
 
   get workspaceLease(): WorkspaceLease | undefined { return this.activeWorkspaceLease; }
+  get interactionRpcPort(): InteractionRpcPort | undefined { return this.interactionEvents?.rpcPort(); }
 
   /** Created only at acceptance; old pending intents never receive a new fence. */
   operationContext(resourceId: string, attemptId: string, runtimeGeneration: number): DispatchContext {
@@ -401,6 +406,13 @@ export class SessionOrchestrator {
   subscribe(listener: SessionEventListener): () => void {
     this.listeners.add(listener);
     return () => this.listeners.delete(listener);
+  }
+
+  /** Internal publication of facts already committed by shared feature services. */
+  publishCommittedEvent(event: SessionEvent): void {
+    this.owner.assertActive();
+    if (event.sessionId !== this.session.id) throw new OrchestratorError("RESOURCE_SCOPE_MISMATCH", "Committed event belongs to another Session");
+    this.notify(event);
   }
 
   bootstrap(): Bootstrap {
@@ -530,6 +542,10 @@ export class SessionOrchestrator {
   respondApproval(authSubjectId: string, commandId: string, approvalId: string, action: "allow_once" | "deny", targetRequest?: CommandRequest): Promise<ControlResponse> {
     return this.enqueueCommand(async () => {
       const request = this.commandRequest(authSubjectId, commandId, "approval.respond", { approvalId, action }, targetRequest);
+      if (this.interactionEvents) {
+        try { return this.interactionEvents.respondLegacyApproval(authSubjectId, commandId, approvalId, action, request); }
+        catch (error) { if (!(error instanceof Error) || error.message !== "INTERACTIONS_UNAVAILABLE") throw error; }
+      }
       return this.commandEngine.commitRequest(request, (facts, clock) => {
         this.assertWritable(); this.recovery.assertAdmission(); this.worker.assertAdmission("control");
         return decideApprovalReservation(facts, request, { approvalId, action }, clock);
@@ -729,8 +745,9 @@ export class SessionOrchestrator {
     const current = this.store.getActiveTurn(this.session.id);
     if (!target || target.sessionId !== context.sessionId || target.generation !== context.runtimeGeneration
       || current?.id !== target.id || ["completed", "failed", "cancelled", "outcome_unknown"].includes(target.status)) return;
-    if (event.kind === "approval_requested" && event.request.turnId !== target.id) return;
+    if ((event.kind === "approval_requested" || event.kind === "question_requested") && event.request.turnId !== target.id) return;
     if (event.kind === "approval_resolved" && this.store.getApproval(event.approvalId)?.turnId !== target.id) return;
+    if (this.interactionEvents?.handle(event)) return;
     const resolvedTurnId = target.id;
     // Native Item IDs can be reused by a resumed runtime. Keep separate
     // projections per Flyx Turn while preserving the source ID for recovery.
@@ -877,19 +894,23 @@ export class SessionOrchestrator {
     const context = options.turnId ? this.dispatchContexts.get(options.turnId)
       ?? this.recovery.recovery.target(this.session.id, options.turnId).context : undefined;
     let blocked = false;
-    let marker: SessionEvent | undefined;
+    const published: SessionEvent[] = [];
     const event = this.store.db.transaction(() => {
       if (context && options.turnStatus && ["completed", "failed", "cancelled"].includes(options.turnStatus)) blocked = this.recovery.protectTerminal(context);
-      const terminal = this.store.commitEvent(this.session.id, type, payload, blocked ? { ...options, activityState: "outcome_unknown" } : options);
+      const terminal = options.turnId && options.turnStatus && ["completed", "failed", "cancelled", "outcome_unknown"].includes(options.turnStatus);
+      const committed = this.store.commitCommand({ sessionId: this.session.id, build: () => ({ result: undefined,
+        events: [ ...(terminal ? this.interactionEvents?.companionEvents(this.session.id, options.turnId!, type) ?? [] : []),
+          { type, payload, options: blocked ? { ...options, activityState: "outcome_unknown" } : options } ],
+      }) })!;
+      published.push(...committed.events);
       if (context && (blocked || options.turnStatus === "outcome_unknown")) {
         const session = this.store.getSession(this.session.id)!;
-        marker = this.store.commitEvent(this.session.id, "session.recovery.blocked", { turnId: context.flyxTurnId,
-          attemptId: context.attemptId, recoveryRevision: session.recoveryRevision, reason: blocked ? "producer_stop_unverified" : "turn_outcome_unknown" });
+        published.push(this.store.commitEvent(this.session.id, "session.recovery.blocked", { turnId: context.flyxTurnId,
+          attemptId: context.attemptId, recoveryRevision: session.recoveryRevision, reason: blocked ? "producer_stop_unverified" : "turn_outcome_unknown" }));
       }
-      return terminal;
+      return committed.events.at(-1)!;
     })();
-    this.notify(event);
-    if (marker) this.notify(marker);
+    for (const committed of published) this.notify(committed);
     if (context && blocked) this.recovery.retained(context);
     return event;
   }

@@ -1,6 +1,8 @@
 import { z } from "zod";
 import { BOUNDED_CONTENT_CAPABILITY, RecoveryCapability, RecoveryInspectPayloadSchema, RecoveryReconcilePayloadSchema, RecoveryAcknowledgePayloadSchema, ContentChunkRequestSchema, TIMELINE_PROJECTION_CAPABILITY, OpenViewRequestSchema, TimelinePageRequestSchema, TimelineSubscribeRequestSchema, TimelineUnsubscribeRequestSchema, type OpenViewRequest, type TimelinePageRequest, type TimelineSubscribeRequest } from "@flyx/mvp-protocol";
 import type { HostRecovery } from "../session/host-recovery.js";
+import { parseInteractionRpcPayload, type InteractionRpcPort, type InteractionMethod } from "../interaction/host-interactions.js";
+import { InteractionRpcError } from "../interaction/interaction-rpc.js";
 import type { ContentStore } from "../content/content-store.js";
 import type { TimelineLeaseOwner } from "../timeline/contracts.js";
 import type { FrameBudget } from "../content/frame-budget.js";
@@ -24,6 +26,7 @@ export interface RpcContext {
   frameBudget?: FrameBudget;
   responseEnvelope?(payload: unknown): unknown;
   assertContentScope?(scope: string): void;
+  assertSessionScope?(sessionId: string, scope: "session:read" | "session:write" | "approval:write"): void;
   viewOwner?(): TimelineLeaseOwner;
   openView?(request: OpenViewRequest): unknown;
   timelinePage?(request: TimelinePageRequest): unknown;
@@ -34,9 +37,15 @@ export interface RpcContext {
   access(method: string, payload: unknown): Promise<unknown>;
 }
 
+export interface CatalogRpcPort {
+  dispatchCatalog(frame: RpcRequest, context: RpcContext): Promise<{ handled: false } | { handled: true; payload: unknown }>;
+  interactionsForSession?(sessionId: string): InteractionRpcPort | undefined;
+}
 export interface RpcDispatcherOptions {
   contentStore?: ContentStore;
   recovery?: HostRecovery;
+  catalogPort?: CatalogRpcPort;
+  interactions?: InteractionRpcPort | ((sessionId: string) => InteractionRpcPort | undefined);
   orchestrator: SessionOrchestrator;
   bootstrap(): unknown;
   descriptor(): unknown;
@@ -53,6 +62,10 @@ export class RpcDispatcher {
 
   async dispatch(frame: RpcRequest, context: RpcContext): Promise<unknown> {
     context.assertAuthorized(frame.method);
+    if (this.options.catalogPort) {
+      const result = await this.options.catalogPort.dispatchCatalog(frame, context);
+      if (result.handled) return result.payload;
+    }
     const { orchestrator } = this.options;
     const workspace = orchestrator.workspace;
     const checkSession = (id?: string) => {
@@ -65,7 +78,25 @@ export class RpcDispatcher {
     const requireViews = () => {
       if (!context.capabilities?.has(TIMELINE_PROJECTION_CAPABILITY) || !context.capabilities.has(BOUNDED_CONTENT_CAPABILITY) || !orchestrator.views?.ready(orchestrator.sessionId)) throw new OrchestratorError("CAPABILITY_REQUIRED", "Canonical Timeline capability is required");
     };
+    const dispatchInteraction = (method: InteractionMethod): unknown => {
+      try {
+        const payload = parseInteractionRpcPayload(method, frame.payload);
+        const scope = method === "interaction.get" || method === "interaction.list" ? "session:read" : "approval:write";
+        if (context.assertSessionScope) context.assertSessionScope(payload.sessionId, scope);
+        else if (this.options.catalogPort || payload.sessionId !== orchestrator.sessionId) throw new OrchestratorError("SESSION_SCOPE_REQUIRED", "Session authorization is unavailable");
+        const port = typeof this.options.interactions === "function" ? this.options.interactions(payload.sessionId) : this.options.interactions ?? this.options.catalogPort?.interactionsForSession?.(payload.sessionId) ?? orchestrator.interactionRpcPort;
+        if (!port) throw new OrchestratorError("INTERACTIONS_UNAVAILABLE", "Typed interactions are unavailable");
+        const targetWorkspace = orchestrator.store.getSession(payload.sessionId)?.workspacePath ?? workspace;
+        return publicValue(port.rpc(method, payload, { authSubjectId: context.subjectId,
+          ...(["interaction.respondApproval", "question.respond"].includes(method) ? { commandId: commandId() } : {}) }), targetWorkspace);
+      }
+      catch (error) { if (error instanceof InteractionRpcError) throw new OrchestratorError(error.code, error.message, error.retryable); throw error; }
+    };
     switch (frame.method) {
+      case "interaction.get":
+      case "interaction.list":
+      case "interaction.respondApproval":
+      case "question.respond": return dispatchInteraction(frame.method);
       case "session.openView": requireViews(); if (!context.openView) throw new OrchestratorError("CAPABILITY_REQUIRED", "Host views are unavailable"); return context.openView(OpenViewRequestSchema.parse(frame.payload));
       case "timeline.getPage": requireViews(); if (!context.timelinePage) throw new OrchestratorError("CAPABILITY_REQUIRED", "Host views are unavailable"); return context.timelinePage(TimelinePageRequestSchema.parse(frame.payload));
       case "timeline.subscribe": requireViews(); if (!context.timelineSubscribe) throw new OrchestratorError("CAPABILITY_REQUIRED", "Host views are unavailable"); return context.timelineSubscribe(TimelineSubscribeRequestSchema.parse(frame.payload));
@@ -135,7 +166,7 @@ export class RpcDispatcher {
       case "command.getReceipt": {
         const payload = z.object({ commandId: z.string().min(1).max(128) }).parse(frame.payload);
         const receipt = orchestrator.store.getCommandReceipt(context.subjectId, payload.commandId);
-        if (!receipt) return { found: false, commandId: payload.commandId };
+        if (!receipt || receipt.method.startsWith("access.")) return { found: false, commandId: payload.commandId };
         return { found: true, commandId: receipt.commandId, method: receipt.method, state: receipt.state, response: publicValue(receipt.response, workspace), updatedAt: receipt.updatedAt };
       }
       case "session.startTurn": {

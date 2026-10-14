@@ -1,4 +1,4 @@
-import { execFile } from "node:child_process";
+import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
 import { mkdtemp, readFile, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -10,7 +10,15 @@ import { CheckpointError } from "./types.js";
 import type { CheckpointManifest } from "./types.js";
 import type { FileState, RestoreCapabilities, RestoreInspection, RevertStep } from "./revert-types.js";
 
+export type ControlledHelperSpawnRequest = {
+  command: string; args: readonly string[]; env: NodeJS.ProcessEnv;
+  purpose: "probe" | "read" | "mutate"; operationId?: string; stepId?: string;
+  /** Trusted registered root for boundary selection; never accepted from RPC. */
+  workspace?: string;
+};
 export type ControlledRestoreOptions = {
+  /** Production injects prelaunch process journaling and the verified execution boundary. */
+  spawnHelper?: (request: ControlledHelperSpawnRequest) => ChildProcess | Promise<ChildProcess>;
   /** Trusted Host configuration only. This is never a client-selected executable. */
   pythonExecutable?: string;
   onSpawn?: (process: {pid:number;operationId:string;stepId:string;kind:"controlled_restore"}) => void | Promise<void>;
@@ -86,20 +94,37 @@ export class ControlledRestore {
   }
   private helper<T>(request: unknown, producer?: {operationId:string;stepId:string}): Promise<T> {
     if(this.sealed)return Promise.reject(new CheckpointError("CONTROLLED_RESTORE_SEALED","Controlled restore is sealed"));
-    const env=Object.fromEntries(Object.entries(process.env).filter(([key])=>!key.startsWith("PYTHON")));
-    return new Promise((resolve,reject)=>{
-      const child=execFile(this.options.pythonExecutable ?? "/usr/bin/python3",["-I","-c",CONTROLLED_RESTORE_HELPER],{env,encoding:"utf8",timeout:30_000,maxBuffer:16*1024*1024},(error,out)=>{
-        if (producer && child.pid)try{this.options.onExit?.({pid:child.pid,...producer});}catch{ /* Original dispatch marker remains if process journal is sealed. */ }
-        if (error) {reject(new CheckpointError("CONTROLLED_RESTORE_UNAVAILABLE","Controlled restore helper did not complete"));return;}
-        try {
-          const result=JSON.parse(out) as {ok:boolean;result:T;code?:string};
-          if (!result.ok) throw new CheckpointError(result.code ?? "RESTORE_HELPER_FAILED","Controlled restore action failed");
-          resolve(result.result);
-        } catch(error) {reject(error instanceof CheckpointError ? error:new CheckpointError("RESTORE_HELPER_FAILED","Controlled restore helper returned invalid data"));}
-      });
-      child.stdin?.on("error",()=>{});
-      void Promise.resolve(producer && child.pid ? this.options.onSpawn?.({pid:child.pid,...producer,kind:"controlled_restore"}):undefined)
-        .then(()=>{if(this.sealed){child.kill("SIGKILL");child.stdin?.destroy();}else child.stdin?.end(JSON.stringify(request));},()=>{child.kill("SIGKILL");child.stdin?.destroy();});
+    const env=Object.fromEntries(Object.entries(process.env).filter(([key])=>!key.startsWith("PYTHON")&&!/^(?:DYLD_|LD_|GCONV_PATH$|GLIBC_TUNABLES$|LOCPATH$)/.test(key)));
+    const operation=(request as {op?:string}).op;
+    const workspace=(request as {workspacePath?:string;capabilities?:RestoreCapabilities}).workspacePath ?? (request as {capabilities?:RestoreCapabilities}).capabilities?.workspace.path;
+    const launch:ControlledHelperSpawnRequest={command:this.options.pythonExecutable ?? "/usr/bin/python3",args:["-I","-c",CONTROLLED_RESTORE_HELPER],env,
+      purpose:producer?"mutate":operation==="probe"?"probe":"read",...(producer??{}),...(workspace?{workspace}:{})};
+    return new Promise<T>((resolve,reject)=>{
+      let settled=false,child:ChildProcess|undefined,timer:ReturnType<typeof setTimeout>|undefined;
+      const fail=(code:string)=>{if(settled)return;settled=true;if(timer)clearTimeout(timer);try{child?.kill("SIGKILL");child?.stdin?.destroy();}catch{/* Root process journal still controls unknown producers. */}reject(new CheckpointError(code,"Controlled restore helper did not complete"));};
+      // The trusted runner commits launch facts before crossing spawn; no mutation input is sent until it returns.
+      void Promise.resolve().then(()=>{if(this.sealed)throw new CheckpointError("CONTROLLED_RESTORE_SEALED","Controlled restore is sealed");return this.options.spawnHelper?this.options.spawnHelper(launch):spawn(launch.command,[...launch.args],{env:launch.env,stdio:["pipe","pipe","pipe"]});}).then((launched)=>{
+        child=launched;const chunks:Buffer[]=[];let bytes=0;
+        if(!child.stdin||!child.stdout){child.kill("SIGKILL");fail("CONTROLLED_RESTORE_UNAVAILABLE");return;}
+        child.stderr?.resume();child.stdin.on("error",()=>{});
+        child.stdout.on("data",(data:Buffer)=>{bytes+=data.length;if(bytes>16*1024*1024){child?.kill("SIGKILL");fail("RESTORE_BUDGET_EXCEEDED");return;}chunks.push(data);});
+        child.once("error",()=>fail("CONTROLLED_RESTORE_UNAVAILABLE"));
+        child.once("close",(code)=>{
+          if(timer)clearTimeout(timer);
+          if(producer&&child?.pid)try{this.options.onExit?.({pid:child.pid,...producer});}catch{/* Sealed original process journals remain unknown. */}
+          if(settled)return;
+          if(code!==0){fail("CONTROLLED_RESTORE_UNAVAILABLE");return;}
+          try{
+            const result=JSON.parse(Buffer.concat(chunks).toString("utf8")) as {ok:boolean;result:T;code?:string};
+            if(!result.ok){fail(result.code??"RESTORE_HELPER_FAILED");return;}
+            settled=true;resolve(result.result);
+          }catch{fail("RESTORE_HELPER_FAILED");}
+        });
+        timer=setTimeout(()=>{child?.kill("SIGKILL");fail("CONTROLLED_RESTORE_UNAVAILABLE");},30_000);
+        void Promise.resolve(producer&&child.pid?this.options.onSpawn?.({pid:child.pid,...producer,kind:"controlled_restore"}):undefined).then(()=>{
+          if(this.sealed){child?.kill("SIGKILL");child?.stdin?.destroy();}else child?.stdin?.end(JSON.stringify(request));
+        },()=>{child?.kill("SIGKILL");child?.stdin?.destroy();});
+      },()=>fail("CONTROLLED_RESTORE_UNAVAILABLE")).catch(()=>fail("CONTROLLED_RESTORE_UNAVAILABLE"));
     });
   }
 }

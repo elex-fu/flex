@@ -23,3 +23,4 @@ export * from "./attention-client.js";
 
 export * from "./recovery-client.js";
 export * from "./session-client.js";
+export * from "./checkpoint-client.js";

@@ -1,0 +1,230 @@
+import { execFileSync } from "node:child_process";
+import { mkdtempSync, mkdirSync, realpathSync, rmSync } from "node:fs";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { RecoveryCapability, type SessionEvent } from "@flyx/mvp-protocol";
+import { createHostCatalogBindings } from "../catalog/host-catalog.js";
+import { createTestHostOwner } from "../lifecycle/host-owner.js";
+import type { ProcessIdentity, ProcessInspector } from "../lifecycle/process-inspector.js";
+import type { ProviderAdapter, DispatchContext } from "../provider/types.js";
+import type { AppServerClient } from "../codex/app-server-client.js";
+import { RecoveryStore } from "../storage/recovery-store.js";
+import { openOwned } from "../storage/open-store.js";
+import { inspectSchema } from "../storage/migrations/schema-version.js";
+import { SessionOrchestrator } from "./orchestrator.js";
+import type { SessionRuntimeContext } from "./session-registry.js";
+import { createCatalogRecoveryBindings, catalogRecoveryConfigurationFingerprint } from "./catalog-recovery.js";
+import type { CatalogRecoveryBindings, CatalogRecoveryOptions, CatalogRecoveryIdentity, CachedCatalogRecoveryManifest, ExistingCatalogRecoveryReader } from "./catalog-recovery.js";
+
+const cleanups: Array<() => void | Promise<void>> = [];
+afterEach(async () => { for (const close of cleanups.splice(0).reverse()) await close(); });
+const identity: ProcessIdentity = { pid: 123, platform: "linux", birth: { kind: "linux", bootId: "12345678-1234-1234-1234-123456789abc", startTicks: "42" } };
+const inspector: ProcessInspector = { currentIdentity: () => identity, inspect: () => ({ state: "exited", reason: "original birth exited" }) };
+function manifest(target: CatalogRecoveryIdentity): CachedCatalogRecoveryManifest {
+  return { source: "real-provider", state: "verified", evidenceId: "cached-acceptance-contract", provider: target.provider,
+    providerInstanceId: target.providerInstanceId, configurationFingerprint: target.configurationFingerprint, verifiedVersions: ["verified-v1"] };
+}
+function existingReader(target: CatalogRecoveryIdentity, client: Pick<AppServerClient, "request">): ExistingCatalogRecoveryReader {
+  return { source: "existing-connection", sessionId: target.sessionId, providerInstanceId: target.providerInstanceId,
+    configurationFingerprint: target.configurationFingerprint, runtimeVersion: "verified-v1", client };
+}
+async function fixture(extra: Omit<CatalogRecoveryOptions, "catalog"> = {}, live = false) {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "flyx-catalog-recovery-")));
+  const checkout = join(root, "checkout"); const workspace = join(checkout, "app");
+  mkdirSync(workspace, { recursive: true }); execFileSync("git", ["init", "--quiet", checkout]);
+  const owner = createTestHostOwner(); const store = openOwned({ databasePath: ":memory:", owner });
+  cleanups.push(() => { if (store.db.open) store.close(); owner.release(); rmSync(root, { recursive: true, force: true }); });
+  store.setHostIdentityMirror({ hostId: "host", fingerprint: "a".repeat(64) });
+  for (const [id, scopes, hostId] of [["writer", ["session:read", "session:write"], "host"], ["reader", ["session:read"], "host"], ["foreign", ["session:write"], "foreign-host"]] as const)
+    store.createDevice({ id, hostId, scopes: [...scopes], platform: "test", credentialKind: "browser-session", credentialRevision: 1, createdAt: new Date().toISOString() });
+  const denied = new Set<string>(); let bindings!: CatalogRecoveryBindings;
+  const runTurn = vi.fn(async () => { throw new Error("No Provider dispatch in recovery"); });
+  const adapter: ProviderAdapter = { provider: "claude", workspace, status: async () => { throw new Error("No Provider version probe"); }, preflight: async () => { throw new Error("No paid preflight"); },
+    runTurn, interrupt: async () => "unavailable", respondApproval: () => false, closeAndWait: async () => ({ stopped: true, treeStopped: true, records: [] }) };
+  const runtimeFactory = vi.fn((context: SessionRuntimeContext) => {
+    if (!live) throw new Error("Recovery must never load a Provider");
+    return new SessionOrchestrator({ store: context.store, owner: context.owner, ownsStore: false, recoverOnStart: false,
+      sessionId: context.session.sessionId, runtimeId: context.runtimeId, workspace: context.workspace.canonicalRoot,
+      checkoutRoot: context.workspace.worktreeRoot, adapter, recovery: bindings.runtimeRecoveryOptions(context) });
+  });
+  const host = await createHostCatalogBindings({ store, owner,
+    configuration: { workspaces: [{ workspaceId: "workspace", root: workspace }], providerInstances: (["claude", "codex"] as const).map((provider) => ({ providerInstanceId: `instance-${provider}`, provider, executable: process.execPath })) },
+    initialLegacySession: { workspaceId: "workspace", providerInstanceId: "instance-claude" }, runtimeFactory,
+    assertSessionAccess: (actor, target) => { if (denied.has(`${actor}:${target.session.sessionId}`)) throw Object.assign(new Error("Session grant revoked"), { code: "FORBIDDEN" }); } });
+  bindings = createCatalogRecoveryBindings({ catalog: host, ...extra });
+  const codex = host.registry.createNew({ authSubjectId: "writer", commandId: "create-codex" }, { workspaceId: "workspace", providerInstanceId: "instance-codex", title: "Recovery target" }).summary.sessionId;
+  const unknown = (sessionId = codex, fingerprint?: string) => {
+    const start = `start:${sessionId}`; const turnId = `turn:${sessionId}`; const attemptId = `attempt:${sessionId}`;
+    store.acceptTurn({ authSubjectId: "writer", sessionId, turnId, commandId: start, requestHash: `hash:${sessionId}`, prompt: "original prompt", generation: 1, attemptId });
+    const context: DispatchContext = { hostOwnerId: owner.ownerId, hostOwnerGeneration: owner.generation, sessionId, flyxTurnId: turnId,
+      runtimeId: `runtime:${sessionId}`, runtimeGeneration: 1, attemptId };
+    const target = host.registry.resolve(sessionId);
+    new RecoveryStore(store).recordNativeBinding({ context, provider: target.session.provider, providerInstanceId: target.session.providerInstanceId,
+      nativeSessionId: `native-session:${sessionId}`, ...(target.session.provider === "codex" ? { nativeTurnId: `native-turn:${sessionId}` } : {}),
+      workspacePath: workspace, configurationFingerprint: fingerprint ?? catalogRecoveryConfigurationFingerprint(target), verifiedVersion: "verified-v1" });
+    store.commitEvent(sessionId, "turn.unknown", { turnId }, { turnId, turnStatus: "outcome_unknown", activityState: "outcome_unknown",
+      commandReceipt: { authSubjectId: "writer", commandId: start, state: "outcome_unknown", response: { turnId, status: "outcome_unknown" } } });
+    host.catalog.setResidency(sessionId, "blocked");
+    return { sessionId, turnId, attemptId, context, start };
+  };
+  const recordProcess = (context: DispatchContext) => {
+    store.db.prepare(`INSERT INTO managed_processes(id,owner_id,owner_generation,runtime_id,runtime_generation,attempt_id,session_id,turn_id,pid,process_group,tree_control,state,updated_at)
+      VALUES('original-process',?,?,?,?,?,?,?,123,123,'process_group','root_exited','now')`)
+      .run(context.hostOwnerId, context.hostOwnerGeneration, context.runtimeId, context.runtimeGeneration, context.attemptId, context.sessionId, context.flyxTurnId);
+    store.db.prepare("INSERT INTO managed_process_identities(process_id,identity_json) VALUES('original-process',?)").run(JSON.stringify(identity));
+    const boundary = { version: 1, boundaryId: "12345678-1234-1234-1234-123456789abc", platform: "linux", backend: "linux_bubblewrap", kernelRelease: "fixture", backendVersion: "fixture", backendDigest: "a".repeat(64), policyDigest: "b".repeat(64), evidenceDigest: "c".repeat(64), verifiedPrivateReadBoundary: true, verifiedPrivateWriteBoundary: true, verifiedChildInheritance: true, treeIsolation: "linux_pid_namespace", verifiedDescendantStop: true };
+    store.db.prepare("INSERT INTO managed_process_boundaries(process_id,proof_json,launch_digest) VALUES('original-process',?,?)").run(JSON.stringify(boundary), "d".repeat(64));
+  };
+  cleanups.push(async () => { await host.closeAndWait(100); });
+  return { root, checkout, workspace, owner, store, host, bindings, codex, denied, runtimeFactory, runTurn, unknown, recordProcess };
+}
+function terminalClient() {
+  const request = vi.fn(async (method: string, params: unknown) => { const id = (params as { threadId: string }).threadId;
+    expect(method).toBe("thread/read"); return { thread: { id, turns: [{ id: id.replace("native-session:", "native-turn:"), status: "completed" }] } }; });
+  return { request, client: { request: request as unknown as AppServerClient["request"] } };
+}
+
+describe("Catalogue recovery without Provider residency", () => {
+  it("reads SQL10 unloaded/blocked Sessions without probing, loading or promoting Catalog verification", async () => {
+    const reader = terminalClient(); const lookup = vi.fn((target: CatalogRecoveryIdentity) => existingReader(target, reader.client));
+    const f = await fixture({ existingCodexReader: lookup }); const original = f.unknown();
+    f.host.providers.recordVerification("instance-codex", { state: "verified", runtimeVersion: "verified-v1", capabilities: [] });
+    expect(inspectSchema(f.store.db).version).toBe(10); expect(f.bindings.recoveryCapabilities()).toEqual([RecoveryCapability]);
+    const intents = f.store.db.prepare("SELECT id,state FROM execution_intents ORDER BY id").all();
+    const recovery = f.bindings.recoveryForSession(f.codex)!;
+    expect(recovery).toBe(f.bindings.recoveryForSession(f.codex));
+    expect(await recovery.inspect(original)).toMatchObject({ nativeState: "unknown", processState: "unknown" });
+    expect(lookup).not.toHaveBeenCalled(); expect(reader.request).not.toHaveBeenCalled();
+    expect(f.runtimeFactory).not.toHaveBeenCalled(); expect(f.runTurn).not.toHaveBeenCalled();
+    expect(f.host.registry.loaded(f.codex)).toBeUndefined();
+    expect(f.store.db.prepare("SELECT id,state FROM execution_intents ORDER BY id").all()).toEqual(intents);
+    f.store.db.prepare("INSERT INTO schema_migrations(version,applied_at) VALUES(11,'future')").run();
+    expect(f.bindings.recoveryCapabilities()).toEqual([]); expect(f.bindings.recoveryForSession(f.codex)).toBeUndefined();
+  });
+
+  it("binds live capture and recovery fingerprints while excluding mutable observed verification and residency", async () => {
+    const f = await fixture({}, true);
+    const before = catalogRecoveryConfigurationFingerprint(f.host.registry.resolve(f.host.legacySessionId));
+    f.host.providers.recordVerification("instance-claude", { state: "verified", runtimeVersion: "version-probe", capabilities: [] });
+    const runtime = await f.host.registry.ensureLoaded(f.host.legacySessionId);
+    if (!(runtime instanceof SessionOrchestrator)) throw new Error("Expected the supplied live recovery runtime");
+    expect(catalogRecoveryConfigurationFingerprint(f.host.registry.resolve(f.host.legacySessionId))).toBe(before);
+    expect(f.bindings.recoveryForSession(f.host.legacySessionId)).toBe(runtime.recovery);
+    expect(f.runtimeFactory).toHaveBeenCalledTimes(1); expect(f.runTurn).not.toHaveBeenCalled();
+    const context: DispatchContext = { hostOwnerId: f.owner.ownerId, hostOwnerGeneration: f.owner.generation, sessionId: runtime.sessionId,
+      flyxTurnId: "capture", runtimeId: runtime.runtimeId, runtimeGeneration: 1, attemptId: "capture-attempt" };
+    const options = f.bindings.runtimeRecoveryOptions(f.runtimeFactory.mock.calls[0]![0]);
+    expect(options.resolveResource!({ sessionId: runtime.sessionId, turnId: "capture", context, provider: "claude" }))
+      .toMatchObject({ providerInstanceId: "instance-claude", workspacePath: f.workspace, configurationFingerprint: before, verifiedVersions: [] });
+    expect(options.checkoutRoot).toBe(f.checkout);
+  });
+
+  it("recovers only the original native Turn through an existing verified connection and publishes through shared Views", async () => {
+    const reader = terminalClient(); const companion = vi.fn(() => [{ type: "interaction.superseded", payload: { deliveryState: "unconfirmed" } }]);
+    const supersede = vi.fn();
+    const f = await fixture({ verifiedManifestForInstance: manifest, existingCodexReader: (target) => existingReader(target, reader.client), companionEvents: companion, supersedeInteractions: supersede });
+    const original = f.unknown(); const recovery = f.bindings.recoveryForSession(f.codex)!;
+    const observed: SessionEvent[] = []; f.host.registry.subscribe(f.codex, (event) => observed.push(event));
+    const evidence = await recovery.inspect(original);
+    expect(evidence).toMatchObject({ nativeState: "terminal", nativeOutcome: "completed", processState: "unknown" });
+    const result = await recovery.reconcile({ ...original, authSubjectId: "writer", commandId: "recover-native", evidenceId: evidence.evidenceId, expectedRecoveryRevision: evidence.recoveryRevision });
+    expect(result).toMatchObject({ turnStatus: "completed", gate: "blocked" });
+    expect(f.store.getCommandReceipt("writer", original.start)?.state).toBe("completed");
+    expect(f.store.getSession(f.codex)?.recoveryState).toBe("blocked");
+    expect(f.host.catalog.requireSession(f.codex).residency).toBe("blocked");
+    expect(reader.request).toHaveBeenCalledWith("thread/read", { threadId: `native-session:${f.codex}`, includeTurns: true }, 15000);
+    expect(companion).toHaveBeenCalledWith(f.codex, original.turnId, "recovery_reconciled");
+    expect(supersede).toHaveBeenCalledWith(f.codex, { attemptId: original.attemptId, runtimeGeneration: 1 }, "recovery_settled");
+    expect(observed.some((event) => event.type === "turn.recovery.reconciled")).toBe(true); expect(f.host.views?.ready(f.codex)).toBe(true);
+    expect(f.runtimeFactory).not.toHaveBeenCalled(); expect(f.runTurn).not.toHaveBeenCalled();
+  });
+
+  it.each(["fixture-manifest", "foreign-config", "malformed-manifest", "fresh-reader", "reader-version", "legacy-binding"])("keeps %s native evidence unknown", async (mismatch) => {
+    const reader = terminalClient();
+    const f = await fixture({ verifiedManifestForInstance: (target) => ({ ...manifest(target), ...(mismatch === "fixture-manifest" ? { source: "fixture" as never } : {}), ...(mismatch === "foreign-config" ? { configurationFingerprint: "other" } : {}), ...(mismatch === "malformed-manifest" ? { evidenceId: 1 as never } : {}) }),
+      existingCodexReader: (target) => ({ ...existingReader(target, reader.client), ...(mismatch === "fresh-reader" ? { source: "new-connection" as never } : {}), ...(mismatch === "reader-version" ? { runtimeVersion: "unverified-version-probe" } : {}) }) });
+    const original = f.unknown(f.codex, mismatch === "legacy-binding" ? "unknown" : undefined);
+    expect((await f.bindings.recoveryForSession(f.codex)!.inspect(original)).nativeState).toBe("unknown");
+    expect(reader.request).not.toHaveBeenCalled(); expect(f.runtimeFactory).not.toHaveBeenCalled();
+  });
+
+  it.each(["grant", "manifest"])("rechecks current %s evidence after async inspection before settling the original receipt", async (changed) => {
+    let allowed = true; let reads = 0; let release!: () => void;
+    const barrier = new Promise<void>((yes) => { release = yes; });
+    const request = vi.fn(async (_method: string, params: unknown) => { if (++reads === 2) await barrier; const id = (params as { threadId: string }).threadId;
+      return { thread: { id, turns: [{ id: id.replace("native-session:", "native-turn:"), status: "completed" }] } }; });
+    const f = await fixture({ verifiedManifestForInstance: (target) => allowed ? manifest(target) : undefined,
+      existingCodexReader: (target) => existingReader(target, { request: request as unknown as AppServerClient["request"] }) });
+    const original = f.unknown(); const recovery = f.bindings.recoveryForSession(f.codex)!;
+    const evidence = await recovery.inspect(original); const receipt = f.store.getCommandReceipt("writer", original.start);
+    const pending = recovery.reconcile({ ...original, authSubjectId: "writer", commandId: `recover-${changed}`, evidenceId: evidence.evidenceId, expectedRecoveryRevision: evidence.recoveryRevision });
+    await new Promise<void>((yes) => setImmediate(yes));
+    expect(f.store.getCommandReceipt("writer", `recover-${changed}`)?.state).toBe("accepted");
+    if (changed === "grant") f.denied.add(`writer:${f.codex}`); else allowed = false;
+    release(); await expect(pending).rejects.toMatchObject({ code: changed === "grant" ? "FORBIDDEN" : "RECOVERY_EVIDENCE_STALE" });
+    expect(f.store.getTurn(original.turnId)?.status).toBe("outcome_unknown");
+    expect(f.store.getCommandReceipt("writer", original.start)).toEqual(receipt);
+    expect(f.store.getCommandReceipt("writer", `recover-${changed}`)?.state).toBe("failed");
+    expect(f.runtimeFactory).not.toHaveBeenCalled();
+  });
+
+  it("rejects foreign or read-only actors and changed immutable Catalog configuration before recovery markers", async () => {
+    const f = await fixture(); const original = f.unknown(); const recovery = f.bindings.recoveryForSession(f.codex)!;
+    const evidence = await recovery.inspect(original);
+    const input = { ...original, evidenceId: evidence.evidenceId, expectedRecoveryRevision: evidence.recoveryRevision };
+    for (const actor of ["foreign", "reader"]) {
+      await expect(recovery.reconcile({ ...input, authSubjectId: actor, commandId: `recover-${actor}` })).rejects.toMatchObject({ code: actor === "foreign" ? "DEVICE_REVOKED" : "SCOPE_REQUIRED" });
+      expect(f.store.getCommandReceipt(actor, `recover-${actor}`)).toBeUndefined();
+    }
+    const provider = f.host.catalog.provider("instance-codex")!;
+    f.host.catalog.putProvider({ ...provider, config: { ...provider.config, model: "changed-config" } });
+    await expect(recovery.reconcile({ ...input, authSubjectId: "writer", commandId: "old-config" })).rejects.toMatchObject({ code: "RECOVERY_RESOURCE_MISMATCH" });
+    expect(f.store.getCommandReceipt("writer", "old-config")).toBeUndefined();
+    expect(f.bindings.recoveryForSession(f.codex)).not.toBe(recovery);
+    expect((await f.bindings.recoveryForSession(f.codex)!.inspect(original)).nativeState).toBe("unknown");
+    expect(f.runtimeFactory).not.toHaveBeenCalled();
+  });
+
+  it("requires aggregate owner process stop and keeps a live sibling execution from releasing the checkout", async () => {
+    const liveInspector: ProcessInspector = { currentIdentity: () => identity, inspect: (original) => original.pid === 124 ? { state: "alive", reason: "original sibling alive" } : { state: "exited", reason: "original exited" } };
+    const f = await fixture({ processInspector: liveInspector, inspectWorkspace: async () => "clear" });
+    const original = f.unknown(); f.recordProcess(original.context);
+    f.store.db.prepare(`INSERT INTO managed_processes(id,owner_id,owner_generation,runtime_id,runtime_generation,attempt_id,session_id,turn_id,pid,process_group,tree_control,state,updated_at)
+      VALUES('sibling-process',?,?,'sibling-runtime',1,'sibling-attempt',?,NULL,124,124,'process_group','running','now')`)
+      .run(f.owner.ownerId, f.owner.generation, f.host.legacySessionId);
+    f.store.db.prepare("INSERT INTO managed_process_identities(process_id,identity_json) VALUES('sibling-process',?)").run(JSON.stringify({ ...identity, pid: 124, birth: { ...identity.birth, startTicks: "43" } }));
+    const recovery = f.bindings.recoveryForSession(f.codex)!; const evidence = await recovery.inspect(original);
+    expect(evidence).toMatchObject({ processState: "running", workspaceState: "held", nativeState: "unknown" });
+    expect(await recovery.acknowledge({ ...original, authSubjectId: "writer", commandId: "sibling-not-stopped", evidenceId: evidence.evidenceId,
+      expectedRecoveryRevision: evidence.recoveryRevision, acknowledgeUnknown: true })).toMatchObject({ state: "blocked", gate: "blocked" });
+    expect(f.store.getTurn(original.turnId)?.status).toBe("outcome_unknown");
+    expect(f.host.catalog.requireSession(f.codex).residency).toBe("blocked"); expect(f.runtimeFactory).not.toHaveBeenCalled();
+  });
+
+  it.each([false, true])("uses the actual checkout proof root and preserves unknown history after explicit acknowledgment (release fault: %s)", async (fault) => {
+    const release = vi.fn(() => { if (fault) throw new Error("Ownership release failed"); });
+    const f = await fixture({ processInspector: inspector, inspectWorkspace: async () => "clear", afterRecovery: release });
+    const original = f.unknown(); f.recordProcess(original.context); const recovery = f.bindings.recoveryForSession(f.codex)!;
+    const evidence = await recovery.inspect(original);
+    expect(evidence).toMatchObject({ processState: "stopped", workspaceState: "clear", nativeState: "unknown" });
+    const input = { ...original, authSubjectId: "writer", commandId: "acknowledge", evidenceId: evidence.evidenceId, expectedRecoveryRevision: evidence.recoveryRevision, acknowledgeUnknown: true as const };
+    if (fault) {
+      await expect(recovery.acknowledge(input)).rejects.toMatchObject({ code: "RECOVERY_RELEASE_PROOF_INVALID" });
+      expect(f.store.getSession(f.codex)).toMatchObject({ activeTurnId: original.turnId, recoveryState: "blocked", activityState: "outcome_unknown" });
+      expect(f.host.catalog.requireSession(f.codex).residency).toBe("blocked");
+      expect(() => f.host.catalog.assertIdle(f.codex)).toThrowError(expect.objectContaining({ code: "RECOVERY_BLOCKED" }));
+    } else {
+      expect(await recovery.acknowledge(input)).toMatchObject({ gate: "released", turnStatus: "outcome_unknown" });
+      expect(f.host.catalog.requireSession(f.codex).residency).toBe("unloaded");
+      expect(() => f.host.catalog.assertIdle(f.codex)).not.toThrow();
+      const proof = recovery.recovery.releaseProof(evidence.evidenceId, [`workspace:${f.checkout}`])!;
+      expect(recovery.recovery.verifyReleaseProof(proof, { resourceKey: `workspace:${f.checkout}`, ownerId: f.owner.ownerId, ownerGeneration: f.owner.generation, purpose: `workspace:${original.turnId}` })).toBe(true);
+      expect(recovery.recovery.releaseProof(evidence.evidenceId, [`workspace:${f.workspace}`])).toBeUndefined();
+      expect(f.host.views?.ready(f.codex)).toBe(true);
+    }
+    expect(f.store.getTurn(original.turnId)?.status).toBe("outcome_unknown");
+    expect(f.store.getCommandReceipt("writer", original.start)?.state).toBe("outcome_unknown");
+    expect(release).toHaveBeenCalledTimes(1); expect(f.runtimeFactory).not.toHaveBeenCalled(); expect(f.runTurn).not.toHaveBeenCalled();
+  });
+});

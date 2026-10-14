@@ -78,7 +78,7 @@ export type OrchestratorOptions = {
   /** Commits an R07 runtime gate without rewriting a known Provider terminal. */
   onExecutionBlocked?: (intent: ExecutionIntentRow, reason: string) => void;
   assertWriteReady?: () => void;
-  recovery?: Pick<HostRecoveryOptions, "resolveResource" | "processInspector" | "inspectBoundary" | "inspectWorkspace" | "codexReader" | "supersedeInteractions" | "companionEvents">;
+  recovery?: Pick<HostRecoveryOptions, "resolveResource" | "checkoutRoot" | "assertCommandAuthorized" | "processInspector" | "inspectBoundary" | "inspectWorkspace" | "codexReader" | "supersedeInteractions" | "companionEvents">;
   runtimeId?: string;
   owner?: HostOwnerHandle;
   store?: SqliteStore;
@@ -248,7 +248,7 @@ export class SessionOrchestrator {
     this.runtimes = new RuntimeRegistry({ drainIngestion: () => this.ingestion.drain() });
     this.runtimes.register(this.runtimeId, this.adapter);
     this.recovery = createHostRecovery({ store: this.store, owner: this.owner, sessionId: this.session.id, workspace: this.workspace,
-      provider: this.session.provider, ...options.recovery, canReleaseWorkspace: this.canReleaseWorkspace,
+      provider: this.session.provider, ...options.recovery, checkoutRoot: this.checkoutRoot, canReleaseWorkspace: this.canReleaseWorkspace,
       onCommit: (events) => events.forEach((event) => this.notify(event)),
       onBlocked: (context) => { this.runtimes.retainBinding(context); this.activeWorkspaceLease?.retain("producer_stop_unverified"); this.owner.retain("producer_stop_unverified"); },
       reconcileRuntime: (context, native) => {

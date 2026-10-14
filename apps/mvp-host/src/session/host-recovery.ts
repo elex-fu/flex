@@ -36,6 +36,8 @@ export type HostRecoveryOptions = {
   owner: HostOwnerHandle;
   sessionId: string;
   workspace: string;
+  /** Exact checkout lease root; a Provider workspace can be a subdirectory. */
+  checkoutRoot?: string;
   provider: ProviderId;
   resolveResource?: RecoveryResourceResolver;
   processInspector?: ProcessInspector;
@@ -229,7 +231,7 @@ export class HostRecovery {
     }
     const workspaceState = await this.options.inspectWorkspace?.(target) ?? "unknown";
     return { state: "stopped", workspaceState, evidence: { kind: "process-tree-stopped", sourceId: digest(proofs), ownerId: target.context.hostOwnerId,
-      ownerGeneration: target.context.hostOwnerGeneration, resourceKeys: [...this.options.owner.resourceKeys, `workspace:${this.options.workspace}`],
+      ownerGeneration: target.context.hostOwnerGeneration, resourceKeys: [...this.options.owner.resourceKeys, `workspace:${this.options.checkoutRoot ?? this.options.workspace}`],
       processRecordIds: proofs.map((proof) => proof.id) } };
   }
 

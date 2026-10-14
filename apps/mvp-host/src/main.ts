@@ -137,11 +137,11 @@ async function manageHost(command: HostCommand, store: SqliteStore, identity: Ho
     if (command.kind === "devices-list") {
       console.log(JSON.stringify(devices.listDevices(), null, 2));
     } else if (command.kind === "devices-revoke") {
-      const revoked = store.db.transaction(() => devices.revokeFromLocal(command.deviceId))();
+      const revoked = devices.credentialTransaction(() => devices.revokeFromLocal(command.deviceId));
       if (!revoked) throw new Error("Device does not exist or is already revoked on this Host");
       console.log(`Revoked device ${command.deviceId}; its active connections will close.`);
     } else if (command.kind === "devices-revoke-all") {
-      const count = store.db.transaction(() => devices.revokeAllFromLocal())();
+      const count = devices.credentialTransaction(() => devices.revokeAllFromLocal());
       console.log(`Revoked ${count} devices and invalidated active pairing grants.`);
     } else if (command.kind === "identity-show") {
       console.log(JSON.stringify(publicHostIdentity(identity), null, 2));
@@ -152,10 +152,10 @@ async function manageHost(command: HostCommand, store: SqliteStore, identity: Ho
       try { approved = await confirm(); } finally { confirm.close(); }
       if (!approved) throw new Error("Key rotation was not confirmed in a local terminal");
       const rotated = await rotateHostIdentity({ directory, expectedMirror: getHostIdentityMirror(identity), authorization: { kind: "local" },
-        beforeCommit: (next, previous) => store.db.transaction(() => {
+        beforeCommit: (next, previous) => devices.credentialTransaction(() => {
           devices.revokeAllFromLocal();
           store.rotateHostIdentityMirror(next, previous);
-        })(),
+        }),
       });
       console.log(`Host key rotated: ${rotated.fingerprint}. Restart the Host and pair each device again.`);
     }

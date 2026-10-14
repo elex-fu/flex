@@ -12,7 +12,9 @@ const fixtures:Awaited<ReturnType<typeof revertFixture>>[]=[];
 afterEach(async()=>{for(const fixture of fixtures.splice(0)){await fixture.revert.drain(20);if(fixture.owner.db.open)fixture.owner.close();await rm(fixture.root,{recursive:true,force:true});}});
 async function fixture(options:Parameters<typeof revertFixture>[0]={}){const value=await revertFixture(options);fixtures.push(value);return value;}
 
-describe("durable controlled revert",()=>{
+// These cases create several real Git repositories and invoke isolated raw
+// restore helpers. Keep their test budget separate from injected fault deadlines.
+describe("durable controlled revert",{timeout:20_000},()=>{
   it("atomically accepts plan, receipt, immutable intent, journal and blocking gate",async()=>{
     const f=await fixture();const revision=f.resolve().sessionRevision;const operation=await f.accept("revert","accept-1");
     expect(f.store.getPreview(f.page.planId,f.context.sessionId,"device-1").state).toBe("consumed");

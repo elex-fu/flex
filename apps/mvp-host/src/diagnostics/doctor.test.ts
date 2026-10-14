@@ -27,7 +27,7 @@ describe("sanitized doctor", () => {
       const local = collectDoctor({ ...context, access: { kind: "local" } });
       expect(local.activity).toEqual({ activeTurns: 1, unknownTurns: 0, activeIntents: 1, unknownIntents: 0 });
       expect(local.content).toMatchObject({ available: true, refs: 0, logicalRefBytes: 0, bytes: 0, expiredRefs: 0 });
-      expect(local.checkpoints).toEqual({ available: false });
+      expect(local.checkpoints).toEqual({ available: true, failed: 0, unsupported: 0, raced: 0, legacyInexact: 0 });
       for (const secret of ["/private", "account-secret", "private-body", "secret-device"]) expect(JSON.stringify(local)).not.toContain(secret);
       expect(() => collectDoctor({ ...context, access: { kind: "remote", scopes: new Set(["session:read"]) } })).toThrow("FORBIDDEN");
     } finally { store.close(); owner.release(); }

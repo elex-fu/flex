@@ -188,7 +188,7 @@ export class SessionOrchestrator {
       const existingSession = options.sessionId ? this.store.getSession(options.sessionId) : this.store.getCurrentSession();
       if (options.sessionId && !existingSession) throw new OrchestratorError("SESSION_NOT_FOUND", "Selected Session does not exist");
       if (existingSession?.status === "archived") throw new OrchestratorError("SESSION_ARCHIVED", "Selected Session is archived");
-      if (!this.recoverOnStart && existingSession?.recoveryState === "blocked") throw new OrchestratorError("RECOVERY_BLOCKED", "Selected Session requires recovery before loading");
+      if (!this.ownsStore && existingSession?.recoveryState === "blocked") throw new OrchestratorError("RECOVERY_BLOCKED", "Selected Session requires recovery before loading");
       if (existingSession && existingSession.workspacePath !== canonicalWorkspace) {
         throw new OrchestratorError("WORKSPACE_MISMATCH", "Persisted session belongs to a different configured workspace");
       }

@@ -803,21 +803,21 @@ B01–B05 来自前一轮定向复现，本轮增加 B06–B09。当前已有构
 | R01 | 已完成并推送 | `4a46642`：Git 19、Timeline 14；`5eddded`：清洁副本 build、生产/测试类型检查、产品与 fixture 检查通过 | 后续批次继续沿用统一验证入口；浏览器仅发现 24 用例，尚未执行 |
 | R02 | 已完成并推送 | `866e407`：Host 192 通过、5 明确跳过；`49ac8ce`：内部运行绑定脱敏，相关 16 用例与类型检查通过 | R03 接入真实 owner，R05/R06 接入持久 attempt；真实 Provider 契约随 R15 验收 |
 | R03 | 所有权基础已集成并推送 | `bdd21d6`、`ad9b0f0`、`ff5c2dc`、`4ab9e49`、`f67181d`：原 owner、只读打开、显式恢复维护、004→006 迁移/重开检查 | 原 Host 硬崩溃的恢复入口补齐；原路径 lease 后续接 worktree |
-| R04 | 开发中 | 进程 journal、分块 JSONL 预算、operation registry、关闭状态机 | Adapter/入口接通、有序关库与进程树停止证明 |
+| R04 | 生产生命周期已合入，平台停止证明未完成 | `86febe3`：Adapter 管理进程、原始派发绑定、异步关闭和共享 Store/Views 归属 | macOS 后代停止仍为 unknown；真实 Provider 与整体入口验收 |
 | R05 | 原子引擎已集成并推送 | `5c34c20`、`3e5a4c5`：owner/lease 接入、命令故障矩阵和冻结旧版本迁移 fixture | 其它批次继续使用同一原子提交入口 |
-| R06 | 核心已集成，生产钩子补齐中 | `5ec7a3c`：持久 Worker、独立控制通道、原始派发绑定；独立 87 用例通过 | checkpoint、泛化 operation、关闭流程与多 Session 合并验收 |
-| R07 | 恢复模块已集成并推送，入口接通中 | `698a448`：只读回执 8 用例；`e4bf372`：Native binding、证据和恢复 CAS | Host/RPC/离线崩溃恢复与真实 Native 证据 |
+| R06 | 核心及执行钩子已合入 | `5ec7a3c`、`c2e0bbd`、`8feef42`：Worker、Checkpoint 钩子、明确停止后解除保留运行绑定 | 泛化 operation 工厂、多 Session 和最终关闭合并验收 |
+| R07 | Host/RPC/离线恢复入口已合入 | `7be14c7`：原尝试证据、已知结果与执行 gate 分离、硬崩溃维护和 typed client | 多 Session 路由、可信版本/进程检查与真实 Native 证据 |
 | R08 | 模块已集成并推送，生产链路已接通 | `7e37d45`、`f67181d`、`59d7616`：正文引用、权限、006 SQL 和严格响应预算 | 最终 Web/原生大内容入口与整体回归 |
 | R09 | 生产链路已集成，合并验收中 | `bbf31d8`、`f4bfcf7`、`59d7616`：固定水位、epoch、万级历史、Direct/Relay 与磁盘重开 | 多 Session/Interaction 投影及最终浏览器验收 |
-| R10 | 共享核心已集成 | `da7f23f`：SessionReplica、能力协商、引用校验、React canonical 分流 | Web 操作入口接通及多 Session DTO 合并 |
-| R11 | 开发与验证中 | Workspace/Provider/Session catalog、007 与离线导入 | 多 Session、legacy 固定路由、共享 Store 与运行时关闭 |
-| R12 | 共享核心已集成 | `1f26299`：平台信号、runtime 归属、缓存/草稿/本机清除；与 R10 合并后 95 客户端用例及严格类型检查通过 | Web 草稿和本机清除入口、真实后台恢复 |
-| R13 | 模块已集成，生产入口接通中 | `54e8ae0`：reservation、delivery、Question、审批卡片和受控原生映射；独立 42 Host 用例通过 | 008 激活、RPC/ingestion 接通与真实答案回传 |
-| R14 | 模块已集成，执行钩子接通中 | `916e3b2`：独立 index/workspace checkpoint、原始文件捕获、精确 Diff 和预览 | 已提交终态及停止证明之后的 after capture；UI 与恢复操作 |
-| R15 | 模块及版本验证已集成，入口接通中 | `82096b9`、`3790ecb`、`ac5988b`：doctor、备份恢复、固定产物、实际握手及真实 schema6 验证 | CLI/恢复 gate、双 Provider 与真机 |
-| R16 | 开发与验证中 | 分阶段 revert journal、受控文件/index 恢复和安全点 | 各外部状态域、partial failure、真实 Provider rewind |
-| R17 | 独立模块已提交，待集成 | worktree 持久操作、原路径 lease 与隔离并发 | Catalog/Worker/RPC 接通、同 checkout 防冲突及生命周期 |
-| R18 | attention 模块已集成，Expo 平台验证中 | `a27a056`：最小提醒事实/队列、过期点击核对；Expo 复用共同核心 | 010 激活、推送入口、安全凭据/deep link、真机网络与后台恢复 |
+| R10 | 共享核心及 Web 入口已合入 | `da7f23f`、`eee9af1`、`6222d68`：Replica、能力协商、引用、Session DTO 和只读回执核对 | Host 动态能力启用及真实浏览器闭环 |
+| R11 | Catalog 和协议模块已合入，生产工厂集成中 | `630da94`、`ee882b6`、`f361d9f`：007、离线导入、公开 DTO 与 SessionClient | 多 Session 工厂、legacy 固定路由、共享 Store 与运行时关闭 |
+| R12 | 共享核心及 Web 草稿入口已合入 | `1f26299`、`6222d68`：平台信号、runtime 归属、持久草稿、原子发送、本机清除与启动屏障 | 真实浏览器及手机后台恢复 |
+| R13 | 008 和生产 RPC/控制钩子已合入 | `54e8ae0`、`e132b32`、`f361d9f`：reservation、delivery、Question、审批卡片和原子终态伴随事件 | 多 Session 单投影 hook、Gateway 动态能力与真实答案回传 |
+| R14 | 模块和执行钩子已合入 | `916e3b2`、`c2e0bbd`、`f361d9f`：独立 index/workspace checkpoint、原始文件、终态后捕获、Diff 与预览 | 生产 factory/RPC/UI 接通及真实捕获验收 |
+| R15 | 模块及 owned operations 已合入 | `82096b9`、`3790ecb`、`ac5988b`、`1d47948`：doctor、备份恢复、固定产物、握手、restore 写 gate | 主入口/CLI 组合、双 Provider 与真机 |
+| R16 | journal、受控恢复及 SQL 已合入 | `56465d0`、`8715b50`、`f361d9f`：分阶段恢复、安全点、恢复证据与 readiness fencing | 生产 factory/RPC/UI、托管 helper 与真实 Provider rewind |
+| R17 | 模块及 009 已合入，生产绑定开发中 | `233c2ac`、`f361d9f`：worktree 持久操作、原路径 lease 与隔离并发 | Catalog/Worker/RPC 接通、托管 Git 与真正停止证明 |
+| R18 | attention SQL 与 Expo 最小平台已合入 | `a27a056`、`de38bc5`、`f361d9f`：提醒事实/队列、010、安全凭据/deep link、共同核心 | Host 提醒工厂与实际推送、真机网络和后台恢复 |
 
 当前仍为开发分支，M1/M2/M3 均未宣称发布完成。整套方案完成前，必须逐项核对第 18 节的退出条件，包括确定性故障、真实 Provider 和真机证据。
 
@@ -836,3 +836,7 @@ B01–B05 来自前一轮定向复现，本轮增加 B06–B09。当前已有构
 | 完整原生 UI 与额外体验 | 可延后 | 完整导航、复杂通知设置、语音和更多视图另排 | 主要改善使用体验；不作为 Host 可靠性验收的前提 |
 
 开发优先级是共享核心与 Web 端到端闭环，再进行 Expo 最小平台验收。原生代码和模拟平台测试通过仅说明实现可继续集成；真机网络、凭据与后台恢复尚须实际证据。SecureStore 保护短凭据，普通 SQLite 的正文缓存不宣称已经加密。提醒点击后重新读取当前状态，不能直接提交过期动作；未知命令始终核对原回执，不能因为重新连上而自动重发。
+
+2026-10-15 合入最小原生平台及 Web 操作入口后的源码规模约为 5,000 行：共享客户端核心约 3,000 行，Web 约 1,200 行，Expo 约 700 行，不含测试和依赖锁文件。这个数字用于说明代码分布，不能换算为完成比例或剩余工期。当前必要投入主要是共享的可靠发送、草稿、权威状态与查询，以及 Web 的操作闭环；完整原生导航、语音和复杂通知设置仍保持后续范围。
+
+本轮已验证共同核心 116 用例、Web 52 用例、Expo/Noise 73 用例，严格客户端类型检查通过；新增 SessionClient 的 15 用例另行通过。Host 全量合并回归仍在修正旧 fixture 和新生命周期/schema 的适配，真实浏览器正在验证。真实双 Provider、手机网络/后台/凭据和推送交付继续保持未验收。

@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { chmod, mkdir, readFile, readdir, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { CheckpointError } from "./types.js";
 import { RevertCrash } from "./revert-types.js";
 import type { NativeRevertProof } from "./revert-types.js";
 import { bindingDigest } from "./git-driver.js";
@@ -254,6 +255,24 @@ it("rejects Promise actor validation inside the atomic acceptance transaction",a
  const f=await fixture();f.restart({revalidateActorInCommit:async()=>{}});const revision=f.resolve().sessionRevision;
  await expect(f.accept("revert","async-actor")).rejects.toThrow("share the SQL boundary");expect(f.owner.getCommandReceipt("device-1","async-actor")).toBeUndefined();expect(f.resolve().sessionRevision).toBe(revision);expect(f.owner.getSession(f.context.sessionId)?.recoveryState).toBe("idle");expect(f.native.calls).toHaveLength(0);
 },15_000);
+
+
+describe("restore readiness remains a separate write gate",()=>{
+  it("joins the R15 readiness guard to atomic acceptance and leaves all command facts absent",async()=>{
+    const f=await fixture();f.owner.db.exec("CREATE TABLE restore_readiness(id TEXT PRIMARY KEY);INSERT INTO restore_readiness VALUES('restored-host')");
+    f.restart({assertRestoreWriteReady:(db)=>{expect(db.inTransaction).toBe(true);if(db.prepare("SELECT 1 FROM restore_readiness LIMIT 1").get())throw new CheckpointError("RESTORE_WRITE_BLOCKED","Restored facts require verification");}});
+    const revision=f.resolve().sessionRevision;await expect(f.accept("revert","restore-blocked")).rejects.toThrow("require verification");
+    expect(f.owner.getCommandReceipt("device-1","restore-blocked")).toBeUndefined();expect(f.store.getPreview(f.page.planId,f.context.sessionId,"device-1").state).toBe("active");expect(f.resolve().sessionRevision).toBe(revision);expect(f.native.calls).toHaveLength(0);
+  },15_000);
+  it.each(["validated","workspace_restored","projection.dispatch"])("blocks the next external/final dispatch when restore readiness appears at %s",async(boundary)=>{
+    let f!:Awaited<ReturnType<typeof fixture>>;f=await fixture({boundary:(current)=>{if(current===boundary)f.owner.db.exec("INSERT OR IGNORE INTO restore_readiness VALUES('restored-host')");}});
+    f.owner.db.exec("CREATE TABLE restore_readiness(id TEXT PRIMARY KEY)");f.restart({assertRestoreWriteReady:(db)=>{expect(db.inTransaction).toBe(true);if(db.prepare("SELECT 1 FROM restore_readiness LIMIT 1").get())throw new CheckpointError("RESTORE_WRITE_BLOCKED","Restored facts require verification");}});
+    const operation=await f.accept();const result=await f.dispatch(operation.operationId);expect(result.resultCode).toBe("RESTORE_WRITE_BLOCKED");expect(f.owner.db.prepare("SELECT COUNT(*) n FROM restore_readiness").get()).toEqual({n:1});
+    expect(f.resolve().epoch).toBe("epoch-1");expect(f.owner.getSession(f.context.sessionId)?.recoveryState).toBe("blocked");expect(f.newTurn).toThrow("RECOVERY_BLOCKED");
+    expect(f.native.calls).toHaveLength(boundary==="projection.dispatch"?1:0);
+    if(boundary==="validated")expect(await readFile(join(f.root,"tracked.txt"),"utf8")).toBe("current-workspace\n");
+  },20_000);
+});
 
 const boundaries=["validated","safety_capture.dispatch","safety_capture.external","safety_captured","workspace_file.dispatch","workspace_file.external","workspace_file.applied","index.dispatch","index.external","index.applied","workspace_restored","provider.dispatch","provider.external","provider_rewound","projection.dispatch","projection_committed"];
 describe("crash reconciliation at every stage",()=>{

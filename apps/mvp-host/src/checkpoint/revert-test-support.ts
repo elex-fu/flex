@@ -69,7 +69,7 @@ export async function revertFixture(options:{restore?:ControlledRestoreOptions;b
   const engine=new CommandEngine(f.owner,{clock:{now:()=>time.toISOString(),id:randomUUID}});
   const serviceOptions:RevertServiceOptions={engine,checkpoints:f.service,previews,restore,native,resolveContext:resolve,
     acquire:async()=>({context:resolve()}),dispatchContextFor:(context,operationId,attemptId)=>({hostOwnerId:"owner-1",hostOwnerGeneration:1,sessionId:context.sessionId,flyxTurnId:operationId,runtimeId:"runtime-1",runtimeGeneration:context.runtimeGeneration,attemptId}),
-    revalidateActorInCommit:()=>{if(!actorAllowed)throw new Error("SCOPE_REQUIRED");},proveQuiescence:async()=>({proven:quiescent,proofId:"stopped-original-writers"}),now:()=>time,
+    assertRestoreWriteReady:()=>{},revalidateActorInCommit:()=>{if(!actorAllowed)throw new Error("SCOPE_REQUIRED");},proveQuiescence:async()=>({proven:quiescent,proofId:"stopped-original-writers"}),now:()=>time,
     projectSuccess:(db,input)=>{db.prepare("UPDATE test_active_view SET epoch=?,native_json=? WHERE session_id=?").run(input.epoch,JSON.stringify(input.nativeProof.nativeHandle),input.operation.sessionId);return {epoch:input.epoch,nativeHandleBinding:bindingDigest(input.nativeProof.nativeHandle)};},
     ...(options.boundary?{onBoundary:options.boundary}:{})};
   let revert=new RevertService(serviceOptions);

@@ -33,6 +33,8 @@ export type RevertServiceOptions = {
   projectSuccess: (db:Database.Database,input:{operation:RevertOperation;epoch:string;nativeProof:NativeRevertProof;sourceSequence:number})=>{epoch:string;nativeHandleBinding:string};
   /** Trusted marker-transaction evidence when custom Worker hooks add revisions. Default allows the two standard Worker commits only. */
   revalidateActorInCommit: (operation:RevertOperation)=>void;
+  /** R15 restore readiness is a separate write gate; never clear it from generic recovery. */
+  assertRestoreWriteReady: (db:Database.Database)=>void;
   verifyWorkerRevision?: (intent:ExecutionIntentRow,operation:RevertOperation,currentRevision:number)=>boolean;
   publishCommitted?: (events:readonly SessionEvent[])=>void;
   nativeTimeoutMs?: number; evidenceTtlMs?: number; now?:()=>Date;
@@ -408,6 +410,8 @@ export class RevertService {
     });this.publish(committed?.events ?? []);return next;
   }
   private assertActor(operation:RevertOperation):void {
+    const readiness=this.options.assertRestoreWriteReady(this.store.db) as unknown;
+    if(readiness && typeof(readiness as {then?:unknown}).then==="function") {void Promise.resolve(readiness).catch(()=>{});throw new CheckpointError("RESTORE_READINESS_MUST_BE_SYNCHRONOUS","Restore readiness must share the SQL boundary");}
     const result=this.options.revalidateActorInCommit(operation) as unknown;
     if(result && typeof(result as {then?:unknown}).then==="function") {void Promise.resolve(result).catch(()=>{});throw new CheckpointError("ACTOR_REVALIDATION_MUST_BE_SYNCHRONOUS","Actor authorization must share the SQL boundary");}
   }

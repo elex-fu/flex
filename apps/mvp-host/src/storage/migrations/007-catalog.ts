@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import type Database from "better-sqlite3";
+import { validateTableContracts } from "./schema-constraints.js";
 
 export const CATALOG_SCHEMA_VERSION = 7;
 export const CATALOG_SCHEMA_SQL = `
@@ -42,6 +43,13 @@ export const legacyProviderInstanceId = (provider: string) => `legacy-provider-$
 export const checkoutKey = (worktreeRoot: string) => createHash("sha256").update(worktreeRoot).digest("hex");
 
 export function validateCatalogSchema(db: Database.Database): void {
+  validateTableContracts(db, {
+    workspaces: { columns: ["id","canonical_root","worktree_root","checkout_key","kind","state","repository_id","capabilities_json","registration_operation_id","created_at","updated_at"], primaryKey: ["id"], nullable: ["registration_operation_id"], constraints: ["CHECK(kind IN ('local','worktree'))", "CHECK(state IN ('active','needs_verification','disabled'))"] },
+    provider_instances: { columns: ["id","provider","executable","config_json","policy_version","state","verification_json","policy_capabilities_json","created_at","updated_at"], primaryKey: ["id"], constraints: ["CHECK(provider IN ('claude','codex'))", "CHECK(policy_version > 0)", "CHECK(state IN ('configured','unconfigured','disabled'))"] },
+    session_catalog: { columns: ["session_id","provider_instance_id","title","native_handle_json","residency_state","archived_at"], primaryKey: ["session_id"], nullable: ["native_handle_json","archived_at"], constraints: ["CHECK(residency_state IN ('unloaded','loading','loaded','closing','blocked'))"], foreignKeys: [{ columns: ["session_id"], parent: "sessions", target: ["id"], onDelete: "CASCADE" }] },
+    catalog_runtime_operations: { columns: ["id","session_id","auth_subject_id","command_id","request_hash","request_format_version","owner_context_json","runtime_id","state","created_at","updated_at"], primaryKey: ["id"], nullable: ["runtime_id"], constraints: ["CHECK(request_format_version = 2)", "CHECK(state IN ('accepted','completed','outcome_unknown'))"] },
+    catalog_import_manifests: { columns: ["id","source_digest","source_schema_version","source_host_id","source_fingerprint","target_backup_path","source_backup_path","counts_json","imported_at"], primaryKey: ["id"] },
+  });
   for (const [table, names] of Object.entries({
     workspaces: ["id","canonical_root","worktree_root","checkout_key","kind","state","repository_id","capabilities_json","registration_operation_id","created_at","updated_at"],
     provider_instances: ["id","provider","executable","config_json","policy_version","state","verification_json","policy_capabilities_json","created_at","updated_at"],
@@ -76,6 +84,7 @@ export function validateCatalogSchema(db: Database.Database): void {
 export function applyCatalogMigration(db: Database.Database, at = new Date().toISOString()): void {
   db.transaction(() => {
     if (db.prepare("SELECT 1 FROM schema_migrations WHERE version=7").get()) { validateCatalogSchema(db); return; }
+    if (!db.prepare("SELECT 1 FROM schema_migrations WHERE version=6").get()) throw new Error("CATALOG_MIGRATION_REQUIRES_006");
     const columns = db.prepare("PRAGMA table_info(sessions)").all() as Array<{name:string}>;
     if (!columns.some((column) => column.name === "revision")) throw new Error("CATALOG_REQUIRES_COMMAND_SCHEMA");
     db.exec(CATALOG_SCHEMA_SQL);

@@ -6,6 +6,8 @@ import {afterEach,describe,expect,it,vi} from "vitest";
 import {SessionSchema,SessionSummaryV2Schema} from "@flyx/mvp-protocol";
 import {createTestHostOwner} from "../lifecycle/host-owner.js";
 import {openOwned} from "../storage/open-store.js";
+import {SqliteStore} from "../storage/db.js";
+import {FROZEN_V6_SCHEMA} from "../test-support/frozen-v6-schema.js";
 import {CatalogStore,hashCatalogRequest} from "../storage/catalog-store.js";
 import {applyCatalogMigration,legacyWorkspaceId,legacyProviderInstanceId} from "../storage/migrations/007-catalog.js";
 import {WorkspaceRegistry} from "../workspace/workspace-registry.js";
@@ -177,7 +179,7 @@ describe("Session catalog and lazy runtime routing",()=>{
 
 describe("SQL-only legacy catalog backfill",()=>{
   it("preserves one native Session and a stable default without verifying arbitrary legacy paths",()=>{
-    const owner=createTestHostOwner();const store=openOwned({databasePath:":memory:",owner});cleanups.push(()=>{store.close();owner.release();});
+    const owner=createTestHostOwner();const store=new SqliteStore(":memory:",{mode:"test-fixture",fixtureSchema:FROZEN_V6_SCHEMA});cleanups.push(()=>{store.close();owner.release();});
     const session=store.createSession("/offline/old-checkout","codex","legacy-session");store.db.prepare("UPDATE sessions SET provider_session_id='legacy-native' WHERE id=?").run(session.id);
     applyCatalogMigration(store.db);const catalog=new CatalogStore(store);cleanups.push(()=>catalog.dispose());
     expect(catalog.legacyDefaultSessionId()).toBe(session.id);
@@ -186,7 +188,7 @@ describe("SQL-only legacy catalog backfill",()=>{
     const before=catalog.requireSession(session.id);applyCatalogMigration(store.db);expect(catalog.requireSession(session.id)).toEqual(before);
   });
   it("does not select a newest default when legacy sources contain multiple active Sessions",()=>{
-    const owner=createTestHostOwner();const store=openOwned({databasePath:":memory:",owner});cleanups.push(()=>{store.close();owner.release();});store.createSession("/old","claude","first");store.createSession("/old","claude","later");
+    const owner=createTestHostOwner();const store=new SqliteStore(":memory:",{mode:"test-fixture",fixtureSchema:FROZEN_V6_SCHEMA});cleanups.push(()=>{store.close();owner.release();});store.createSession("/old","claude","first");store.createSession("/old","claude","later");
     applyCatalogMigration(store.db);const catalog=new CatalogStore(store);cleanups.push(()=>catalog.dispose());expect(catalog.legacyDefaultSessionId()).toBeUndefined();catalog.setLegacyDefaultOnce("first");expect(catalog.legacyDefaultSessionId()).toBe("first");
   });
 });

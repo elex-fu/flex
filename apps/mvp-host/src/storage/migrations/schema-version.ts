@@ -2,8 +2,12 @@ import type Database from "better-sqlite3";
 import { validateCommandExecutionSchema } from "./004-command-execution.js";
 import { validateRecoverySchema } from "./005-recovery.js";
 import { validateViewsSchema } from "./006-views-schema.js";
+import { validateCatalogSchema } from "./007-catalog.js";
+import { validateInteractionSchema } from "./008-interactions.js";
+import { validateWorkspaceHistorySchema } from "./009-workspace-history.js";
+import { validateAttentionSchema } from "./010-attention.js";
 
-export const SUPPORTED_SCHEMA_VERSION = 6;
+export const SUPPORTED_SCHEMA_VERSION = 10;
 
 export class StoreSchemaError extends Error {
   constructor(readonly code: "FUTURE_SCHEMA" | "SCHEMA_INVALID", message: string) {
@@ -119,7 +123,8 @@ export function inspectSchema(db: Database.Database, options: { maximumVersion?:
       try { validateCommandExecutionSchema(db); }
       catch { throw new StoreSchemaError("SCHEMA_INVALID", "Declared command execution schema is incomplete; offline repair is required."); }
     }
-    for (const [migration, validate] of [[5, validateRecoverySchema], [6, validateViewsSchema]] as const) {
+    for (const [migration, validate] of [[5, validateRecoverySchema], [6, validateViewsSchema],
+      [7, validateCatalogSchema], [8, validateInteractionSchema], [9, validateWorkspaceHistorySchema], [10, validateAttentionSchema]] as const) {
       if (version < migration) continue;
       if (!rows.some((row) => row.version === migration) || !rows.some((row) => row.version === migration - 1)) {
         throw new StoreSchemaError("SCHEMA_INVALID", `Declared schema is missing ordered migration ${migration}.`);

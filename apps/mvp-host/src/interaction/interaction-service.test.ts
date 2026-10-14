@@ -9,6 +9,8 @@ import { SqliteStore, type ApprovalRow } from "../storage/db.js";
 import { CommandEngine, hashCommandRequest } from "../orchestration/command-engine.js";
 import { decideAcceptTurn, decideApprovalReservation } from "../orchestration/decider.js";
 import { applyInteractionMigration } from "../storage/migrations/008-interactions.js";
+import { applyCatalogMigration } from "../storage/migrations/007-catalog.js";
+import { FROZEN_V6_SCHEMA } from "../test-support/frozen-v6-schema.js";
 import { InteractionService } from "./interaction-service.js";
 import { interactionFence } from "./types.js";
 import { parseClaudeQuestions } from "./native-question-codec.js";
@@ -22,7 +24,8 @@ afterEach(() => { while (services.length)
   services.pop()!.close(); while (stores.length)
   stores.pop()!.close(); });
 function setup(migrate = true) {
-  const store = new SqliteStore();
+  const store = migrate ? new SqliteStore() : new SqliteStore(":memory:", { mode: "test-fixture", fixtureSchema: FROZEN_V6_SCHEMA });
+  if (!migrate) applyCatalogMigration(store.db);
   stores.push(store);
   const session = store.createSession("/tmp/fixture", "claude", "session");
   let now = "2026-10-15T00:00:00.000Z";

@@ -5,6 +5,10 @@ import { inspectSchema, StoreSchemaError } from "./migrations/schema-version.js"
 import type { ProviderId, RpcError, Session, SessionEvent, TimelineItem, Turn } from "@flyx/mvp-protocol";
 import { applyRecoveryMigration } from "./migrations/005-recovery.js";
 import { applyViewsSchemaMigration } from "./migrations/006-views.js";
+import { applyCatalogMigration } from "./migrations/007-catalog.js";
+import { applyInteractionMigration } from "./migrations/008-interactions.js";
+import { applyWorkspaceHistoryMigration } from "./migrations/009-workspace-history.js";
+import { applyAttentionMigration } from "./migrations/010-attention.js";
 import { applyCommandExecutionMigration } from "./migrations/004-command-execution.js";
 import { ExecutionStore, toExecutionIntent, type RawExecutionIntent } from "./execution-store.js";
 import { decideAcceptTurn } from "../orchestration/decider.js";
@@ -386,6 +390,8 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 export type SqliteStoreOptions = {
   mode?: "owned" | "readonly" | "maintenance" | "management" | "recovery-maintenance" | "test-fixture";
   owner?: HostOwnerHandle;
+  /** NODE_ENV=test + test-fixture only. Load a pinned old schema without auto-upgrading it. */
+  fixtureSchema?: string;
 };
 
 export class SqliteStore {
@@ -403,6 +409,7 @@ export class SqliteStore {
     // supplies a real owner, including under Vitest.
     this.mode = options.mode ?? (filePath !== ":memory:" && process.env.NODE_ENV === "test" ? "test-fixture" : "owned");
     if (this.mode === "test-fixture" && process.env.NODE_ENV !== "test") throw new Error("Raw file-backed fixtures are only allowed under NODE_ENV=test");
+    if (options.fixtureSchema !== undefined && (this.mode !== "test-fixture" || process.env.NODE_ENV !== "test" || filePath !== ":memory:")) throw new Error("PINNED_SCHEMA_FIXTURE_ONLY");
     if (this.mode === "recovery-maintenance" && !options.owner) throw new Error("HOST_OWNER_REQUIRED");
     const isWriter = this.mode === "owned" || this.mode === "maintenance" || this.mode === "recovery-maintenance";
     this.ownerHandle = isWriter ? options.owner ?? (filePath === ":memory:" ? createTestHostOwner() : HostOwnerLock.acquire({ databasePath: filePath, mode: this.mode === "maintenance" ? "maintenance" : "host" })) : undefined;
@@ -419,6 +426,11 @@ export class SqliteStore {
       this.db = new Database(connectionPath, { readonly: this.mode === "readonly", fileMustExist: this.mode === "readonly" || this.mode === "management" || this.mode === "recovery-maintenance", timeout: this.mode === "management" || this.mode === "recovery-maintenance" ? 1_000 : 5_000 });
       try {
         this.ownerHandle?.assertStorePath(connectionPath);
+        if (options.fixtureSchema !== undefined) {
+          this.db.pragma("foreign_keys = ON");
+          this.db.transaction(() => { this.db.exec(options.fixtureSchema!); inspectSchema(this.db); })();
+          return;
+        }
         const schema = inspectSchema(this.db);
         if (this.mode === "readonly" || this.mode === "management" || this.mode === "recovery-maintenance") {
           if (this.mode === "management" && schema.version < 3) throw new StoreSchemaError("SCHEMA_INVALID", "Local revocation requires the current schema; migrate the offline Host first.");
@@ -524,6 +536,10 @@ export class SqliteStore {
     applyCommandExecutionMigration(this.db);
     applyRecoveryMigration(this.db);
     applyViewsSchemaMigration(this.db);
+    applyCatalogMigration(this.db);
+    applyInteractionMigration(this.db);
+    applyWorkspaceHistoryMigration(this.db);
+    applyAttentionMigration(this.db);
   }
 
   private upsertTimelineInternal(sessionId: string, input: TimelineUpsert, updatedAt: string): void {

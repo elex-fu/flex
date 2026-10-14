@@ -1,6 +1,7 @@
 import type Database from "better-sqlite3";
 import { randomUUID } from "node:crypto";
 import type { CheckpointManifest } from "../../checkpoint/types.js";
+import { validateTableContracts, validateUniqueIndex } from "./schema-constraints.js";
 
 /** Called by the owned migration runner inside its shared SQLite transaction. */
 export const CHECKPOINT_SCHEMA_SQL = `
@@ -81,6 +82,19 @@ export function applyCheckpointSchema(db: Database.Database): void {
   })();
 }
 
+export function validateCheckpointSchema(db: Database.Database): void {
+  validateTableContracts(db, {
+    checkpoint_captures: { columns: ["checkpoint_id","session_id","workspace_id","turn_id","attempt_id","phase","status","workspace_ref","index_ref","manifest_json","started_at","completed_at"], primaryKey: ["checkpoint_id"], nullable: ["turn_id","attempt_id","completed_at"], unique: [["workspace_ref"],["index_ref"]], constraints: ["CHECK(status IN ('capturing','complete','unsupported','raced','failed','legacy_inexact'))"], foreignKeys: [{ columns: ["session_id"], parent: "sessions", target: ["id"] }] },
+    checkpoint_files: { columns: ["checkpoint_id","path","entry_json"], primaryKey: ["checkpoint_id","path"], foreignKeys: [{ columns: ["checkpoint_id"], parent: "checkpoint_captures", target: ["checkpoint_id"], onDelete: "CASCADE" }] },
+    checkpoint_baselines: { columns: ["session_id","checkpoint_id"], primaryKey: ["session_id"], foreignKeys: [{ columns: ["session_id"], parent: "sessions", target: ["id"] }, { columns: ["checkpoint_id"], parent: "checkpoint_captures", target: ["checkpoint_id"] }] },
+    checkpoint_diffs: { columns: ["diff_id","session_id","before_checkpoint_id","after_checkpoint_id","layer","created_at"], primaryKey: ["diff_id"], unique: [["before_checkpoint_id","after_checkpoint_id","layer"]], constraints: ["CHECK(layer IN ('workspace','index'))"], foreignKeys: [{ columns: ["session_id"], parent: "sessions", target: ["id"] }, { columns: ["before_checkpoint_id"], parent: "checkpoint_captures", target: ["checkpoint_id"] }, { columns: ["after_checkpoint_id"], parent: "checkpoint_captures", target: ["checkpoint_id"] }] },
+    checkpoint_diff_files: { columns: ["diff_id","file_id","position","entry_json"], primaryKey: ["diff_id","file_id"], unique: [["diff_id","position"]], foreignKeys: [{ columns: ["diff_id"], parent: "checkpoint_diffs", target: ["diff_id"], onDelete: "CASCADE" }] },
+    checkpoint_preview_plans: { columns: ["plan_id","actor_id","session_id","checkpoint_id","current_checkpoint_id","state","expires_at","plan_json","created_at"], primaryKey: ["plan_id"], constraints: ["CHECK(state IN ('active','consumed','expired','invalidated'))"], foreignKeys: [{ columns: ["session_id"], parent: "sessions", target: ["id"] }, { columns: ["checkpoint_id"], parent: "checkpoint_captures", target: ["checkpoint_id"] }, { columns: ["current_checkpoint_id"], parent: "checkpoint_captures", target: ["checkpoint_id"] }] },
+    checkpoint_pins: { columns: ["checkpoint_id","owner_kind","owner_id"], primaryKey: ["checkpoint_id","owner_kind","owner_id"], foreignKeys: [{ columns: ["checkpoint_id"], parent: "checkpoint_captures", target: ["checkpoint_id"] }] },
+  });
+  validateUniqueIndex(db, "checkpoint_captures", ["session_id","turn_id","attempt_id","phase"], "WHERE turn_id IS NOT NULL AND attempt_id IS NOT NULL AND phase IN ('before','after')", "checkpoint_attempt_phase");
+}
+
 
 /** R16 shares migration009 and the owned Store transaction. Never waits for Git or Native here. */
 export const REVERT_SCHEMA_SQL = `
@@ -139,4 +153,12 @@ export function validateRevertSchema(db: Database.Database): void {
     const columns = (db.prepare(`PRAGMA table_info(${table})`).all() as Array<{name:string}>).map((row)=>row.name);
     if (expected.some((name)=>!columns.includes(name))) throw new Error(`SCHEMA_INVALID: migration009 ${table}`);
   }
+  validateTableContracts(db, {
+    checkpoint_revert_operations: { columns: REVERT_REQUIRED_COLUMNS.checkpoint_revert_operations!, primaryKey: ["operation_id"], unique: [["actor_id","command_id"]], constraints: ["CHECK(stage IN ('validated','safety_captured','workspace_restored','provider_rewound','projection_committed','partial_failure'))", "CHECK(status IN ('queued','running','blocked','completed','rolled_back'))"], foreignKeys: [{ columns: ["session_id"], parent: "sessions", target: ["id"] }, { columns: ["plan_id"], parent: "checkpoint_preview_plans", target: ["plan_id"] }, { columns: ["actor_id","command_id"], parent: "command_receipts", target: ["auth_subject_id","command_id"] }] },
+    checkpoint_revert_steps: { columns: REVERT_REQUIRED_COLUMNS.checkpoint_revert_steps!, primaryKey: ["operation_id","step_id"], unique: [["operation_id","ordinal"]], foreignKeys: [{ columns: ["operation_id"], parent: "checkpoint_revert_operations", target: ["operation_id"] }] },
+    checkpoint_revert_step_attempts: { columns: REVERT_REQUIRED_COLUMNS.checkpoint_revert_step_attempts!, primaryKey: ["attempt_id"], constraints: ["CHECK(state IN ('dispatching','applied','outcome_unknown'))"], foreignKeys: [{ columns: ["operation_id","step_id"], parent: "checkpoint_revert_steps", target: ["operation_id","step_id"] }] },
+    checkpoint_revert_gates: { columns: REVERT_REQUIRED_COLUMNS.checkpoint_revert_gates!, primaryKey: ["session_id"], constraints: ["CHECK(state IN ('blocked','released'))", "REFERENCES checkpoint_revert_operations(operation_id) DEFERRABLE INITIALLY DEFERRED"], foreignKeys: [{ columns: ["session_id"], parent: "sessions", target: ["id"] }, { columns: ["operation_id"], parent: "checkpoint_revert_operations", target: ["operation_id"] }] },
+    checkpoint_revert_evidence: { columns: REVERT_REQUIRED_COLUMNS.checkpoint_revert_evidence!, primaryKey: ["evidence_id"], nullable: ["consumed_by"], foreignKeys: [{ columns: ["operation_id"], parent: "checkpoint_revert_operations", target: ["operation_id"] }, { columns: ["session_id"], parent: "sessions", target: ["id"] }] },
+    checkpoint_revert_view_boundaries: { columns: REVERT_REQUIRED_COLUMNS.checkpoint_revert_view_boundaries!, primaryKey: ["operation_id"], foreignKeys: [{ columns: ["operation_id"], parent: "checkpoint_revert_operations", target: ["operation_id"] }, { columns: ["session_id"], parent: "sessions", target: ["id"] }, { columns: ["target_checkpoint_id"], parent: "checkpoint_captures", target: ["checkpoint_id"] }, { columns: ["safety_checkpoint_id"], parent: "checkpoint_captures", target: ["checkpoint_id"] }] },
+  });
 }

@@ -39,21 +39,21 @@ function seedV4(path: string): void {
 }
 
 describe("ordered owned schema and recovery metadata", () => {
-  it("migrates a real v4 file through recovery and views, then reopens without changing schema", () => {
+  it("migrates a real v4 file through the current schema, then reopens without changing schema", () => {
     const f = fixture(); seedV4(f.databasePath);
     const first = new SqliteStore(f.databasePath, { mode: "owned" });
     const session = first.createSession("/controlled-workspace");
     const schema = first.db.prepare("SELECT name,sql FROM sqlite_master ORDER BY name").all();
     expect(inspectSchema(first.db).version).toBe(SUPPORTED_SCHEMA_VERSION);
     expect((first.db.prepare("PRAGMA table_info(execution_intents)").all() as Array<{ name: string }>).some((column) => column.name === "dispatch_context_json")).toBe(true);
-    expect(first.db.prepare("SELECT version FROM schema_migrations ORDER BY version").all()).toEqual([1, 2, 3, 4, 5, 6].map((version) => ({ version })));
+    expect(first.db.prepare("SELECT version FROM schema_migrations ORDER BY version").all()).toEqual(Array.from({ length: SUPPORTED_SCHEMA_VERSION }, (_, index) => ({ version: index + 1 })));
     first.close();
     const second = new SqliteStore(f.databasePath, { mode: "owned" });
     try {
       expect(second.getSession(session.id)?.workspacePath).toBe("/controlled-workspace");
       expect(second.db.prepare("SELECT name,sql FROM sqlite_master ORDER BY name").all()).toEqual(schema);
       const reader = openReadOnly(f.databasePath);
-      try { expect(inspectSchema(reader.db).version).toBe(6); } finally { reader.close(); }
+      try { expect(inspectSchema(reader.db).version).toBe(SUPPORTED_SCHEMA_VERSION); } finally { reader.close(); }
     } finally { second.close(); }
   });
 

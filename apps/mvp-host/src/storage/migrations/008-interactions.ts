@@ -1,4 +1,5 @@
 import type Database from "better-sqlite3";
+import { validateTableContracts } from "./schema-constraints.js";
 export const INTERACTION_SCHEMA_VERSION = 8;
 export const INTERACTION_SCHEMA = `
 CREATE TABLE interactions (
@@ -61,6 +62,11 @@ export function validateInteractionSchema(db: Database.Database): void {
     if (names.some((name) => !columns.some((column) => column.name === name)))
       throw new Error(`SCHEMA_INVALID: migration 008 table ${table}`);
   }
+  validateTableContracts(db, {
+    interactions: { columns: required.interactions!, primaryKey: ["interaction_id"], nullable: ["attempt_id","runtime_id","runtime_generation","native_request_id","native_method","dispatch_context_json","reason_code","legacy_approval_id"], unique: [["legacy_approval_id"],["session_id","attempt_id","native_method","native_request_id"]], constraints: ["CHECK(kind IN ('approval','question'))", "CHECK(version >= 0)", "CHECK(status IN ('pending','responding','delivered','confirmed','expired','superseded','outcome_unknown'))", "CHECK(delivery_state IN ('none','accepted','local_delivery','native_confirmation','unconfirmed','legacy'))", "CHECK(evidence_kind IN ('native_request','local_delivery','native_confirmation','legacy','unknown'))"], foreignKeys: [{ columns: ["session_id"], parent: "sessions", target: ["id"] }, { columns: ["turn_id"], parent: "turns", target: ["id"] }, { columns: ["legacy_approval_id"], parent: "approvals", target: ["approval_id"] }] },
+    interaction_reservations: { columns: required.interaction_reservations!, primaryKey: ["interaction_id"], unique: [["intent_id"]], foreignKeys: [{ columns: ["interaction_id"], parent: "interactions", target: ["interaction_id"] }, { columns: ["intent_id"], parent: "execution_intents", target: ["id"] }, { columns: ["auth_subject_id","command_id"], parent: "command_receipts", target: ["auth_subject_id","command_id"], onUpdate: "CASCADE" }] },
+    interaction_delivery_evidence: { columns: required.interaction_delivery_evidence!, primaryKey: ["id"], nullable: ["source_id"], constraints: ["CHECK(kind IN ('local-delivery','native-ack','not-dispatched','unknown','legacy'))", "CHECK(kind <> 'native-ack' OR source_id IS NOT NULL)"], foreignKeys: [{ columns: ["interaction_id"], parent: "interactions", target: ["interaction_id"] }] },
+  });
 }
 /** Legacy local resolution stays legacy evidence; no native ACK or new delivery intent is invented. */
 export function applyInteractionMigration(db: Database.Database, occurredAt = new Date().toISOString()): void {
@@ -69,6 +75,7 @@ export function applyInteractionMigration(db: Database.Database, occurredAt = ne
       validateInteractionSchema(db);
       return;
     }
+    if (!db.prepare("SELECT 1 FROM schema_migrations WHERE version=7").get()) throw new Error("INTERACTION_MIGRATION_REQUIRES_007");
     db.exec(INTERACTION_SCHEMA);
     const approvals = db.prepare("SELECT * FROM approvals ORDER BY created_at, approval_id").all() as Array<{
       approval_id: string;

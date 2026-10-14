@@ -8,8 +8,6 @@ import type { SqliteStore } from "../storage/db.js";
 import { HostOwnerLock, type HostOwnerHandle } from "../lifecycle/host-owner.js";
 import { openOwned } from "../storage/open-store.js";
 import { SUPPORTED_SCHEMA_VERSION } from "../storage/migrations/schema-version.js";
-import { INTERACTION_SCHEMA } from "../storage/migrations/008-interactions.js";
-import { applyAttentionSchema } from "../attention/store.js";
 import { invalidateRestoredAccess } from "./restore-service.js";
 import { ContentStore } from "../content/content-store.js";
 import { getHostIdentityMirror, loadOrCreateHostIdentity } from "../identity/host-identity.js";
@@ -141,7 +139,6 @@ describe("restored deferred work is fenced", () => {
     const f = await fixture(); const timestamp = "2026-10-01T00:00:00.000Z";
     f.store.acceptTurn({ authSubjectId: "device-1", sessionId: f.session.id, turnId: "turn-1", commandId: "command-1", requestHash: "hash", prompt: "work", generation: 1 });
     f.store.createDevice({ id: "device-1", hostId: f.identity.hostId, platform: "test", credentialKind: "noise-static-key", credentialRevision: 1, scopes: ["host:read"], createdAt: timestamp });
-    f.store.db.exec(INTERACTION_SCHEMA); applyAttentionSchema(f.store.db);
     const question = { blocking: true, questions: [{ questionId: "q", header: "Question", question: "Value?", options: [], multiSelect: false, allowFreeText: true, secret: false }] };
     for (const status of ["pending", "responding", "outcome_unknown", "confirmed"]) f.store.db.prepare(`INSERT INTO interactions
       (interaction_id,session_id,turn_id,kind,version,status,delivery_state,evidence_kind,request_json,allowed_actions_json,expires_at,created_at,updated_at)

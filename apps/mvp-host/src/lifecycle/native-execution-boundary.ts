@@ -1,10 +1,11 @@
-import { spawn, type ChildProcess, type SpawnOptions } from "node:child_process";
+import { spawn, type SpawnOptions } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { lstatSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { chmod, mkdir, mkdtemp, readFile, readdir, readlink, rm, symlink, writeFile } from "node:fs/promises";
 import { release, tmpdir } from "node:os";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { SystemProcessInspector, type ProcessIdentity } from "./process-inspector.js";
+import type { ManagedChildHandle } from "./managed-child-handle.js";
 import { NativeBoundaryError, type NativeBoundaryBackend, type NativeBoundaryPlatform, type NativeBoundaryProof, type NativeBoundaryPublicSummary, type NativeBoundaryReadinessCode } from "./native-boundary-proof.js";
 export { NativeBoundaryError, inspectNativeBoundaryStop, isNativeBoundaryProof, nativeIdentityDigest } from "./native-boundary-proof.js";
 export type { NativeBoundaryProof, NativeBoundaryPublicSummary, NativeBoundaryReadinessCode } from "./native-boundary-proof.js";
@@ -32,7 +33,7 @@ export type NativeBoundarySpawnRequest = {
 };
 export type NativeBoundaryLaunchEvidence = { proof: NativeBoundaryProof; launchDigest: string };
 export interface NativeBoundaryProcessRegistry {
-  spawn(command: string, args: readonly string[], options: SpawnOptions, evidence: NativeBoundaryLaunchEvidence): ChildProcess;
+  spawn(command: string, args: readonly string[], options: SpawnOptions, evidence: NativeBoundaryLaunchEvidence): ManagedChildHandle;
 }
 export type NativeBoundaryLaunchPlan = {
   command: string;
@@ -138,7 +139,7 @@ export class NativeExecutionBoundary {
     return { command: this.backend.path, args, options, proof: this.proof, launchDigest };
   }
   /** The registry commits the fourth-argument evidence with its launching row before OS spawn. */
-  spawn(registry: NativeBoundaryProcessRegistry, request: NativeBoundarySpawnRequest): ChildProcess {
+  spawn(registry: NativeBoundaryProcessRegistry, request: NativeBoundarySpawnRequest): ManagedChildHandle {
     const plan = this.plan(request);
     return registry.spawn(plan.command, plan.args, plan.options, { proof: plan.proof, launchDigest: plan.launchDigest });
   }

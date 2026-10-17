@@ -35,13 +35,36 @@ describe("managed SDK runtime integration", () => {
     let captured: { command: string; args: readonly string[]; options: import("node:child_process").SpawnOptions } | undefined;
     const f = managed((command, args, options) => { expect(f.records.at(-1)).toMatchObject({ state: "launching", ...context, boundaryEvidence: { launchDigest: "a".repeat(64) } }); captured = { command, args, options }; return child; });
     const events: AdapterEvent[] = [];
-    const queryFactory = ((request) => { const process = request.options?.spawnClaudeCodeProcess?.(sdkRequest); expect(process).toBe(child); return { async *[Symbol.asyncIterator]() { yield init; yield result; }, interrupt: async () => {}, close: () => { stdin.end(); } } as unknown as Query; }) as typeof import("@anthropic-ai/claude-agent-sdk").query;
+    const queryFactory = ((request) => { const process = request.options?.spawnClaudeCodeProcess?.(sdkRequest); expect(process).not.toBe(child); expect(process?.stdin).toBe(stdin); expect(process?.stdout).toBe(stdout); return { async *[Symbol.asyncIterator]() { yield init; yield result; }, interrupt: async () => {}, close: () => { stdin.end(); } } as unknown as Query; }) as typeof import("@anthropic-ai/claude-agent-sdk").query;
     const adapter = new ClaudeAdapter({ ...f.options, workspace, queryFactory, onEvent: (event) => events.push(event) });
     try {
       expect(await adapter.runTurn(context.flyxTurnId, "task", undefined, context)).toMatchObject({ status: "completed", evidence: { kind: "native-terminal", sourceId: "native-result-uuid" } });
       expect(captured).toMatchObject({ command: sdkRequest.command, args: sdkRequest.args, options: { cwd: workspace, env: sdkRequest.env } }); expect(captured?.options.signal).toBe(forwarded.signal); expect(forwarded.signal.aborted).toBe(false); expect(kill).not.toHaveBeenCalled();
       expect(f.records.at(-1)?.state).toBe("stopped"); expect(f.stops.at(-1)).toMatchObject({ context, result: { treeStopped: true } }); expect(events.at(-1)).toMatchObject({ kind: "turn_completed", dispatchContext: context, terminalEvidence: { kind: "native-terminal", sourceId: "native-result-uuid" } });
     } finally { await adapter.closeAndWait(); adapter.sealCallbacks(); adapter.sealProcessJournal(); }
+  });
+  it("fails closed when a launch is rejected before any OS process exists", async () => {
+    const f = managed(() => { throw new Error("ENOENT"); }); const events: AdapterEvent[] = []; const failures: Error[] = [];
+    const sdkRequest: SdkSpawnOptions = { command: "fixture-sdk-executable", args: [], cwd: workspace, env: {}, signal: new AbortController().signal };
+    const queryFactory = ((request) => {
+      const process = request.options?.spawnClaudeCodeProcess?.(sdkRequest);
+      // The locked SDK registers its own error handler synchronously right after the callback.
+      process?.on("error", (error) => failures.push(error));
+      if (process) {
+        expect(process.stdin).toBeDefined(); expect(process.stdout).toBeDefined();
+        expect(process.killed).toBe(false); expect(process.exitCode).toBeNull(); expect(process.signalCode).toBeNull();
+        expect(process.kill("SIGTERM")).toBe(false);
+      }
+      return { async *[Symbol.asyncIterator]() { yield init; }, close() {}, interrupt: async () => {} } as unknown as Query;
+    }) as typeof import("@anthropic-ai/claude-agent-sdk").query;
+    const adapter = new ClaudeAdapter({ ...f.options, workspace, queryFactory, onEvent: (event) => events.push(event) });
+    try {
+      expect(await adapter.runTurn(context.flyxTurnId, "task", undefined, context)).toMatchObject({ status: "outcome_unknown", evidence: { kind: "unknown" } });
+      expect(failures.map((error) => error.message)).toEqual(["ENOENT"]);
+      expect(f.records.map((record) => record.state)).toEqual(["launching", "not_spawned"]);
+      expect(f.records.at(-1)?.errorCode).toBe("SPAWN_THROW");
+      expect(events.some((event) => ["turn_completed", "turn_failed", "turn_cancelled"].includes(event.kind))).toBe(false);
+    } finally { await adapter.closeAndWait(); }
   });
   it("snapshots controlled Provider model, executable and allowlisted environment", async () => {
     const environment = { PATH: "registered-path", LANG: "C" }; let configured: unknown;

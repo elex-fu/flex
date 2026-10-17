@@ -45,6 +45,103 @@ export function isNativeBoundaryProof(value: unknown): value is NativeBoundaryPr
     && (p.treeIsolation === "unverified" && p.verifiedDescendantStop === false || p.platform === "linux" && p.treeIsolation === "linux_pid_namespace" && p.verifiedDescendantStop === true);
 }
 
+export const NATIVE_RAW_PROCESS_EVIDENCE_VERSION = 1;
+
+/**
+ * Original operating-system launch/popen observation. It is recorded once,
+ * together with the durable launching row, and is the immutable identity of
+ * that launch: a later proof (newer backend, supervisor or proof version) may
+ * be stored beside it but must never replace or rewrite it. The `version` /
+ * `kind` fields are part of the stored JSON so a future proof variant can
+ * coexist without reinterpreting v1 records.
+ */
+export type NativeRawLaunchEvidenceV1 = Readonly<{
+  version: 1;
+  kind: "original_launch";
+  platform: NativeBoundaryPlatform;
+  backend: NativeBoundaryBackend;
+  /** Raw root PID reported by the OS at the original launch. */
+  pid: number;
+  launchDigest: string;
+  observedAt: string;
+}>;
+
+/** Later root observation for the same launch; an observation, never a stop proof. */
+export type NativeRawExitEvidenceV1 = Readonly<{
+  version: 1;
+  kind: "root_exit";
+  pid: number;
+  code: number | null;
+  signal: NodeJS.Signals | null;
+  observedAt: string;
+}>;
+
+export type NativeRawProcessEvidence = NativeRawLaunchEvidenceV1 | NativeRawExitEvidenceV1;
+
+/**
+ * Durable raw-evidence ledger for one launch. `launch` is the original
+ * identity; `later` only grows and never includes a replacement original.
+ */
+export type NativeRawEvidenceLedgerV1 = Readonly<{
+  version: 1;
+  launch: NativeRawLaunchEvidenceV1;
+  later: readonly NativeRawProcessEvidence[];
+}>;
+
+export type NativeRawEvidenceErrorCode = "NATIVE_RAW_EVIDENCE_INVALID" | "NATIVE_RAW_EVIDENCE_CONFLICT";
+export class NativeRawEvidenceError extends Error {
+  readonly retryable = false;
+  constructor(readonly code: NativeRawEvidenceErrorCode) { super(code); this.name = "NativeRawEvidenceError"; }
+}
+
+function rawBackendMatches(platform: unknown, backend: unknown): boolean {
+  return platform === "darwin" && backend === "macos_seatbelt" || platform === "linux" && backend === "linux_bubblewrap";
+}
+function rawPid(value: unknown): value is number {
+  return Number.isSafeInteger(value) && (value as number) > 0;
+}
+
+export function isNativeRawLaunchEvidence(value: unknown): value is NativeRawLaunchEvidenceV1 {
+  if (!value || typeof value !== "object") return false;
+  const evidence = value as Partial<NativeRawLaunchEvidenceV1>;
+  return evidence.version === NATIVE_RAW_PROCESS_EVIDENCE_VERSION && evidence.kind === "original_launch"
+    && rawBackendMatches(evidence.platform, evidence.backend) && rawPid(evidence.pid)
+    && typeof evidence.launchDigest === "string" && /^[a-f0-9]{64}$/.test(evidence.launchDigest)
+    && typeof evidence.observedAt === "string" && evidence.observedAt.length > 0;
+}
+
+export function isNativeRawProcessEvidence(value: unknown): value is NativeRawProcessEvidence {
+  if (isNativeRawLaunchEvidence(value)) return true;
+  if (!value || typeof value !== "object") return false;
+  const evidence = value as Partial<NativeRawExitEvidenceV1>;
+  return evidence.version === NATIVE_RAW_PROCESS_EVIDENCE_VERSION && evidence.kind === "root_exit"
+    && rawPid(evidence.pid)
+    && (evidence.code === null || Number.isSafeInteger(evidence.code))
+    && (evidence.signal === null || typeof evidence.signal === "string")
+    && typeof evidence.observedAt === "string" && evidence.observedAt.length > 0;
+}
+
+/** Freeze the original launch identity into a fresh ledger; it is never mutated in place. */
+export function nativeRawEvidenceLedger(launch: NativeRawLaunchEvidenceV1): NativeRawEvidenceLedgerV1 {
+  if (!isNativeRawLaunchEvidence(launch)) throw new NativeRawEvidenceError("NATIVE_RAW_EVIDENCE_INVALID");
+  return Object.freeze({ version: NATIVE_RAW_PROCESS_EVIDENCE_VERSION, launch: Object.freeze({ ...launch }), later: Object.freeze([]) });
+}
+
+/**
+ * Append a later observation beside the original launch. A record that tries
+ * to overwrite the original identity (another `original_launch`, or an exit
+ * for another PID) is a conflict: the stored ledger is left untouched and the
+ * caller must keep the original launch identity.
+ */
+export function appendNativeRawProcessEvidence(ledger: NativeRawEvidenceLedgerV1, incoming: NativeRawProcessEvidence): NativeRawEvidenceLedgerV1 {
+  if (!ledger || typeof ledger !== "object" || ledger.version !== NATIVE_RAW_PROCESS_EVIDENCE_VERSION
+    || !isNativeRawLaunchEvidence(ledger.launch) || !Array.isArray(ledger.later) || !ledger.later.every(isNativeRawProcessEvidence)
+    || !isNativeRawProcessEvidence(incoming)) throw new NativeRawEvidenceError("NATIVE_RAW_EVIDENCE_INVALID");
+  if (incoming.kind !== "root_exit") throw new NativeRawEvidenceError("NATIVE_RAW_EVIDENCE_CONFLICT");
+  if (incoming.pid !== ledger.launch.pid) throw new NativeRawEvidenceError("NATIVE_RAW_EVIDENCE_CONFLICT");
+  return Object.freeze({ version: NATIVE_RAW_PROCESS_EVIDENCE_VERSION, launch: ledger.launch, later: Object.freeze([...ledger.later, Object.freeze({ ...incoming })]) });
+}
+
 /** Proof must be reloaded and verified against the original durable launch, never supplied by an RPC caller. */
 export function inspectNativeBoundaryStop(
   proof: unknown,

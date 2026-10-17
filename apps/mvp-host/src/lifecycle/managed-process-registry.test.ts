@@ -62,6 +62,22 @@ describe("managed process ownership", () => {
     expect(records.map((record) => record.state)).toEqual(["launching", "not_spawned"]);
     expect((await registry.closeAndWait(0)).stopped).toBe(true);
   });
+  it("settles a no-PID launch error as not_spawned instead of a fabricated root exit", async () => {
+    const records: ManagedProcessRecord[] = [];
+    const child = new EventEmitter() as ChildProcess;
+    Object.assign(child, { pid: undefined, stdin: null, stdout: null, stderr: null, kill: () => false });
+    const registry = new ManagedProcessRegistry({ journal: { save: (record) => records.push({ ...record }) },
+      context: () => context, spawn: (() => child) as typeof spawn, groupExists: () => "absent" });
+    const handle = registry.spawn("fixture", [], {});
+    expect(handle.pid).toBeUndefined(); expect(handle.rawEvidence()).toEqual([]);
+    child.emit("error", new Error("ENOENT"));
+    await handle.exited;
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(records.map((record) => [record.state, record.errorCode])).toEqual([["launching", undefined], ["not_spawned", "SPAWN_FAILED"]]);
+    expect(records.some((record) => record.state === "root_exited")).toBe(false);
+    expect(handle.kill("SIGKILL")).toBe(false);
+    expect((await registry.closeAndWait(0)).stopped).toBe(true);
+  });
   it("unverified process group exit remains blocked even when the group vanished", async () => {
     const child = new EventEmitter() as ChildProcess;
     Object.assign(child, { pid: 5_000_000, stdin: new PassThrough(), kill: () => true });

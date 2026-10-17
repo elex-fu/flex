@@ -1,4 +1,4 @@
-import { execFile, type ChildProcess } from "node:child_process";
+import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { mkdtemp, mkdir, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -210,14 +210,19 @@ describe.runIf(process.platform === "darwin")("actual helper-only macOS policy; 
     const registry=new ManagedProcessRegistry({journal:new SqliteProcessJournal(db),context:()=>({...context,attemptId:"diagnostic-"+registries.length})});
     registries.push(registry);
     const launchDigest=createHash("sha256").update(JSON.stringify({command,args,cwd,env})).digest("hex");
-    const child:ChildProcess=registry.spawn(command,args,{cwd,env,stdio:["ignore","pipe","pipe"]},{
+    const child=registry.spawn(command,args,{cwd,env,stdio:["ignore","pipe","pipe"]},{
       proof:{kind:"workspace-git-readonly-policy-diagnostic",policyDigest:profileDigest,verifiedStableProcessBirth:false},launchDigest,
     });
     let stdout="",stderr="";
     const finished=new Promise<void>((resolve,reject)=>{
       child.stdout?.on("data",(data:Buffer)=>{stdout+=data.toString("utf8");if(Buffer.byteLength(stdout)>32*1024){child.kill("SIGKILL");reject(new Error("output exceeded"));}});
       child.stderr?.on("data",(data:Buffer)=>{stderr+=data.toString("utf8");});
-      child.once("error",reject);child.once("close",code=>code===0?resolve():reject(new Error("probe exit "+code+": "+stderr)));
+      child.once("error",reject);
+      void child.exited.then(exit=>{
+        const stream=child.stdout;
+        const drained=stream&&!stream.readableEnded&&!stream.destroyed?new Promise<void>(done=>{stream.once("end",()=>done());stream.once("close",()=>done());}):Promise.resolve();
+        void drained.then(()=>exit.code===0?resolve():reject(new Error("probe exit "+exit.code+": "+stderr)));
+      });
     });
     const watchdog=setTimeout(()=>child.kill("SIGKILL"),8_000);
     try {await finished;} finally {clearTimeout(watchdog);}

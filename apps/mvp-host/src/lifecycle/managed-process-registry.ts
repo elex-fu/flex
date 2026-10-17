@@ -3,9 +3,11 @@ import { randomUUID } from "node:crypto";
 import type Database from "better-sqlite3";
 import { SystemProcessInspector, type ProcessIdentity } from "./process-inspector.js";
 import { validateTreeStopEvidence, type ProcessBoundaryEvidence, type ProcessTreeStopEvidence } from "./managed-process-evidence.js";
+import { adoptNodeChildProcess, type ManagedChildHandle } from "./managed-child-handle.js";
 import { MANAGED_PROCESS_EVIDENCE_SCHEMA } from "../storage/migrations/005-process-evidence.js";
 export { MANAGED_PROCESS_SCHEMA } from "../storage/migrations/004-managed-process-schema.js";
 export { processIdentityDigest, type ProcessBoundaryEvidence, type ProcessTreeStopEvidence } from "./managed-process-evidence.js";
+export type { ManagedChildExit, ManagedChildHandle, ManagedChildRawEvidence } from "./managed-child-handle.js";
 
 export type ProcessLaunchContext = {
   hostOwnerId: string;
@@ -82,7 +84,7 @@ export class SqliteProcessJournal implements ProcessJournal {
   }
 }
 
-type Entry = { child: ChildProcess; record: ManagedProcessRecord; exited: boolean; exit: Promise<void> };
+type Entry = { handle: ManagedChildHandle; record: ManagedProcessRecord; exited: boolean };
 export class ManagedProcessRegistry {
   private readonly entries = new Map<string, Entry>();
   private closing = false;
@@ -99,7 +101,7 @@ export class ManagedProcessRegistry {
     verifyDescendantStop?: (record: ManagedProcessRecord) => ProcessTreeStopEvidence | undefined | Promise<ProcessTreeStopEvidence | undefined>;
   }) {}
 
-  spawn(command: string, args: readonly string[], options: SpawnOptions, boundaryEvidence?: ProcessBoundaryEvidence): ChildProcess {
+  spawn(command: string, args: readonly string[], options: SpawnOptions, boundaryEvidence?: ProcessBoundaryEvidence): ManagedChildHandle {
     if (this.closing) throw new Error("RUNTIME_CLOSING");
     const grouped = process.platform !== "win32";
     const record: ManagedProcessRecord = {
@@ -116,33 +118,34 @@ export class ManagedProcessRegistry {
       this.options.journal.save(record);
       throw error;
     }
-    let resolveExit!: () => void;
-    const exit = new Promise<void>((resolve) => { resolveExit = resolve; });
-    const entry: Entry = { child, record, exited: false, exit };
+    const handle = adoptNodeChildProcess({ id: record.id, child, grouped });
+    const entry: Entry = { handle, record, exited: false };
     this.entries.set(record.id, entry);
-    child.once("exit", () => {
+    void handle.exited.then(() => {
+      if (entry.exited) return;
       entry.exited = true;
-      record.state = "root_exited";
+      // A handle without a PID never observed an OS process: its terminal
+      // observation settles as "never spawned", never as a normal root exit.
+      if (handle.pid === undefined) { record.state = "not_spawned"; record.errorCode = "SPAWN_FAILED"; }
+      else record.state = "root_exited";
       this.persist(record);
-      resolveExit();
     });
-    child.once("error", () => {
-      if (child.pid === undefined) {
+    handle.on("error", () => {
+      if (handle.pid === undefined) {
         entry.exited = true; record.state = "not_spawned"; record.errorCode = "SPAWN_FAILED";
-        resolveExit();
       } else { record.state = "unknown"; record.errorCode = "PROCESS_ERROR"; }
       this.persist(record);
     });
-    if (child.pid !== undefined) {
-      record.pid = child.pid;
-      record.processIdentity = (this.options.identify ?? ((pid) => new SystemProcessInspector({ pid }).currentIdentity()))(child.pid);
-      if (grouped) record.processGroup = child.pid;
+    if (handle.pid !== undefined) {
+      record.pid = handle.pid;
+      record.processIdentity = (this.options.identify ?? ((pid) => new SystemProcessInspector({ pid }).currentIdentity()))(handle.pid);
+      if (grouped) record.processGroup = handle.pid;
       record.state = "running";
       // If this commit fails after spawn, the durable launching row remains a recovery gate.
       try { this.options.journal.save(record); }
       catch (error) { record.state = "unknown"; record.errorCode = "PID_PERSIST_FAILED"; void this.stopEntry(entry, 1_000); throw error; }
     }
-    return child;
+    return handle;
   }
 
   records(): ManagedProcessRecord[] { return [...this.entries.values()].map(({ record }) => ({ ...record })); }
@@ -151,13 +154,7 @@ export class ManagedProcessRegistry {
     this.journalSealed = true;
     // Detach only this Host's IPC handles after drain/unknown settlement. An
     // escaped descendant holding a pipe is still durably unknown, never stopped.
-    for (const entry of this.entries.values()) {
-      try { entry.child.stdin?.destroy?.(); } catch { /* Handle cleanup is not process proof. */ }
-      try { entry.child.stdout?.destroy?.(); } catch { /* Handle cleanup is not process proof. */ }
-      try { entry.child.stderr?.destroy?.(); } catch { /* Handle cleanup is not process proof. */ }
-      try { if (entry.child.connected) entry.child.disconnect(); } catch { /* IPC may already be closed. */ }
-      try { entry.child.unref?.(); } catch { /* Detached handles never become stop evidence. */ }
-    }
+    for (const entry of this.entries.values()) entry.handle.dispose();
   }
   closeAndWait(deadlineMs = 5_000): Promise<ProcessStopResult> {
     this.closing = true;
@@ -172,15 +169,18 @@ export class ManagedProcessRegistry {
   }
   private async stopEntry(entry: Entry, deadlineMs: number): Promise<boolean> {
     const deadline = Date.now() + Math.max(0, deadlineMs);
-    try { entry.child.stdin?.end(); } catch { /* group proof still required */ }
-    if (!entry.exited) await waitForExit(entry.exit, Math.min(this.options.gracefulExitMs ?? 2_000, Math.max(0, deadlineMs / 2)));
-    if (!entry.exited) {
+    try { entry.handle.stdin?.end(); } catch { /* group proof still required */ }
+    let exit = await entry.handle.waitForExit(Math.min(this.options.gracefulExitMs ?? 2_000, Math.max(0, deadlineMs / 2)));
+    if (exit) entry.exited = true;
+    if (!exit) {
       this.signalOwnedRoot(entry, "SIGTERM");
-      await waitForExit(entry.exit, Math.max(0, (deadline - Date.now()) / 2));
+      exit = await entry.handle.waitForExit(Math.max(0, (deadline - Date.now()) / 2));
+      if (exit) entry.exited = true;
     }
-    if (!entry.exited) {
+    if (!exit) {
       this.signalOwnedRoot(entry, "SIGKILL");
-      await waitForExit(entry.exit, Math.max(0, deadline - Date.now()));
+      exit = await entry.handle.waitForExit(Math.max(0, deadline - Date.now()));
+      if (exit) entry.exited = true;
     }
     if (entry.record.state === "not_spawned") return true;
     const group = entry.record.processGroup;
@@ -202,11 +202,9 @@ export class ManagedProcessRegistry {
     return false;
   }
   private signalOwnedRoot(entry: Entry, signal: NodeJS.Signals): void {
-    if (entry.exited || entry.child.pid === undefined) return;
-    try {
-      if (entry.record.processGroup !== undefined) process.kill(-entry.record.processGroup, signal);
-      else entry.child.kill(signal);
-    } catch { /* signal delivery is not an exit proof */ }
+    // The handle refuses to signal an already observed exit or a missing PID,
+    // so a signal request never becomes exit proof or a recycled-PID kill.
+    entry.handle.kill(signal);
   }
   private persist(record: ManagedProcessRecord): boolean {
     if (this.journalSealed) return false;
@@ -220,11 +218,4 @@ function groupExists(pid: number): "present" | "absent" | "unknown" {
   catch (error) {
     return (error as NodeJS.ErrnoException).code === "ESRCH" ? "absent" : "unknown";
   }
-}
-async function waitForExit(exit: Promise<void>, deadlineMs: number): Promise<boolean> {
-  if (deadlineMs <= 0) return false;
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  const result = await Promise.race([exit.then(() => true), new Promise<boolean>((resolve) => { timer = setTimeout(() => resolve(false), deadlineMs); })]);
-  if (timer) clearTimeout(timer);
-  return result;
 }

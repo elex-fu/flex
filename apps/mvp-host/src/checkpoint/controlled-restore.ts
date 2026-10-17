@@ -1,8 +1,9 @@
-import { execFile, spawn, type ChildProcess } from "node:child_process";
-import { createHash } from "node:crypto";
+import { execFile, spawn } from "node:child_process";
+import { createHash, randomUUID } from "node:crypto";
 import { mkdtemp, readFile, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { adoptNodeChildProcess, type ManagedChildExit, type ManagedChildHandle } from "../lifecycle/managed-child-handle.js";
 import { CONTROLLED_RESTORE_HELPER } from "./controlled-restore-helper.js";
 import { digest, validateCheckpointPath } from "./git-driver.js";
 import type { CheckpointGitDriver } from "./git-driver.js";
@@ -18,7 +19,7 @@ export type ControlledHelperSpawnRequest = {
 };
 export type ControlledRestoreOptions = {
   /** Production injects prelaunch process journaling and the verified execution boundary. */
-  spawnHelper?: (request: ControlledHelperSpawnRequest) => ChildProcess | Promise<ChildProcess>;
+  spawnHelper?: (request: ControlledHelperSpawnRequest) => ManagedChildHandle | Promise<ManagedChildHandle>;
   /** Trusted Host configuration only. This is never a client-selected executable. */
   pythonExecutable?: string;
   onSpawn?: (process: {pid:number;operationId:string;stepId:string;kind:"controlled_restore"}) => void | Promise<void>;
@@ -100,26 +101,35 @@ export class ControlledRestore {
     const launch:ControlledHelperSpawnRequest={command:this.options.pythonExecutable ?? "/usr/bin/python3",args:["-I","-c",CONTROLLED_RESTORE_HELPER],env,
       purpose:producer?"mutate":operation==="probe"?"probe":"read",...(producer??{}),...(workspace?{workspace}:{})};
     return new Promise<T>((resolve,reject)=>{
-      let settled=false,child:ChildProcess|undefined,timer:ReturnType<typeof setTimeout>|undefined;
+      let settled=false,child:ManagedChildHandle|undefined,timer:ReturnType<typeof setTimeout>|undefined;
       const fail=(code:string)=>{if(settled)return;settled=true;if(timer)clearTimeout(timer);try{child?.kill("SIGKILL");child?.stdin?.destroy();}catch{/* Root process journal still controls unknown producers. */}reject(new CheckpointError(code,"Controlled restore helper did not complete"));};
       // The trusted runner commits launch facts before crossing spawn; no mutation input is sent until it returns.
-      void Promise.resolve().then(()=>{if(this.sealed)throw new CheckpointError("CONTROLLED_RESTORE_SEALED","Controlled restore is sealed");return this.options.spawnHelper?this.options.spawnHelper(launch):spawn(launch.command,[...launch.args],{env:launch.env,stdio:["pipe","pipe","pipe"]});}).then((launched)=>{
+      void Promise.resolve().then(()=>{if(this.sealed)throw new CheckpointError("CONTROLLED_RESTORE_SEALED","Controlled restore is sealed");return this.options.spawnHelper?this.options.spawnHelper(launch):adoptNodeChildProcess({id:randomUUID(),child:spawn(launch.command,[...launch.args],{env:launch.env,stdio:["pipe","pipe","pipe"]})});}).then((launched)=>{
         child=launched;const chunks:Buffer[]=[];let bytes=0;
-        if(!child.stdin||!child.stdout){child.kill("SIGKILL");fail("CONTROLLED_RESTORE_UNAVAILABLE");return;}
-        child.stderr?.resume();child.stdin.on("error",()=>{});
-        child.stdout.on("data",(data:Buffer)=>{bytes+=data.length;if(bytes>16*1024*1024){child?.kill("SIGKILL");fail("RESTORE_BUDGET_EXCEEDED");return;}chunks.push(data);});
-        child.once("error",()=>fail("CONTROLLED_RESTORE_UNAVAILABLE"));
-        child.once("close",(code)=>{
+        const stdin=launched.stdin,stdout=launched.stdout;
+        if(!stdin||!stdout){launched.kill("SIGKILL");fail("CONTROLLED_RESTORE_UNAVAILABLE");return;}
+        launched.stderr?.resume();stdin.on("error",()=>{});
+        let exit:ManagedChildExit|undefined,stdoutClosed=false;
+        // The helper's own close boundary is exit plus a drained stdout pipe;
+        // the managed journal keeps the root exit fact either way.
+        const settle=()=>{
+          if(settled||!exit||!stdoutClosed)return;
           if(timer)clearTimeout(timer);
           if(producer&&child?.pid)try{this.options.onExit?.({pid:child.pid,...producer});}catch{/* Sealed original process journals remain unknown. */}
-          if(settled)return;
-          if(code!==0){fail("CONTROLLED_RESTORE_UNAVAILABLE");return;}
+          if(exit.code!==0){fail("CONTROLLED_RESTORE_UNAVAILABLE");return;}
           try{
             const result=JSON.parse(Buffer.concat(chunks).toString("utf8")) as {ok:boolean;result:T;code?:string};
             if(!result.ok){fail(result.code??"RESTORE_HELPER_FAILED");return;}
             settled=true;resolve(result.result);
           }catch{fail("RESTORE_HELPER_FAILED");}
+        };
+        stdout.on("data",(data:Buffer)=>{bytes+=data.length;if(bytes>16*1024*1024){child?.kill("SIGKILL");fail("RESTORE_BUDGET_EXCEEDED");return;}chunks.push(data);});
+        launched.once("error",()=>fail("CONTROLLED_RESTORE_UNAVAILABLE"));
+        launched.once("exit",(value)=>{
+          exit=value;settle();
         });
+        stdout.once("end",()=>{stdoutClosed=true;settle();});
+        stdout.once("close",()=>{stdoutClosed=true;settle();});
         timer=setTimeout(()=>{child?.kill("SIGKILL");fail("CONTROLLED_RESTORE_UNAVAILABLE");},30_000);
         void Promise.resolve(producer&&child.pid?this.options.onSpawn?.({pid:child.pid,...producer,kind:"controlled_restore"}):undefined).then(()=>{
           if(this.sealed){child?.kill("SIGKILL");child?.stdin?.destroy();}else child?.stdin?.end(JSON.stringify(request));

@@ -131,7 +131,13 @@ function managedGitFixture(store: ReturnType<typeof openOwned>, request: HostChe
     child.stderr?.resume(); child.stdin?.on("error", () => {});
     child.stdout?.on("data", (data: Buffer) => { bytes += data.length; if (bytes > request.maxBuffer) abort(); else stdout.push(data); });
     child.once("error", reject);
-    child.once("close", (code) => { clearTimeout(timer); request.signal.removeEventListener("abort", abort); if (code === null) reject(new Error("Managed Git outcome unknown")); else resolve({ stdout: Buffer.concat(stdout), exitCode: code }); });
+    // The managed Git close boundary is the root exit plus a drained stdout pipe.
+    void child.exited.then(async (exit) => {
+      const stream = child.stdout;
+      if (stream && !stream.readableEnded && !stream.destroyed) await new Promise<void>((done) => { stream.once("end", () => done()); stream.once("close", () => done()); });
+      clearTimeout(timer); request.signal.removeEventListener("abort", abort);
+      if (exit.code === null) reject(new Error("Managed Git outcome unknown")); else resolve({ stdout: Buffer.concat(stdout), exitCode: exit.code });
+    });
     child.stdin?.end(request.input ? Buffer.from(request.input.data, "base64") : undefined);
   });
 }

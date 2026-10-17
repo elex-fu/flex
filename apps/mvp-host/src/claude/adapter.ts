@@ -13,6 +13,7 @@ import {
   type SpawnOptions as SdkSpawnOptions,
   type SpawnedProcess,
 } from "@anthropic-ai/claude-agent-sdk";
+import { claudeSpawnedProcess, failedClaudeSpawnedProcess } from "./spawned-process.js";
 import type {
   AdapterEvent,
   AdapterEventHandler,
@@ -428,7 +429,16 @@ export class ClaudeAdapter implements ProviderAdapter {
     const pathOverride = this.executableOverride;
     return {
       cwd: this.workspace,
-      spawnClaudeCodeProcess: (request: SdkSpawnOptions): SpawnedProcess => active.runtime.spawn({ command: request.command, args: request.args, cwd: request.cwd ?? this.workspace, env: request.env, signal: request.signal, stdio: ["pipe", "pipe", "pipe"], windowsHide: true }) as SpawnedProcess,
+      // The SDK's spawn callback is synchronous; the narrow handle is the only
+      // real launch identity. A failed prepare/commit must surface as an error
+      // on a bounded facade, never as a fabricated PID or a normal exit.
+      spawnClaudeCodeProcess: (request: SdkSpawnOptions): SpawnedProcess => {
+        try {
+          return claudeSpawnedProcess(active.runtime.spawn({ command: request.command, args: request.args, cwd: request.cwd ?? this.workspace, env: request.env, signal: request.signal, stdio: ["pipe", "pipe", "pipe"], windowsHide: true }));
+        } catch (error) {
+          return failedClaudeSpawnedProcess(error instanceof Error ? error : new Error(String(error)));
+        }
+      },
       ...(pathOverride ? { pathToClaudeCodeExecutable: pathOverride } : {}),
       ...(resumeSessionId ? { resume: resumeSessionId } : {}),
       ...(this.model ? { model: this.model } : {}),

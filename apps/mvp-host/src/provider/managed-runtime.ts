@@ -1,12 +1,13 @@
-import type { ChildProcess, SpawnOptions } from "node:child_process";
+import type { SpawnOptions } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { ManagedProcessRegistry, type ProcessStopResult } from "../lifecycle/managed-process-registry.js";
+import type { ManagedChildExit, ManagedChildHandle } from "../lifecycle/managed-child-handle.js";
 import type { DispatchContext } from "./types.js";
 import { dispatchContextForTurn } from "./types.js";
 
 export type NativeSpawnRequest = Omit<SpawnOptions, "cwd" | "env"> & { command: string; args: readonly string[]; cwd: string; env: NodeJS.ProcessEnv };
 export interface ProviderExecutionBoundary {
-  spawn(registry: ManagedProcessRegistry, request: NativeSpawnRequest): ChildProcess;
+  spawn(registry: ManagedProcessRegistry, request: NativeSpawnRequest): ManagedChildHandle;
 }
 export type BoundaryReadiness =
   | { ready: true; boundary: ProviderExecutionBoundary; proof: { verifiedPrivateReadBoundary: true; verifiedDescendantStop: boolean } }
@@ -21,7 +22,7 @@ export type ManagedRuntimeOptions = {
 export type PreparedNativeRuntime = {
   context: DispatchContext;
   registry: ManagedProcessRegistry;
-  spawn(request: NativeSpawnRequest): ChildProcess;
+  spawn(request: NativeSpawnRequest): ManagedChildHandle;
   closeAndWait(deadlineMs?: number): Promise<ProcessStopResult>;
 };
 
@@ -65,20 +66,23 @@ export class ManagedRuntimeController {
 }
 
 export async function inspectNativeVersion(runtime: PreparedNativeRuntime, executable: string, cwd: string, env: NodeJS.ProcessEnv, timeoutMs = 5_000): Promise<string> {
-  let child: ChildProcess;
+  let child: ManagedChildHandle;
   try { child = runtime.spawn({ command: executable, args: ["--version"], cwd, env, stdio: ["pipe", "pipe", "pipe"], windowsHide: true }); }
   catch (error) { await runtime.closeAndWait(timeoutMs); throw error; }
+  // A launch that did not deliver the requested pipes cannot be inspected or
+  // released as a normal run; fail closed instead of reading fabricated output.
+  if (!child.stdout || !child.stderr) { await runtime.closeAndWait(timeoutMs); throw new Error("NATIVE_VERSION_STDIO_UNAVAILABLE"); }
   let output = "";
-  child.stdout?.setEncoding("utf8"); child.stderr?.setEncoding("utf8");
+  child.stdout.setEncoding("utf8"); child.stderr.setEncoding("utf8");
   const append = (chunk: string) => { if (Buffer.byteLength(output) < 16 * 1024) output += chunk; };
-  child.stdout?.on("data", append); child.stderr?.on("data", append);
-  let timer: ReturnType<typeof setTimeout> | undefined;
+  child.stdout.on("data", append); child.stderr.on("data", append);
   try {
-    await new Promise<void>((resolve, reject) => {
+    const exit = await new Promise<ManagedChildExit | undefined>((resolve, reject) => {
       child.once("error", reject);
-      child.once("exit", (code) => code === 0 ? resolve() : reject(new Error("NATIVE_VERSION_FAILED")));
-      timer = setTimeout(() => { reject(new Error("NATIVE_VERSION_TIMEOUT")); }, timeoutMs);
+      void child.waitForExit(timeoutMs).then(resolve, reject);
     });
+    if (!exit) throw new Error("NATIVE_VERSION_TIMEOUT");
+    if (exit.code !== 0) throw new Error("NATIVE_VERSION_FAILED");
     return output.trim() || "unknown";
-  } finally { if (timer) clearTimeout(timer); await runtime.closeAndWait(timeoutMs); }
+  } finally { await runtime.closeAndWait(timeoutMs); }
 }

@@ -1,16 +1,17 @@
-import { spawn, type ChildProcess, type SpawnOptions } from "node:child_process";
+import { spawn, type SpawnOptions } from "node:child_process";
 import { mkdtemp, mkdir, readFile, writeFile, symlink, chmod, lstat, readdir, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { ManagedProcessRegistry, type ManagedProcessRecord } from "./managed-process-registry.js";
+import type { ManagedChildHandle } from "./managed-child-handle.js";
 import { NativeBoundaryError, prepareNativeExecutionBoundary, macosPrivateBoundaryProfile, linuxPrivateBoundaryArguments, type NativeBoundaryLaunchEvidence, type NativeBoundaryOptions, type NativeBoundaryProcessRegistry, type NativeExecutionBoundary } from "./native-execution-boundary.js";
 import { inspectNativeBoundaryStop, isNativeBoundaryProof, nativeIdentityDigest, type NativeBoundaryProof } from "./native-boundary-proof.js";
 import type { ProcessIdentity, ProcessInspector } from "./process-inspector.js";
 
-const roots: string[] = [], boundaries: NativeExecutionBoundary[] = [], children: ChildProcess[] = [];
+const roots: string[] = [], boundaries: NativeExecutionBoundary[] = [], children: ManagedChildHandle[] = [];
 afterEach(async () => {
-  for (const child of children.splice(0)) if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+  for (const child of children.splice(0)) child.kill("SIGKILL");
   for (const boundary of boundaries.splice(0)) await boundary.dispose().catch(() => {});
   for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true });
 });
@@ -36,9 +37,14 @@ function registry() {
   const wrapped: NativeBoundaryProcessRegistry = { spawn(command, args, options, proof) { evidence.push(proof); const child = processes.spawn(command, args, options, proof); children.push(child); return child; } };
   return { wrapped, processes, records, evidence };
 }
-async function output(child: ChildProcess): Promise<{ stdout: string; code: number | null }> {
+async function output(child: ManagedChildHandle): Promise<{ stdout: string; code: number | null }> {
   let stdout = ""; child.stdout?.on("data", (chunk: Buffer) => { stdout += chunk.toString(); }); child.stderr?.resume();
-  return new Promise((resolveResult, reject) => { child.once("error", reject); child.once("close", (code) => resolveResult({ stdout, code })); });
+  const exit = await child.exited;
+  const stream = child.stdout;
+  // The narrow handle observes the root exit; the helper's own close boundary
+  // is exit plus a drained stdout pipe, otherwise trailing output is lost.
+  if (stream && !stream.readableEnded && !stream.destroyed) await new Promise<void>((resolveEnd) => { stream.once("end", () => resolveEnd()); stream.once("close", () => resolveEnd()); });
+  return { stdout, code: exit.code };
 }
 const supported = process.platform === "darwin" || process.platform === "linux";
 

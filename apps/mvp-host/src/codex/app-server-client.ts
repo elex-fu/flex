@@ -1,6 +1,7 @@
-import type { ChildProcess, ChildProcessWithoutNullStreams, SpawnOptions } from "node:child_process";
+import type { SpawnOptions } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { ManagedProcessRegistry, type ProcessStopResult } from "../lifecycle/managed-process-registry.js";
+import type { ManagedChildHandle } from "../lifecycle/managed-child-handle.js";
 import { JsonlDecoder } from "./jsonl-decoder.js";
 
 export type JsonRpcId = string | number;
@@ -49,7 +50,7 @@ const MAX_RPC_LINE_BYTES = 2 * 1024 * 1024;
  * exactly one JSON object per line.
  */
 export class StdioAppServerClient implements AppServerClient {
-  private process: ChildProcessWithoutNullStreams | undefined;
+  private process: ManagedChildHandle | undefined;
   private decoder: JsonlDecoder | undefined;
   private readonly processes: ManagedProcessRegistry;
   private startPromise: Promise<void> | undefined;
@@ -67,7 +68,7 @@ export class StdioAppServerClient implements AppServerClient {
       args?: readonly string[];
       handlers: AppServerClientHandlers;
       processes?: ManagedProcessRegistry;
-      spawn?: (command: string, args: readonly string[], options: SpawnOptions) => ChildProcess;
+      spawn?: (command: string, args: readonly string[], options: SpawnOptions) => ManagedChildHandle;
     },
   ) {
     // Direct adapter contract tests can use an isolated registry. Production
@@ -123,7 +124,13 @@ export class StdioAppServerClient implements AppServerClient {
       env: this.options.env,
       stdio: ["pipe", "pipe", "pipe"],
       windowsHide: true,
-    }) as ChildProcessWithoutNullStreams;
+    });
+    // A launch that did not deliver its stdio pipes has no usable RPC channel;
+    // fail the start and stop the exact root instead of inventing a peer.
+    if (!child.stdin || !child.stdout || !child.stderr) {
+      child.kill("SIGKILL");
+      throw new Error("CODEX_APP_SERVER_STDIO_UNAVAILABLE");
+    }
     this.process = child;
     this.decoder = new JsonlDecoder(MAX_RPC_LINE_BYTES, (line) => this.handleLine(line), (error) => {
       this.handleExit(error);
@@ -137,8 +144,8 @@ export class StdioAppServerClient implements AppServerClient {
     // not copied into remotely visible errors.
     child.stderr.on("data", (_chunk: string) => {});
     child.once("error", (error) => this.handleExit(error));
-    child.once("exit", (code, signal) => {
-      this.handleExit(new Error(`Codex app-server exited (${signal ?? code ?? "unknown"})`));
+    child.once("exit", (exit) => {
+      this.handleExit(new Error(`Codex app-server exited (${exit.signal ?? exit.code ?? "unknown"})`));
     });
 
     await this.sendRequest("initialize", {
@@ -171,13 +178,14 @@ export class StdioAppServerClient implements AppServerClient {
   }
 
   private write(message: JsonObject): boolean {
-    if (this.closed || this.closing || !this.process?.stdin.writable) return false;
+    const stdin = this.process?.stdin;
+    if (this.closed || this.closing || !stdin?.writable) return false;
     try {
       // A false return only signals stream backpressure; the frame was still
       // accepted into Node's write buffer and must not be treated as failure.
       const frame = `${JSON.stringify(message)}\n`;
       if (Buffer.byteLength(frame, "utf8") > MAX_RPC_LINE_BYTES) return false;
-      this.process.stdin.write(frame);
+      stdin.write(frame);
       return true;
     } catch {
       return false;

@@ -6,6 +6,8 @@
 > 对照基线：Flyx 当前工作树，Paseo 710851ccb，T3 Code 4ba4871af  
 > 对应方案：[能力差异与优化技术方案](./paseo-t3code-comparison-and-optimization-technical-design.md)
 
+2026-10-18 起，后续核心工作按 [核心能力技术方案](./core-capabilities-technical-design.md) 的 C0–C8 批次和验收条件推进。本文保留原 R01–R18 的实现细节与历史验证；既有模块完成状态不等于新方案的生产交付完成，macOS 本机执行仍须先满足平台契约。
+
 ## 1 实施结论
 
 实现顺序保持 M1 可靠性基础、M2 日常使用闭环、M3 隔离并发与回退。首批改动应先修复现有数据契约，再抽取模块：文本增量、Provider 代际、Host 所有权和关闭顺序修好后，才能可靠引入持久执行意图、恢复和多 Session。
@@ -806,24 +808,28 @@ B01–B05 来自前一轮定向复现，本轮增加 B06–B09。当前已有构
 | R04 | 生产生命周期已合入，平台停止证明未完成 | `86febe3`：Adapter 管理进程、原始派发绑定、异步关闭和共享 Store/Views 归属 | macOS 后代停止仍为 unknown；真实 Provider 与整体入口验收 |
 | R05 | 原子引擎已集成并推送 | `5c34c20`、`3e5a4c5`：owner/lease 接入、命令故障矩阵和冻结旧版本迁移 fixture | 其它批次继续使用同一原子提交入口 |
 | R06 | 核心、执行钩子和全局关闭边界已合入 | `5ec7a3c`、`c2e0bbd`、`8feef42`、`99801bb`：Worker、Checkpoint 钩子、明确停止后解除保留运行绑定；全局服务在 Store 关闭前排空和封闭 | 泛化 operation、最终入口和多 Session 整体关闭验收 |
-| R07 | Host/RPC/离线恢复及 Catalog 绑定已合入 | `7be14c7`、`b277134`：原尝试证据、已知结果与执行 gate 分离、硬崩溃维护、typed client；未加载 Session 可按原始 Catalog 身份读取恢复事实 | 主入口接通、可信版本/进程检查与真实 Native 证据；默认无可信版本清单 |
+| R07 | Host/RPC/离线恢复及 Catalog 绑定已合入，中央入口已接入 | `7be14c7`、`b277134`、`afa4c6e`：原尝试证据、已知结果与执行 gate 分离、硬崩溃维护、typed client；已受理操作在逻辑关闭期间仍重查当前权限并完成限定排空 | 可信版本/进程检查与真实 Native 证据；默认无可信版本清单 |
 | R08 | 模块已集成并推送，生产链路已接通 | `7e37d45`、`f67181d`、`59d7616`：正文引用、权限、006 SQL 和严格响应预算 | 最终 Web/原生大内容入口与整体回归 |
-| R09 | 生产链路和共享投影已合入 | `bbf31d8`、`f4bfcf7`、`59d7616`、`eb302e4`：固定水位、epoch、万级历史、Direct/Relay、磁盘重开及共享 Interaction 投影；真实 Chrome 29 用例通过 | 主入口多 Session 组合验收 |
+| R09 | 生产链路和共享投影已合入，中央入口支持多 Session 历史 | `bbf31d8`、`f4bfcf7`、`59d7616`、`eb302e4`：固定水位、epoch、万级历史、Direct/Relay、磁盘重开及共享 Interaction 投影；真实 Chrome 29 用例通过 | 真实 Provider 与客户端操作闭环 |
 | R10 | 共享核心、Web 和动态传输端口已合入 | `da7f23f`、`eee9af1`、`6222d68`、`7388cc6`：Replica、能力协商、引用、Session DTO、只读回执核对及当前服务能力协商；真实 Chrome 29 用例通过 | 主入口实际服务启用及真实 Provider 闭环 |
-| R11 | Catalog 生产工厂、协议和传输组合已合入 | `630da94`、`ee882b6`、`a409554`、`fed93dd`、`7388cc6`：007、离线导入、公开 DTO、SessionClient、延迟运行时与固定 legacy 默认；空库原子创建，已有多 Session 要求显式默认 | main 中央组合、只读启动与端到端多 Session 验收 |
+| R11 | Catalog 生产工厂、协议、中央入口和只读启动已接入 | `630da94`、`ee882b6`、`a409554`、`fed93dd`、`7388cc6`、`59c1e20`、`c11e08d`：007、离线导入、公开 DTO、SessionClient、延迟运行时与固定 legacy 默认；SQL 历史启动保留原身份，超时回调在共享 Store 关闭前封闭 | 工作区/Provider/进程契约的显式验证与真实运行闭环 |
 | R12 | 共享核心及 Web 草稿入口已合入并取得浏览器证据 | `1f26299`、`6222d68`、`b480bd5`：平台信号、runtime 归属、持久草稿、原子发送、本机清除与启动屏障；实际 IndexedDB 写失败与刷新恢复通过 | 手机后台与网络切换验收 |
-| R13 | 008、共享投影和生产传输端口已合入 | `54e8ae0`、`e132b32`、`f361d9f`、`eb302e4`、`7388cc6`：reservation、delivery、Question、审批卡片、原子终态伴随事件及当前 lease/Session 权限重查 | main 启用及真实 Native 答案回传 |
+| R13 | 008、共享投影、传输端口和中央 Interaction anchor 已接入 | `54e8ae0`、`e132b32`、`f361d9f`、`eb302e4`、`7388cc6`、`7b00860`、`1ce3657`：reservation、delivery、Question、审批卡片、原子终态伴随事件及当前 lease/Session 权限重查；强制封闭不伪造 Native 确认 | 真实 Native 审批/问答回传及双设备端到端竞争 |
 | R14 | 模块、执行钩子、工厂及托管 Git 注入已合入 | `916e3b2`、`c2e0bbd`、`1335a0b`、`aaccfad`、`0e62b9a`：独立 index/workspace checkpoint、原始文件、Diff/预览 RPC、typed client；真实旧 schema fixture、历史只读查询和派发前不可变 Git 请求 | main/UI 接通及实际托管 Git/捕获验收；注入端口本身不构成停止证明 |
-| R15 | operations CLI、诊断主入口和 Relay 快照通道已合入 | `82096b9`、`3790ecb`、`ac5988b`、`1d47948`、`846c31a`、`93a10af`、`57ac6cb`、`04830fa`：doctor、备份恢复、固定产物、握手、restore 写 gate；实际 CLI 及恢复只读启动无需 Provider 预检 | Catalog 全局主入口组合、双 Provider 与真机；离线恢复仍需原始全部生产进程确已停止的独立证据 |
+| R15 | operations CLI、中央诊断入口和 Relay 快照通道已合入 | `82096b9`、`3790ecb`、`ac5988b`、`1d47948`、`846c31a`、`93a10af`、`57ac6cb`、`04830fa`：doctor、备份恢复、固定产物、握手、restore 写 gate；实际 CLI 及恢复只读启动无需 Provider 预检 | 双 Provider 与真机；离线恢复仍需原始全部生产进程确已停止的独立证据 |
 | R16 | journal、受控恢复及 SQL 已合入 | `56465d0`、`8715b50`、`f361d9f`：分阶段恢复、安全点、恢复证据与 readiness fencing | 生产 factory/RPC/UI、托管 helper 与真实 Provider rewind |
 | R17 | 模块、Host 绑定、传输端口和公开客户端已合入 | `233c2ac`、`33587ee`、`9732372`、`7388cc6`：worktree 持久操作、原路径 lease、原始/恢复派发隔离、typed client 和作用域路由 | main 接通、托管 Git 与真正停止证明；缺少证明时写操作仍不可用 |
-| R18 | Host 提醒工厂、传输端口与 Expo 最小平台已合入 | `a27a056`、`de38bc5`、`52a3812`、`f0ea18a`、`7388cc6`：提醒事实/队列、010、安全凭据/deep link、原生 SessionClient 与共同核心；原子事实和全局提醒生命周期 | main 中央入口、实际推送、真机网络和后台恢复；默认无已配置推送服务 |
+| R18 | Host 提醒工厂、中央提醒事实入口与 Expo 最小平台已合入 | `a27a056`、`de38bc5`、`52a3812`、`f0ea18a`、`7388cc6`：提醒事实/队列、010、安全凭据/deep link、原生 SessionClient 与共同核心；原子事实和全局提醒生命周期 | 实际推送、真机网络和后台恢复；默认无已配置推送服务 |
 
 当前仍为开发分支，M1/M2/M3 均未宣称发布完成。整套方案完成前，必须逐项核对第 18 节的退出条件，包括确定性故障、真实 Provider 和真机证据。
 
 2026-10-15 已集成基础的合并验证：Host 570 用例通过、5 个真实 Provider 用例明确跳过；client-core 101 用例、Web 26 用例通过，Host/client/Web 严格类型检查及 Host 构建通过。Host 测试使用本机临时监听和测试数据，禁用真实 Provider。后续生产端口、007–010 激活、多 Session 和原生平台提交继续进行独立合并验收，不能据此宣称完整十八批次已交付。
 
 2026-10-15 在 `04830fa` 合并源码上的完整 Host 回归：1,000 用例通过、0 失败、5 个真实 Provider 用例明确跳过；严格生产/测试类型检查与生产构建通过。包含真实 operations CLI、SQL 007–010 统一激活、Catalog/Recovery/Interaction/Attention/Worktree 生产端口、全局关闭及恢复只读启动。完整回归发现并修复了传输关闭重复调用，实际 HTTP 生命周期用例验证只关闭一次。共同核心 142、Web 52、Expo 83 用例通过。Chrome 的 29 用例在已合入新 Gateway 的 `b277134` 上通过，使用 `test-support/e2e-main.ts` 确定性 Host；不能作为产品 main 多 Session 或真实 Native 验收。报告保留于 `/private/tmp/flyx-final-merged-host-confirmed-20261015.json` 与 `/private/tmp/flyx-browser-merged-evidence-20261015/summary.json`。
+
+2026-10-15 已推送至 `c11e08d` 的收尾包括 `71cb2f8`、`418a634`、`afa4c6e`、`1ce3657`、`c11e08d` 的启动生产者核对、共享运行时封闭、已受理 Recovery 权限延续、Interaction 强制封闭和 Registry 迟到回调封闭。本次中央 `main` 组合在其上接入实际 Host application、本地配置和最终关闭边界，严格测试类型检查与生产构建通过。完整 Host 回归共 1,094 用例：**1,089 通过、0 失败、5 个真实 Provider 用例明确跳过**；报告为 `/private/tmp/flyx-central-host-serial-full-20261015.json`。包含中央 application 4/4、本地配置 3/3、实际 CLI 5/5，以及实际 Fastify 关闭超时、延后配对确认、Store 已关闭后的迟到回调隔离。
+
+首次并行完整回归的 1,081 通过、8 超时未通过、5 跳过仍保留于 `/private/tmp/flyx-central-host-full-20261015.json`。8 个超时位于 `host-checkpoints`（2）和 `revert-service`（6），在不修改源码或期限的串行选中重跑中全部通过，耗时 4.235–7.413 秒，记录于 `/private/tmp/flyx-central-checkpoint-timeout-retry-20261015.json`。随后完整串行回归取得上述 1,089/0/5 结果。Host 验证入口采用文件串行调度，内部故障、竞态用例及产品期限保持原定义；选中重跑没有被当作完整回归结果。
 
 ## 20 客户端范围与交付优先级
 
@@ -845,4 +851,45 @@ B01–B05 来自前一轮定向复现，本轮增加 B06–B09。当前已有构
 
 从投入必要性看，共享核心与 Web 优先级最高：它们决定日常会话是否可靠，也为 Host 能力提供实际操作入口。Expo 最小流程适合保留，以便验证手机配对、安全凭据、网络切换和后台恢复；进一步扩展原生界面应等待 Host 接通与真实移动场景验收。若阶段目标只是本机 CLI 开发，完整原生客户端可以后移；若目标是离开电脑仍能接收提醒、审批和继续任务，最小移动端是必要入口。
 
-客户端成熟度的下一步以实际闭环判断：跨 Session 选择使用真实 Catalog；审批和问答取得当前权限并由 Native 确认；历史 Diff 与恢复查询通过实际 Host 路由；手机后台恢复和提醒跳转取得真机证据。当前共同核心和确定性测试已具备基础，但中央入口、真实 Provider、手机网络/后台/凭据和推送交付仍未完成全部验收。
+客户端成熟度的下一步以实际闭环判断：跨 Session 选择使用真实 Catalog；审批和问答取得当前权限并由 Native 确认；历史 Diff 与恢复查询通过实际 Host 路由；手机后台恢复和提醒跳转取得真机证据。当前共同核心和确定性测试已具备基础，中央历史入口已通过组合回归；真实 Provider、手机网络/后台/凭据和推送交付仍未完成全部验收。
+
+## 21 整体进度与剩余实施清单
+
+R01–R18 均已有实现和分批提交。中央只读入口已通过合并回归，当前阶段转入实际执行链路开发和产品闭环验收。工程基础、生产入口可读、原生执行可用和发布验收是不同状态；M1/M2/M3 仍未宣称发布完成，也不能用“18 批均有代码”换算成完成百分比。
+
+中央入口由 `createHostApplication` 统一组合单一 owner/Store、SQL Catalog、Views、Interaction、Recovery、Device、Attention、Relay 与 operations。空库原子创建完整默认 Session；已有库保留原始工作区、Provider 和 Native 绑定。历史读取、配对和选会话不会启动 Native。工作区、Provider 和平台停止契约仍须单独验证，当前默认执行保持不可用。Checkpoint、Revert 和 Worktree 的完整生产执行仍未接入此入口。
+
+本次已完成中央入口最终合并回归：严格类型、生产构建及完整 Host 1,089/0/5 通过。实际关闭用例证明期限后可以关闭 Store，迟到 callback 不再进行 SQL 或发布；未知生产进程保留原所有权。共同核心、Web 和 Expo 最近的合并验证分别为 142、52、83 项通过；浏览器 29 项通过的范围仍为确定性 Host，不扩展解释为当前 main 的真实 Native 验收。
+
+| 优先级 | 剩余任务 | 当前实现基础 | 完成条件 |
+| --- | --- | --- | --- |
+| P0 | 实际受控执行与原始停止证据 | 托管 Native/只读 Git 接口、原始进程身份、运行代际、版本/能力门槛 | 实现实际 query executor、托管预检 helper 和 owned activation；真实环境验证私有目录隔离、全部后代停止及原始派发绑定；缺少证明时继续不启用写能力 |
+| P0 | 可信版本与兼容验收链路 | manifest、结果校验器、证据记录器、独立兼容 runner | 接通实际 readiness 产物和 recorder，调度 Recovery 场景、纳入 Codex，生成绑定实际环境的可信验收包并由主入口验证加载 |
+| P0 | 原始恢复与恢复备份的放行入口 | 原尝试 Recovery、restore readiness、保留 owner/lease、只读历史 | 离线恢复使用原 checkout 根；显式核对外部状态后提交证据并解除对应 gate；不得仅切换状态或重新运行 preflight 放行 |
+| P1 | R14 Checkpoint 生产与 Web 闭环 | before/after/index capture、精确 Diff、引用、preview、typed client | 中央工厂/RPC/UI 接通；真实 dirty/staged/untracked/binary/repository 场景捕获通过 |
+| P1 | R16 Revert 生产与界面闭环 | 安全点、分阶段 journal、原始/恢复尝试隔离、partial failure gate | 实际 workspace restore + Provider rewind；故障中间点可核对，部分失败保留恢复入口并阻止新 Turn |
+| P1 | R17 Worktree 生产与界面闭环 | worktree journal、checkout lease、后台操作与 typed client | 真实受控 Git runner；隔离目录可用，重开/未知停止/删除均不错误放行；UI 可查询和操作 |
+| P1 | 双 Provider 与 R13 真实交互验收 | Claude/Codex 适配器、共同 Engine/Worker、结构化问答和审批投影 | 分别完成实际认证、发送、流式、审批、问答、中断、终态、断线和恢复；Native 确认与 Host 回执一致 |
+| P1 | Web 的完整操作闭环 | Session 选择、权威 Timeline、草稿/Outbox、大内容及交互卡片 | 使用实际中央 Host 跑通发送、切会话、审批、Diff、恢复和回执核对；补齐 Revert/Worktree 操作界面 |
+| P2 | Expo 最小流程真机验收 | 安全凭据、SQLite、Noise、deep link、AppState/NetInfo、SessionClient 和最小界面 | 真机完成配对、切会话、发送/审批、断网与网络切换、短/长后台、凭据撤销；未知命令不自动重发 |
+| P2 | 实际推送交付 | Attention 事实、队列、状态重查和提醒跳转机制 | 配置真实推送交付通道，取得送达/重试/撤销/过期提醒证据；提醒点击只读取当前状态 |
+| P2 | 发布验收和运行手册 | 固定构建产物、doctor/backup/restore、故障矩阵和对比方案 | 汇总真实版本矩阵、原始进程证明、性能/长历史数据、恢复演练、浏览器和真机证据；逐项满足第 18 节条件 |
+
+下一轮优先补齐 P0 实际执行、可信验收及恢复放行链路，同时推进 R14/R16 的托管 Git、R17 的关库回调隔离和 Web Recovery 操作页。原生客户端保持最小范围；完整导航、语音、复杂通知设置、额外 Provider 和多 Agent 不进入本轮关键路径。剩余工作包含实质开发与真实环境验证，主要投入仍在运行可靠性和完整操作链路。
+
+## 22 源码复核后细化的关键路径
+
+2026-10-15 对中央组合后的调用链再次核对，确认以下不是仅补测试即可完成的任务。模块端口、实际执行器、主入口组合和真实验收分别交付；不能把注入端口或 fixture 成功当作生产能力已开启。
+
+| 实施项 | 已确认的源码差距 | 下一步实现与验收 |
+| --- | --- | --- |
+| 托管只读 Git 与 Native 激活 | `ManagedWorkspaceQuery.prepare()` 在所有平台均返回不可用，`execute()` 没有实际执行器；当前 application 无可信缓存加载或 owned activation；启动后资源验证状态保持未验证 | 实现有原始 journal、私有资源隔离、预算和后代停止证明的执行器；准备阶段 helper 同样纳入原始进程跟踪；显式验证后调用 Catalog revalidation，不在历史读取时触发 |
+| 平台执行契约 | macOS 已有私有目录隔离证据，但后代停止仍为 unknown；Linux Native boundary 有 bwrap 路径，但版本/自检 helper 还未纳入统一原始 journal | 分平台取得真实后端、内核与进程出生身份、隔离和停止证据；版本/自检仅作诊断，未取得契约的平台保持不可执行 |
+| 兼容与可信缓存 | runner 等待入口尚未生成的 readiness 文件；生产 adapter/recovery 尚未调用 recorder；要求 Recovery 结果但未调度该场景；当前配置没有对等 Codex 验收行 | 接通私有就绪产物、实际录制及双 Provider 场景；绑定 executable/SDK/adapter/runtime/Node/OS、配置、checkout、策略与停止证据，验证 fresh fully-verified 产物后加载 |
+| 显式恢复与 Restore gate | 生产恢复缺可信版本清单、已有 Codex 会话读取和实际 workspace 停止检查；离线恢复在子目录配置下使用 Provider workspace 路径而非原 checkout 根；restore readiness 缺外部状态复核与解除入口 | 保持原始 Session/Turn/attempt/checkout 绑定；新增证据约束的复核提交，不自动重发未知写；原生产者恢复和备份恢复验证是独立前提 |
+| Checkpoint / Revert 托管 Git | checkpoint factory 与不可变托管请求端口已有实现，但尚未组合进 main；ControlledRestore 的仓库/对象检查仍存在未托管 Git 路径 | 固定最终 argv/env/cwd/预算、实际 lease 和原 dispatch context；在派发前持久化 helper 原始记录；生产路径缺端口时明确拒绝，覆盖迟到/超时/Store 关闭 |
+| Revert 实际 Native 驱动 | 目前真实 Native rewind 驱动及主入口 RPC/UI 未完成；用统一业务 gate 阻止所有调用会挡住已受理回退自身的继续步骤 | 实现 Provider 实际 prepare/apply/query 和成功后的句柄/Timeline 原子投影；已受理步骤重查原操作、当前权限、lease 及独立 restore gate，不复用新命令的全局 gate |
+| Worktree 生产执行与关闭 | RawWorktreeGit 仍有直接 exec 路径；当前 hard seal 会在未排空时提前抛错；仅在 drainServices 停止 Git 晚于 operation drain；source Session 的自有 intent 可能挡住执行 | 先修复同步 callback fence 和原始未知结果保留，再实现派发前 journal 的 runner；在 stopProducers 发起停止；使用限定 operation 类型的 scheduler 与 fresh scoped continuation |
+| Web 与移动闭环 | Web 已有会话/历史/草稿/审批基础，缺完整 Recovery、Checkpoint、Revert、Worktree 操作入口；Expo 已有最小平台但无真机证据 | 先完成 Web 原始证据展示、显式恢复和只读回执核对，再接 Diff/回退/worktree；Expo 保持最小范围，以实际配对、网络、后台、撤销和推送验收判断成熟度 |
+
+正在实现的独立范围是：ControlledRestore 托管 Git 端口与对应 factory、Worktree 同步封闭和迟到回调回归、Web Recovery 界面与权限/Outbox 回归。它们冻结后逐批合并、验证、提交推送；其中任何一项完成都不单独代表 R14–R18 的完整交付。Git/原生 helper 测试按批次串行运行，避免跨批次资源竞争掩盖实际故障。

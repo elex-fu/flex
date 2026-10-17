@@ -81,6 +81,18 @@ describe("global Catalog lifecycle boundary", () => {
     } finally { vi.useRealTimers(); if (store.db.open) store.close(); }
   });
 
+  it("attempts every pre-Store fence and closes the shared Store when one service seal fails", async () => {
+    const { owner, store } = fixture();
+    const sealed = vi.fn(), journalFence = vi.fn(), closeStore = vi.spyOn(store, "close");
+    const host = new CatalogHostLifecycle({ store, owner, catalog: { closeAndWait: async () => [clean] },
+      services: [{ drain: async () => true, seal: () => { throw new Error("service fence failed"); } }, { drain: async () => true, seal: sealed }],
+      sealJournals: journalFence,
+    });
+    await expect(host.closeAndWait(100)).rejects.toThrow("service fence failed");
+    expect(sealed).toHaveBeenCalledOnce(); expect(journalFence).toHaveBeenCalledOnce();
+    expect(closeStore).toHaveBeenCalledOnce(); expect(store.db.open).toBe(false); expect(owner.retainedReason).toBeTruthy();
+  });
+
   it("closes every transport and seals all services when one transport fails", async () => {
     const { owner, store } = fixture();
     const other = vi.fn(async () => undefined); const sealed = vi.fn();

@@ -8,8 +8,10 @@ export default defineConfig({
     // TypeScript sources under src/.
     include: ["src/**/*.test.ts"],
     exclude: ["dist/**"],
-    // Git and native helper fixtures fork multiple processes per case. Bound
-    // concurrency so independent unit deadlines remain useful under a full run.
-    maxWorkers: 4,
+    // Git and native helper fixtures already fork processes within a case.
+    // Keep files serial so concurrent fixture trees do not exhaust their own
+    // bounded stop/restore deadlines. Each case still tests its explicit races.
+    fileParallelism: false,
+    maxWorkers: 1,
   },
 });

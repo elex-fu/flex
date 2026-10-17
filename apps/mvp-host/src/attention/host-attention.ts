@@ -245,6 +245,7 @@ export class HostAttention {
   }
   /** Called after the final Engine commits and before shared Store/owner close. */
   seal(): void {
+    if (this.state === "sealed") return;
     this.state = "sealed"; if (this.timer) clearInterval(this.timer); this.timer = undefined;
     this.service.abortDeliveries(); this.detach(); this.releaseInteraction();
     for (const { context } of this.leases.values()) this.disconnect(context);

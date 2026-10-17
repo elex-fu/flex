@@ -10,7 +10,9 @@ FLYX_PROVIDER=claude pnpm start:host
 FLYX_PROVIDER=codex pnpm start:host
 ```
 
-Host 只绑定 loopback；跨设备访问应使用 Tailscale Serve 提供 HTTPS/WSS。首次启动会运行所选 Provider 的认证/运行时 preflight。
+Host 只绑定 loopback；跨设备访问应使用 Tailscale Serve 提供 HTTPS/WSS。开发分支主入口先打开 Catalog、历史与恢复服务，不在配对或切换会话时启动 Provider。工作区、Provider 与进程契约未经验证时，执行保持不可用；当前主入口和确定性测试不能替代真实双 Provider、托管 Git 与手机验收。
+
+空库启动会原子创建一个完整的默认 Session。已有 Session 保留原来的工作区和 Provider 绑定，`FLYX_PROVIDER`、`FLYX_WORKSPACE` 不会改写它们。多资源配置使用 Host 本地的 `FLYX_CATALOG_CONFIG` JSON 文件；首次启动多个资源时，另设 `FLYX_LEGACY_WORKSPACE_ID` 和 `FLYX_LEGACY_PROVIDER_INSTANCE_ID`。已有库尚无固定默认时，通过配置中的 `legacyDefaultSessionId` 或 `FLYX_LEGACY_DEFAULT_SESSION_ID` 明确选择既有 Session。
 
 手机接入的启动方式：
 
@@ -29,7 +31,9 @@ Codex 模式默认只开放命令执行和文件变更，并关闭本机已配�
 
 详细架构、协议映射、安全边界和验证矩阵见 [双 Provider 远程控制技术方案](docs/dual-provider-remote-control-technical-design.md)。
 
-与本地 Paseo、T3 Code 的实现差异、引入决策、接口设计和分阶段验收见 [能力差异与优化技术方案](docs/paseo-t3code-comparison-and-optimization-technical-design.md)。
+下一阶段的核心交付以 [核心能力技术方案](docs/core-capabilities-technical-design.md) 为准：macOS 本机执行契约、显式激活、原始恢复、Session/Worktree、精确 Diff/回退和 Web/手机最小闭环。方案含具体接口、迁移、C0–C8 批次和验收矩阵；macOS 监督候选尚未取得可用性证明。
+
+与本地 Paseo、T3 Code 的历史实现差异和架构依据见 [能力差异与优化技术方案](docs/paseo-t3code-comparison-and-optimization-technical-design.md)。
 
 具体函数改造、数据迁移、RPC 契约、18 个实施批次与故障验收见 [分阶段实施方案](docs/flyx-optimization-implementation-plan.md)。
 

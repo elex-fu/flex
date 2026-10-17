@@ -43,6 +43,17 @@ describe("HostLifecycle", () => {
     await expect(lifecycle.shutdown()).rejects.toThrow("disk");
     expect(calls).not.toContain("release"); expect(lifecycle.readiness).toBe("recovery_required");
   });
+  it("attempts Store close and preserves ownership when the pre-Store seal fails", async () => {
+    const { calls, hooks } = fixture();
+    hooks.sealJournal = () => { calls.push("seal"); throw new Error("journal fence failed"); };
+    const lifecycle = new HostLifecycle(hooks);
+    await expect(lifecycle.shutdown()).rejects.toThrow("journal fence failed");
+    expect(calls.indexOf("seal")).toBeLessThan(calls.indexOf("store"));
+    expect(calls.filter((call) => call === "store")).toHaveLength(1);
+    expect(calls).toContain("retain"); expect(calls).not.toContain("release");
+    expect(lifecycle.readiness).toBe("recovery_required");
+  });
+
   it("bounds an SDK stop hook which never resolves", async () => {
     vi.useFakeTimers();
     try {

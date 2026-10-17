@@ -3,6 +3,7 @@ import { assertHostOwner, type HostOwnerHandle } from "./host-owner.js";
 import { HostLifecycle } from "./host-lifecycle.js";
 import { OperationRegistry, type OperationKind } from "./operation-registry.js";
 import type { RuntimeCloseReport } from "../session/orchestrator.js";
+import type { RuntimeCloseReport as CatalogRuntimeCloseReport } from "../session/session-registry.js";
 
 /** Global services use an absolute deadline; Session runtimes use a remaining duration. */
 export type CatalogGlobalService = {
@@ -13,7 +14,7 @@ export type CatalogGlobalService = {
 export type CatalogHostLifecycleOptions = {
   store: SqliteStore;
   owner: HostOwnerHandle;
-  catalog: { closeAndWait(deadlineMs: number): Promise<readonly RuntimeCloseReport[]> };
+  catalog: { closeAndWait(deadlineMs: number): Promise<readonly CatalogRuntimeCloseReport[]> };
   operations?: OperationRegistry;
   services?: readonly CatalogGlobalService[];
   /** Only actual accepted work may be recorded as unknown by this callback. */
@@ -28,7 +29,7 @@ export class CatalogHostLifecycle {
   private readonly lifecycle: HostLifecycle;
   private readonly transports = new Set<() => Promise<void>>();
   private readonly services: CatalogGlobalService[];
-  private reports: Promise<readonly RuntimeCloseReport[]> | undefined;
+  private reports: Promise<readonly CatalogRuntimeCloseReport[]> | undefined;
   private closing: Promise<RuntimeCloseReport> | undefined;
   private deadlineAt = Infinity;
   private sealed = false;
@@ -73,7 +74,12 @@ export class CatalogHostLifecycle {
         await options.afterTransportsClosed?.();
         if (results.some((result) => result.status === "rejected")) throw new Error("HOST_TRANSPORT_CLOSE_FAILED");
       },
-      sealJournal: () => { this.sealServices(); options.sealJournals?.(); },
+      sealJournal: () => {
+        let failure: unknown;
+        try { this.sealServices(); } catch (error) { failure = error; }
+        try { options.sealJournals?.(); } catch (error) { failure ??= error; }
+        if (failure) throw failure;
+      },
       closeStore: () => options.store.close(),
       releaseOwnership: () => options.owner.release(),
     });

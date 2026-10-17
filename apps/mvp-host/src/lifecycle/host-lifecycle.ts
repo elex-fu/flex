@@ -59,6 +59,8 @@ export class HostLifecycle {
     catch (error) { failure ??= error; safe = false; this.hooks.retainOwnership("SHUTDOWN_CLOSE_FAILED"); }
     try {
       this.hooks.sealJournal?.();
+    } catch (error) { failure ??= error; safe = false; this.hooks.retainOwnership("SHUTDOWN_CLOSE_FAILED"); }
+    try {
       await boundedOrThrow(this.hooks.closeStore(), deadlineMs);
       if (safe && !failure) this.hooks.releaseOwnership();
     } catch (error) { failure ??= error; safe = false; this.hooks.retainOwnership("SHUTDOWN_CLOSE_FAILED"); }

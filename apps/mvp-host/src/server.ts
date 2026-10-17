@@ -29,6 +29,7 @@ type PairingAttempt = { startedAt: number; count: number };
 export type PairingConfirmation = () => boolean | Promise<boolean>;
 
 class AuthManager {
+  private sealed = false;
   private pairingToken: string;
   private pairingExpiresAt: string;
   private readonly credentials = new Map<string, { expiresAt: number; deviceId: string }>();
@@ -44,7 +45,11 @@ class AuthManager {
   get pairingUrlToken(): string { return this.pairingToken; }
   get expiresAt(): string { return this.pairingExpiresAt; }
 
+  seal(): void { this.sealed = true; this.credentials.clear(); this.tickets.clear(); this.pairingAttempts.clear(); }
+  private assertOpen(): void { if (this.sealed) throw new OrchestratorError("HOST_SHUTDOWN", "Host authentication is closed"); }
+
   activeQrPairingToken(): string {
+    this.assertOpen();
     if (this.orchestrator.store.hasActivePairingGrant(hash(this.pairingToken))) return this.pairingToken;
     this.pairingToken = randomBytes(32).toString("base64url");
     this.pairingExpiresAt = new Date(Date.now() + 5 * 60_000).toISOString();
@@ -53,6 +58,7 @@ class AuthManager {
   }
 
   async exchangePairingToken(token: string, rateKey = "unknown"): Promise<string> {
+    this.assertOpen();
     const now = Date.now();
     this.pruneEphemeral(now);
     for (const [key, limit] of [[`ip:${rateKey}`, 5], [`grant:${hash(token)}`, 5], ["global", 30]] as const) {
@@ -65,6 +71,7 @@ class AuthManager {
     const tokenHash = hash(token);
     if (!this.orchestrator.store.hasActivePairingGrant(tokenHash)) throw new OrchestratorError("PAIRING_INVALID", "Pairing token is invalid or expired");
     if (!(await this.confirmPairing())) throw new OrchestratorError("PAIRING_DENIED", "Pairing was denied on the Host");
+    this.assertOpen();
     const device = this.devices().credentialTransaction(() => {
       if (!this.orchestrator.store.consumePairingGrant(tokenHash)) throw new OrchestratorError("PAIRING_INVALID", "Pairing token is invalid or expired");
       return this.devices().createBrowserDevice({ pairingGrant: token });
@@ -75,6 +82,7 @@ class AuthManager {
   }
 
   createBrowserSession(credential: string): string {
+    this.assertOpen();
     this.pruneEphemeral(Date.now());
     const key = hash(credential);
     const pending = this.credentials.get(key);
@@ -90,6 +98,7 @@ class AuthManager {
   }
 
   sessionSubject(rawCookie: string | undefined): string | undefined {
+    this.assertOpen();
     if (!rawCookie) return undefined;
     const record = this.orchestrator.store.findAuthSession(hash(rawCookie));
     if (!record || record.revokedAt || Date.parse(record.expiresAt) <= Date.now()) return undefined;
@@ -99,6 +108,7 @@ class AuthManager {
   }
 
   revokeBrowserSession(rawCookie: string | undefined): boolean {
+    this.assertOpen();
     const subject = this.sessionSubject(rawCookie);
     if (!subject) return false;
     const device = this.devices().getDeviceForAuthSession(subject);
@@ -111,6 +121,7 @@ class AuthManager {
   }
 
   issueTicket(subject: string): string {
+    this.assertOpen();
     this.pruneEphemeral(Date.now());
     const device = this.devices().getDeviceForAuthSession(subject);
     if (!device) throw new OrchestratorError("UNAUTHENTICATED", "Pair this browser first");
@@ -120,6 +131,7 @@ class AuthManager {
   }
 
   issueDeviceTicket(refreshCredential: string): { ticket: string; deviceId: string; expiresInMs: number } {
+    this.assertOpen();
     this.pruneEphemeral(Date.now());
     const device = this.devices().authenticateRefreshCredential(refreshCredential);
     const ticket = randomBytes(32).toString("base64url");
@@ -128,6 +140,7 @@ class AuthManager {
   }
 
   consumeTicket(rawTicket: string): PendingTicket | undefined {
+    this.assertOpen();
     this.pruneEphemeral(Date.now());
     const key = hash(rawTicket);
     const ticket = this.tickets.get(key);
@@ -186,6 +199,8 @@ export type HostServer = {
   start(): Promise<string>;
   stop(): Promise<void>;
   closeTransports(): Promise<void>;
+  /** Detach SQL-capable callbacks even when physical listener close stalls. */
+  fenceTransports(): void;
 };
 
 export function createHostServer(options: HostServerOptions): HostServer {
@@ -200,10 +215,12 @@ export function createHostServer(options: HostServerOptions): HostServer {
   let gateway: ConnectionGateway;
   let relay: HostRelaySupervisor | undefined;
   let identityPoll: ReturnType<typeof setInterval> | undefined;
+  let transportsFenced = false;
   let localOrigin = `http://127.0.0.1:${options.port ?? connectivity.port}`;
   const identityDirectory = options.identityDirectory ?? process.env.FLYX_IDENTITY_DIR ?? resolve(dirname(options.orchestrator.store.db.name), "identity");
   const auth = new AuthManager(options.orchestrator, () => devices, options.pairingConfirmation);
   const assertIdentity = () => {
+    if (transportsFenced) throw new OrchestratorError("HOST_SHUTDOWN", "Host transports are closed");
     const mirror = options.orchestrator.store.getHostIdentityMirror();
     if (!identity || mirror?.hostId !== identity.hostId || mirror.fingerprint !== identity.fingerprint) {
       throw new OrchestratorError("IDENTITY_MISMATCH", "Host identity changed; restart and pair again");
@@ -241,8 +258,10 @@ export function createHostServer(options: HostServerOptions): HostServer {
   const hasWebRoot = existsSync(webRoot);
   if (hasWebRoot) void app.register(fastifyStatic, { root: webRoot, wildcard: true });
   app.addHook("onReady", async () => {
+    if (transportsFenced) throw new OrchestratorError("HOST_SHUTDOWN", "Host transports are closed");
     const store = options.orchestrator.store;
     identity ??= store.db.name === ":memory:" ? generateHostIdentity() : await loadOrCreateHostIdentity({ directory: identityDirectory, expectedMirror: store.getHostIdentityMirror() ?? null });
+    if (transportsFenced) throw new OrchestratorError("HOST_SHUTDOWN", "Host transports are closed");
     const mirror = store.getHostIdentityMirror();
     if (mirror && (mirror.hostId !== identity.hostId || mirror.fingerprint !== identity.fingerprint)) throw new OrchestratorError("IDENTITY_MISMATCH", "Host identity does not match database");
     store.setHostIdentityMirror(getHostIdentityMirror(identity));
@@ -268,12 +287,11 @@ export function createHostServer(options: HostServerOptions): HostServer {
     identityPoll.unref?.();
   });
   app.addHook("onClose", async () => {
-    clearInterval(identityPoll);
-    gateway?.close();
+    fenceTransports();
     await relay?.stop();
-    if (!options.devices) devices?.close();
   });
   app.addHook("onRequest", async (request, reply) => {
+    if (transportsFenced) return reply.code(503).send({ error: { code: "HOST_SHUTDOWN", message: "Host transports are closed", retryable: false } });
     const requestOrigin = validatedRequestOrigin(request, connectivity.publicBaseUrl);
     if (!requestOrigin) return reply.code(403).send({ error: { code: "HOST_REJECTED", message: "Host header rejected", retryable: false } });
     const pathname = new URL(request.raw.url ?? "/", "http://flyx.local").pathname;
@@ -416,7 +434,21 @@ export function createHostServer(options: HostServerOptions): HostServer {
 
   let stopPromise: Promise<void> | undefined;
   let transportClosePromise: Promise<void> | undefined;
-  const closeTransports = () => transportClosePromise ??= app.close();
+  const fenceTransports = () => {
+    if (transportsFenced) return;
+    transportsFenced = true;
+    auth.seal(); clearInterval(identityPoll);
+    let failure: unknown;
+    for (const fence of [
+      () => gateway?.close(),
+      () => { if (!options.devices) devices?.close(); },
+      () => { void relay?.stop().catch(() => app.log.error({ code: "RELAY_STOP_FAILED" }, "Relay shutdown requires recovery")); },
+    ]) {
+      try { fence(); } catch (error) { failure ??= error; }
+    }
+    if (failure) throw failure;
+  };
+  const closeTransports = () => { fenceTransports(); return transportClosePromise ??= app.close(); };
   const registerClose = options.lifecycle?.registerTransportShutdown?.bind(options.lifecycle) ?? options.orchestrator.registerTransportShutdown?.bind(options.orchestrator);
   const unregisterClose = registerClose?.(closeTransports);
   app.addHook("onClose", async () => { unregisterClose?.(); });
@@ -425,7 +457,7 @@ export function createHostServer(options: HostServerOptions): HostServer {
     get identity() { if (!identity) throw new Error("Host is not ready"); return identity; },
     get devices() { return devices; },
     get relay() { return relay; },
-    getPairingUrl, getRelayPairingUrl, closeTransports,
+    getPairingUrl, getRelayPairingUrl, closeTransports, fenceTransports,
     async start() {
       const host = options.host ?? "127.0.0.1";
       if (!isLoopbackHost(host)) throw new OrchestratorError("HOST_BIND_FORBIDDEN", "Flyx Host must bind to loopback; expose it with Tailscale Serve");
@@ -445,7 +477,12 @@ export function createHostServer(options: HostServerOptions): HostServer {
             const closeHost = options.lifecycle?.closeAndWait?.bind(options.lifecycle) ?? options.orchestrator.closeAndWait?.bind(options.orchestrator);
             if (closeHost && !(await closeHost()).clean) throw new OrchestratorError("SHUTDOWN_RECOVERY_REQUIRED", "Host stopped with retained unverified execution ownership");
           }
-        } finally { await closeTransports(); }
+        } finally {
+          // A registered lifecycle already bounded this close Promise. Keep
+          // its result even if physical listener shutdown is still pending.
+          if (registerClose && transportClosePromise) fenceTransports();
+          else await closeTransports();
+        }
       })();
       return stopPromise;
     },

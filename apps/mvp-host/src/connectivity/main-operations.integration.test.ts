@@ -9,6 +9,7 @@ import { SqliteProcessJournal } from "../lifecycle/managed-process-registry.js";
 import { loadOrCreateHostIdentity, getHostIdentityMirror } from "../identity/host-identity.js";
 import { openForMaintenance, openOwned, openReadOnly } from "../storage/open-store.js";
 import { verifyOfflineHostQuiescence } from "./offline-quiescence.js";
+import { createHostCatalogReadBindings } from "../catalog/host-catalog.js";
 
 const roots: string[] = [];
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
@@ -77,8 +78,17 @@ describe("actual main operations routing", { timeout: 30000 }, () => {
   it("starts restored history without preparing or preflighting a Native Provider", async () => {
     const f = await fixture(), workspace = join(f.root, "workspace"); mkdirSync(workspace);
     execFileSync("git", ["init", "--quiet", workspace]);
-    const owner = HostOwnerLock.acquire({ databasePath: f.databasePath, identityDirectory: f.identityDirectory, mode: "maintenance" });
-    const store = openForMaintenance({ databasePath: f.databasePath, owner });
+    const owner = HostOwnerLock.acquire({ databasePath: f.databasePath, identityDirectory: f.identityDirectory });
+    const store = openOwned({ databasePath: f.databasePath, owner });
+    // Restore a complete existing Catalog, rather than asking a restored empty
+    // database to create a new Session through the external-state write gate.
+    const catalog = await createHostCatalogReadBindings({ store, owner,
+      configuration: { workspaces: [{ workspaceId: "restored-workspace", root: workspace }],
+        providerInstances: [{ providerInstanceId: "restored-provider", provider: "codex", executable: "/unavailable/flyx-cli-probe" }] },
+      initialLegacySession: { workspaceId: "restored-workspace", providerInstanceId: "restored-provider" },
+    });
+    const sessionId = catalog.legacySessionId;
+    await catalog.closeAndWait();
     const timestamp = new Date().toISOString();
     store.db.prepare("INSERT INTO host_state VALUES('restore_readiness',?,?)").run(JSON.stringify({ v: 1, status: "external_state_unverified", restoredAt: timestamp, backupCreatedAt: timestamp,
       possibleDispatchIntents: 0, reasonCodes: ["RESTORE_GIT_STATE_UNVERIFIED", "RESTORE_PROVIDER_HISTORY_UNVERIFIED"], relayRegistrationInvalidated: false }), timestamp);
@@ -99,8 +109,33 @@ describe("actual main operations routing", { timeout: 30000 }, () => {
       expect(errors).not.toContain("preflight"); expect(errors).not.toContain("Native execution unavailable");
       child.kill("SIGTERM"); expect(await ended).toBe(0);
       const readonly = openReadOnly(f.databasePath);
-      try { expect(readonly.db.prepare("SELECT COUNT(*) AS count FROM managed_processes").get()).toEqual({ count: 0 }); }
+      try {
+        expect(readonly.db.prepare("SELECT COUNT(*) AS count FROM managed_processes").get()).toEqual({ count: 0 });
+        expect(readonly.db.prepare("SELECT session_id FROM session_catalog").all()).toEqual([{ session_id: sessionId }]);
+      }
       finally { readonly.close(); }
     } finally { if (child.exitCode === null) { child.kill("SIGKILL"); await ended; } }
+  });
+
+  it("preserves a bind startup error when cleanup also requires original-producer recovery", async () => {
+    const f = await fixture(), workspace = join(f.root, "workspace"); mkdirSync(workspace);
+    const owner = HostOwnerLock.acquire({ databasePath: f.databasePath, identityDirectory: f.identityDirectory, mode: "maintenance" });
+    const store = openForMaintenance({ databasePath: f.databasePath, owner });
+    new SqliteProcessJournal(store.db).save({ id: "original-startup-helper", hostOwnerId: owner.ownerId, hostOwnerGeneration: owner.generation,
+      runtimeId: "original-helper", runtimeGeneration: 1, attemptId: "original-attempt", state: "unknown", treeControl: "unavailable" });
+    store.close(); owner.release();
+    const occupied = createServer(); await new Promise<void>((yes) => occupied.listen(0, "127.0.0.1", yes));
+    const port = (occupied.address() as { port: number }).port;
+    try {
+      const child = spawnSync(process.execPath, ["--import", "tsx", resolve("src/main.ts"), "start"], {
+        env: { ...f.env, NODE_ENV: "production", FLYX_PROVIDER: "codex", FLYX_WORKSPACE: workspace, PORT: String(port) }, encoding: "utf8", timeout: 20000,
+      });
+      expect(child.status).toBe(1); expect(child.stderr).toContain("EADDRINUSE");
+      expect(child.stderr).toContain("Host startup cleanup failed");
+      const readonly = openReadOnly(f.databasePath);
+      try {
+        expect(readonly.db.prepare("SELECT state FROM managed_processes WHERE id='original-startup-helper'").get()).toEqual({ state: "unknown" });
+      } finally { readonly.close(); }
+    } finally { await new Promise<void>((yes, no) => occupied.close((error) => error ? no(error) : yes())); }
   });
 });

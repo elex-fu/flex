@@ -6,6 +6,10 @@ import type { NativeBoundaryProof } from "../lifecycle/native-boundary-proof.js"
 import type { ProcessIdentity } from "../lifecycle/process-inspector.js";
 import type { DispatchContext } from "../provider/types.js";
 import { RecoveryStore } from "../storage/recovery-store.js";
+import { ExecutionStore } from "../storage/execution-store.js";
+import { CommandEngine, hashCommandRequest } from "../orchestration/command-engine.js";
+import { decideAcceptTurn } from "../orchestration/decider.js";
+import type { CommandRequest } from "../orchestration/command-contract.js";
 import { openOwned } from "../storage/open-store.js";
 import { checkoutKey } from "../storage/migrations/007-catalog.js";
 import { createCatalogRecoveryBindings, catalogRecoveryConfigurationFingerprint } from "./catalog-recovery.js";
@@ -72,6 +76,29 @@ describe("pure SQL original producer startup readiness", () => {
     expect(f.store.db.prepare("SELECT total_changes() AS n").get()).toEqual(changes); expect(f.native).not.toHaveBeenCalled(); expect(f.git).not.toHaveBeenCalled();
     await f.host.closeAndWait(100); expect(f.host.ready).toBe(false);
     expect(inspectCatalogStartupReadiness(f.host, { includeCurrentOwner: true }).ready).toBe(true);
+  });
+
+  it("checks fresh producer facts inside atomic command admission and intent revalidation without blocking a clean owned transaction", async () => {
+    const f = await fixture();
+    const assertReady = vi.fn(() => {
+      expect(f.store.db.inTransaction).toBe(true);
+      if (!inspectCatalogStartupReadiness(f.host).ready) throw new Error("HOST_RECOVERY_REQUIRED");
+    });
+    const request: CommandRequest = { authSubjectId: "actor", commandId: "current-command", method: "session.startTurn", targetSessionId: f.sessionId,
+      requestFormatVersion: 2, requestHash: hashCommandRequest("session.startTurn", { prompt: "current" }, { requestFormatVersion: 2, targetSessionId: f.sessionId }),
+      dispatchBinding: { hostOwnerId: f.owner.ownerId, hostOwnerGeneration: f.owner.generation, runtimeId: "current-runtime" } };
+    const accepted = new CommandEngine(f.store, { admission: assertReady }).commitRequest(request,
+      (facts, clock) => decideAcceptTurn(facts, request, { prompt: "current" }, clock));
+    expect(f.store.getCommandReceipt("actor", "current-command")?.state).toBe("accepted");
+    const execution = new ExecutionStore(f.store), id = accepted.intents[0]!.id;
+    execution.claim(id, { id: f.owner.ownerId, generation: f.owner.generation }, assertReady);
+    execution.transition({ id, expectedStates: ["claimed"], state: "dispatching" }, assertReady);
+    expect(execution.get(id)?.state).toBe("dispatching"); expect(assertReady).toHaveBeenCalledTimes(3);
+    f.process({ hostOwnerId: "unresolved-owner", hostOwnerGeneration: 5, runtimeId: "unresolved-query", runtimeGeneration: 1, attemptId: "unresolved-attempt" }, "newly-observed-helper", "unknown", null);
+    expect(() => execution.transition({ id, expectedStates: ["dispatching"], state: "acknowledged" }, assertReady)).toThrow("HOST_RECOVERY_REQUIRED");
+    expect(execution.get(id)?.state).toBe("dispatching");
+    expect(f.store.getCommandReceipt("actor", "current-command")?.state).toBe("accepted");
+    expect(f.native).not.toHaveBeenCalled(); expect(f.git).not.toHaveBeenCalled();
   });
 
   it("recognizes committed full-tree stop plus explicit acknowledgment while preserving unknown Turn/receipt/intent history", async () => {

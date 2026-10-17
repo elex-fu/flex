@@ -6,15 +6,16 @@ import { DeviceRegistry } from "./auth/device-registry.js";
 import { parseConnectivityConfig, resolveConnectivityConfig } from "./connectivity/config.js";
 import { createPairingConfirmation, parseHostCommand, type HostCommand } from "./connectivity/terminal.js";
 import { getHostIdentityMirror, loadOrCreateHostIdentity, publicHostIdentity, rotateHostIdentity, type HostIdentityFileV1 } from "./identity/host-identity.js";
-import { createHostServer } from "./server.js";
-import { SessionOrchestrator } from "./session/orchestrator.js";
+import type { HostServer } from "./server.js";
+import { createHostApplication } from "./host-application.js";
+import { readHostCatalogBootstrap } from "./catalog/local-host-configuration.js";
 import { runOfflineRecovery } from "./connectivity/recovery-cli.js";
 import { HOST_OPERATIONS_CLI_USAGE, runHostOperationsCommand } from "./connectivity/operations-cli.js";
 import { verifyOfflineHostQuiescence } from "./connectivity/offline-quiescence.js";
 import { CATALOG_IMPORT_CLI_USAGE, runCatalogImportCli } from "./catalog/catalog-import-cli.js";
-import { createHostOperations, hostDiagnosticsRpc, HOST_DIAGNOSTICS_RPC_SCOPES, OperationSnapshotLane } from "./operations/host-operations.js";
+import { OperationSnapshotLane } from "./operations/host-operations.js";
 import { SqliteStore } from "./storage/db.js";
-import { HostOwnerLock, assertWorkspacePrivacy, canonicalPath } from "./lifecycle/host-owner.js";
+import { HostOwnerLock, canonicalPath } from "./lifecycle/host-owner.js";
 import { openForMaintenance, openForManagement, openOwned, openReadOnly } from "./storage/open-store.js";
 
 await main().catch((error: unknown) => {
@@ -31,6 +32,7 @@ async function main(): Promise<void> {
     console.log("Recovery: recovery inspect <sessionId> <turnId> [--attempt <attemptId>] [--upgrade-metadata]");
     console.log("Recovery write: recovery reconcile|acknowledge <sessionId> <turnId> <evidenceId> <recoveryRevision> <commandId> [--attempt <attemptId>] [--acknowledge-unknown]");
     console.log("Select the existing Host using FLYX_DB and FLYX_IDENTITY_DIR. Key rotation requires confirmation in a local terminal.");
+    console.log("Catalog startup: FLYX_CATALOG_CONFIG selects a local configuration; FLYX_LEGACY_DEFAULT_SESSION_ID selects an existing default when none was migrated.");
     return;
   }
   const defaultDatabase = process.env.FLYX_PROVIDER === "codex" ? ".flyx/mvp-codex.sqlite" : ".flyx/mvp.sqlite";
@@ -124,50 +126,27 @@ async function main(): Promise<void> {
   const owner = HostOwnerLock.acquire({ databasePath, identityDirectory });
   const snapshotLane = new OperationSnapshotLane(() => owner.assertActive()).withSnapshot;
   let store: SqliteStore | undefined;
-  let orchestrator: SessionOrchestrator | undefined;
+  let application: Awaited<ReturnType<typeof createHostApplication>> | undefined;
   let pairingConfirmation: ReturnType<typeof createPairingConfirmation> | undefined;
-  let server: ReturnType<typeof createHostServer> | undefined;
+  let server: HostServer | undefined;
   try {
-    assertWorkspacePrivacy(workspace, [dirname(owner.databasePath), owner.identityDirectory!, owner.coordinationDirectory!]);
-    await assertFixtureWorkspace(workspace);
     await mkdir(dirname(owner.databasePath), { recursive: true, mode: 0o700 });
     store = openOwned({ databasePath: owner.databasePath, owner });
     const identity = await loadOrCreateHostIdentity({ directory: owner.identityDirectory!, expectedMirror: store.getHostIdentityMirror() ?? null });
     store.setHostIdentityMirror(getHostIdentityMirror(identity));
     const connectivity = await resolveConnectivityConfig(parseConnectivityConfig());
-    const operations = createHostOperations({ store, owner }, { identityDirectory: owner.identityDirectory!, applicationVersion: "0.0.1", withSnapshot: snapshotLane,
-      doctorFacts: () => ({ readiness: { status: orchestrator?.lifecycle.readiness === "ready" ? "ready" : "read_only", reasonCodes: owner.retainedReason ? ["OWNER_RECOVERY_REQUIRED"] : [] } }),
-    });
-    orchestrator = new SessionOrchestrator({ workspace, databasePath: owner.databasePath, provider, owner, store, assertWriteReady: operations.assertWriteReady });
+    const bootstrap = readHostCatalogBootstrap({ store, workspace, provider, environment: process.env });
     pairingConfirmation = createPairingConfirmation();
-    const restored = Boolean(store.db.prepare("SELECT 1 FROM host_state WHERE key='restore_readiness'").get());
-    if (restored) orchestrator.markProviderUnavailable();
-    const boundary = restored ? undefined : await orchestrator.prepareNativeRuntime();
-    if (boundary && !boundary.ready) console.error(`Native execution unavailable (${boundary.code}); Host remains available for read-only history and recovery.`);
-    if (!restored && (!boundary || boundary.ready) && process.env.FLYX_SKIP_PREFLIGHT !== "1" && process.env.NODE_ENV !== "test") {
-      try {
-        const status = await orchestrator.adapter.preflight();
-        console.log(`${providerName(status.provider)} preflight passed: ${status.transport} ${status.adapterVersion}, runtime ${status.runtimeVersion}`);
-      } catch (error) {
-        orchestrator.markProviderUnavailable();
-        console.error(`Provider unavailable; Host remains read-only: ${error instanceof Error ? error.message : "Preflight failed"}`);
-      }
-    }
-    server = createHostServer({ orchestrator, pairingConfirmation, identity, identityDirectory: owner.identityDirectory!, connectivity, snapshotLane,
-      domainPorts: [{ methodScopes: HOST_DIAGNOSTICS_RPC_SCOPES, ready: () => Boolean(store?.db.open), capabilities: () => [],
-        dispatch: async (frame, context) => {
-          if (!Object.hasOwn(HOST_DIAGNOSTICS_RPC_SCOPES, frame.method)) return { handled: false };
-          if (!server || !context.leaseId || context.transportGeneration === undefined) throw new Error("AUTH_REQUIRED");
-          const current = server.devices.assertLease(context.leaseId, context.transportGeneration);
-          if (current.deviceId !== context.subjectId) throw new Error("DEVICE_REVOKED");
-          return { handled: true, payload: hostDiagnosticsRpc(operations, frame.method, frame.payload, current.scopes) };
-        },
-      }],
-      ...(process.env.FLYX_WEB_ROOT ? { webRoot: process.env.FLYX_WEB_ROOT } : {}) });
-    const address = await server.start();
+    application = await createHostApplication({ store, owner, identity, ...bootstrap, snapshotLane,
+      server: { pairingConfirmation, connectivity, ...(process.env.FLYX_WEB_ROOT ? { webRoot: process.env.FLYX_WEB_ROOT } : {}) },
+    });
+    server = application.server;
+    const address = await application.start();
+    const legacy = application.catalog.registry.resolve(application.catalog.legacySessionId);
     console.log(`Flyx MVP Host listening at ${address}`);
-    console.log(`Workspace: ${workspace}`);
-    console.log(`Provider: ${providerName(provider)}`);
+    console.log(`Workspace: ${legacy.workspace.canonicalRoot}`);
+    console.log(`Provider: ${providerName(legacy.session.provider)}`);
+    console.log("Readiness: history and recovery available; execution requires separately verified workspace, Provider and process contracts.");
     console.log(`Host: ${identity.hostId} (${identity.fingerprint})`);
     console.log(`Connectivity: ${connectivity.mode}${connectivity.publicBaseUrl ? ` — ${connectivity.publicBaseUrl}` : ""}`);
     let shutdownPromise: Promise<void> | undefined;
@@ -196,9 +175,12 @@ async function main(): Promise<void> {
     }
   } catch (error) {
     pairingConfirmation?.close();
-    if (server) await server.stop();
-    else if (orchestrator) await orchestrator.closeAndWait();
-    else { store?.close(); owner.release(); }
+    try {
+      if (application) await application.stop();
+      else { if (store?.db.open) store.close(); owner.release(); }
+    } catch (cleanupError) {
+      console.error(`Host startup cleanup failed: ${cleanupError instanceof Error ? cleanupError.message : "recovery required"}`);
+    }
     throw error;
   }
 }
@@ -241,15 +223,6 @@ async function printPairingUrl(label: string, url: string): Promise<void> {
   // QR generation stays on this machine; the fragment contains the one-use
   // grant and public identity only, and is never sent to a QR service.
   console.log(await QRCode.toString(url, { type: "terminal", small: true, errorCorrectionLevel: "M" }));
-}
-
-async function assertFixtureWorkspace(root: string): Promise<void> {
-  try {
-    const marker = await stat(resolve(root, ".git"));
-    if (!marker.isDirectory() && !marker.isFile()) throw new Error("not a Git repository");
-  } catch (error) {
-    throw new Error(`FLYX_WORKSPACE must be an existing Git fixture repository: ${error instanceof Error ? error.message : String(error)}`);
-  }
 }
 
 function parseProvider(value: string | undefined): ProviderId {

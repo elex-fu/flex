@@ -17,13 +17,13 @@ type Intent = { id: string; session_id: string; turn_id: string | null; attempt_
   state: string; dispatch_context_json: string | null; commit_id: string; source_sequence: number };
 type Release = { evidenceId: string; context: DispatchContext; records: readonly string[]; acknowledged: boolean };
 
-/** Producer inventory only. No Provider, Git, PID inspection, mutation, or catalogue-ready check. */
+/** Fresh producer inventory, including inside an owned synchronous command transaction. No external work or mutation. */
 export function inspectCatalogStartupReadiness(host: CatalogFacts, options: CatalogStartupReadinessOptions = {}): CatalogStartupReadiness {
   const blockers = new Set<string>();
   const block = (code: string) => { blockers.add(code); };
   try {
     const db = host.store.db;
-    if (!db.open || db.inTransaction || inspectSchema(db).version !== SUPPORTED_SCHEMA_VERSION) return verdict(["STARTUP_SCHEMA_UNVERIFIED"]);
+    if (!db.open || inspectSchema(db).version !== SUPPORTED_SCHEMA_VERSION) return verdict(["STARTUP_SCHEMA_UNVERIFIED"]);
     const recovery = new RecoveryStore(host.store);
     const records = processRecords(db);
     const intents = db.prepare("SELECT * FROM execution_intents ORDER BY id").all() as Intent[];

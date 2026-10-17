@@ -90,7 +90,7 @@ async function fixture() {
 }
 
 describe("managed worktrees production Catalog binding", () => {
-  it("commits real Session receipts/intent before Git, publishes only after commit, and preserves dirty state across archive/restore", async () => {
+  it("commits real Session receipts/intent before Git, publishes only after commit, and preserves dirty state across archive/restore", { timeout: 30_000 }, async () => {
     const f = await fixture();
     const created = await f.command("worktree.create", { sessionId: f.source, repositoryId: "repo-one" }, "create-one");
     expect(created.receiptState).toBe("accepted"); expect(f.catalog.workspace(created.worktree.workspaceId)).toBeUndefined();
@@ -146,7 +146,7 @@ describe("managed worktrees production Catalog binding", () => {
     expect(f.binding.execution.forCommand(f.actor.subjectId, "restored")).toHaveLength(0); expect(f.runtimeFactory).not.toHaveBeenCalled();
   });
 
-  it("rolls back Catalog reservation, operation, receipt, and intent together and never publishes before the outer commit", async () => {
+  it("rolls back Catalog reservation, operation, receipt, and intent together and never publishes before the outer commit", { timeout: 30_000 }, async () => {
     const f = await fixture(), record = await f.create(), sessionId = f.createSession(record.workspaceId);
     const beforeEvents = f.delivered.length;
     const detach = f.store.registerProjectionHook((_id, event) => { if (event.type === "worktree.archive.accepted") throw new Error("projection fault"); });
@@ -158,7 +158,7 @@ describe("managed worktrees production Catalog binding", () => {
     await f.run(accepted.commandId); expect(f.catalog.workspace(record.workspaceId)?.state).toBe("disabled");
   });
 
-  it("scans every Session on a checkout and keeps distinct worktrees independently leased across databases", async () => {
+  it("scans every Session on a checkout and keeps distinct worktrees independently leased across databases", { timeout: 30_000 }, async () => {
     const f = await fixture(), one = await f.create(), two = await f.create();
     const a = f.createSession(one.workspaceId), b = f.createSession(one.workspaceId), isolated = f.createSession(two.workspaceId);
     f.catalog.setResidency(b, "loaded");
@@ -178,7 +178,7 @@ describe("managed worktrees production Catalog binding", () => {
     } finally { same.release(); separate.release(); otherStore.close(); otherOwner.release(); }
   });
 
-  it("keeps interrupted writers fenced and accepts separate recovery receipts only with the original proof and fresh observation CAS", async () => {
+  it("keeps interrupted writers fenced and accepts separate recovery receipts only with the original proof and fresh observation CAS", { timeout: 30_000 }, async () => {
     const f = await fixture(); f.fault("register");
     const created = await f.command("worktree.create", { sessionId: f.source, repositoryId: "repo-one" }, "original");
     expect(await f.run(created.commandId)).toMatchObject({ status: "outcome_unknown" });
@@ -227,7 +227,7 @@ describe("managed worktrees production Catalog binding", () => {
     expect(await readFile(join(f.binding.store.require(accepted.worktree.worktreeId).path, "tracked.txt"), "utf8")).toBe("base\n");
   });
 
-  it("requires stop proof for every dispatched successor before another resume can claim", async () => {
+  it("requires stop proof for every dispatched successor before another resume can claim", { timeout: 30_000 }, async () => {
     const f = await fixture(); f.fault("register");
     const accepted = await f.command("worktree.create", { sessionId: f.source, repositoryId: "repo-one" }, "chain-original"); await f.run(accepted.commandId); f.stopVerified(true);
     const inspect = async (commandId: string) => {

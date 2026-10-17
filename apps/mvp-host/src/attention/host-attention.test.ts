@@ -216,7 +216,11 @@ describe("owned Host attention binding", () => {
     f.fetch.mockImplementationOnce(async () => { held.enter(); await held.barrier; return new Response(JSON.stringify({ data: { status: "ok", id: "late-ticket" } })); });
     f.question(); const sending = f.host.flush(); void sending.catch(() => {}); await held.entered;
     expect(await f.host.drain(Date.now() + 5)).toBe(false); await expect(f.host.shutdownService.drain(Date.now() + 5)).rejects.toThrow("ATTENTION_DRAIN_TIMEOUT"); expect(f.host.capabilities()).toEqual([]); expect(f.host.rpc()).toBeUndefined();
-    f.store.commitEvent(f.session.id, "session.recovery.required", { turnId: "turn" }, { turnId: "turn", turnStatus: "outcome_unknown", activityState: "outcome_unknown" });
+    // Keep the committed source on the fixture clock: the attention store's
+    // fixed `now` and retention would otherwise expire the pinned question fact
+    // as soon as the wall clock moved past the fixture date.
+    f.store.commitCommand({ sessionId: f.session.id, occurredAt: date, build: () => ({ result: undefined,
+      events: [{ type: "session.recovery.required", payload: { turnId: "turn" }, options: { turnId: "turn", turnStatus: "outcome_unknown", activityState: "outcome_unknown" } }] }) });
     expect(f.facts().map((item) => item.kind)).toEqual(["question", "recovery_blocked"]);
     f.host.seal(); const before = f.rows(); held.release(); await expect(sending).rejects.toThrow("ATTENTION_SEALED"); expect(f.rows()).toEqual(before); expect(f.fetch).toHaveBeenCalledOnce();
     expect(await f.host.drain(Date.now() + 1000)).toBe(true);

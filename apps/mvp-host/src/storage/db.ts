@@ -9,6 +9,7 @@ import { applyCatalogMigration } from "./migrations/007-catalog.js";
 import { applyInteractionMigration } from "./migrations/008-interactions.js";
 import { applyWorkspaceHistoryMigration } from "./migrations/009-workspace-history.js";
 import { applyAttentionMigration } from "./migrations/010-attention.js";
+import { applyExecutionActivationMigration } from "./migrations/011-execution-activation.js";
 import { applyCommandExecutionMigration } from "./migrations/004-command-execution.js";
 import { ExecutionStore, toExecutionIntent, type RawExecutionIntent } from "./execution-store.js";
 import { decideAcceptTurn } from "../orchestration/decider.js";
@@ -540,6 +541,7 @@ export class SqliteStore {
     applyInteractionMigration(this.db);
     applyWorkspaceHistoryMigration(this.db);
     applyAttentionMigration(this.db);
+    applyExecutionActivationMigration(this.db);
   }
 
   private upsertTimelineInternal(sessionId: string, input: TimelineUpsert, updatedAt: string): void {

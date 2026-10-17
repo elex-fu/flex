@@ -75,9 +75,10 @@ describe("owned Host attention binding", () => {
     expect(f.store.db.prepare("SELECT name,sql FROM sqlite_master ORDER BY name").all()).toEqual(schema);
     expect(() => createHostAttentionBindings({ ...f.options, owner: { ...f.owner } })).toThrow("verified Host owner");
     expect(() => createHostAttentionBindings({ ...f.options, hostId: "client-host" })).toThrow("ATTENTION_HOST_BINDING_INVALID");
-    f.store.db.prepare("DELETE FROM schema_migrations WHERE version=10").run();
+    f.store.db.prepare("DELETE FROM schema_migrations WHERE version IN (10,11)").run();
     expect(() => createHostAttentionBindings(f.options)).toThrow("ATTENTION_SCHEMA_NOT_READY");
     f.store.db.prepare("INSERT INTO schema_migrations(version,applied_at) VALUES(10,?)").run(date);
+    f.store.db.prepare("INSERT INTO schema_migrations(version,applied_at) VALUES(11,?)").run(date);
     f.store.db.exec("DROP INDEX attention_one_active_push");
     expect(() => createHostAttentionBindings(f.options)).toThrow(/schema/i);
     expect(f.store.db.prepare("SELECT 1 FROM sqlite_master WHERE name='attention_one_active_push'").get()).toBeUndefined();
@@ -194,7 +195,7 @@ describe("owned Host attention binding", () => {
     expect(f.rows()[0]?.state).toBe("cancelled"); expect(f.store.db.prepare("SELECT revoked_at FROM attention_push_subscriptions").get()).toEqual({ revoked_at: date }); await f.host.flush(); expect(f.fetch).toHaveBeenCalledOnce();
     await expect(list(f)).rejects.toThrow("DEVICE_REVOKED");
   });
-  it("reopens genuine schema010, recovers dispatching to unknown, and sends no historical or accepted reminder twice", async () => {
+  it("reopens the owned schema, recovers dispatching to unknown, and sends no historical or accepted reminder twice", async () => {
     const f = await fixture(); await f.start(); await f.enable(); f.complete(); await f.host.flush();
     f.store.createTurn({ sessionId: f.session.id, turnId: "second", commandId: "second", requestHash: "second", prompt: "second", generation: 2 }); f.complete("second");
     f.store.db.prepare("UPDATE attention_deliveries SET state='dispatching',attempts=1 WHERE state='pending'").run();
@@ -206,7 +207,7 @@ describe("owned Host attention binding", () => {
     const engine = new CommandEngine(store); const interaction = new InteractionService(engine, { resolveSession: () => ({ provider: "claude" }) }); services.push(interaction);
     const restarted = createHostAttentionBindings({ ...f.options, store, owner, devices: registry, interactions: interaction, assertActorSession: (deviceId, sessionId) => { if (!store.getSession(sessionId) || !store.getDevice(deviceId) || store.getDevice(deviceId)?.revokedAt) throw new Error("FORBIDDEN"); } }); hosts.push(restarted); restarted.start(); await restarted.flush();
     expect(f.fetch).toHaveBeenCalledOnce(); expect(store.db.prepare("SELECT state,attempts FROM attention_deliveries ORDER BY state").all()).toEqual([{ state: "accepted", attempts: 1 }, { state: "outcome_unknown", attempts: 1 }]);
-    expect(store.db.prepare("SELECT MAX(version) AS version FROM schema_migrations").get()).toEqual({ version: 10 });
+    expect(store.db.prepare("SELECT MAX(version) AS version FROM schema_migrations").get()).toEqual({ version: 11 });
     const lease = registry.openLease(f.device.id, { kind: "relay", generation: 3, protocolVersion: 2, capabilities: ["attention-v1"], close: vi.fn() });
     const view = await attentionRpc(restarted, { leaseId: lease.leaseId, generation: 3 }, "attention.list", {}) as AttentionListResponse; expect(view.items).toHaveLength(2);
     await restarted.postCommitWake(originalCommit).catch(() => {}); expect(f.fetch).toHaveBeenCalledOnce();

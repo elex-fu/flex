@@ -65,7 +65,7 @@ export class CatalogStore {
       const existing = this.workspace(input.workspaceId);
       if (existing && existing.canonicalRoot !== input.canonicalRoot) throw new CatalogError("WORKSPACE_REGISTRATION_CONFLICT", "A workspace ID cannot silently move to another root");
       const at = new Date().toISOString();
-      this.db.prepare(`INSERT INTO workspaces VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET
+      this.db.prepare(`INSERT INTO workspaces(id,canonical_root,worktree_root,checkout_key,kind,state,repository_id,capabilities_json,registration_operation_id,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET
         worktree_root=excluded.worktree_root,checkout_key=excluded.checkout_key,kind=excluded.kind,state=excluded.state,repository_id=excluded.repository_id,
         capabilities_json=excluded.capabilities_json,registration_operation_id=excluded.registration_operation_id,updated_at=excluded.updated_at`)
         .run(input.workspaceId,input.canonicalRoot,input.worktreeRoot,input.checkoutKey,input.kind,input.state,input.repositoryId,JSON.stringify(input.capabilities),input.registrationOperationId ?? null,existing?.createdAt ?? at,at);
@@ -82,7 +82,7 @@ export class CatalogStore {
     const previous = this.provider(input.providerInstanceId);
     if (previous && previous.provider !== input.provider) throw new CatalogError("PROVIDER_REGISTRATION_CONFLICT");
     const at = new Date().toISOString();
-    this.db.prepare(`INSERT INTO provider_instances VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET executable=excluded.executable,config_json=excluded.config_json,
+    this.db.prepare(`INSERT INTO provider_instances(id,provider,executable,config_json,policy_version,state,verification_json,policy_capabilities_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET executable=excluded.executable,config_json=excluded.config_json,
       policy_version=excluded.policy_version,state=excluded.state,verification_json=excluded.verification_json,policy_capabilities_json=excluded.policy_capabilities_json,updated_at=excluded.updated_at`)
       .run(input.providerInstanceId,input.provider,input.executable,JSON.stringify(input.config),input.policyVersion,input.state,JSON.stringify(input.verification),JSON.stringify(input.policyCapabilities),previous?.createdAt ?? at,at);
     return this.provider(input.providerInstanceId)!;

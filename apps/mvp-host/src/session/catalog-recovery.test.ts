@@ -91,7 +91,7 @@ describe("Catalogue recovery without Provider residency", () => {
     const reader = terminalClient(); const lookup = vi.fn((target: CatalogRecoveryIdentity) => existingReader(target, reader.client));
     const f = await fixture({ existingCodexReader: lookup }); const original = f.unknown();
     f.host.providers.recordVerification("instance-codex", { state: "verified", runtimeVersion: "verified-v1", capabilities: [] });
-    expect(inspectSchema(f.store.db).version).toBe(10); expect(f.bindings.recoveryCapabilities()).toEqual([RecoveryCapability]);
+    expect(inspectSchema(f.store.db).version).toBe(11); expect(f.bindings.recoveryCapabilities()).toEqual([RecoveryCapability]);
     const intents = f.store.db.prepare("SELECT id,state FROM execution_intents ORDER BY id").all();
     const recovery = f.bindings.recoveryForSession(f.codex)!;
     expect(recovery).toBe(f.bindings.recoveryForSession(f.codex));
@@ -100,7 +100,7 @@ describe("Catalogue recovery without Provider residency", () => {
     expect(f.runtimeFactory).not.toHaveBeenCalled(); expect(f.runTurn).not.toHaveBeenCalled();
     expect(f.host.registry.loaded(f.codex)).toBeUndefined();
     expect(f.store.db.prepare("SELECT id,state FROM execution_intents ORDER BY id").all()).toEqual(intents);
-    f.store.db.prepare("INSERT INTO schema_migrations(version,applied_at) VALUES(11,'future')").run();
+    f.store.db.prepare("INSERT INTO schema_migrations(version,applied_at) VALUES(12,'future')").run();
     expect(f.bindings.recoveryCapabilities()).toEqual([]); expect(f.bindings.recoveryForSession(f.codex)).toBeUndefined();
   });
 

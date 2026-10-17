@@ -486,17 +486,26 @@ export class HostWorktrees {
   async closeAndWait(deadlineMs = 5000): Promise<{ drained: boolean; producerStopped: boolean; clean: boolean; state: "stopped" | "recovery_required" }> {
     this.stopAdmission();
     const deadline = Date.now() + Math.max(0, deadlineMs);
-    const stop = this.options.closeGit ? this.trackCall(() => this.options.closeGit!(Math.max(0, deadline - Date.now()))).catch(() => ({ producerStopped: false, clean: false })) : Promise.resolve({ producerStopped: false, clean: false });
+    // Stopping Git is part of shutdown itself; the callback fence must not suppress this explicit attempt.
+    const stop = this.options.closeGit ? Promise.resolve().then(() => this.options.closeGit!(Math.max(0, deadline - Date.now()))).catch(() => ({ producerStopped: false, clean: false })) : Promise.resolve({ producerStopped: false, clean: false });
     const drain = async () => { while (this.calls.size || this.running.size) await Promise.allSettled([...this.calls, ...this.running.values()]); return { drained: true, stop: await stop }; };
     let timer: ReturnType<typeof setTimeout> | undefined;
     const report = await Promise.race([drain(), new Promise<{ drained: boolean; stop: WorktreeDriverClose }>((resolve) => { timer = setTimeout(() => resolve({ drained: false, stop: { producerStopped: false, clean: false } }), Math.max(0, deadline - Date.now())); })]);
     if (timer) clearTimeout(timer);
-    if (report.drained) this.cancelUndispatched();
+    // A sealed host writes no further SQL: undispatched intents stay durably pending for explicit recovery.
+    if (report.drained && !this.sealed) this.cancelUndispatched();
     const unknown = Boolean(this.options.catalog.db.prepare("SELECT 1 FROM worktree_operations WHERE state IN ('running','outcome_unknown') LIMIT 1").get());
     const clean = report.drained && report.stop.producerStopped && report.stop.clean && !unknown;
     return { drained: report.drained, producerStopped: report.stop.producerStopped, clean, state: clean ? "stopped" : "recovery_required" };
   }
-  /** Call after producer drain; this only seals journals, it never releases an unknown checkout lease. */
-  seal(): void { if (this.running.size || this.calls.size) throw new WorktreeError("WORKTREE_PRODUCER_UNKNOWN", "Drain worktree producers before sealing SQL callbacks"); this.options.sealGitJournal?.(); this.sealed = true; this.stopAdmission(); }
+  /**
+   * Idempotent synchronous callback fence. It never claims producers stopped and never releases a
+   * retained checkout lease; in-flight work keeps running and is awaited by {@link closeAndWait}.
+   */
+  seal(): void {
+    if (this.sealed) return;
+    this.sealed = true; this.stopAdmission();
+    this.options.sealGitJournal?.();
+  }
 }
 export function createHostWorktrees(options: HostWorktreesOptions): HostWorktrees { return new HostWorktrees(options); }

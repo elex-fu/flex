@@ -58,9 +58,11 @@ async function fixture() {
   const attestedContexts: number[] = [];
   const accepted: string[] = [], markers: string[] = [], launchContexts: Array<{ operationId: string; worktreeId: string; contextOperationId?: string; contextWorktreeId?: string }> = [];
   const raw = new RawWorktreeGit({ objects: (path) => new CheckpointGitDriver(path) });
+  const sealGitJournal = vi.fn();
   const binding: HostWorktrees = new HostWorktrees({ catalog, workspaces, sessions, devices, owner, managedRoot: managed, privateDirectories: [privateRoot, coordination], git: raw,
     executionReadiness: () => ({ ready: true }),
     assertWriteReady: () => { if (!ready) throw new Error("RESTORE_EXTERNAL_STATE_UNVERIFIED"); },
+    sealGitJournal,
     accepted: (intent) => { expect(store.db.inTransaction).toBe(false); accepted.push(intent.id); },
     producerStopProof: async (operation, original, successors) => { attestedContexts.push(1 + successors.length); return stopVerified ? { kind: "verified-worktree-stop", operationId: operation.operationId, dispatchContextDigest: worktreeDispatchContextDigest(original), writerContextsDigest: worktreeWriterContextsDigest(proofIncludesSuccessors ? [original, ...successors] : [original]), sourceId: "fixture-attestation", contractId: "deterministic-test-port" } : undefined; },
     recoveryAuthorization: (_record, operation, inspection) => ({ proof: { ownerId: owner.ownerId, ownerGeneration: owner.generation, evidenceId: inspection.evidenceId, turnId: operation.operationId, attemptId: operation.operationId, resourceKeys: ["workspace:" + binding.store.require(operation.worktreeId).path] }, verifyProof: () => stopVerified && inspection.producerStopped }),
@@ -82,7 +84,7 @@ async function fixture() {
   const command = async (method: WorktreeCommandMethod, payload: unknown, commandId = "worktree-" + ++commandCounter, principal = actor) => binding.command(method, payload, commandId, principal);
   const run = async (commandId: string, principal = actor) => { const intent = binding.execution.forCommand(principal.subjectId, commandId)[0]!; return binding.dispatchAccepted(intent.id); };
   const create = async () => { const result = await command("worktree.create", { sessionId: source, repositoryId: "repo-one" }); await run(result.commandId); return binding.store.require(result.worktree.worktreeId); };
-  return { root, repository, managed, privateRoot, coordination, owner, store, catalog, workspaces, providers, sessions, devices, runtimeFactory, delivered, actor, source, context, createSession, binding, raw, accepted, markers, launchContexts, command, run, create,
+  return { root, repository, managed, privateRoot, coordination, owner, store, catalog, workspaces, providers, sessions, devices, runtimeFactory, delivered, actor, source, context, createSession, binding, raw, accepted, markers, launchContexts, command, run, create, sealGitJournal,
     stopVerified: (value: boolean) => { stopVerified = value; }, ready: (value: boolean) => { ready = value; }, fault: (boundary: string, moment = "applied") => { fault = { boundary, moment }; },
     revokeAtMarker: () => { revokeAtMarker = true; }, proofIncludesSuccessors: (value: boolean) => { proofIncludesSuccessors = value; }, attestedContexts,
     hold: (boundary: string) => { boundaryGate = { boundary, entered: deferred(), release: deferred() }; return boundaryGate; },
@@ -250,19 +252,36 @@ describe("managed worktrees production Catalog binding", () => {
     expect(f.catalog.assertIdle(f.source)).toBeUndefined();
   });
 
-  it("drains tracked producers before sealing and cancels accepted commands that were never dispatched", async () => {
+  it("seals idempotently without draining and cancels accepted commands that were never dispatched", async () => {
     const f = await fixture(), accepted = await f.command("worktree.create", { sessionId: f.source, repositoryId: "repo-one" }, "drain-running");
     const hold = f.hold("register"), run = f.run(accepted.commandId); await hold.entered.promise;
     expect(await f.binding.closeAndWait(1)).toMatchObject({ drained: false, producerStopped: false, clean: false });
-    expect(() => f.binding.seal()).toThrow(/Drain/); hold.release.resolve(); await run;
+    const record = f.binding.store.require(accepted.worktree.worktreeId);
+    const peer = HostOwnerLock.acquire({ databasePath: join(f.privateRoot, "seal-peer.db"), identityDirectory: join(f.privateRoot, "seal-peer-identity"), coordinationDirectory: f.coordination });
+    try {
+      expect(() => f.binding.seal()).not.toThrow();
+      expect(() => f.binding.seal()).not.toThrow();
+      expect(f.sealGitJournal).toHaveBeenCalledTimes(1);
+      // A callback fence must not release the running producer's retained checkout lease.
+      expect(() => WorkspaceLease.acquire({ workspace: record.path, owner: peer })).toThrow(/holds this resource/);
+    } finally { peer.release(); }
+    hold.release.resolve(); await run;
     expect(await f.binding.closeAndWait(100)).toMatchObject({ drained: true, producerStopped: false, clean: false });
-    expect(f.binding.getOperation({ sessionId: f.source, operationId: accepted.operation.operationId }, f.actor).operation.state).toBe("completed");
+    // The fence rejects the late publication of a producer that was still running at seal time: its Git
+    // work cannot be claimed as a committed result, so the durable row stays explicitly unproven.
+    expect(f.binding.store.operation(accepted.operation.operationId).state).toBe("outcome_unknown");
+    expect(f.store.getCommandReceipt(f.actor.subjectId, accepted.commandId)?.state).toBe("outcome_unknown");
+    // A sealed driver closes query admission too; the durable row stays the source of truth.
+    expect(() => f.binding.getOperation({ sessionId: f.source, operationId: accepted.operation.operationId }, f.actor)).toThrow(/unavailable/);
     const queued = await fixture(), pending = await queued.command("worktree.create", { sessionId: queued.source, repositoryId: "repo-one" }, "never-dispatched");
     await queued.binding.closeAndWait(100);
     expect(queued.store.getCommandReceipt(queued.actor.subjectId, pending.commandId)?.state).toBe("failed");
     expect(queued.binding.execution.forCommand(queued.actor.subjectId, pending.commandId)[0]?.state).toBe("settled");
     expect(queued.binding.store.steps(pending.operation.operationId)).toHaveLength(0);
     await expect(queued.command("worktree.create", { sessionId: queued.source, repositoryId: "repo-one" }, "late")).rejects.toThrow(/admission/);
+    expect(() => queued.binding.seal()).not.toThrow();
+    expect(() => queued.binding.seal()).not.toThrow();
+    expect(queued.sealGitJournal).toHaveBeenCalledTimes(1);
   });
 
   it("retains the original checkout lease and withholds final Catalog publication when current Git tree stop is unverified", async () => {

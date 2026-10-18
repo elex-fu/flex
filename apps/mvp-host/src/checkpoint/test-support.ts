@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { SqliteStore } from "../storage/db.js";
 import { applyCheckpointSchema } from "../storage/migrations/009-checkpoints.js";
+import { rawCheckpointGitRunner } from "../test-support/managed-git-fixtures.js";
 import { CheckpointGitDriver } from "./git-driver.js";
 import { CheckpointStore } from "./checkpoint-store.js";
 import { CheckpointService } from "./checkpoint-service.js";
@@ -38,7 +39,7 @@ export async function userGitState(root: string): Promise<{ index?: Buffer; head
 }
 export function checkpointFixture(root: string, dbPath = ":memory:") {
   const owner = new SqliteStore(dbPath); const session = owner.createSession(root); applyCheckpointSchema(owner.db);
-  const store = new CheckpointStore(owner.db); const driver = new CheckpointGitDriver(root);
+  const store = new CheckpointStore(owner.db); const driver = new CheckpointGitDriver(root, { runGit: rawCheckpointGitRunner() });
   const context: CheckpointContext & { turnId: string; attemptId: string } = {
     sessionId: session.id, workspaceId: "default", turnId: "turn-1", attemptId: "attempt-1",
     lease: { workspaceId: "default", leaseId: "lease-1", generation: 1 }, sessionRevision: 2,

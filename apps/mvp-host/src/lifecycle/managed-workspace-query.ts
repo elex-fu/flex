@@ -9,7 +9,8 @@ export type ManagedWorkspaceQueryCode =
   | "WORKSPACE_QUERY_PLATFORM_UNSUPPORTED"
   | "WORKSPACE_QUERY_CLOSED"
   | "WORKSPACE_QUERY_INPUT_INVALID"
-  | "WORKSPACE_QUERY_EXECUTABLE_UNTRUSTED";
+  | "WORKSPACE_QUERY_EXECUTABLE_UNTRUSTED"
+  | "WORKSPACE_QUERY_RESULT_INVALID";
 export class ManagedWorkspaceQueryError extends Error {
   readonly retryable = false;
   constructor(readonly code: ManagedWorkspaceQueryCode) {
@@ -17,15 +18,22 @@ export class ManagedWorkspaceQueryError extends Error {
     this.name = "ManagedWorkspaceQueryError";
   }
 }
-export type ManagedWorkspaceQueryReadiness = Readonly<{
-  ready: false;
-  code: ManagedWorkspaceQueryCode;
-  platform: NodeJS.Platform;
-}>;
+export type ManagedWorkspaceQueryReadiness =
+  | Readonly<{ ready: true; platform: NodeJS.Platform }>
+  | Readonly<{ ready: false; code: ManagedWorkspaceQueryCode; platform: NodeJS.Platform }>;
 export type ManagedWorkspaceQueryCloseReport = Readonly<{
   closed: true;
-  producerStopped: true;
-  clean: true;
+  producerStopped: boolean;
+  clean: boolean;
+}>;
+/**
+ * Trusted injected executor. Only a proven managed runner may implement this;
+ * its own stop report is the only accepted producer evidence. Without it the
+ * port stays fail-closed on every platform.
+ */
+export type ManagedWorkspaceQueryExecutor = Readonly<{
+  run(plan: ManagedWorkspaceQueryPlan): Promise<{ stdout: string }>;
+  closeAndWait(deadlineMs: number): Promise<{ producerStopped: boolean; clean: boolean }>;
 }>;
 export type ManagedWorkspaceQueryOptions = {
   /** Shared Host journal, retained for a future proven executor. Never owned or closed here. */
@@ -35,6 +43,8 @@ export type ManagedWorkspaceQueryOptions = {
   assertActive: () => void;
   privateRoots: readonly string[];
   gitExecutable?: string;
+  /** Main injects a proven managed executor; RPC input can never select one. */
+  executor?: ManagedWorkspaceQueryExecutor;
   trackOperation?: (work: Promise<unknown>) => void;
 };
 export type ManagedWorkspaceQueryPlan = Readonly<{
@@ -50,7 +60,8 @@ export type ManagedWorkspaceQueryPlan = Readonly<{
 const DEFAULT_GIT = "/Library/Developer/CommandLineTools/usr/bin/git";
 const LIMIT_BYTES = 16 * 1024;
 const LIMIT_TIME_MS = 5_000;
-const QUERY_ENV = Object.freeze({
+/** Canonical controlled query environment. Exported so the managed runner executes the same fixed values. */
+export const MANAGED_QUERY_ENV: Readonly<Record<string, string>> = Object.freeze({
   PATH: "/usr/bin:/bin",
   LANG: "C",
   LC_ALL: "C",
@@ -63,6 +74,22 @@ const QUERY_ENV = Object.freeze({
   GIT_ATTR_NOSYSTEM: "1",
   GIT_ALLOW_PROTOCOL: "",
 });
+const QUERY_TAILS = Object.freeze({
+  toplevel: Object.freeze(["rev-parse", "--show-toplevel"]),
+  common_dir: Object.freeze(["rev-parse", "--path-format=absolute", "--git-common-dir"]),
+});
+export type ManagedWorkspaceQueryShape = keyof typeof QUERY_TAILS;
+/** The one canonical final argv for a controlled Workspace query; the managed runner rechecks it verbatim. */
+export function managedWorkspaceQueryArgv(cwd: string, shape: ManagedWorkspaceQueryShape): readonly string[] {
+  return Object.freeze([
+    "--no-optional-locks", "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null",
+    "-c", "credential.helper=", "-c", "protocol.allow=never", "-C", cwd, ...QUERY_TAILS[shape],
+  ]);
+}
+/** Identify the exact bounded query shape of an already composed argv, or undefined. */
+export function managedWorkspaceQueryShape(argv: readonly string[], cwd: string): ManagedWorkspaceQueryShape | undefined {
+  return (Object.keys(QUERY_TAILS) as ManagedWorkspaceQueryShape[]).find((shape) => same(argv, managedWorkspaceQueryArgv(cwd, shape)));
+}
 function invalid(): never { throw new ManagedWorkspaceQueryError("WORKSPACE_QUERY_INPUT_INVALID"); }
 function same(left: readonly string[], right: readonly string[]): boolean {
   return left.length === right.length && left.every((value, index) => value === right[index]);
@@ -90,11 +117,10 @@ export function planManagedWorkspaceQuery(
       !Number.isSafeInteger(input.maxBufferBytes) || input.maxBufferBytes <= 0 || input.maxBufferBytes > LIMIT_BYTES ||
       !Number.isSafeInteger(input.timeoutMs) || input.timeoutMs <= 0 || input.timeoutMs > LIMIT_TIME_MS ||
       input.operationId !== undefined && (typeof input.operationId !== "string" || input.operationId.length < 1 || input.operationId.length > 256)) invalid();
-  const prefix = ["-c", "core.fsmonitor=false", "-C", input.cwd];
-  const query = same(input.argv, [...prefix, "rev-parse", "--show-toplevel"])
-    ? ["rev-parse", "--show-toplevel"]
-    : same(input.argv, [...prefix, "rev-parse", "--path-format=absolute", "--git-common-dir"])
-      ? ["rev-parse", "--path-format=absolute", "--git-common-dir"] : invalid();
+  const callerPrefix = ["-c", "core.fsmonitor=false", "-C", input.cwd];
+  const shape = ([...Object.keys(QUERY_TAILS)] as ManagedWorkspaceQueryShape[])
+    .find(value => same(input.argv, [...callerPrefix, ...QUERY_TAILS[value]]));
+  if (!shape) invalid();
   let cwd: string;
   try {
     cwd = realpathSync(input.cwd);
@@ -106,12 +132,9 @@ export function planManagedWorkspaceQuery(
   } catch { invalid(); }
   return Object.freeze({
     command: controlledExecutable(options.gitExecutable ?? DEFAULT_GIT),
-    argv: Object.freeze([
-      "--no-optional-locks", "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null",
-      "-c", "credential.helper=", "-c", "protocol.allow=never", "-C", cwd, ...query,
-    ]),
+    argv: managedWorkspaceQueryArgv(cwd, shape),
     cwd,
-    env: QUERY_ENV,
+    env: MANAGED_QUERY_ENV,
     maxBufferBytes: input.maxBufferBytes,
     timeoutMs: input.timeoutMs,
     ...(input.operationId !== undefined ? { operationId: input.operationId } : {}),
@@ -158,8 +181,12 @@ export class ManagedWorkspaceQuery {
     this.preparation ??= Promise.resolve().then(() => {
       if (!this.accepting || this.sealed) return this.unavailable("WORKSPACE_QUERY_CLOSED");
       this.options.assertActive();
-      return this.unavailable(process.platform === "darwin"
-        ? "WORKSPACE_QUERY_PROCESS_BIRTH_UNAVAILABLE" : "WORKSPACE_QUERY_PLATFORM_UNSUPPORTED");
+      // Only Main can inject a proven executor; the shipped platform codes stay
+      // the answer whenever no trusted executor exists.
+      return this.options.executor
+        ? Object.freeze({ ready: true as const, platform: process.platform })
+        : this.unavailable(process.platform === "darwin"
+          ? "WORKSPACE_QUERY_PROCESS_BIRTH_UNAVAILABLE" : "WORKSPACE_QUERY_PLATFORM_UNSUPPORTED");
     });
     return this.preparation;
   }
@@ -188,10 +215,18 @@ export class ManagedWorkspaceQuery {
     this.accepting = false;
     this.drainPromise ??= (async () => {
       await this.preparation;
+      // Stop producers first: an injected executor owns the real stop evidence.
+      let stop: { producerStopped: boolean; clean: boolean };
+      if (this.options.executor) {
+        try { stop = await this.options.executor.closeAndWait(deadlineMs); }
+        catch { stop = { producerStopped: false, clean: false }; }
+      } else {
+        // No production process was launched; this is an empty producer set,
+        // not a proof derived from a process group or missing PID.
+        stop = { producerStopped: true, clean: true };
+      }
       await Promise.allSettled([...this.operations]);
-      // No production process was launched; this is an empty producer set,
-      // not a proof derived from a process group or missing PID.
-      return Object.freeze({ closed: true, producerStopped: true, clean: true });
+      return Object.freeze({ closed: true as const, producerStopped: stop.producerStopped, clean: stop.clean && this.operations.size === 0 });
     })();
     return this.drainPromise;
   }
@@ -201,7 +236,7 @@ export class ManagedWorkspaceQuery {
   private async execute(input: ManagedWorkspaceQueryInput): Promise<{ stdout: string }> {
     if (!this.accepting || this.sealed) throw new ManagedWorkspaceQueryError("WORKSPACE_QUERY_CLOSED");
     this.options.assertActive();
-    planManagedWorkspaceQuery(input, this.options);
+    const plan = planManagedWorkspaceQuery(input, this.options);
     const context = Object.freeze({ ...this.options.context({ purpose: "query", ...(input.operationId !== undefined ? { operationId: input.operationId } : {}) }) });
     if ([context.hostOwnerId, context.runtimeId, context.attemptId].some(value => typeof value !== "string" || value.length < 1) ||
         !Number.isSafeInteger(context.hostOwnerGeneration) || context.hostOwnerGeneration < 1 ||
@@ -209,7 +244,13 @@ export class ManagedWorkspaceQuery {
     const readiness = await this.prepare();
     if (!this.accepting || this.sealed) throw new ManagedWorkspaceQueryError("WORKSPACE_QUERY_CLOSED");
     this.options.assertActive();
-    throw new ManagedWorkspaceQueryError(readiness.code);
+    if (!readiness.ready || !this.options.executor) throw new ManagedWorkspaceQueryError(readiness.ready ? "WORKSPACE_QUERY_PLATFORM_UNSUPPORTED" : readiness.code);
+    const result = await this.options.executor.run(plan);
+    if (!this.accepting || this.sealed) throw new ManagedWorkspaceQueryError("WORKSPACE_QUERY_CLOSED");
+    if (!result || typeof result.stdout !== "string" || Buffer.byteLength(result.stdout, "utf8") > plan.maxBufferBytes) {
+      throw new ManagedWorkspaceQueryError("WORKSPACE_QUERY_RESULT_INVALID");
+    }
+    return { stdout: result.stdout };
   }
   private unavailable(code: ManagedWorkspaceQueryCode): ManagedWorkspaceQueryReadiness {
     return Object.freeze({ ready: false, code, platform: process.platform });

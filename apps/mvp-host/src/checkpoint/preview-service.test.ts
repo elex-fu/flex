@@ -9,6 +9,7 @@ import { CheckpointStore } from "./checkpoint-store.js";
 import { CheckpointGitDriver } from "./git-driver.js";
 import { SqliteStore } from "../storage/db.js";
 import { checkpointFixture, fixtureGit, removeFixture, temporaryRepository, userGitState } from "./test-support.js";
+import { rawCheckpointGitRunner } from "../test-support/managed-git-fixtures.js";
 
 const roots: string[] = []; const owners: SqliteStore[] = [];
 async function fixture(persistent = false) {
@@ -47,7 +48,7 @@ describe("persistent preview-only revert plans", { timeout: 30_000 }, () => {
     await writeFile(join(value.root, "tracked.txt"), "different\n");
     const page = await value.preview.createPreview({ sessionId: context.sessionId, actorId: context.actorId, checkpointId: target.checkpointId, expectedSessionRevision: context.sessionRevision });
     value.owner.close(); const owner = new SqliteStore(join(value.root, "host.sqlite")); owners.push(owner);
-    const store = new CheckpointStore(owner.db); const driver = new CheckpointGitDriver(value.root);
+    const store = new CheckpointStore(owner.db); const driver = new CheckpointGitDriver(value.root, { runGit: rawCheckpointGitRunner() });
     const checkpoints = new CheckpointService({ store, driverFor: () => driver, assertLease: () => {} });
     const preview = new CheckpointPreviewService({ checkpoints, resolveContext: () => structuredClone(value.getContext()), now: () => value.clock.now });
     expect(preview.getPreview({ sessionId: context.sessionId, actorId: context.actorId, planId: page.planId }).expectedWorkspaceDigest).toBe(page.expectedWorkspaceDigest);

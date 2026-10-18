@@ -10,6 +10,7 @@ import { createTestHostOwner } from "../lifecycle/host-owner.js";
 import { CommandEngine, hashCommandRequest } from "../orchestration/command-engine.js";
 import { applyCheckpointSchema } from "../storage/migrations/009-checkpoints.js";
 import { temporaryRepository, userGitState, removeFixture } from "../checkpoint/test-support.js";
+import { rawCheckpointGitRunner } from "../test-support/managed-git-fixtures.js";
 import type { ProviderAdapter, ProviderOutcome } from "../provider/types.js";
 import type { OrchestratorOptions } from "./orchestrator.js";
 
@@ -20,7 +21,7 @@ afterEach(async () => { for (const value of open.splice(0)) { value.host.close()
 async function setup(options: { before?: () => Promise<void>; after?: () => Promise<void>; proof?: () => boolean; hook?: () => Promise<void>; gate?: () => void } = {}) {
   const root = await temporaryRepository(); const outcome = barrier<ProviderOutcome>(); const calls: string[] = []; const blocked = vi.fn();
   let host!: SessionOrchestrator; let service!: CheckpointService; let checkpoints!: CheckpointStore;
-  const driver = new CheckpointGitDriver(root);
+  const driver = new CheckpointGitDriver(root, { runGit: rawCheckpointGitRunner() });
   const adapter: ProviderAdapter = { provider: "claude", workspace: root, status: async () => { throw new Error("not used"); }, preflight: async () => { throw new Error("no real Provider"); },
     runTurn: async () => { throw new Error("beginTurn required"); }, beginTurn: (_context, prompt) => { calls.push(prompt); return { outcome: outcome.promise }; },
     interrupt: async () => "accepted", respondApproval: () => true };

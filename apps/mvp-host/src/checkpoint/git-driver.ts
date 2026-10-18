@@ -1,4 +1,3 @@
-import { execFile } from "node:child_process";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash } from "node:crypto";
 import { constants } from "node:fs";
@@ -405,6 +404,10 @@ export class CheckpointGitDriver {
   }
   private async git(args: string[], options: { gitDirectory?: string; worktree?: string; index?: string; input?: Buffer; maxBytes?: number; allowFailure?: boolean; commitIdentity?: boolean } = {}): Promise<Buffer | undefined> {
     if (this.lifecycle.signal.aborted) throw new CheckpointError("CHECKPOINT_GIT_SEALED", "Checkpoint Git execution is sealed");
+    const runner = this.options.runGit;
+    // No direct spawn fallback: production composition always injects the
+    // journaling managed runner, and a missing runner must refuse.
+    if (!runner) throw new CheckpointError("CHECKPOINT_MANAGED_GIT_REQUIRED", "Checkpoint Git requires the managed runner");
     const env: Record<string, string> = { GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null", GIT_OPTIONAL_LOCKS: "0", GIT_TERMINAL_PROMPT: "0", GIT_PAGER: "cat", GIT_NO_REPLACE_OBJECTS: "1", GIT_NO_LAZY_FETCH: "1" };
     if (options.index) env.GIT_INDEX_FILE = options.index;
     if (options.gitDirectory) env.GIT_DIR = options.gitDirectory;
@@ -417,7 +420,7 @@ export class CheckpointGitDriver {
       operation: this.operations.getStore() ?? Object.freeze({ kind: "fingerprint" as const }),
     });
     let result: CheckpointGitRunResult;
-    try { result = await (this.options.runGit ?? ((value) => this.legacyRunGit(value)))(request); }
+    try { result = await runner(request); }
     catch (error) {
       if (error instanceof CheckpointError) throw error;
       throw new CheckpointError("GIT_OPERATION_FAILED", `Checkpoint Git ${args[0] ?? "operation"} failed`);
@@ -430,17 +433,5 @@ export class CheckpointGitDriver {
       throw new CheckpointError("GIT_OPERATION_FAILED", `Checkpoint Git ${args[0] ?? "operation"} failed`);
     }
     return Buffer.from(result.stdout);
-  }
-  /** Compatibility only. Production Host composition supplies the tracked prelaunch runner. */
-  private legacyRunGit(request: CheckpointGitRunRequest): Promise<CheckpointGitRunResult> {
-    const inherited = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith("GIT_") && !/^(?:DYLD_|LD_|GCONV_PATH$|GLIBC_TUNABLES$|LOCPATH$)/.test(key)));
-    return new Promise((resolveResult, reject) => {
-      const child = execFile(request.command, [...request.args], { cwd: request.cwd, env: { ...inherited, ...request.env }, encoding: "buffer", timeout: request.timeoutMs, maxBuffer: request.maxBuffer, signal: request.signal }, (error, stdout) => {
-        if (error && typeof error.code !== "number") { reject(error); return; }
-        resolveResult({ stdout, exitCode: error ? Number(error.code) : 0 });
-      });
-      child.stdin?.on("error", () => { /* Completion reports a closed/failed command. */ });
-      child.stdin?.end(request.input ? Buffer.from(request.input.data, "base64") : undefined);
-    });
   }
 }

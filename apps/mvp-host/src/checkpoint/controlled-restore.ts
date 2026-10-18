@@ -1,11 +1,10 @@
-import { execFile, spawn } from "node:child_process";
-import { createHash, randomUUID } from "node:crypto";
+import { createHash } from "node:crypto";
 import { mkdtemp, readFile, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { adoptNodeChildProcess, type ManagedChildExit, type ManagedChildHandle } from "../lifecycle/managed-child-handle.js";
+import { type ManagedChildExit, type ManagedChildHandle } from "../lifecycle/managed-child-handle.js";
 import { CONTROLLED_RESTORE_HELPER } from "./controlled-restore-helper.js";
-import { digest, validateCheckpointPath } from "./git-driver.js";
+import { digest, validateCheckpointPath, type CheckpointGitOperation, type CheckpointGitRunner, type CheckpointGitRunResult } from "./git-driver.js";
 import type { CheckpointGitDriver } from "./git-driver.js";
 import { CheckpointError } from "./types.js";
 import type { CheckpointManifest } from "./types.js";
@@ -22,6 +21,8 @@ export type ControlledRestoreOptions = {
   spawnHelper?: (request: ControlledHelperSpawnRequest) => ManagedChildHandle | Promise<ManagedChildHandle>;
   /** Trusted Host configuration only. This is never a client-selected executable. */
   pythonExecutable?: string;
+  /** Managed Git runner for repository binding and isolated-index queries. Without it restore refuses; there is no direct fallback. */
+  runGit?: CheckpointGitRunner;
   onSpawn?: (process: {pid:number;operationId:string;stepId:string;kind:"controlled_restore"}) => void | Promise<void>;
   onExit?: (process: {pid:number;operationId:string;stepId:string}) => void;
   /** Deterministic tests only; no production RPC carries this. */
@@ -29,7 +30,8 @@ export type ControlledRestoreOptions = {
 };
 export class ControlledRestore {
   private sealed=false;
-  seal():void {this.sealed=true;}
+  private readonly lifecycle=new AbortController();
+  seal():void {this.sealed=true;this.lifecycle.abort();}
   constructor(private readonly options: ControlledRestoreOptions = {}) {}
   async probe(): Promise<void> { await this.helper({op:"probe"}); }
   async identify(workspace: string, gitDirectory: string): Promise<RestoreCapabilities> {
@@ -41,9 +43,11 @@ export class ControlledRestore {
       .map((step) => ({stepId:step.stepId,kind:step.kind === "index" ? "index":"file",...(step.path ? {path:step.path}: {})}))});
   }
   async verifyRepository(workspace: string, capabilities: RestoreCapabilities): Promise<void> {
-    const env=Object.fromEntries(Object.entries(process.env).filter(([key])=>!key.startsWith("GIT_")));
-    Object.assign(env,{GIT_CONFIG_NOSYSTEM:"1",GIT_CONFIG_GLOBAL:"/dev/null",GIT_OPTIONAL_LOCKS:"0",GIT_TERMINAL_PROMPT:"0",GIT_NO_REPLACE_OBJECTS:"1",GIT_NO_LAZY_FETCH:"1"});
-    const query=(args:string[])=>new Promise<string>((resolve,reject)=>execFile("git",["-c","core.fsmonitor=false","-c","core.hooksPath=/dev/null",...args],{cwd:workspace,env,encoding:"utf8",timeout:30_000},(error,out)=>error?reject(new CheckpointError("WORKSPACE_BINDING_CHANGED","Registered repository mapping changed")):resolve(out.trim())));
+    const query = async (args: string[]): Promise<string> => {
+      const result = await this.restoreGit({ kind: "fingerprint" }, args, workspace, {}, 64 * 1024);
+      if (result.exitCode !== 0) throw new CheckpointError("WORKSPACE_BINDING_CHANGED", "Registered repository mapping changed");
+      return Buffer.from(result.stdout).toString("utf8").trim();
+    };
     const gitDirectory=await realpath(await query(["rev-parse","--absolute-git-dir"]));
     const root=await realpath(await query(["rev-parse","--show-toplevel"]));
     if (gitDirectory!==capabilities.gitDirectory.path || root!==capabilities.workspace.path) throw new CheckpointError("WORKSPACE_BINDING_CHANGED","Registered repository mapping changed");
@@ -70,8 +74,9 @@ export class ControlledRestore {
     }
     const temp=await mkdtemp(join(tmpdir(),"flyx-revert-index-"));
     try {
-      const index=join(temp,"index"); await this.objectGit(capabilities.gitDirectory.path,temp,index,["read-tree",tree]);
-      const actual=(await this.objectGit(capabilities.gitDirectory.path,temp,index,["write-tree"])).toString("ascii").trim();
+      const operation=Object.freeze({kind:"verify" as const,checkpointId:manifest.checkpointId,layer:"index" as const});
+      const index=join(temp,"index"); await this.objectGit(operation,capabilities.gitDirectory.path,temp,index,["read-tree",tree]);
+      const actual=(await this.objectGit(operation,capabilities.gitDirectory.path,temp,index,["write-tree"])).toString("ascii").trim();
       if (actual !== tree) throw new CheckpointError("TARGET_OBJECT_CORRUPT", "Prepared index differs from its retained tree");
       const data=await readFile(index); if (data.length>64*1024*1024) throw new CheckpointError("RESTORE_BUDGET_EXCEEDED", "Prepared index exceeds restore budget");
       return {data,digest:digest(Buffer.concat([Buffer.from("index\0"),data]))};
@@ -86,12 +91,19 @@ export class ControlledRestore {
       ...(fault ? {fault}: {})},{operationId,stepId:step.stepId});
   }
   private objectOid(data: Buffer, length: number): string { return createHash(length === 64 ? "sha256":"sha1").update(`blob ${data.length}\0`).update(data).digest("hex"); }
-  private objectGit(gitDirectory: string, workspace: string, index: string, args: string[]): Promise<Buffer> {
-    const env=Object.fromEntries(Object.entries(process.env).filter(([key])=>!key.startsWith("GIT_")));
-    Object.assign(env,{GIT_DIR:gitDirectory,GIT_WORK_TREE:workspace,GIT_INDEX_FILE:index,GIT_CONFIG_NOSYSTEM:"1",GIT_CONFIG_GLOBAL:"/dev/null",GIT_OPTIONAL_LOCKS:"0",GIT_NO_REPLACE_OBJECTS:"1",GIT_NO_LAZY_FETCH:"1",GIT_TERMINAL_PROMPT:"0"});
-    const config=["core.fsmonitor=false","core.hooksPath=/dev/null","core.attributesFile=/dev/null","core.untrackedCache=false","core.preloadIndex=false","core.splitIndex=false","gc.auto=0","maintenance.auto=false"];
-    return new Promise((resolve,reject)=>execFile("git",[...config.flatMap((value)=>["-c",value]),...args],{cwd:workspace,env,encoding:"buffer",timeout:30_000,maxBuffer:1024*1024},
-      (error,out)=>error ? reject(new CheckpointError("GIT_OPERATION_FAILED","Controlled index preparation failed")):resolve(out)));
+  /** One isolated-index query through the injected managed runner; no direct spawn fallback. */
+  private async objectGit(operation: CheckpointGitOperation, gitDirectory: string, workspace: string, index: string, args: string[]): Promise<Buffer> {
+    const env=Object.freeze({GIT_DIR:gitDirectory,GIT_WORK_TREE:workspace,GIT_INDEX_FILE:index});
+    const result=await this.restoreGit(operation,args,workspace,env,1024*1024);
+    if (result.exitCode !== 0) throw new CheckpointError("GIT_OPERATION_FAILED","Controlled index preparation failed");
+    return Buffer.from(result.stdout);
+  }
+  private async restoreGit(operation: CheckpointGitOperation, args: readonly string[], cwd: string, env: Readonly<Record<string, string>>, maxBuffer: number): Promise<CheckpointGitRunResult> {
+    const runner=this.options.runGit;
+    // No direct spawn fallback: restore composition injects the journaling
+    // managed runner, and a missing runner must refuse.
+    if(!runner)throw new CheckpointError("CHECKPOINT_MANAGED_GIT_REQUIRED","Controlled restore requires the managed Git runner");
+    return await runner(Object.freeze({command:"git",args:Object.freeze([...args]),cwd,workspace:cwd,env,maxInputBytes:0,maxBuffer,timeoutMs:30_000,signal:this.lifecycle.signal,operation:Object.freeze(operation)}));
   }
   private helper<T>(request: unknown, producer?: {operationId:string;stepId:string}): Promise<T> {
     if(this.sealed)return Promise.reject(new CheckpointError("CONTROLLED_RESTORE_SEALED","Controlled restore is sealed"));
@@ -104,7 +116,9 @@ export class ControlledRestore {
       let settled=false,child:ManagedChildHandle|undefined,timer:ReturnType<typeof setTimeout>|undefined;
       const fail=(code:string)=>{if(settled)return;settled=true;if(timer)clearTimeout(timer);try{child?.kill("SIGKILL");child?.stdin?.destroy();}catch{/* Root process journal still controls unknown producers. */}reject(new CheckpointError(code,"Controlled restore helper did not complete"));};
       // The trusted runner commits launch facts before crossing spawn; no mutation input is sent until it returns.
-      void Promise.resolve().then(()=>{if(this.sealed)throw new CheckpointError("CONTROLLED_RESTORE_SEALED","Controlled restore is sealed");return this.options.spawnHelper?this.options.spawnHelper(launch):adoptNodeChildProcess({id:randomUUID(),child:spawn(launch.command,[...launch.args],{env:launch.env,stdio:["pipe","pipe","pipe"]})});}).then((launched)=>{
+      void Promise.resolve().then(()=>{if(this.sealed)throw new CheckpointError("CONTROLLED_RESTORE_SEALED","Controlled restore is sealed");
+        if(!this.options.spawnHelper)throw new CheckpointError("CONTROLLED_RESTORE_UNAVAILABLE","Controlled restore requires a managed helper launcher");
+        return this.options.spawnHelper(launch);}).then((launched)=>{
         child=launched;const chunks:Buffer[]=[];let bytes=0;
         const stdin=launched.stdin,stdout=launched.stdout;
         if(!stdin||!stdout){launched.kill("SIGKILL");fail("CONTROLLED_RESTORE_UNAVAILABLE");return;}

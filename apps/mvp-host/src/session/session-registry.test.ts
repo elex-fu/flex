@@ -14,6 +14,7 @@ import {WorkspaceRegistry} from "../workspace/workspace-registry.js";
 import {ProviderInstanceRegistry} from "../provider/provider-instance-registry.js";
 import {SessionRegistry,type RuntimeCloseReport,type SessionRuntimeContext} from "./session-registry.js";
 import {LegacySessionFacade} from "./legacy-session-facade.js";
+import {rawGitServiceRunner,rawWorkspaceGitQuery} from "../test-support/managed-git-fixtures.js";
 
 const roots:string[]=[];const cleanups:Array<()=>void>=[];
 afterEach(()=>{for(const cleanup of cleanups.splice(0).reverse())cleanup();for(const root of roots.splice(0))rmSync(root,{recursive:true,force:true});});
@@ -37,11 +38,11 @@ async function fixture(factory?:(context:SessionRuntimeContext)=>Promise<FakeRun
   const owner=createTestHostOwner();const store=openOwned({databasePath:":memory:",owner});cleanups.push(()=>{store.close();owner.release();});
   applyCatalogMigration(store.db);
   const catalog=new CatalogStore(store);cleanups.push(()=>catalog.dispose());
-  const workspaces=new WorkspaceRegistry(catalog,{owner});await workspaces.registerLocal({workspaceId:"workspace-one",root:checkout});
+  const workspaces=new WorkspaceRegistry(catalog,{owner,readOnlyGit:rawWorkspaceGitQuery()});await workspaces.registerLocal({workspaceId:"workspace-one",root:checkout});
   const providers=new ProviderInstanceRegistry(catalog);
   for(const provider of ["claude","codex"] as const){providers.registerLocal({providerInstanceId:`instance-${provider}`,provider,executable:process.execPath,policyCapabilities:["streamingText","workspaceWrite"]});providers.recordVerification(`instance-${provider}`,{state:"verified",runtimeVersion:"fixture-version",capabilities:["streamingText","workspaceWrite"]});}
   const runtimeFactory=vi.fn(factory??((context)=>{const runtime=new FakeRuntime(context.session.sessionId,context.runtimeId);runtime.closeGate.resolve(clean);return runtime;}));
-  const registry=new SessionRegistry(catalog,workspaces,providers,{owner,runtimeFactory});
+  const registry=new SessionRegistry(catalog,workspaces,providers,{owner,runtimeFactory,gitRunner:rawGitServiceRunner()});
   const create=(commandId:string,provider="claude")=>registry.createNew({authSubjectId:"primary-device",commandId},{workspaceId:"workspace-one",providerInstanceId:`instance-${provider}`,title:commandId}).summary;
   return {root,checkout,owner,store,catalog,workspaces,providers,registry,runtimeFactory,create};
 }

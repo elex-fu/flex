@@ -16,6 +16,7 @@ import {
   MANAGED_PROCESS_SCHEMA, MANAGED_PROCESS_IDENTITY_SCHEMA,
   ManagedProcessRegistry, SqliteProcessJournal, type ManagedProcessRecord,
 } from "./managed-process-registry.js";
+import { createFixtureManagedGitRunner } from "../test-support/managed-git-fixtures.js";
 
 const run = promisify(execFile);
 const context = { hostOwnerId: "query-owner", hostOwnerGeneration: 1, runtimeId: "query-runtime", runtimeGeneration: 1, attemptId: "query-attempt" };
@@ -46,6 +47,7 @@ describe("fail-closed Workspace query port", () => {
         trackOperation: work => { tracked.push(work); },
       });
       const readiness = await service.prepare();
+      if (readiness.ready) throw new Error("A runner-less port must never become ready");
       expect(readiness).toMatchObject({ ready: false, code: process.platform === "darwin" ? "WORKSPACE_QUERY_PROCESS_BIRTH_UNAVAILABLE" : "WORKSPACE_QUERY_PLATFORM_UNSUPPORTED" });
       if (process.platform === "darwin") await expect(service.readOnlyGit(input(workspace))).rejects.toMatchObject({ code: readiness.code });
       expect(writes).toBe(0);
@@ -83,6 +85,25 @@ describe("fail-closed Workspace query port", () => {
     expect(await preparing).toMatchObject({ ready: false, code: "WORKSPACE_QUERY_CLOSED" });
     await expect(service.readOnlyGit(input(workspace))).rejects.toMatchObject({ code: "WORKSPACE_QUERY_CLOSED" });
     expect(writes).toBe(0);
+  });
+
+  it("runs a real bounded query only through an injected proven executor with stop evidence", async () => {
+    await run(git, ["init", "-q", workspace]);
+    const runner = createFixtureManagedGitRunner({ privateRoots: [privateRoot] });
+    try {
+      const service = createManagedWorkspaceQuery({ journal: { save: () => {} }, context: () => context,
+        assertActive: () => {}, privateRoots: [privateRoot], gitExecutable: git, executor: runner.workspaceQueryPort() });
+      await expect(service.prepare()).resolves.toMatchObject({ ready: true, platform: process.platform });
+      const toplevel = await service.readOnlyGit(input(workspace));
+      expect(toplevel.stdout.trim()).toBe(workspace);
+      const common = await service.readOnlyGit(input(workspace, true));
+      expect(common.stdout.trim()).toBe(join(workspace, ".git"));
+      expect(await service.drain()).toEqual({ closed: true, producerStopped: true, clean: true });
+      expect((await runner.closeAndWait(1_000)).producerStopped).toBe(true);
+    } finally {
+      await runner.closeAndWait(1_000);
+      runner.sealJournal();
+    }
   });
 
   it.runIf(process.platform === "darwin")("rebuilds only the exact bounded rev-parse plans with a controlled environment", () => {

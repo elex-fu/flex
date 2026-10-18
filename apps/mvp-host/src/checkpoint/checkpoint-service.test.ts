@@ -9,6 +9,7 @@ import { CheckpointStore } from "./checkpoint-store.js";
 import { SqliteStore } from "../storage/db.js";
 import { applyCheckpointSchema } from "../storage/migrations/009-checkpoints.js";
 import { checkpointFixture, fixtureGit, removeFixture, temporaryRepository, userGitState } from "./test-support.js";
+import { rawCheckpointGitRunner } from "../test-support/managed-git-fixtures.js";
 import type { AfterCheckpointContext } from "./types.js";
 
 const roots: string[] = []; const owners: SqliteStore[] = [];
@@ -93,7 +94,7 @@ describe("persistent exact checkpoint service", { timeout: 30_000 }, () => {
     const { root, store, context, driver, owner } = await fixture();
     const outsideRoot = join(root, "ordinary-directory"); await mkdir(outsideRoot);
     let unavailable = true;
-    const service = new CheckpointService({ store, driverFor: () => unavailable ? new CheckpointGitDriver(outsideRoot) : driver, assertLease: () => {} });
+    const service = new CheckpointService({ store, driverFor: () => unavailable ? new CheckpointGitDriver(outsideRoot, { runGit: rawCheckpointGitRunner() }) : driver, assertLease: () => {} });
     const before = await service.captureBefore(context); expect(before.status).toBe("failed");
     owner.createTurn({ sessionId: context.sessionId, turnId: context.turnId, commandId: "cmd", requestHash: "hash", prompt: "done", generation: 1 });
     owner.commitEvent(context.sessionId, "turn.completed", {}, { turnId: context.turnId, turnStatus: "completed", activityState: "idle" });
@@ -128,7 +129,7 @@ describe("persistent exact checkpoint service", { timeout: 30_000 }, () => {
     applyCheckpointSchema(owner.db); const store = new CheckpointStore(owner.db); const baseline = store.getBaseline(session.id)!;
     expect(baseline.status).toBe("legacy_inexact"); expect(baseline.workspaceTree).toBeUndefined(); expect(baseline.indexTree).toBeUndefined();
     applyCheckpointSchema(owner.db); expect(store.getBaseline(session.id)?.checkpointId).toBe(baseline.checkpointId);
-    const driver = new CheckpointGitDriver(root); const service = new CheckpointService({ store, driverFor: () => driver, assertLease: () => {} });
+    const driver = new CheckpointGitDriver(root, { runGit: rawCheckpointGitRunner() }); const service = new CheckpointService({ store, driverFor: () => driver, assertLease: () => {} });
     const disposable = checkpointFixture(root); const context = { ...disposable.context, sessionId: session.id }; disposable.owner.close();
     const returned = await service.ensureSessionBaseline(context); expect(returned.checkpointId).toBe(baseline.checkpointId);
   });

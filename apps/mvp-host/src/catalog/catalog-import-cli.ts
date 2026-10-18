@@ -4,7 +4,7 @@ import { assertHostOwner } from "../lifecycle/host-owner.js";
 import type { SqliteStore } from "../storage/db.js";
 import { CatalogError, CatalogStore } from "../storage/catalog-store.js";
 import { CatalogImportService, type CatalogImportPlan, type CatalogImportResult } from "../storage/import-service.js";
-import { WorkspaceRegistry } from "../workspace/workspace-registry.js";
+import { WorkspaceRegistry, type WorkspaceGitQuery } from "../workspace/workspace-registry.js";
 import { ProviderInstanceRegistry } from "../provider/provider-instance-registry.js";
 import { validateCatalogSchema } from "../storage/migrations/007-catalog.js";
 const Id = z.string().min(1).max(256);
@@ -47,6 +47,8 @@ export type CatalogImportCliOptions = {
     owner: HostOwnerHandle;
     backupDirectory: string;
     privateDirectories?: readonly string[];
+    /** Main injects the managed read-only Git query runner; without it workspace verification fails closed. */
+    readOnlyGit?: WorkspaceGitQuery;
 };
 /** Thin local CLI handler. The caller opens an existing offline, owned Store. */
 export async function runCatalogImportCli(options: CatalogImportCliOptions, value: CatalogImportCliRequest): Promise<CatalogImportCliResult> {
@@ -61,7 +63,7 @@ export async function runCatalogImportCli(options: CatalogImportCliOptions, valu
         throw new CatalogError("IMPORT_DRY_RUN_REQUIRED", "Review the dry-run digest before importing");
     const catalog = new CatalogStore(options.store);
     try {
-        const workspaces = new WorkspaceRegistry(catalog, { owner: options.owner, ...(options.privateDirectories ? { privateDirectories: options.privateDirectories } : {}) });
+        const workspaces = new WorkspaceRegistry(catalog, { owner: options.owner, ...(options.privateDirectories ? { privateDirectories: options.privateDirectories } : {}), ...(options.readOnlyGit ? { readOnlyGit: options.readOnlyGit } : {}) });
         const providers = new ProviderInstanceRegistry(catalog);
         const service = new CatalogImportService(catalog, workspaces, providers, { owner: options.owner, backupDirectory: options.backupDirectory });
         const legacyProviders = input.legacyProviderInstances ? { ...(input.legacyProviderInstances.claude ? { claude: input.legacyProviderInstances.claude } : {}), ...(input.legacyProviderInstances.codex ? { codex: input.legacyProviderInstances.codex } : {}) } : undefined;

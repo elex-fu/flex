@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { CreateSessionV2Schema, RenameSessionV2Schema, ChangeSessionStatusV2Schema, ListSessionsV2Schema, type ListSessionsV2Response, type SessionEvent, type SessionSummaryV2 } from "@flyx/mvp-protocol";
 import type { HostOwnerHandle } from "../lifecycle/host-owner.js";
-import { GitService } from "../git/git-service.js";
+import { GitService, type GitServiceRunner } from "../git/git-service.js";
 import { CatalogError, CatalogStore, hashCatalogRequest, publicSessionSummary, type CatalogCommand, type CatalogCommit, type CatalogSession, type ProviderInstanceRecord, type WorkspaceRecord } from "../storage/catalog-store.js";
 import type { SqliteStore, TurnRow } from "../storage/db.js";
 import { WorkspaceRegistry } from "../workspace/workspace-registry.js";
@@ -25,6 +25,8 @@ export type SessionRegistryOptions<R extends SessionRuntime> = {
   /** Trusted Host fence shared with still-preparing runtimes. It must perform no SQL. */
   sealRuntime?(runtime:R):void;
   publish?:(event:SessionEvent)=>void;
+  /** Managed Git runner for Session status/Diff reads; without it those reads stay unavailable. */
+  gitRunner?:GitServiceRunner;
 };
 type Entry<R> = {runtime?:R;runtimeId?:string;loading?:Promise<R>;closing?:Promise<RuntimeCloseReport>;unsubscribe?:()=>void;cancelLoad:boolean};
 const stopped:RuntimeCloseReport={closed:true,producerStopped:true,clean:true,state:"stopped",stopped:true,recoveryRequired:false};
@@ -244,8 +246,8 @@ export class SessionRegistry<R extends SessionRuntime=SessionRuntime> {
   archive(command:CatalogCommand,input:unknown):CatalogCommit {const parsed=ChangeSessionStatusV2Schema.parse(input);this.assertExecutionResources(parsed.sessionId);const result=this.catalog.change(command,"session.archive",parsed);this.publish(result.events);return result;}
   unarchive(command:CatalogCommand,input:unknown):CatalogCommit {const parsed=ChangeSessionStatusV2Schema.parse(input);this.assertExecutionResources(parsed.sessionId);const result=this.catalog.change(command,"session.unarchive",parsed);this.publish(result.events);return result;}
   private publish(events:readonly SessionEvent[]):void {this.publishCommittedEvents(events);}
-  async gitStatus(sessionId:string){const resolved=this.resolve(sessionId);const workspace=this.workspaces.require(resolved.workspace.workspaceId);return new GitService(workspace.worktreeRoot).status();}
-  async gitDiff(sessionId:string){const resolved=this.resolve(sessionId);const workspace=this.workspaces.require(resolved.workspace.workspaceId);const baseline=this.store.getSessionBaseline(sessionId);const result=await new GitService(workspace.worktreeRoot).diff(baseline?.head);return {...result,...(baseline?.head?{baselineHead:baseline.head}:{}),...(baseline?{baselineDirty:baseline.dirty}:{baselineWarning:"Session baseline has not been captured; historical attribution is unavailable."})};}
+  async gitStatus(sessionId:string){const resolved=this.resolve(sessionId);const workspace=this.workspaces.require(resolved.workspace.workspaceId);return new GitService(workspace.worktreeRoot,this.options.gitRunner?{runner:this.options.gitRunner}:{}).status();}
+  async gitDiff(sessionId:string){const resolved=this.resolve(sessionId);const workspace=this.workspaces.require(resolved.workspace.workspaceId);const baseline=this.store.getSessionBaseline(sessionId);const result=await new GitService(workspace.worktreeRoot,this.options.gitRunner?{runner:this.options.gitRunner}:{}).diff(baseline?.head);return {...result,...(baseline?.head?{baselineHead:baseline.head}:{}),...(baseline?{baselineDirty:baseline.dirty}:{baselineWarning:"Session baseline has not been captured; historical attribution is unavailable."})};}
   async closeAll(deadlineMs?:number):Promise<RuntimeCloseReport[]> {
     this.shuttingDown=true;
     return Promise.all([...this.entries.keys()].map((id)=>this.closeRuntime(id,deadlineMs).catch(()=>({closed:false,producerStopped:false,clean:false,state:"recovery_required" as const,recoveryRequired:true}))));

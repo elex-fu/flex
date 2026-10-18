@@ -8,6 +8,7 @@ import { createTestHostOwner, HostOwnerLock } from "../lifecycle/host-owner.js";
 import { openOwned } from "../storage/open-store.js";
 import { SqliteStore } from "../storage/db.js";
 import { FROZEN_V6_SCHEMA } from "../test-support/frozen-v6-schema.js";
+import { rawWorkspaceGitQuery } from "../test-support/managed-git-fixtures.js";
 import { applyCatalogMigration } from "../storage/migrations/007-catalog.js";
 import { applyInteractionMigration } from "../storage/migrations/008-interactions.js";
 import { CommandEngine, hashCommandRequest } from "../orchestration/command-engine.js";
@@ -84,7 +85,7 @@ async function fixture(options: Partial<HostCatalogOptions> = {}, withInteractio
         applyInteractionMigration(store.db);
     const runtimeFactory = vi.fn((context: SessionRuntimeContext) => new EngineRuntime(context));
     const configuration = { workspaces: [{ workspaceId: "workspace-one", root: providerRoot }], providerInstances: (["claude", "codex"] as const).map((provider) => ({ providerInstanceId: `instance-${provider}`, provider, executable: process.execPath, policyCapabilities: ["streamingText", "workspaceWrite", "interrupt", "interactiveApprovals", "gitDiff"] })) };
-    const host = await createHostCatalogBindings({ store, owner, configuration, initialLegacySession: { workspaceId: "workspace-one", providerInstanceId: "instance-claude", title: "Default" }, ...(actualDefault ? {} : { runtimeFactory }), ...options });
+    const host = await createHostCatalogBindings({ store, owner, readOnlyGit: rawWorkspaceGitQuery(), configuration, initialLegacySession: { workspaceId: "workspace-one", providerInstanceId: "instance-claude", title: "Default" }, ...(actualDefault ? {} : { runtimeFactory }), ...options });
     cleanup.push(async () => { await host.closeAndWait(50); });
     for (const provider of ["claude", "codex"] as const)
         host.providers.recordVerification(`instance-${provider}`, { state: "verified", runtimeVersion: "fixture-1", capabilities: ["streamingText", "workspaceWrite", "interrupt", "interactiveApprovals", "gitDiff"] });

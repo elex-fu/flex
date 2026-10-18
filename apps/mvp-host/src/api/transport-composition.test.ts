@@ -18,6 +18,7 @@ import { createHostServer } from "../server.js";
 import { HostRecovery } from "../session/host-recovery.js";
 import { createHostOperations, hostDiagnosticsRpc, HOST_DIAGNOSTICS_RPC_SCOPES } from "../operations/host-operations.js";
 import { openOwned } from "../storage/open-store.js";
+import { rawWorkspaceGitQuery } from "../test-support/managed-git-fixtures.js";
 import { ConnectionGateway, type ConnectionGatewayOptions, type DuplexTransport } from "./connection-gateway.js";
 import { AccessCommandReceipts, ACCESS_RECEIPTS_CAPABILITY } from "./access-command-receipts.js";
 import type { SnapshotCoordinator } from "../operations/operation-files.js";
@@ -84,7 +85,7 @@ async function fixture() {
   const actor = devices.createBrowserDevice(), restricted = devices.createBrowserDevice({ scopes: ["session:read"] });
   const denied = new Set<string>();
   const runtimeFactory = vi.fn(() => { throw new Error("Transport reads must not construct a Provider"); });
-  const catalog = await createHostCatalogBindings({ store, owner, configuration: { workspaces: [{ workspaceId: "workspace", root: workspace }], providerInstances: [{ providerInstanceId: "provider", provider: "claude", executable: process.execPath, policyCapabilities: ["streamingText", "interactiveApprovals"] }] }, initialLegacySession: { workspaceId: "workspace", providerInstanceId: "provider" }, runtimeFactory,
+  const catalog = await createHostCatalogBindings({ store, owner, readOnlyGit: rawWorkspaceGitQuery(), configuration: { workspaces: [{ workspaceId: "workspace", root: workspace }], providerInstances: [{ providerInstanceId: "provider", provider: "claude", executable: process.execPath, policyCapabilities: ["streamingText", "interactiveApprovals"] }] }, initialLegacySession: { workspaceId: "workspace", providerInstanceId: "provider" }, runtimeFactory,
     assertSessionAccess: (_actor, target) => { if (denied.has(target.session.sessionId))
       throw new AccessError("FORBIDDEN", "Session grant changed"); } });
   cleanup.push(() => catalog.closeAndWait());

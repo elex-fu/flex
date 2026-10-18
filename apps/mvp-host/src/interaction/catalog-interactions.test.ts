@@ -15,6 +15,7 @@ import { fenceAdapterEvent, type DispatchContext, type ProviderAdapter, type Pro
 import { SessionOrchestrator } from "../session/orchestrator.js";
 import type { SessionRuntimeContext } from "../session/session-registry.js";
 import { openOwned } from "../storage/open-store.js";
+import { rawWorkspaceGitQuery } from "../test-support/managed-git-fixtures.js";
 import { createCatalogInteractionBindings, type CatalogInteractionBindings, type CatalogInteractionsOptions } from "./catalog-interactions.js";
 const cleanup: Array<() => Promise<unknown> | void> = [];
 afterEach(async () => { for (const close of cleanup.splice(0).reverse())
@@ -46,7 +47,7 @@ async function fixture(change: {
     deliver: ReturnType<typeof vi.fn<(id: string) => boolean>>;
   }> = [];
   const runtimeFactory = vi.fn<(context: SessionRuntimeContext) => void>(() => { });
-  const catalog = await createHostCatalogBindings({ store, owner, configuration: {
+  const catalog = await createHostCatalogBindings({ store, owner, readOnlyGit: rawWorkspaceGitQuery(), configuration: {
       workspaces: [{ workspaceId: "workspace", root: workspace, capabilities: ["streamingText", "workspaceWrite", "interrupt", "interactiveApprovals", "structuredQuestions"] }],
       providerInstances: [{ providerInstanceId: "provider", provider: "claude", executable: process.execPath, policyCapabilities: ["streamingText", "workspaceWrite", "interrupt", "interactiveApprovals", "structuredQuestions"] }],
     }, initialLegacySession: { workspaceId: "workspace", providerInstanceId: "provider" },

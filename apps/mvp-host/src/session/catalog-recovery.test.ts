@@ -12,6 +12,7 @@ import type { AppServerClient } from "../codex/app-server-client.js";
 import { RecoveryStore } from "../storage/recovery-store.js";
 import { openOwned } from "../storage/open-store.js";
 import { inspectSchema } from "../storage/migrations/schema-version.js";
+import { rawWorkspaceGitQuery } from "../test-support/managed-git-fixtures.js";
 import { SessionOrchestrator } from "./orchestrator.js";
 import type { SessionRuntimeContext } from "./session-registry.js";
 import { createCatalogRecoveryBindings, catalogRecoveryConfigurationFingerprint } from "./catalog-recovery.js";
@@ -48,7 +49,7 @@ async function fixture(extra: Omit<CatalogRecoveryOptions, "catalog"> = {}, live
       sessionId: context.session.sessionId, runtimeId: context.runtimeId, workspace: context.workspace.canonicalRoot,
       checkoutRoot: context.workspace.worktreeRoot, adapter, recovery: bindings.runtimeRecoveryOptions(context) });
   });
-  const host = await createHostCatalogBindings({ store, owner,
+  const host = await createHostCatalogBindings({ store, owner, readOnlyGit: rawWorkspaceGitQuery(),
     configuration: { workspaces: [{ workspaceId: "workspace", root: workspace }], providerInstances: (["claude", "codex"] as const).map((provider) => ({ providerInstanceId: `instance-${provider}`, provider, executable: process.execPath, policyCapabilities: live ? ["workspaceWrite"] : [] })) },
     initialLegacySession: { workspaceId: "workspace", providerInstanceId: "instance-claude" }, runtimeFactory,
     assertSessionAccess: (actor, target) => { if (denied.has(`${actor}:${target.session.sessionId}`)) throw Object.assign(new Error("Session grant revoked"), { code: "FORBIDDEN" }); } });

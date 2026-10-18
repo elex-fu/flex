@@ -10,6 +10,7 @@ import { openOwned, openReadOnly } from "../storage/open-store.js";
 import { inspectSchema, SUPPORTED_SCHEMA_VERSION } from "../storage/migrations/schema-version.js";
 import { legacyProviderInstanceId, legacyWorkspaceId } from "../storage/migrations/007-catalog.js";
 import { FROZEN_V6_SCHEMA } from "../test-support/frozen-v6-schema.js";
+import { rawWorkspaceGitQuery } from "../test-support/managed-git-fixtures.js";
 import { createHostCatalogBindings, type CatalogRpcContext, type HostCatalogOptions } from "./host-catalog.js";
 
 const roots: string[] = [];
@@ -56,7 +57,7 @@ function database(legacy = false) {
     return { root, data, checkout, providerRoot, store, owner, ownerOptions, workspaceId, configuration, runtimeFactory, initialLegacySession };
 }
 async function catalog(f: ReturnType<typeof database>, options: Partial<HostCatalogOptions> = {}) {
-    const host = await createHostCatalogBindings({ owner: f.owner, store: f.store, configuration: f.configuration, initialLegacySession: f.initialLegacySession, runtimeFactory: f.runtimeFactory, ...options });
+    const host = await createHostCatalogBindings({ owner: f.owner, store: f.store, readOnlyGit: rawWorkspaceGitQuery(), configuration: f.configuration, initialLegacySession: f.initialLegacySession, runtimeFactory: f.runtimeFactory, ...options });
     cleanups.push(() => host.closeAndWait().then(() => undefined));
     return host;
 }

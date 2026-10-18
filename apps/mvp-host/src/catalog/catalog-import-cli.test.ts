@@ -14,6 +14,7 @@ import { ProviderInstanceRegistry } from "../provider/provider-instance-registry
 import { SqliteStore } from "../storage/db.js";
 import { FROZEN_V6_SCHEMA } from "../test-support/frozen-v6-schema.js";
 import { parseCatalogImportCommand, runCatalogImportCli } from "./catalog-import-cli.js";
+import { rawWorkspaceGitQuery } from "../test-support/managed-git-fixtures.js";
 const cleanups: Array<() => void> = [];
 const roots: string[] = [];
 afterEach(() => { for (const cleanup of cleanups.splice(0).reverse())
@@ -38,7 +39,7 @@ async function fixture() {
     applyCatalogMigration(store.db);
     const catalog = new CatalogStore(store);
     cleanups.push(() => catalog.dispose());
-    const workspaces = new WorkspaceRegistry(catalog, { owner });
+    const workspaces = new WorkspaceRegistry(catalog, { owner, readOnlyGit: rawWorkspaceGitQuery() });
     await workspaces.registerLocal({ workspaceId: "workspace-one", root: checkout });
     new ProviderInstanceRegistry(catalog).registerLocal({ providerInstanceId: "instance-claude", provider: "claude", executable: process.execPath });
     const sourceOwnerOptions = { databasePath: sourcePath, identityDirectory: join(root, "source", "identity"), coordinationDirectory };

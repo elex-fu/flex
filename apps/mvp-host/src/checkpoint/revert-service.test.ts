@@ -7,6 +7,7 @@ import type { NativeRevertProof } from "./revert-types.js";
 import { bindingDigest } from "./git-driver.js";
 import { revertFixture, stageRaw } from "./revert-test-support.js";
 import { fixtureGit, userGitState } from "./test-support.js";
+import { rawCheckpointGitRunner, rawControlledHelperSpawner } from "../test-support/managed-git-fixtures.js";
 
 const fixtures:Awaited<ReturnType<typeof revertFixture>>[]=[];
 afterEach(async()=>{for(const fixture of fixtures.splice(0)){await fixture.revert.drain(20);if(fixture.owner.db.open)fixture.owner.close();await rm(fixture.root,{recursive:true,force:true});}});
@@ -238,7 +239,7 @@ describe("sealed publication at shutdown",()=>{
     const marked=f.revert.store.require(operation.operationId,f.context.sessionId);expect(marked.steps.some((step)=>step.kind==="workspace_file" && step.state==="dispatching")).toBe(true);
     const text=await readFile(join(f.root,"tracked.txt"),"utf8");f.revert.seal();f.owner.close();release();expect((await running).resultCode).toBe("REVERT_SEALED");
     expect(await readFile(join(f.root,"tracked.txt"),"utf8")).toBe(text);expect(f.native.calls).toHaveLength(0);
-    f.reopen();f.restart({restore:new (await import("./controlled-restore.js")).ControlledRestore(),onBoundary:()=>{}});expect(f.owner.getSession(f.context.sessionId)?.recoveryState).toBe("blocked");
+    f.reopen();f.restart({restore:new (await import("./controlled-restore.js")).ControlledRestore({runGit:rawCheckpointGitRunner(),spawnHelper:rawControlledHelperSpawner()}),onBoundary:()=>{}});expect(f.owner.getSession(f.context.sessionId)?.recoveryState).toBe("blocked");
     const resumed=await f.resume(operation.operationId);expect((await f.dispatch(resumed.operationId)).status).toBe("settled");
   },20_000);
   it("does not publish a late native result after shared Store close; recovery queries the original token",async()=>{
@@ -246,7 +247,7 @@ describe("sealed publication at shutdown",()=>{
     f.native.applyOverride=async(request)=>{f.native.states.set(request.requestId,f.native.proof(request,"unknown",true));reached();return new Promise((resolve)=>{release=resolve;});};
     const operation=await f.accept();const running=f.dispatch(operation.operationId);await entered;const request=f.native.calls[0]!;
     f.revert.seal();f.owner.close();const proof=f.native.proof(request);f.native.states.set(request.requestId,proof);release(proof);expect((await running).resultCode).toBe("REVERT_SEALED");
-    f.reopen();f.restart({restore:new (await import("./controlled-restore.js")).ControlledRestore(),onBoundary:()=>{}});
+    f.reopen();f.restart({restore:new (await import("./controlled-restore.js")).ControlledRestore({runGit:rawCheckpointGitRunner(),spawnHelper:rawControlledHelperSpawner()}),onBoundary:()=>{}});
     expect(f.resolve().epoch).toBe("epoch-1");expect(f.owner.getSession(f.context.sessionId)?.recoveryState).toBe("blocked");expect(f.revert.store.require(operation.operationId,f.context.sessionId).steps.find((step)=>step.kind==="provider")?.state).toBe("dispatching");
     const resumed=await f.resume(operation.operationId);expect((await f.dispatch(resumed.operationId)).status).toBe("settled");expect(f.native.calls).toHaveLength(1);
   },20_000);

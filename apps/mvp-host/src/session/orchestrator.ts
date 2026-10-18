@@ -19,7 +19,7 @@ import { WorkspaceLease } from "../workspace/workspace-lease.js";
 import { CodexAdapter } from "../codex/adapter.js";
 import type { AdapterEvent, DispatchContext, ProviderAdapter, ProviderId } from "../provider/types.js";
 import { dispatchContextForTurn } from "../provider/types.js";
-import { GitService, type GitDiff, type GitStatus } from "../git/git-service.js";
+import { GitService, type GitDiff, type GitServiceRunner, type GitStatus } from "../git/git-service.js";
 import { CommandEngine, hashCommandRequest } from "../orchestration/command-engine.js";
 import { decideAcceptTurn, decideApprovalReservation, decideInterrupt } from "../orchestration/decider.js";
 import { ExecutionWorker, type ExecutionWorkerOptions, type OperationIntentHandler } from "../orchestration/execution-worker.js";
@@ -94,6 +94,8 @@ export type OrchestratorOptions = {
   providerOptions?: { executable?: string; model?: string; environment?: Readonly<Record<string, string>> };
   nativeStateRoots?: readonly string[];
   nativeBoundaryFactory?: typeof prepareNativeExecutionBoundary;
+  /** Managed Git runner for status/Diff reads; without it those reads stay unavailable. */
+  gitRunner?: GitServiceRunner;
   shutdownDeadlineMs?: number;
 };
 
@@ -234,7 +236,7 @@ export class SessionOrchestrator {
           if (device && !device.scopes.includes(scope)) throw new OrchestratorError("SCOPE_REQUIRED", "Device cannot perform this command");
         },
       });
-      this.git = new GitService(this.checkoutRoot);
+      this.git = new GitService(this.checkoutRoot, options.gitRunner ? { runner: options.gitRunner } : {});
       if (!options.adapter) this.nativeRuntime = new HostManagedRuntime({ store: this.store, owner: this.owner, sessionId: this.session.id, runtimeId: this.runtimeId, workspace: canonicalWorkspace, provider,
         ...(options.privateDirectories ? { privateRoots: options.privateDirectories } : {}), ...(options.nativeStateRoots ? { nativeStateRoots: options.nativeStateRoots } : {}), ...(options.nativeBoundaryFactory ? { boundaryFactory: options.nativeBoundaryFactory } : {}) });
       const nativeOptions = { ...options.providerOptions, ...this.nativeRuntime?.options, workspace: canonicalWorkspace, onEvent: (event: AdapterEvent) => this.enqueueAdapterEvent(event) };

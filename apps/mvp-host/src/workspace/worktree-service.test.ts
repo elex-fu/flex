@@ -12,6 +12,7 @@ import { WORKTREE_SCHEMA_SQL } from "../storage/migrations/009-worktree.js";
 import { RawWorktreeGit } from "./worktree-git.js";
 import { WorktreeStore, WorktreeError, type ManagedWorktreeRecord, type WorktreeOperationRecord } from "./worktree-store.js";
 import { WorktreeService, type WorktreeCatalog } from "./worktree-service.js";
+import { rawCheckpointGitRunner } from "../test-support/managed-git-fixtures.js";
 
 const roots: string[] = [], databases: Database.Database[] = [], owners: HostOwnerHandle[] = [], leases: Array<{ lease: WorkspaceLease; owner: HostOwnerHandle; operationId: string }> = [];
 afterEach(async () => {
@@ -47,7 +48,7 @@ async function fixture() {
   const owner = HostOwnerLock.acquire({ databasePath: join(privateDirectory, "host.db"), identityDirectory: join(privateDirectory, "identity"), coordinationDirectory: join(root, "coordination") }); owners.push(owner);
   const db = new Database(owner.databasePath); databases.push(db); db.pragma("foreign_keys=ON"); db.exec(WORKTREE_SCHEMA_SQL);
   const store = new WorktreeStore(db, () => "2026-10-15T00:00:00.000Z"), catalog = new Catalog(db, repository);
-  const driver = new RawWorktreeGit({ objects: (path) => new CheckpointGitDriver(path) });
+  const driver = new RawWorktreeGit({ objects: (path) => new CheckpointGitDriver(path, { runGit: rawCheckpointGitRunner() }) });
   let fault: { name: string; moment: string } | undefined, stopped = true;
   const service = new WorktreeService(store, {
     managedRoot: managed, privateDirectories: [privateDirectory], catalog, git: driver,

@@ -15,6 +15,7 @@ import {CatalogImportService} from "./import-service.js";
 import {WorkspaceRegistry} from "../workspace/workspace-registry.js";
 import {ProviderInstanceRegistry} from "../provider/provider-instance-registry.js";
 import {SessionRegistry} from "../session/session-registry.js";
+import {rawWorkspaceGitQuery} from "../test-support/managed-git-fixtures.js";
 
 const roots:string[]=[];const cleanups:Array<()=>void>=[];
 afterEach(()=>{for(const cleanup of cleanups.splice(0).reverse())cleanup();for(const root of roots.splice(0))rmSync(root,{recursive:true,force:true});});
@@ -27,7 +28,7 @@ async function fixture() {
   const targetOptions=ownerOptions("target");const owner=HostOwnerLock.acquire({...targetOptions,mode:"maintenance"});
   mkdirSync(join(root,"target"),{recursive:true});const store=openForMaintenance({databasePath:owner.databasePath,owner});cleanups.push(()=>{store.close();owner.release();});store.setHostIdentityMirror(mirror);applyCatalogMigration(store.db);
   const catalog=new CatalogStore(store);cleanups.push(()=>catalog.dispose());
-  const workspaces=new WorkspaceRegistry(catalog,{owner});await workspaces.registerLocal({workspaceId:"workspace-one",root:checkout});
+  const workspaces=new WorkspaceRegistry(catalog,{owner,readOnlyGit:rawWorkspaceGitQuery()});await workspaces.registerLocal({workspaceId:"workspace-one",root:checkout});
   const providers=new ProviderInstanceRegistry(catalog);for(const provider of ["claude","codex"] as const)providers.registerLocal({providerInstanceId:`instance-${provider}`,provider,executable:process.execPath});
   const service=new CatalogImportService(catalog,workspaces,providers,{owner,backupDirectory:join(root,"backups")});
   const source=(name="source",provider:"claude"|"codex"="claude",sessionId=randomUUID())=>{

@@ -31,6 +31,7 @@ import { createHostCheckpoints, type CheckpointRpcContext, type HostCheckpointsO
 import type { CheckpointPreviewContext } from "./preview-service.js";
 import type { NativeRevertDriver, NativeRevertProof, NativeRevertRequest, RevertOperation } from "./revert-types.js";
 import { fixtureGit, removeFixture, temporaryRepository, userGitState } from "./test-support.js";
+import { rawCheckpointGitRunner, rawHostCheckpointGitRunner, rawWorkspaceGitQuery } from "../test-support/managed-git-fixtures.js";
 import { stageRaw } from "./revert-test-support.js";
 
 const cleanups: Array<() => void | Promise<void>> = [];
@@ -40,7 +41,7 @@ async function fixture(input: { revert?: boolean; verified?: boolean; helper?: s
   const owner = createTestHostOwner(), store = openOwned({ databasePath: ":memory:", owner });
   cleanups.push(() => { store.close(); owner.release(); });
   const catalog = new CatalogStore(store); cleanups.push(() => catalog.dispose());
-  const workspaces = new WorkspaceRegistry(catalog, { owner }); await workspaces.registerLocal({ workspaceId: "workspace-1", root });
+  const workspaces = new WorkspaceRegistry(catalog, { owner, readOnlyGit: rawWorkspaceGitQuery() }); await workspaces.registerLocal({ workspaceId: "workspace-1", root });
   const providers = new ProviderInstanceRegistry(catalog); providers.registerLocal({ providerInstanceId: "provider-1", provider: "codex", executable: process.execPath });
   if (input.verified) providers.recordVerification("provider-1", { state: "verified", runtimeVersion: "fixture-native-v1", capabilities: ["workspaceWrite"] });
   const runtimeFactory = vi.fn(() => { throw new Error("History must not load a Provider"); });
@@ -94,10 +95,10 @@ async function fixture(input: { revert?: boolean; verified?: boolean; helper?: s
     proveQuiescence: async () => ({ proven: true, proofId: "fixture-stopped-original-process-tree" }), projectSuccess, assertRestoreWriteReady,
     verifiedNativeCapabilities: async () => input.verified ? [{ kind: "conversation-rewind", evidenceId: "actual-test-version-evidence", driverVersion: "fixture-native-v1", verifiedVersion: "fixture-native-v1" }] : [],
   };
-  const options: HostCheckpointsOptions = { store, owner, registry, workspaces, views, authorizeSession: authorize,
+  const options: HostCheckpointsOptions = { store, owner, registry, workspaces, views, authorizeSession: authorize, runGit: rawHostCheckpointGitRunner(),
     runtimeState: () => ({ lease, runtimeGeneration, nativeHandle: currentNativeHandle }), leaseForContext: () => lease,
     captureStateFor: () => ({ runtimeGeneration, nativeHandle: currentNativeHandle }),
-    ...(input.revert ? { revert: ports, restoreOptions: { spawnHelper: managedSpawn, onSpawn: spawn, onExit: exit, ...(input.helper ? { pythonExecutable: input.helper } : {}) } } : {}),
+    ...(input.revert ? { revert: ports, restoreOptions: { spawnHelper: managedSpawn, runGit: rawCheckpointGitRunner(), onSpawn: spawn, onExit: exit, ...(input.helper ? { pythonExecutable: input.helper } : {}) } } : {}),
   };
   const host = await createHostCheckpoints(options); cleanups.push(() => { host.seal(); });
   const rpcContext = (actor = "device-1"): CheckpointRpcContext => ({ subjectId: actor, protocolVersion: 2, capabilities: new Set([CHECKPOINT_DIFF_CAPABILITY, CHECKPOINT_REVERT_CAPABILITY]), assertAuthorized: () => {}, assertSessionScope: (id, scope) => authorize(id, actor, scope) });
@@ -185,7 +186,7 @@ describe("owned checkpoint production factory and RPC", { timeout: 20_000 }, () 
     expect(inspectSchema(store.db).version).toBe(version);
     expect(store.db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'checkpoint_%'").all()).toEqual([]);
     const catalog = new CatalogStore(store); cleanups.push(() => catalog.dispose());
-    const workspaces = new WorkspaceRegistry(catalog, { owner }), providers = new ProviderInstanceRegistry(catalog);
+    const workspaces = new WorkspaceRegistry(catalog, { owner, readOnlyGit: rawWorkspaceGitQuery() }), providers = new ProviderInstanceRegistry(catalog);
     const runtimeFactory = vi.fn(() => { throw new Error("No legacy Provider launch"); });
     const registry = new SessionRegistry(catalog, workspaces, providers, { owner, runtimeFactory });
     const views = new HostViews(store, owner, { resolveResource: () => undefined }); cleanups.push(() => views.close());

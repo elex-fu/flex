@@ -5,8 +5,11 @@ import { join } from "node:path";
 import { promisify } from "node:util";
 import { afterEach, describe, expect, it } from "vitest";
 import { GitService } from "./git-service.js";
+import { rawGitServiceRunner } from "../test-support/managed-git-fixtures.js";
 
 const execFile = promisify(execFileCallback);
+/** Real service bound to the raw deterministic runner; managed limits need the lifecycle tests. */
+function managedService(workspace: string): GitService { return new GitService(workspace, { runner: rawGitServiceRunner() }); }
 const repositories: string[] = [];
 async function git(workspace: string, ...args: string[]): Promise<string> {
   return (await execFile("git", ["-c", "core.fsmonitor=false", ...args], {
@@ -38,7 +41,7 @@ describe("Git status and diff contracts", () => {
     await git(workspace, "mv", "README.md", "Renamed README.md");
     await writeFile(join(workspace, "Renamed README.md"), "initial content\nunstaged addition\n");
     const indexBefore = await readFile(join(workspace, ".git", "index"));
-    const service = new GitService(workspace);
+    const service = managedService(workspace);
     const status = await service.status();
     expect(status).toMatchObject({ available: true, branch: "main", dirty: true, files: [{ path: "Renamed README.md", originalPath: "README.md", index: "R", worktree: "M" }] });
     expect(status.filesTruncated).toBeUndefined();
@@ -58,7 +61,7 @@ describe("Git status and diff contracts", () => {
     await writeFile(join(workspace, "复制 空格.txt"), source);
     await writeFile(join(workspace, "original.txt"), source + "changed source\n");
     await git(workspace, "add", "--all");
-    const status = await new GitService(workspace).status();
+    const status = await managedService(workspace).status();
     expect(status.available).toBe(true);
     expect(status.files).toHaveLength(2);
     expect(status.files).toContainEqual({ path: "复制 空格.txt", originalPath: "original.txt", index: "C", worktree: " " });
@@ -79,7 +82,7 @@ describe("Git status and diff contracts", () => {
     await mkdir(join(workspace, "new folder"));
     await writeFile(join(workspace, "new folder", "new file.txt"), "untracked\n");
     await writeFile(join(workspace, "ignored.log"), "ignored\n");
-    const diff = await new GitService(workspace).diff();
+    const diff = await managedService(workspace).diff();
     expect(diff.available).toBe(true);
     expect(diff.files).toEqual(expect.arrayContaining([
       { path: "staged 空格.txt", index: "M", worktree: " " },
@@ -99,7 +102,7 @@ describe("Git status and diff contracts", () => {
     await commit(workspace);
     await git(workspace, "mv", "README.md", "000 renamed.md");
     for (let index = 1; index < 200; index++) await writeFile(join(workspace, `file-${String(index).padStart(3, "0")}.txt`), "new\n");
-    const service = new GitService(workspace);
+    const service = managedService(workspace);
     const exact = await service.status();
     expect(exact.files).toHaveLength(200);
     expect(exact.filesTruncated).toBeUndefined();
@@ -115,7 +118,7 @@ describe("Git status and diff contracts", () => {
   for (const objectFormat of ["sha1", "sha256"] as const) {
     it(`supports clean and dirty unborn repositories in ${objectFormat} without treating HEAD absence as a diff failure`, async () => {
       const workspace = await repository(objectFormat);
-      const service = new GitService(workspace);
+      const service = managedService(workspace);
       const clean = await service.diff();
       expect(clean).toMatchObject({ available: true, branch: "main", dirty: false, files: [], diff: "", truncated: false });
       expect(clean.head).toBeUndefined();
@@ -142,13 +145,21 @@ describe("Git status and diff contracts", () => {
     const workspace = await repository();
     await writeFile(join(workspace, "tracked.txt"), "baseline\n");
     await commit(workspace);
-    const invalid = await new GitService(workspace).diff("missing-baseline");
+    const invalid = await managedService(workspace).diff("missing-baseline");
     expect(invalid.available).toBe(false);
     expect(invalid.error).toBeTruthy();
     const nonRepository = await mkdtemp(join(tmpdir(), "flyx-non-git-contract-"));
     repositories.push(nonRepository);
-    const missing = await new GitService(nonRepository).diff();
+    const missing = await managedService(nonRepository).diff();
     expect(missing.available).toBe(false);
     expect(missing.error).toBeTruthy();
+  });
+
+  it("refuses Git reads without the managed runner instead of spawning directly", async () => {
+    const workspace = await repository();
+    const refused = new GitService(workspace);
+    const status = await refused.status();
+    expect(status).toEqual({ available: false, dirty: false, files: [], error: "MANAGED_GIT_RUNNER_REQUIRED" });
+    expect((await refused.diff()).error).toBe("MANAGED_GIT_RUNNER_REQUIRED");
   });
 });

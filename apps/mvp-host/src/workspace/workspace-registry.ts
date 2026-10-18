@@ -1,13 +1,10 @@
-import { execFile } from "node:child_process";
 import { realpathSync } from "node:fs";
-import { promisify } from "node:util";
 import { basename,dirname } from "node:path";
 import { z } from "zod";
 import { assertHostOwner, assertWorkspacePrivacy, type HostOwnerHandle } from "../lifecycle/host-owner.js";
 import { CatalogError, CatalogStore, type WorkspaceRecord } from "../storage/catalog-store.js";
 import { checkoutKey } from "../storage/migrations/007-catalog.js";
 
-const run = promisify(execFile);
 const LocalWorkspaceConfig = z.strictObject({
   workspaceId:z.string().min(1).max(256),root:z.string().min(1),repositoryId:z.string().min(1).max(256).optional(),
   capabilities:z.array(z.string().min(1).max(128)).max(64).default(["streamingText","structuredToolCalls","gitDiff","workspaceWrite","interrupt","interactiveApprovals","resumeConversation"]),
@@ -37,7 +34,11 @@ export class WorkspaceRegistry {
   private privatePaths():string[] { const owner=this.options.owner;return [...(owner.databasePath!==":memory:"?[dirname(owner.databasePath)]:[]),...(owner.identityDirectory?[owner.identityDirectory]:[]),...(owner.coordinationDirectory?[owner.coordinationDirectory]:[]),...(this.options.privateDirectories??[])]; }
   private async query(root:string,args:readonly string[],operationId?:string):Promise<string> {
     const argv=["-c","core.fsmonitor=false","-C",root,...args];
-    const result=this.options.readOnlyGit?await this.options.readOnlyGit({argv:Object.freeze(argv),cwd:root,maxBufferBytes:16*1024,timeoutMs:5000,...(operationId?{operationId}:{})}):await run("git",argv,{cwd:root,encoding:"utf8",maxBuffer:16*1024,timeout:5000});
+    // No direct spawn fallback: production composes the managed read-only query
+    // runner, and a missing runner must refuse instead of launching raw Git.
+    const query=this.options.readOnlyGit;
+    if(!query)throw new CatalogError("WORKSPACE_GIT_RUNNER_REQUIRED","Workspace verification requires the managed Git query runner");
+    const result=await query({argv:Object.freeze(argv),cwd:root,maxBufferBytes:16*1024,timeoutMs:5000,...(operationId?{operationId}:{})});
     if(typeof result.stdout!=="string"||Buffer.byteLength(result.stdout,"utf8")>16*1024)throw new CatalogError("WORKSPACE_GIT_OUTPUT_INVALID");
     this.options.owner.assertActive();return result.stdout.trim();
   }

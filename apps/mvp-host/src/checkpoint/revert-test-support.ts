@@ -16,6 +16,7 @@ import type { RevertServiceOptions } from "./revert-service.js";
 import { bindingDigest } from "./git-driver.js";
 import type { NativeRevertDriver, NativeRevertPreparation, NativeRevertProof, NativeRevertRequest } from "./revert-types.js";
 import { checkpointFixture, fixtureGit, temporaryRepository } from "./test-support.js";
+import { rawCheckpointGitRunner, rawControlledHelperSpawner } from "../test-support/managed-git-fixtures.js";
 
 export async function stageRaw(root:string,path:string,text:string|Buffer,mode="100644"):Promise<void> {
   const oid=(await fixtureGit(root,["hash-object","-w","--no-filters","--stdin"],Buffer.isBuffer(text)?text:Buffer.from(text))).toString().trim();
@@ -65,7 +66,7 @@ export async function revertFixture(options:{restore?:ControlledRestoreOptions;b
   const previews=new CheckpointPreviewService({checkpoints:f.service,resolveContext:resolve,now:()=>time,verifyLeaseSuccession:()=>true});
   const page=await previews.createPreview({sessionId:f.context.sessionId,actorId:"device-1",checkpointId:target.checkpointId,expectedSessionRevision:resolve().sessionRevision});
   const native=new VerifiedNativeFake();native.now=()=>time;
-  const restore=new ControlledRestore(options.restore);
+  const restore=new ControlledRestore({runGit:rawCheckpointGitRunner(),spawnHelper:rawControlledHelperSpawner(),...options.restore});
   const engine=new CommandEngine(f.owner,{clock:{now:()=>time.toISOString(),id:randomUUID}});
   const serviceOptions:RevertServiceOptions={engine,checkpoints:f.service,previews,restore,native,resolveContext:resolve,
     acquire:async()=>({context:resolve()}),dispatchContextFor:(context,operationId,attemptId)=>({hostOwnerId:"owner-1",hostOwnerGeneration:1,sessionId:context.sessionId,flyxTurnId:operationId,runtimeId:"runtime-1",runtimeGeneration:context.runtimeGeneration,attemptId}),

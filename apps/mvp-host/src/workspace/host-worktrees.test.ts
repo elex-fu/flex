@@ -17,6 +17,7 @@ import { HostWorktrees, worktreeDispatchContextDigest, worktreeWriterContextsDig
 import { RawWorktreeGit } from "./worktree-git.js";
 import { WorkspaceRegistry } from "./workspace-registry.js";
 import { WorkspaceLease } from "./workspace-lease.js";
+import { rawCheckpointGitRunner, rawWorkspaceGitQuery } from "../test-support/managed-git-fixtures.js";
 
 const roots: string[] = [], cleanups: Array<() => void> = [];
 afterEach(async () => { for (const cleanup of cleanups.splice(0).reverse()) cleanup(); for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true }); });
@@ -35,7 +36,7 @@ async function fixture() {
   // Fixture migration activation only. The production binding never executes DDL.
   applyCatalogMigration(store.db); store.db.exec(WORKTREE_SCHEMA_SQL);
   store.db.prepare("INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES (9,?)").run(new Date().toISOString());
-  const catalog = new CatalogStore(store), workspaces = new WorkspaceRegistry(catalog, { owner, privateDirectories: [privateRoot] });
+  const catalog = new CatalogStore(store), workspaces = new WorkspaceRegistry(catalog, { owner, privateDirectories: [privateRoot], readOnlyGit: rawWorkspaceGitQuery() });
   await workspaces.registerLocal({ workspaceId: "repository-workspace", root: repository, repositoryId: "repo-one" });
   const providers = new ProviderInstanceRegistry(catalog); providers.registerLocal({ providerInstanceId: "provider-one", provider: "codex", executable: process.execPath });
   const runtimeFactory = vi.fn(() => { throw new Error("QUERY_MUST_NOT_LOAD_PROVIDER"); });
@@ -57,7 +58,7 @@ async function fixture() {
   let ready = true, revokeAtMarker = false, proofIncludesSuccessors = true;
   const attestedContexts: number[] = [];
   const accepted: string[] = [], markers: string[] = [], launchContexts: Array<{ operationId: string; worktreeId: string; contextOperationId?: string; contextWorktreeId?: string }> = [];
-  const raw = new RawWorktreeGit({ objects: (path) => new CheckpointGitDriver(path) });
+  const raw = new RawWorktreeGit({ objects: (path) => new CheckpointGitDriver(path, { runGit: rawCheckpointGitRunner() }) });
   const binding: HostWorktrees = new HostWorktrees({ catalog, workspaces, sessions, devices, owner, managedRoot: managed, privateDirectories: [privateRoot, coordination], git: raw,
     executionReadiness: () => ({ ready: true }),
     assertWriteReady: () => { if (!ready) throw new Error("RESTORE_EXTERNAL_STATE_UNVERIFIED"); },

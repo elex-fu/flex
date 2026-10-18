@@ -45,6 +45,20 @@ export type RawWorktreeGitOptions = {
   onExit?(child: ChildProcess): void;
   maxFiles?: number; maxBytes?: number;
 };
+/** One managed Worktree Git dispatch. The runner owns config, environment, budgets and stop evidence. */
+export type WorktreeGitExecRequest = Readonly<{
+  cwd: string;
+  args: readonly string[];
+  input?: Buffer;
+  /** Final fixed overrides only; the managed runner never merges arbitrary Host environment. */
+  env: Readonly<Record<string, string>>;
+}>;
+export type WorktreeGitExec = (request: WorktreeGitExecRequest) => Promise<Buffer>;
+export type WorktreeGitDriverOptions = {
+  objects(path: string): RawCheckpointObjects;
+  exec: WorktreeGitExec;
+  maxFiles?: number; maxBytes?: number;
+};
 const CONFIG = ["core.hooksPath=/dev/null", "core.fsmonitor=false", "core.untrackedCache=false", "core.preloadIndex=false", "core.attributesFile=/dev/null", "submodule.recurse=false", "gc.auto=0", "maintenance.auto=false", "commit.gpgSign=false", "diff.external="];
 const OID = /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/;
 function missing(error: unknown): boolean { return !!error && typeof error === "object" && "code" in error && (error.code === "ENOENT" || error.code === "ENOTDIR"); }
@@ -55,9 +69,9 @@ export function validateWorktreeFile(path: string): void {
   if (!path || isAbsolute(path) || path.includes("\0") || path.split("/").some((part) => !part || part === "." || part === ".." || part.toLowerCase() === ".git") || process.platform === "win32" && path.includes("\\")) throw new WorktreeError("WORKTREE_UNSUPPORTED_PATH", "Git tree path is outside the controlled namespace");
 }
 
-/** Register with --no-checkout, then write immutable object bytes ourselves. No checkout/add/reset/clean/filter. */
-export class RawWorktreeGit implements WorktreeGit {
-  constructor(private readonly options: RawWorktreeGitOptions) {}
+/** Parameterized driver: every Git call crosses the injected exec port, never a local spawn. */
+export class WorktreeGitDriver implements WorktreeGit {
+  constructor(private readonly options: WorktreeGitDriverOptions) {}
   async resolve(repository: string, ref: string): Promise<string> { return this.options.objects(repository).resolveCommit(ref); }
   async validate(repository: string, commit: string, destination: string): Promise<void> {
     const objects = this.options.objects(repository), entries = await objects.listTree(commit);
@@ -262,18 +276,60 @@ export class RawWorktreeGit implements WorktreeGit {
   private linkTarget(root: string, path: string, target: string): void { if (!target || isAbsolute(target) || !inside(root, resolve(dirname(join(root, path)), target)) || target.split("/").some((part) => part.toLowerCase() === ".git")) throw new WorktreeError("WORKTREE_UNSUPPORTED_SYMLINK", "Git symlink escapes the managed checkout"); }
   private oid(value: string): void { if (!OID.test(value)) throw new WorktreeError("WORKTREE_INVALID_OBJECT", "Worktree contains an invalid Git object ID"); }
   private async optionalCommit(objects: RawCheckpointObjects, ref: string): Promise<string | undefined> { try { return await objects.resolveCommit(ref); } catch { return undefined; } }
-  private git(cwd: string, args: string[], input?: Buffer, extra: NodeJS.ProcessEnv = {}): Promise<Buffer> {
+  private async git(cwd: string, args: string[], input?: Buffer, extra: Readonly<Record<string, string>> = {}): Promise<Buffer> {
+    return await this.options.exec({ cwd, args, ...(input !== undefined ? { input } : {}), env: extra });
+  }
+}
+
+/**
+ * Explicit deterministic fixture with a raw local `execFile`: no journal, no
+ * stop evidence. It exists so existing fixtures keep exercising real Git; it is
+ * never a production path and production composition must not select it.
+ */
+export class RawWorktreeGit extends WorktreeGitDriver {
+  constructor(private readonly fixture: RawWorktreeGitOptions) {
+    super({ objects: fixture.objects, ...(fixture.maxFiles !== undefined ? { maxFiles: fixture.maxFiles } : {}), ...(fixture.maxBytes !== undefined ? { maxBytes: fixture.maxBytes } : {}),
+      exec: (request) => this.rawExec(request) });
+  }
+  private rawExec(request: WorktreeGitExecRequest): Promise<Buffer> {
     const env: NodeJS.ProcessEnv = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith("GIT_")));
-    Object.assign(env, { GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null", GIT_OPTIONAL_LOCKS: "0", GIT_TERMINAL_PROMPT: "0", GIT_PAGER: "cat", GIT_NO_REPLACE_OBJECTS: "1", GIT_NO_LAZY_FETCH: "1" }, extra);
+    Object.assign(env, { GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null", GIT_OPTIONAL_LOCKS: "0", GIT_TERMINAL_PROMPT: "0", GIT_PAGER: "cat", GIT_NO_REPLACE_OBJECTS: "1", GIT_NO_LAZY_FETCH: "1" }, request.env);
     return new Promise((resolveResult, reject) => {
-      const child = execFile("git", [...CONFIG.flatMap((config) => ["-c", config]), ...args], { cwd, env, encoding: "buffer", timeout: 30_000, maxBuffer: 32 * 1024 * 1024 }, (error, stdout) => {
-        this.options.onExit?.(child);
+      const child = execFile("git", [...CONFIG.flatMap((config) => ["-c", config]), ...request.args], { cwd: request.cwd, env, encoding: "buffer", timeout: 30_000, maxBuffer: 32 * 1024 * 1024 }, (error, stdout) => {
+        this.fixture.onExit?.(child);
         if (error) { reject(new WorktreeError("WORKTREE_GIT_FAILED", "Managed Git operation failed")); return; }
         resolveResult(stdout);
       });
-      try { this.options.onSpawn?.(child, args); } catch (error) { child.kill("SIGTERM"); reject(error); }
+      try { this.fixture.onSpawn?.(child, request.args); } catch (error) { child.kill("SIGTERM"); reject(error); }
       child.stdin?.on("error", () => {});
-      child.stdin?.end(input);
+      child.stdin?.end(request.input);
     });
+  }
+}
+
+export type ManagedWorktreeGitOptions = {
+  /** The managed runner: durable launching, bounded output and proven descendant stop. */
+  runner: { run(request: {
+    purpose: "worktree_write"; args: readonly string[]; cwd: string; env?: Readonly<Record<string, string>>;
+    input?: Readonly<{ encoding: "base64"; data: string; bytes: number }>; maxOutputBytes: number; timeoutMs: number; operationId?: string;
+  }): Promise<{ stdout: Uint8Array; exitCode: number }> };
+  objects(path: string): RawCheckpointObjects;
+  /** Trusted original operation identity; it never comes from RPC input. */
+  operationId?: () => string | undefined;
+  maxFiles?: number; maxBytes?: number;
+};
+
+/** Runner-backed production Worktree Git. Every child is journaled and stopped with evidence. */
+export class ManagedWorktreeGit extends WorktreeGitDriver {
+  constructor(options: ManagedWorktreeGitOptions) {
+    super({ objects: options.objects, ...(options.maxFiles !== undefined ? { maxFiles: options.maxFiles } : {}), ...(options.maxBytes !== undefined ? { maxBytes: options.maxBytes } : {}),
+      exec: async (request) => {
+        const input = request.input ? Object.freeze({ encoding: "base64" as const, data: request.input.toString("base64"), bytes: request.input.length }) : undefined;
+        const operationId = options.operationId?.();
+        const result = await options.runner.run({ purpose: "worktree_write", args: request.args, cwd: request.cwd, env: request.env,
+          ...(input ? { input } : {}), maxOutputBytes: 32 * 1024 * 1024, timeoutMs: 30_000, ...(operationId ? { operationId } : {}) });
+        if (result.exitCode !== 0) throw new WorktreeError("WORKTREE_GIT_FAILED", "Managed Git operation failed");
+        return Buffer.from(result.stdout);
+      } });
   }
 }

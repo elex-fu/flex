@@ -184,6 +184,24 @@ describe("pure SQL original producer startup readiness", () => {
     expect(inspectCatalogStartupReadiness(f.host).ready).toBe(false);
   });
 
+  it("adds activation verdicts as blockers only when the readiness callback is supplied", async () => {
+    const f = await fixture();
+    const notReady = { state: "invalid", ready: false, resourceKind: "provider", resourceId: "provider", readinessRevision: 3, reasonCodes: ["PROVIDER_EXECUTABLE_CHANGED"] } as const;
+    const verdict = inspectCatalogStartupReadiness(f.host, { activationReadiness: () => [notReady] });
+    expect(verdict.ready).toBe(false);
+    expect(verdict.blockers).toEqual(["PROVIDER_EXECUTABLE_CHANGED", "RESOURCE_ACTIVATION_UNVERIFIED"]);
+    expect(verdict.activation).toEqual([notReady]);
+    const valid = { ...notReady, state: "valid", ready: true, reasonCodes: [] } as const;
+    expect(inspectCatalogStartupReadiness(f.host, { activationReadiness: () => [valid] })).toEqual({ ready: true, blockers: [], activation: [valid] });
+    // Without the callback the result shape and blockers are exactly as before.
+    expect(inspectCatalogStartupReadiness(f.host)).toEqual({ ready: true, blockers: [] });
+    // A throwing callback stays fail-closed without an activation projection.
+    const unreachable = inspectCatalogStartupReadiness(f.host, { activationReadiness: () => { throw new Error("Store unreadable"); } });
+    expect(unreachable.ready).toBe(false);
+    expect(unreachable.blockers).toEqual(["RESOURCE_ACTIVATION_UNVERIFIED"]);
+    expect(unreachable.activation).toBeUndefined();
+  });
+
   it("never treats a cleared active pointer as proof for recovery, close or generic operation gates", async () => {
     const f = await fixture(); f.unknown(); const { operation } = await f.acknowledge();
     f.store.db.prepare("UPDATE sessions SET recovery_state='blocked',recovery_revision=recovery_revision+1 WHERE id=?").run(f.sessionId);

@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { resolve } from "node:path";
 import { CreateSessionV2Schema } from "@flyx/mvp-protocol";
 import { assertHostOwner, type HostOwnerHandle } from "../lifecycle/host-owner.js";
+import type { ActivationReadinessPort } from "../lifecycle/host-activation-load.js";
 import { CatalogError, CatalogStore, hashCatalogRequest, publicSessionSummary } from "../storage/catalog-store.js";
 import { LocalCatalogConfigurationSchema, type LocalCatalogConfiguration } from "../session/configured-catalog.js";
 import { WorkspaceRegistry, type WorkspaceGitQuery } from "../workspace/workspace-registry.js";
@@ -10,19 +11,48 @@ import { ProviderInstanceRegistry, parseLocalProviderInstance } from "../provide
 export type CatalogReadBootstrapOptions = {
     privateDirectories?: readonly string[];
     readOnlyGit?: WorkspaceGitQuery;
+    /**
+     * Explicit activation readiness (design §6.3 step 5). When supplied, the
+     * bootstrap registers/loads identities and withdraws only the verdicts the
+     * recorded facts no longer support; reading history never erases evidence
+     * unconditionally.
+     */
+    readiness?: ActivationReadinessPort;
     initialLegacySession?: { workspaceId: string; providerInstanceId: string; title?: string };
     restoreWriteReady?: (db: CatalogStore["db"]) => void;
 };
 
-/** Readiness is invalidated without changing original Recovery resource identities. */
+/**
+ * Unconditional readiness invalidation for the legacy (no readiness port)
+ * bootstrap: with migration 011 installed it also clears the activation
+ * reference and bumps the readiness revision, so a stale reference can never
+ * outlive the reset. Original Recovery resource identities are untouched.
+ */
 export function invalidateCatalogResourceReadiness(catalog: CatalogStore, owner: HostOwnerHandle): void {
     assertLocalOwner(catalog, owner);
+    if (activationColumnsAvailable(catalog.db)) {
+        catalog.db.prepare("UPDATE workspaces SET state='needs_verification',activation_operation_id=NULL,activation_binding_digest=NULL,readiness_revision=readiness_revision+1 WHERE state='active'").run();
+        for (const provider of catalog.providers()) {
+            if (provider.state === "disabled") continue;
+            catalog.db.prepare("UPDATE provider_instances SET state='unconfigured',verification_json=?,activation_operation_id=NULL,activation_binding_digest=NULL,readiness_revision=readiness_revision+1 WHERE id=?")
+                .run(JSON.stringify({ ...provider.verification, state: "unverified" }), provider.providerInstanceId);
+        }
+        return;
+    }
+    // A Store without migration 011 cannot reference an activation at all.
     catalog.db.prepare("UPDATE workspaces SET state='needs_verification' WHERE state='active'").run();
     for (const provider of catalog.providers()) {
         if (provider.state === "disabled") continue;
         catalog.db.prepare("UPDATE provider_instances SET state='unconfigured',verification_json=? WHERE id=?")
             .run(JSON.stringify({ ...provider.verification, state: "unverified" }), provider.providerInstanceId);
     }
+}
+
+function activationColumnsAvailable(db: CatalogStore["db"]): boolean {
+    try {
+        const columns = db.prepare("PRAGMA table_info(workspaces)").all() as Array<{ name: string }>;
+        return columns.some((column) => column.name === "readiness_revision");
+    } catch { return false; }
 }
 
 function assertLocalOwner(catalog: CatalogStore, owner: HostOwnerHandle): void {
@@ -44,7 +74,9 @@ export function registerCatalogReadMetadata(catalog: CatalogStore, owner: HostOw
     const providers = new ProviderInstanceRegistry(catalog);
     catalog.db.transaction(() => {
         owner.assertActive();
-        invalidateCatalogResourceReadiness(catalog, owner);
+        // With an explicit readiness port only the decided verdicts are withdrawn
+        // (after identities are registered); the legacy path stays unconditional.
+        if (!options.readiness?.available) invalidateCatalogResourceReadiness(catalog, owner);
         for (const input of parsed.workspaces) {
             if (catalog.workspace(input.workspaceId)) continue;
             // Unknown checkout identity is explicit. It is never derived from cwd.
@@ -57,6 +89,13 @@ export function registerCatalogReadMetadata(catalog: CatalogStore, owner: HostOw
                 continue;
             }
             catalog.putProvider({ ...input, config: { environment: input.config.environment, sandboxRequired: true, ...(input.config.model ? { model: input.config.model } : {}) }, state: "unconfigured", verification: { state: "unverified", capabilities: [] } });
+        }
+        if (options.readiness?.available) {
+            const at = new Date().toISOString();
+            for (const readiness of options.readiness.scan()) {
+                if (readiness.ready || !readiness.reasonCodes.length) continue;
+                options.readiness.withdraw(readiness, at);
+            }
         }
         if (parsed.legacyDefaultSessionId) catalog.setLegacyDefaultOnce(parsed.legacyDefaultSessionId);
         if (!catalog.legacyDefaultSessionId() && options.initialLegacySession && !catalog.db.prepare("SELECT 1 FROM sessions LIMIT 1").get()) {

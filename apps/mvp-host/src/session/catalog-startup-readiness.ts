@@ -6,11 +6,24 @@ import { isNativeBoundaryProof } from "../lifecycle/native-boundary-proof.js";
 import type { ProcessIdentity } from "../lifecycle/process-inspector.js";
 import { dispatchContextForTurn, type DispatchContext } from "../provider/types.js";
 import { RecoveryStore, digest, type RecoveryProcessRecord, type RecoveryTarget, type StoredRecoveryEvidence } from "../storage/recovery-store.js";
+import type { ActivationResourceReadiness } from "../storage/activation-store.js";
 import { inspectSchema, SUPPORTED_SCHEMA_VERSION } from "../storage/migrations/schema-version.js";
 import { catalogRecoveryConfigurationFingerprint } from "./catalog-recovery.js";
 
-export type CatalogStartupReadiness = Readonly<{ ready: boolean; blockers: readonly string[] }>;
-export type CatalogStartupReadinessOptions = { includeCurrentOwner?: boolean };
+export type CatalogStartupReadiness = Readonly<{
+  ready: boolean;
+  blockers: readonly string[];
+  /** Present only when an activation readiness callback was supplied (design §6.3 step 5). */
+  activation?: readonly ActivationResourceReadiness[];
+}>;
+export type CatalogStartupReadinessOptions = {
+  includeCurrentOwner?: boolean;
+  /**
+   * Current execution-activation verdicts (read-only; persisting a withdrawal is
+   * the bootstrap's decision). Non-ready verdicts with reasons become blockers.
+   */
+  activationReadiness?: () => readonly ActivationResourceReadiness[];
+};
 type CatalogFacts = Pick<HostCatalog, "store" | "catalog" | "owner">;
 type Intent = { id: string; session_id: string; turn_id: string | null; attempt_id: string; runtime_generation: number;
   auth_subject_id: string; command_id: string; request_hash: string; kind: string; resource_id: string;
@@ -94,10 +107,28 @@ export function inspectCatalogStartupReadiness(host: CatalogFacts, options: Cata
     }
     if (db.prepare("SELECT 1 FROM managed_worktrees WHERE state='blocked' LIMIT 1").get()) block("WORKTREE_OPERATION_UNRESOLVED");
     if (db.prepare("SELECT 1 FROM recovery_operations WHERE phase IN ('marked','checking') LIMIT 1").get()) block("RECOVERY_OPERATION_UNRESOLVED");
+    let activation: readonly ActivationResourceReadiness[] | undefined;
+    if (options.activationReadiness) {
+      try {
+        activation = options.activationReadiness();
+        for (const readiness of activation) {
+          if (readiness.ready || !readiness.reasonCodes.length) continue;
+          for (const code of readiness.reasonCodes) block(code);
+          block("RESOURCE_ACTIVATION_UNVERIFIED");
+        }
+      } catch { block("RESOURCE_ACTIVATION_UNVERIFIED"); activation = undefined; }
+    }
+    return verdict([...blockers], activation);
   } catch { block("STARTUP_FACTS_UNVERIFIED"); }
   return verdict([...blockers]);
 }
-function verdict(blockers: readonly string[]): CatalogStartupReadiness { return Object.freeze({ ready: !blockers.length, blockers: Object.freeze([...blockers].sort()) }); }
+function verdict(blockers: readonly string[], activation?: readonly ActivationResourceReadiness[]): CatalogStartupReadiness {
+  return Object.freeze({
+    ready: !blockers.length,
+    blockers: Object.freeze([...blockers].sort()),
+    ...(activation ? { activation } : {}),
+  });
+}
 
 /** Historical proof remains tied to its original inventory; newer launches are checked separately. */
 function releasedFacts(host: CatalogFacts, target: RecoveryTarget, records: readonly RecoveryProcessRecord[]): Release[] {

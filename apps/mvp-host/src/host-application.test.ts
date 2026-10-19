@@ -8,6 +8,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { BOUNDED_CONTENT_CAPABILITY, SESSION_CATALOG_CAPABILITY, TIMELINE_PROJECTION_CAPABILITY, INTERACTION_CAPABILITY, STRUCTURED_QUESTION_CAPABILITY, AttentionCapability, RecoveryCapability, CHECKPOINT_DIFF_CAPABILITY, CHECKPOINT_REVERT_CAPABILITY, WORKTREE_CAPABILITY, OpenViewResponseSchema } from "@flyx/mvp-protocol";
 import { ACCESS_RECEIPTS_CAPABILITY } from "./api/access-command-receipts.js";
 import { parseConnectivityConfig } from "./connectivity/config.js";
+import { HOST_EXECUTION_READINESS_CAPABILITY } from "./diagnostics/activation-rpc.js";
 import { createHostApplication } from "./host-application.js";
 import { getHostIdentityMirror, loadOrCreateHostIdentity } from "./identity/host-identity.js";
 import { HostOwnerLock } from "./lifecycle/host-owner.js";
@@ -118,6 +119,18 @@ describe("production Host application graph", { timeout: 10000 }, () => {
     const original = f.application.lifecycle.closeAndWait(); expect(f.application.lifecycle.closeAndWait()).toBe(original);
     expect(await original).toMatchObject({ closed: true, producerStopped: true, clean: true });
     expect(f.owner.retainedReason).toBeUndefined();
+  });
+
+  it("projects explicit execution activation through the read-only readiness RPC and Host doctor", async () => {
+    const f = await fixture(), { client, hello } = await connect(f);
+    expect(hello.capabilities).toContain(HOST_EXECUTION_READINESS_CAPABILITY);
+    const readiness = payload(await client.request("host.getExecutionReadiness", { targets: [{ workspaceId: "workspace", providerInstanceId: "provider" }] }));
+    expect(readiness.hostState).toBe("read_only");
+    expect(readiness.targets).toEqual([expect.objectContaining({ workspaceId: "workspace", providerInstanceId: "provider", capabilities: [],
+      reasonCodes: expect.arrayContaining(["PROVIDER_NOT_ACTIVATED", "WORKSPACE_NOT_ACTIVATED"]) })]);
+    expect((payload(await client.request("host.doctor")).readiness as { reasonCodes: string[] }).reasonCodes)
+      .toEqual(expect.arrayContaining(["PROVIDER_NOT_ACTIVATED", "WORKSPACE_NOT_ACTIVATED"]));
+    expect(f.store.db.prepare("SELECT COUNT(*) AS count FROM managed_processes").get()).toEqual({ count: 0 });
   });
 
   it("serves migrated Claude/Codex histories through the real Gateway while the original legacy default remains pinned", async () => {

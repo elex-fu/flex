@@ -1,5 +1,6 @@
 import { mkdir, stat } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
+import { randomUUID } from "node:crypto";
 import type { ProviderId } from "@flyx/mvp-protocol";
 import QRCode from "qrcode";
 import { DeviceRegistry } from "./auth/device-registry.js";
@@ -13,9 +14,17 @@ import { runOfflineRecovery } from "./connectivity/recovery-cli.js";
 import { HOST_OPERATIONS_CLI_USAGE, runHostOperationsCommand } from "./connectivity/operations-cli.js";
 import { verifyOfflineHostQuiescence } from "./connectivity/offline-quiescence.js";
 import { CATALOG_IMPORT_CLI_USAGE, runCatalogImportCli } from "./catalog/catalog-import-cli.js";
+import { ACTIVATION_CLI_USAGE, runActivationCli, type ActivationCliResult } from "./lifecycle/activation-cli.js";
+import { HostActivationLoad, localActivationFacts } from "./lifecycle/host-activation-load.js";
+import { createHostActivationService, privateRootsFor, type ManagedQueryExecutorFactory } from "./lifecycle/host-activation-service.js";
+import { createManagedWorkspaceQuery } from "./lifecycle/managed-workspace-query.js";
 import { OperationSnapshotLane } from "./operations/host-operations.js";
+import { inspectCatalogStartupReadiness } from "./session/catalog-startup-readiness.js";
+import { createActivationOperationStore } from "./storage/activation-store.js";
+import { CatalogStore } from "./storage/catalog-store.js";
 import { SqliteStore } from "./storage/db.js";
-import { HostOwnerLock, canonicalPath } from "./lifecycle/host-owner.js";
+import { HostOwnerLock, canonicalPath, type HostOwnerHandle } from "./lifecycle/host-owner.js";
+import { SqliteProcessJournal } from "./lifecycle/managed-process-registry.js";
 import { openForMaintenance, openForManagement, openOwned, openReadOnly } from "./storage/open-store.js";
 
 await main().catch((error: unknown) => {
@@ -29,6 +38,7 @@ async function main(): Promise<void> {
     console.log("Flyx Host: start | devices list | devices revoke <deviceId> | devices revoke-all | identity show | identity rotate");
     console.log(`Operations: ${HOST_OPERATIONS_CLI_USAGE}`);
     console.log(`Catalog: ${CATALOG_IMPORT_CLI_USAGE}`);
+    console.log(`Activation: ${ACTIVATION_CLI_USAGE}`);
     console.log("Recovery: recovery inspect <sessionId> <turnId> [--attempt <attemptId>] [--upgrade-metadata]");
     console.log("Recovery write: recovery reconcile|acknowledge <sessionId> <turnId> <evidenceId> <recoveryRevision> <commandId> [--attempt <attemptId>] [--acknowledge-unknown]");
     console.log("Select the existing Host using FLYX_DB and FLYX_IDENTITY_DIR. Key rotation requires confirmation in a local terminal.");
@@ -88,6 +98,16 @@ async function main(): Promise<void> {
     } finally { offlineStore?.close(); owner.release(); }
     return;
   }
+  if (command.kind === "activation") {
+    await stat(databasePath);
+    const owner = HostOwnerLock.acquire({ databasePath, identityDirectory, mode: "maintenance" });
+    let offlineStore: SqliteStore | undefined;
+    try {
+      offlineStore = openForMaintenance({ databasePath: owner.databasePath, owner });
+      console.log(JSON.stringify(await runActivationCommand(offlineStore, owner, command.argv), null, 2));
+    } finally { offlineStore?.close(); owner.release(); }
+    return;
+  }
   if (command.kind === "recovery") {
     console.log(JSON.stringify(await runOfflineRecovery(command, { databasePath, identityDirectory }), null, 2));
     return;
@@ -138,6 +158,7 @@ async function main(): Promise<void> {
     const bootstrap = readHostCatalogBootstrap({ store, workspace, provider, environment: process.env });
     pairingConfirmation = createPairingConfirmation();
     application = await createHostApplication({ store, owner, identity, ...bootstrap, snapshotLane,
+      compatibilityEvidencePath: compatibilityEvidencePathFor(owner.databasePath),
       server: { pairingConfirmation, connectivity, ...(process.env.FLYX_WEB_ROOT ? { webRoot: process.env.FLYX_WEB_ROOT } : {}) },
     });
     server = application.server;
@@ -215,6 +236,51 @@ async function manageHost(command: HostCommand, store: SqliteStore, identity: Ho
     }
   } finally {
     devices.dispose();
+  }
+}
+
+/** Host-private compatibility evidence log shared by the Host graph and the activation CLI (design §6.3). */
+function compatibilityEvidencePathFor(databasePath: string): string {
+  return resolve(process.env.FLYX_COMPATIBILITY_EVIDENCE_PATH ?? join(dirname(databasePath), "compatibility-evidence.jsonl"));
+}
+
+/**
+ * Offline execution activation (design §6.3). The maintenance owner is the only
+ * live writer while the Host is stopped; the managed query executor is composed
+ * exactly like the Host read path, so a platform without a proven process-birth
+ * contract refuses instead of launching raw Git. Installed supervisor/adapter
+ * facts arrive with their own contracts and stay absent until then, which keeps
+ * verify fail-closed instead of inferring readiness.
+ */
+async function runActivationCommand(store: SqliteStore, owner: HostOwnerHandle, argv: readonly string[]): Promise<ActivationCliResult> {
+  const privateDirectories = [dirname(owner.databasePath), owner.identityDirectory!, owner.coordinationDirectory!];
+  const privateRoots = privateRootsFor({ owner }, privateDirectories);
+  const observation = localActivationFacts({ compatibilityEvidencePath: compatibilityEvidencePathFor(owner.databasePath), privateRoots });
+  const catalog = new CatalogStore(store);
+  try {
+    const operations = createActivationOperationStore(
+      { db: store.db, workspace: (id) => catalog.workspace(id), provider: (id) => catalog.provider(id) },
+      { guard: () => { owner.assertActive(); owner.assertStorePath(store.db.name); } },
+    );
+    const load = new HostActivationLoad(operations, observation);
+    const executorFactory: ManagedQueryExecutorFactory = async () => {
+      const managed = createManagedWorkspaceQuery({
+        journal: new SqliteProcessJournal(store.db), privateRoots,
+        assertActive: () => { owner.assertActive(); store.assertWriterOwner(); },
+        context: ({ operationId }) => ({ hostOwnerId: owner.ownerId, hostOwnerGeneration: owner.generation,
+          runtimeId: "activation-query", runtimeGeneration: 1, attemptId: operationId ?? randomUUID() }),
+      });
+      return { readOnlyGit: managed.readOnlyGit, prepare: () => managed.prepare(),
+        closeAndWait: async (deadlineMs) => { const report = await managed.drain(deadlineMs); return { producerStopped: report.producerStopped, clean: report.clean }; } };
+    };
+    const service = createHostActivationService({
+      facts: { db: store.db, owner, catalog, readiness: () => inspectCatalogStartupReadiness({ store, catalog, owner }) },
+      operations, load, observation, actorId: "local-maintenance", executorFactory,
+    });
+    try { return await runActivationCli(argv, service); }
+    finally { await service.close(); }
+  } finally {
+    catalog.dispose();
   }
 }
 

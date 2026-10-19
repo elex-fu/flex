@@ -60,7 +60,13 @@ describe("Host CLI commands", () => {
     expect(parseHostCommand(["restore","backup-dir","rollback-dir"])).toEqual({kind:"operations",action:"restore",directory:"backup-dir",rollbackDirectory:"rollback-dir"});
     expect(parseHostCommand(["catalog","dry-run","source.sqlite","backup-dir"])).toEqual({kind:"catalog-import",backupDirectory:"backup-dir",request:{mode:"dry-run",sourceDatabasePath:"source.sqlite"}});
     expect(parseHostCommand(["catalog","import","source.sqlite","backup-dir","a".repeat(64)])).toEqual({kind:"catalog-import",backupDirectory:"backup-dir",request:{mode:"import",sourceDatabasePath:"source.sqlite",approvedSourceDigest:"a".repeat(64)}});
-    for(const args of [["doctor","extra"],["backup"],["restore","backup-dir"],["catalog","import","source.sqlite","backup-dir"]])expect(()=>parseHostCommand(args)).toThrow();
+    expect(parseHostCommand(["activation","verify","--workspace","w","--provider","p"]))
+      .toEqual({kind:"activation",command:"verify",argv:["verify","--workspace","w","--provider","p"]});
+    expect(parseHostCommand(["activation","inspect","operation-1"])).toEqual({kind:"activation",command:"inspect",argv:["inspect","operation-1"]});
+    expect(parseHostCommand(["activation","activate","--evidence","operation-1","--command-id","command-1"]))
+      .toEqual({kind:"activation",command:"activate",argv:["activate","--evidence","operation-1","--command-id","command-1"]});
+    for(const args of [["doctor","extra"],["backup"],["restore","backup-dir"],["catalog","import","source.sqlite","backup-dir"],
+      ["activation"],["activation","status"],["activation","verify","--workspace"]])expect(()=>parseHostCommand(args)).toThrow();
   });
   it("keeps startup as default and supports device and identity management", () => {
     expect(parseHostCommand([])).toEqual({ kind: "start" });

@@ -2,6 +2,7 @@ import { z, ZodError } from "zod";
 import { ProtocolVersion, SESSION_CATALOG_CAPABILITY, TIMELINE_PROJECTION_CAPABILITY, BOUNDED_CONTENT_CAPABILITY, CreateSessionV2Schema, RenameSessionV2Schema, ChangeSessionStatusV2Schema, ListSessionsV2Schema, SessionTargetV2Schema, StartTurnV2Schema, InterruptTurnV2Schema, RespondApprovalV2Schema, EmptyCatalogRequestSchema, SessionEventsV2RequestSchema, SessionDiffV2RequestSchema, HOST_CATALOG_METHOD_SCOPES, OpenViewRequestSchema, TimelinePageRequestSchema, TimelineSubscribeRequestSchema, TimelineUnsubscribeRequestSchema, ContentChunkRequestSchema, InteractionSchema, type CatalogMutationResponse, type SessionSummaryV2, type SessionEvent, type SessionExecutionResponseV2, type Bootstrap, } from "@flyx/mvp-protocol";
 import type { HostOwnerHandle } from "../lifecycle/host-owner.js";
 import { assertHostOwner } from "../lifecycle/host-owner.js";
+import type { ActivationReadinessPort } from "../lifecycle/host-activation-load.js";
 import type { SqliteStore, CommandReceiptRow } from "../storage/db.js";
 import { CatalogError, CatalogStore, publicSessionSummary, type CatalogCommit, type CatalogSession, type ProviderVerification, type ProviderInstanceRecord } from "../storage/catalog-store.js";
 import { validateCatalogSchema } from "../storage/migrations/007-catalog.js";
@@ -58,6 +59,14 @@ export type HostCatalogOptions = {
         title?: string;
     };
     readOnlyGit?: WorkspaceGitQuery;
+    /**
+     * Explicit execution-activation readiness (design §6.3 step 5). Receives the
+     * freshly opened CatalogStore so the port reads exactly the records the
+     * metadata bootstrap registers; supplied only for the metadata read path,
+     * where the bootstrap withdraws the verdicts the recorded facts no longer
+     * support instead of invalidating unconditionally.
+     */
+    activationReadiness?: (catalog: CatalogStore) => ActivationReadinessPort;
     /** Local trusted integrations only. No RPC path can supply runtime options. */
     runtimeOptions?: (context: SessionRuntimeContext, services: CatalogRuntimeServices) => CatalogRuntimeOptions;
     runtimeFactory?: (context: SessionRuntimeContext, services: CatalogRuntimeServices) => Promise<CatalogExecutionRuntime> | CatalogExecutionRuntime;
@@ -683,7 +692,10 @@ async function openHostCatalog(options: HostCatalogOptions, metadataOnly: boolea
             throw new CatalogError("LEGACY_DEFAULT_REQUIRED", "Choose the existing default Session in local Host configuration");
         if (legacyDefault && configuration.legacyDefaultSessionId && legacyDefault !== configuration.legacyDefaultSessionId)
             throw new CatalogError("LEGACY_DEFAULT_CONFLICT");
-        const configured = metadataOnly ? registerCatalogReadMetadata(catalog, options.owner, configuration, { ...(options.privateDirectories ? { privateDirectories: options.privateDirectories } : {}), ...(options.readOnlyGit ? { readOnlyGit: options.readOnlyGit } : {}), ...(options.initialLegacySession ? { initialLegacySession: options.initialLegacySession } : {}), ...(options.restoreWriteReady ? { restoreWriteReady: options.restoreWriteReady } : {}) }) : await registerConfiguredCatalog(catalog, options.owner, configuration, { ...(options.privateDirectories ? { privateDirectories: options.privateDirectories } : {}), ...(options.readOnlyGit ? { readOnlyGit: options.readOnlyGit } : {}) });
+        const readiness = metadataOnly ? options.activationReadiness?.(catalog) : undefined;
+        const configured = metadataOnly
+            ? registerCatalogReadMetadata(catalog, options.owner, configuration, { ...(options.privateDirectories ? { privateDirectories: options.privateDirectories } : {}), ...(options.readOnlyGit ? { readOnlyGit: options.readOnlyGit } : {}), ...(options.initialLegacySession ? { initialLegacySession: options.initialLegacySession } : {}), ...(options.restoreWriteReady ? { restoreWriteReady: options.restoreWriteReady } : {}), ...(readiness ? { readiness } : {}) })
+            : await registerConfiguredCatalog(catalog, options.owner, configuration, { ...(options.privateDirectories ? { privateDirectories: options.privateDirectories } : {}), ...(options.readOnlyGit ? { readOnlyGit: options.readOnlyGit } : {}) });
         const initial = options.initialLegacySession;
         if (!metadataOnly && !catalog.legacyDefaultSessionId() && !hasSessions && initial)
             options.store.db.transaction(() => { const input = { ...initial, title: initial.title ?? "Untitled session" }; const created = catalog.create({ authSubjectId: "host-bootstrap", commandId: "catalog-legacy-default" }, input, { workspace: configured.workspaces.require(input.workspaceId), provider: configured.providers.require(input.providerInstanceId) }); catalog.setLegacyDefaultOnce(created.summary.sessionId); })();

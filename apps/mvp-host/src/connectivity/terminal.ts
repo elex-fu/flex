@@ -1,6 +1,7 @@
 import { parseRecoveryCommand, type RecoveryCliCommand } from "./recovery-cli.js";
 import { parseHostOperationsCommand, HOST_OPERATIONS_CLI_USAGE, type HostOperationsCliCommand } from "./operations-cli.js";
 import { parseCatalogImportCommand, CATALOG_IMPORT_CLI_USAGE, type CatalogImportCliCommand } from "../catalog/catalog-import-cli.js";
+import { ACTIVATION_CLI_USAGE, isActivationCliCommand, type ActivationCliCommand } from "../lifecycle/activation-cli.js";
 import { createHash } from "node:crypto";
 import { createInterface } from "node:readline/promises";
 
@@ -76,8 +77,9 @@ async function askTerminal(prompt: string, signal: AbortSignal): Promise<string>
   finally { readline.close(); }
 }
 
+export type HostActivationCommand = { kind: "activation"; command: ActivationCliCommand; argv: readonly string[] };
 export type HostCommand = { kind: "start" | "help" | "devices-list" | "devices-revoke-all" | "identity-show" | "identity-rotate" }
-  | { kind: "devices-revoke"; deviceId: string } | RecoveryCliCommand | HostOperationsCliCommand | CatalogImportCliCommand;
+  | { kind: "devices-revoke"; deviceId: string } | RecoveryCliCommand | HostOperationsCliCommand | CatalogImportCliCommand | HostActivationCommand;
 
 export function parseHostCommand(args: readonly string[]): HostCommand {
   const operations = parseHostOperationsCommand(args);
@@ -86,6 +88,17 @@ export function parseHostCommand(args: readonly string[]): HostCommand {
   if (catalog) return catalog;
   const recovery = parseRecoveryCommand(args);
   if (recovery) return recovery;
+  if (args[0] === "activation") {
+    const command = args[1];
+    if (!isActivationCliCommand(command)) throw new Error(`Usage: ${ACTIVATION_CLI_USAGE}`);
+    const rest = args.slice(2);
+    // Shape only: allowed flag names and their meaning stay the lifecycle module's decision.
+    const malformed = command === "inspect"
+      ? rest.length !== 1 || rest[0]!.startsWith("--")
+      : rest.length % 2 !== 0 || rest.some((value, index) => index % 2 === 0 ? !value.startsWith("--") || value === "--" : !value);
+    if (malformed) throw new Error(`Usage: ${ACTIVATION_CLI_USAGE}`);
+    return { kind: "activation", command, argv: Object.freeze(args.slice(1)) };
+  }
   if (!args.length || args.length === 1 && args[0] === "start") return { kind: "start" };
   if (args.length === 1 && ["help", "--help", "-h"].includes(args[0]!)) return { kind: "help" };
   if (args.length === 2 && args[0] === "devices" && args[1] === "list") return { kind: "devices-list" };
@@ -95,5 +108,5 @@ export function parseHostCommand(args: readonly string[]): HostCommand {
   if (args.length === 3 && args[0] === "devices" && args[1] === "revoke" && /^[a-zA-Z0-9_-]{1,128}$/.test(args[2]!)) {
     return { kind: "devices-revoke", deviceId: args[2]! };
   }
-  throw new Error(`Usage: start | devices list | devices revoke <deviceId> | devices revoke-all | identity show | identity rotate | ${HOST_OPERATIONS_CLI_USAGE} | ${CATALOG_IMPORT_CLI_USAGE}`);
+  throw new Error(`Usage: start | devices list | devices revoke <deviceId> | devices revoke-all | identity show | identity rotate | ${HOST_OPERATIONS_CLI_USAGE} | ${CATALOG_IMPORT_CLI_USAGE} | activation verify|activate|inspect`);
 }

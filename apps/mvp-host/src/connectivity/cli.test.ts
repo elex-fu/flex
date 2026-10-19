@@ -1,13 +1,19 @@
 import { execFile } from "node:child_process";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
+import Database from "better-sqlite3";
 import { describe, expect, it } from "vitest";
 import { DeviceRegistry } from "../auth/device-registry.js";
 import { getHostIdentityMirror, loadOrCreateHostIdentity } from "../identity/host-identity.js";
+import { HostOwnerLock } from "../lifecycle/host-owner.js";
+import { registerConfiguredCatalog } from "../session/configured-catalog.js";
+import { CatalogStore } from "../storage/catalog-store.js";
 import { SqliteStore } from "../storage/db.js";
+import { openOwned } from "../storage/open-store.js";
+import { rawWorkspaceGitQuery } from "../test-support/managed-git-fixtures.js";
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../../../..");
 const runFile = promisify(execFile);
@@ -50,4 +56,44 @@ describe("Host management command isolation", () => {
       await rm(temporary, { recursive: true, force: true });
     }
   }, 15_000);
+
+  it("refuses offline activation without a proven query executor and records the rejection", async () => {
+    const temporary = await mkdtemp(join(tmpdir(), "flyx-activation-cli-"));
+    const databasePath = join(temporary, "data", "host.sqlite"), identityDirectory = join(temporary, "identity"), workspace = join(temporary, "workspace");
+    try {
+      await mkdir(join(temporary, "data"), { mode: 0o700 }); await mkdir(workspace, { mode: 0o700 });
+      await runFile("git", ["init", "--quiet", workspace]);
+      const executable = join(temporary, "codex-bin"); await writeFile(executable, "#!/bin/sh\nexit 1\n", { mode: 0o755 });
+      const owner = HostOwnerLock.acquire({ databasePath, identityDirectory });
+      try {
+        const store = openOwned({ databasePath, owner });
+        try {
+          const catalog = new CatalogStore(store);
+          try {
+            await registerConfiguredCatalog(catalog, owner, { workspaces: [{ workspaceId: "workspace", root: workspace }],
+              providerInstances: [{ providerInstanceId: "provider", provider: "codex", executable }] },
+            { readOnlyGit: rawWorkspaceGitQuery() });
+          } finally { catalog.dispose(); }
+        } finally { store.close(); }
+      } finally { owner.release(); }
+      const env = { ...process.env, FLYX_DB: databasePath, FLYX_IDENTITY_DIR: identityDirectory, FLYX_CONNECTIVITY_MODE: "local", FLYX_RELAY_ENABLED: "0", FLYX_ALLOW_INSECURE_HTTP: "1" };
+      const run = (args: string[]) => runFile(process.execPath,
+        [join(repoRoot, "node_modules/tsx/dist/cli.mjs"), join(repoRoot, "apps/mvp-host/src/main.ts"), ...args],
+        { env, cwd: repoRoot, timeout: 20_000, maxBuffer: 128 * 1024 });
+      const refusal = await run(["activation", "verify", "--workspace", "workspace", "--provider", "provider"]).then(
+        (result) => { throw new Error(`activation verify unexpectedly succeeded: ${result.stdout}`); },
+        (error: { code?: number; stderr?: string }) => error);
+      expect(refusal.code).toBe(1);
+      expect(refusal.stderr).toContain("Activation verification did not produce a reachable binding");
+      const db = new Database(databasePath, { readonly: true });
+      try {
+        const row = db.prepare("SELECT id,state,result_json FROM host_execution_operations WHERE kind='activation' ORDER BY created_at DESC,id DESC LIMIT 1")
+          .get() as { id: string; state: string; result_json: string };
+        expect(row.state).toBe("rejected");
+        expect(JSON.parse(row.result_json)).toMatchObject({ reasonCodes: expect.arrayContaining(["WORKSPACE_QUERY_UNVERIFIED"]) });
+        const inspected = await run(["activation", "inspect", row.id]);
+        expect(JSON.parse(inspected.stdout)).toMatchObject({ command: "inspect", operation: { id: row.id, state: "rejected" } });
+      } finally { db.close(); }
+    } finally { await rm(temporary, { recursive: true, force: true }); }
+  }, 30_000);
 });

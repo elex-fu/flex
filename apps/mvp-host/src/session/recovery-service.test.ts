@@ -100,6 +100,71 @@ describe("recovery observation lifecycle", () => {
     f.store.db.prepare("UPDATE managed_processes SET state='running' WHERE id='inspection-1'").run();
     expect(service.recovery.verifyReleaseProof(proof, { ownerId: "original-owner", ownerGeneration: 2, resourceKey: "db:key", purpose: "host" })).toBe(false);
   });
+  it("reuses persisted same-owner helper stop evidence to release recovery without another helper launch", async () => {
+    const f = fixture(); let launches = 0; let nativeReads = 0; const executions: string[][] = [];
+    const service = new RecoveryService({ store: f.store, now: () => new Date(clockStart).toISOString(),
+      inspectExecution: async (target) => { executions.push(target.ownerProcesses.map((record) => record.id));
+        return { ...stopped(), evidence: { ...stopped().evidence!, processRecordIds: target.ownerProcesses.map((record) => record.id) } }; },
+      inspectNative: async () => {
+        nativeReads += 1;
+        if (launches) return terminal(); // A later read needs no new helper: the saved one carries the durable stop proof.
+        const id = `inspection-${++launches}`;
+        f.store.db.prepare(`INSERT INTO managed_processes(id,owner_id,owner_generation,runtime_id,runtime_generation,attempt_id,session_id,turn_id,pid,process_group,tree_control,state,updated_at)
+          VALUES(?,'original-owner',2,?,1,?,?,'original-turn',?,?,'process_group','stopped','now')`)
+          .run(id, `inspection-runtime-${launches}`, `inspection-attempt-${launches}`, f.session.id, 200 + launches, 200 + launches);
+        return { ...terminal(), inspectionExecution: { version: 1, state: "stopped", originalContextDigest: digest(f.context),
+          helpers: [{ launchId: id, launchDigest: digest(id), processRecordIds: [id], sourceId: `fixture-stop:${id}`, contractId: "fixture-full-tree-v1" }] } };
+      },
+      verifyNativeInspectionEvidence: (handle, evidence) => evidence.state === "stopped" && evidence.originalContextDigest === digest(handle.context)
+        && evidence.helpers.every((helper) => helper.launchDigest === digest(helper.launchId) && helper.sourceId === `fixture-stop:${helper.launchId}` && helper.contractId === "fixture-full-tree-v1"
+          && helper.processRecordIds.length === 1 && helper.processRecordIds[0] === helper.launchId
+          && !!f.store.db.prepare("SELECT 1 FROM managed_processes WHERE id=? AND owner_id='original-owner' AND owner_generation=2 AND state='stopped' AND session_id=? AND turn_id='original-turn' AND runtime_id <> 'original-runtime'").get(helper.launchId, f.session.id)),
+    });
+    const view = await service.inspect({ sessionId: f.session.id, turnId: "original-turn", attemptId: "original-attempt" });
+    expect(view.processState).toBe("stopped");
+    const result = await service.reconcile(f.input(view));
+    expect(result).toMatchObject({ state: "completed", gate: "released" });
+    // The prior helper was never re-spawned; its persisted stop evidence covered the whole re-inspection.
+    expect(launches).toBe(1); expect(nativeReads).toBe(2);
+    expect(executions).toEqual([["process-original"], ["process-original"]]);
+    const final = service.recovery.evidence(service.recovery.operation(result.operationId)!.evidenceId)!;
+    expect(final.native.inspectionExecution?.helpers.map((helper) => helper.launchId)).toEqual(["inspection-1"]);
+    expect(f.store.db.prepare("SELECT id FROM managed_processes WHERE runtime_id <> 'original-runtime' ORDER BY id").all()).toEqual([{ id: "inspection-1" }]);
+    expect(f.recovery.releaseProof(final.view.evidenceId)).toBeDefined();
+  });
+  it("rejects re-inspection and never spawns a replacement helper when a saved helper stop proof is missing", async () => {
+    const f = fixture(); let launches = 0; let nativeReads = 0;
+    const service = new RecoveryService({ store: f.store, now: () => new Date(clockStart).toISOString(),
+      inspectExecution: async (target) => ({ ...stopped(), evidence: { ...stopped().evidence!, processRecordIds: target.ownerProcesses.map((record) => record.id) } }),
+      inspectNative: async () => {
+        nativeReads += 1;
+        const id = `inspection-${++launches}`;
+        f.store.db.prepare(`INSERT INTO managed_processes(id,owner_id,owner_generation,runtime_id,runtime_generation,attempt_id,session_id,turn_id,pid,process_group,tree_control,state,updated_at)
+          VALUES(?,'original-owner',2,?,1,?,?,'original-turn',?,?,'process_group','stopped','now')`)
+          .run(id, `inspection-runtime-${launches}`, `inspection-attempt-${launches}`, f.session.id, 200 + launches, 200 + launches);
+        return { ...terminal(), inspectionExecution: { version: 1, state: "stopped", originalContextDigest: digest(f.context),
+          helpers: [{ launchId: id, launchDigest: digest(id), processRecordIds: [id], sourceId: `fixture-stop:${id}`, contractId: "fixture-full-tree-v1" }] } };
+      },
+      verifyNativeInspectionEvidence: (handle, evidence) => evidence.state === "stopped" && evidence.originalContextDigest === digest(handle.context)
+        && evidence.helpers.every((helper) => helper.launchDigest === digest(helper.launchId) && helper.sourceId === `fixture-stop:${helper.launchId}` && helper.contractId === "fixture-full-tree-v1"
+          && helper.processRecordIds.length === 1 && helper.processRecordIds[0] === helper.launchId
+          && !!f.store.db.prepare("SELECT 1 FROM managed_processes WHERE id=? AND owner_id='original-owner' AND owner_generation=2 AND state='stopped' AND session_id=? AND turn_id='original-turn' AND runtime_id <> 'original-runtime'").get(helper.launchId, f.session.id)),
+    });
+    const view = await service.inspect({ sessionId: f.session.id, turnId: "original-turn", attemptId: "original-attempt" });
+    expect(view.processState).toBe("stopped");
+    expect(launches).toBe(1); expect(nativeReads).toBe(1);
+    // The durable stop record of the saved helper disappears (it may never have stopped).
+    f.store.db.prepare("UPDATE managed_processes SET state='running' WHERE id='inspection-1'").run();
+    await expect(service.inspect({ sessionId: f.session.id, turnId: "original-turn", attemptId: "original-attempt" })).rejects.toMatchObject({ code: "RECOVERY_EVIDENCE_STALE" });
+    // Fail-closed before any new inspection helper launch, and nothing was re-spawned or released.
+    expect(nativeReads).toBe(1); expect(launches).toBe(1);
+    expect(f.store.db.prepare("SELECT COUNT(*) AS count FROM managed_processes WHERE runtime_id <> 'original-runtime'").get()).toEqual({ count: 1 });
+    expect(f.store.db.prepare("SELECT COUNT(*) AS count FROM recovery_evidence").get()).toEqual({ count: 1 });
+    const proof = f.recovery.releaseProof(view.evidenceId)!;
+    expect(f.recovery.verifyReleaseProof(proof, { resourceKey: "workspace:key", ownerId: "original-owner", ownerGeneration: 2, purpose: "workspace:original-turn" })).toBe(false);
+    expect(f.store.getTurn("original-turn")?.status).toBe("outcome_unknown");
+    expect(f.store.getActiveTurn(f.session.id)?.id).toBe("original-turn");
+  });
   it("rejects an unrelated same-owner successor rather than excluding it as an inspection helper", async () => {
     const f = fixture();
     const service = new RecoveryService({ store: f.store, inspectExecution: async () => stopped(), inspectNative: async () => {

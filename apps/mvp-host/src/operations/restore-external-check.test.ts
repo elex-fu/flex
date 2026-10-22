@@ -55,6 +55,19 @@ describe("restore external maintenance receipts", () => {
     await expect(f.service.confirmState({ operationId: evidence.operationId, evidenceId: evidence.evidenceId, expectedRevision: evidence.revision })).rejects.toThrow("RESTORE_CHECK_STALE");
     expect(f.store.db.prepare("SELECT 1 FROM host_state WHERE key='restore_readiness'").get()).toBeDefined();
   });
+  it("accepts stopped same-owner helper launches and rejects them without durable full-tree stop proof", async () => {
+    const f = await fixture();
+    const launch = { launchId: "inspection-helper-launch", launchDigest: "d".repeat(64), state: "stopped" as const,
+      stop: { kind: "process-tree-stopped" as const, sourceId: "supervisor-stop-ledger", contractId: "pidns-v1", launchDigest: "d".repeat(64) } };
+    f.mutate((value) => ({ ...value, supervisor: { ...value.supervisor, launches: [launch] } }));
+    expect(await f.service.inspectState({ commandId: "helper-stopped" })).toMatchObject({ state: "ready", reasonCodes: [] });
+    f.mutate((value) => ({ ...value, supervisor: { ...value.supervisor, launches: [{ ...launch, state: "running" }] } }));
+    expect(await f.service.inspectState({ commandId: "helper-running" })).toMatchObject({ state: "rejected", reasonCodes: ["RESTORE_ORIGINAL_OPERATIONS_UNRESOLVED"] });
+    const { stop: _missingStop, ...launchWithoutStop } = launch;
+    f.mutate((value) => ({ ...value, supervisor: { ...value.supervisor, launches: [launchWithoutStop] } }));
+    expect(await f.service.inspectState({ commandId: "helper-stop-missing" })).toMatchObject({ state: "rejected", reasonCodes: ["RESTORE_ORIGINAL_OPERATIONS_UNRESOLVED"] });
+    expect(f.store.db.prepare("SELECT 1 FROM host_state WHERE key='restore_readiness'").get()).toBeDefined();
+  });
   it("requires complete supervisor coverage and exact checkout root", async () => {
     const f = await fixture(); f.mutate((value) => ({ ...value, supervisor: { ...value.supervisor, coverage: "unknown" }, checkouts: value.checkouts.map((check) => ({ ...check, checkoutRoot: "/checkout/app" })) }));
     expect(await f.service.inspectState({ commandId: "bad-checks" })).toMatchObject({ state: "rejected", reasonCodes: ["RESTORE_GIT_STATE_UNVERIFIED", "RESTORE_SUPERVISOR_COVERAGE_UNVERIFIED"] });

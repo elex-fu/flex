@@ -4,8 +4,6 @@ import { WORKTREE_COMMAND_METHODS } from "./host-worktrees.js";
 
 /** ExecutionIntentState has no "accepted" member: a committed, not-yet-dispatched intent is durably pending. */
 const DISPATCHABLE_INTENT_STATE = "pending" as const;
-/** ExecutionStore.list clamps any scan to at most 1000 rows. */
-const SCAN_LIMIT = 1000;
 
 export type WorktreeSchedulerOptions = {
   store: ExecutionStore;
@@ -39,6 +37,7 @@ export class WorktreeScheduler {
     // Snapshot the owner identity so later caller mutation cannot widen dispatch eligibility.
     this.owner = { id: options.owner.id, generation: options.owner.generation };
     this.methods = new Set(options.methods ?? WORKTREE_COMMAND_METHODS);
+    if ([...this.methods].some((method) => !WORKTREE_COMMAND_METHODS.includes(method as typeof WORKTREE_COMMAND_METHODS[number]))) throw new Error("WORKTREE_SCHEDULER_METHOD_INVALID");
   }
   get isSealed(): boolean { return this.sealed; }
   get queued(): number { return this.queue.length; }
@@ -54,7 +53,12 @@ export class WorktreeScheduler {
   scan(): number {
     if (this.sealed) return 0;
     let queued = 0;
-    for (const intent of this.options.store.list({ state: DISPATCHABLE_INTENT_STATE, limit: SCAN_LIMIT })) if (this.enqueue(intent)) queued++;
+    // Filter before scanning: a prefix of unrelated/old-owner pending rows must
+    // never permanently hide current work behind ExecutionStore.list's cap.
+    if (!this.methods.size) return 0;
+    const rows = this.options.store.store.db.prepare(`SELECT id FROM execution_intents WHERE state=? AND kind IN (${[...this.methods].map(() => "?").join(",")}) AND json_extract(dispatch_context_json,'$.hostOwnerId')=? AND json_extract(dispatch_context_json,'$.hostOwnerGeneration')=? ORDER BY created_at,ordinal,id`)
+      .all(DISPATCHABLE_INTENT_STATE, ...this.methods, this.owner.id, this.owner.generation) as Array<{ id: string }>;
+    for (const row of rows) { const intent = this.options.store.get(row.id); if (intent && this.enqueue(intent)) queued++; }
     if (queued) this.pump();
     return queued;
   }
@@ -97,7 +101,13 @@ export class WorktreeScheduler {
   private pump(): void {
     while (!this.sealed && this.queue.length && this.inFlight.size < this.limit) {
       const intent = this.queue.shift()!;
-      const pending = Promise.resolve().then(() => this.options.dispatch(intent.id));
+      const pending = Promise.resolve().then(() => {
+        // seal() may run between reserving capacity and this microtask. Re-read
+        // owner/state too: queued copies are not authority to dispatch.
+        const current = this.options.store.get(intent.id);
+        if (!current || !this.eligible(current)) return;
+        return this.options.dispatch(intent.id);
+      });
       this.inFlight.add(pending);
       void pending.then(
         () => this.finish(intent, pending, undefined),

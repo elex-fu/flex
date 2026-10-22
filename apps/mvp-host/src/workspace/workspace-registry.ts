@@ -23,6 +23,12 @@ export class WorkspaceRegistry {
     if(workspace.state!=="active") throw new CatalogError("WORKSPACE_NOT_VERIFIED","Workspace must be verified through local Host configuration");
     this.assertCurrent(workspace); return workspace;
   }
+  /** Existing original-runtime controls still validate paths after write activation is withdrawn. */
+  requireControl(id:string):WorkspaceRecord {
+    const workspace=this.get(id); if(!workspace)throw new CatalogError("WORKSPACE_NOT_FOUND");
+    if(workspace.state!=="active"&&workspace.state!=="needs_verification")throw new CatalogError("WORKSPACE_NOT_VERIFIED");
+    this.assertCurrent(workspace);return workspace;
+  }
   list() { return this.catalog.workspaces(); }
   listPublic() { return this.list().map((record)=>({workspaceId:record.workspaceId,label:basename(record.canonicalRoot),kind:record.kind,state:record.state,repositoryId:record.repositoryId})); }
   private assertCurrent(record:WorkspaceRecord):void {

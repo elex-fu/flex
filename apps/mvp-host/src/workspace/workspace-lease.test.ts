@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { HostOwnerLock, type HostOwnerHandle } from "../lifecycle/host-owner.js";
 import { WorkspaceLease } from "./workspace-lease.js";
+import { SystemProcessInspector, type ProcessInspector } from "../lifecycle/process-inspector.js";
 
 const roots: string[] = [];
 const owners: HostOwnerHandle[] = [];
@@ -79,5 +80,23 @@ describe("checkout leases", () => {
     lease.release();
     const next = WorkspaceLease.acquire({ workspace: f.workspace, owner: f.second });
     leases.push(next);
+  });
+  it("recovers the exact original checkout purpose only after an explicitly inspected prior owner exits", () => {
+    const f = fixture(), original = WorkspaceLease.acquire({ workspace: f.workspace, owner: f.first, operationId: "original-operation" });
+    leases.push(original); original.retain("original helper unknown");
+    let state: "alive" | "unknown" | "exited" = "unknown";
+    const inspector: ProcessInspector = { currentIdentity: () => new SystemProcessInspector().currentIdentity(), inspect: () => ({ state, reason: "deterministic-fixture" }) };
+    const authorize = (ownership: { ownerId: string; ownerGeneration: number; resourceKey: string; purpose: string }) => {
+      expect(ownership.purpose).toBe("workspace:original-operation"); expect(ownership.ownerId).toBe(f.first.ownerId);
+      return {
+      proof: { ownerId: ownership.ownerId, ownerGeneration: ownership.ownerGeneration, evidenceId: "committed-gate", turnId: "original-operation", attemptId: "attempt", resourceKeys: [ownership.resourceKey] },
+      verifyProof: (_proof: unknown, context: { purpose: string }) => context.purpose === "workspace:original-operation",
+      };
+    };
+    const recover = () => WorkspaceLease.recoverReserved({ canonicalWorkspace: realpathSync(f.workspace), owner: f.second, operationId: "original-operation", inspector, authorize });
+    expect(() => recover()).toThrow("cannot be proven exited"); state = "alive"; expect(() => recover()).toThrow("cannot be proven exited");
+    state = "exited"; const successor = recover(); leases.push(successor);
+    expect(successor.ownership().ownerId).toBe(f.second.ownerId); successor.assertActive();
+    expect(() => original.assertActive()).toThrow();
   });
 });

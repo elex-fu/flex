@@ -1,5 +1,6 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash, randomUUID } from "node:crypto";
+import { lstatSync, realpathSync } from "node:fs";
 import { z } from "zod";
 import {
   WORKTREE_CAPABILITY, WorktreeCreateRpcSchema, WorktreeExistingRpcSchema, WorktreeListRpcSchema,
@@ -54,7 +55,8 @@ export type HostWorktreesOptions = {
   trackOperation?<T>(kind: "producer", operation: () => Promise<T>): Promise<T>;
   accepted?(intent: ExecutionIntentRow): void;
   producerStopProof?(operation: WorktreeOperationRecord, original: DispatchContext, successors: readonly DispatchContext[]): Promise<WorktreeProducerStopProof | undefined>;
-  recoveryAuthorization?(record: ManagedWorktreeRecord, operation: WorktreeOperationRecord, inspection: StoredWorktreeInspection): OwnershipRecoveryAuthorization | undefined;
+  recoveryAuthorization?(record: ManagedWorktreeRecord, operation: WorktreeOperationRecord, inspection: StoredWorktreeInspection, ownership?: { ownerId: string; ownerGeneration: number; resourceKey: string }): OwnershipRecoveryAuthorization | undefined;
+  recoverRepositoryMetadata?(record: ManagedWorktreeRecord, operation: WorktreeOperationRecord, inspection: StoredWorktreeInspection): Promise<void>;
   /** Must derive stopped/clean from original central identity and full-tree evidence, never root exit alone. */
   closeGit?(deadlineMs: number): Promise<WorktreeDriverClose>;
   sealGitJournal?(): void;
@@ -138,14 +140,22 @@ export class HostWorktrees {
       acquireLease: (record, operation) => {
         const evidenceId = operation.facts.recoveryEvidenceId;
         const inspection = typeof evidenceId === "string" ? this.store.inspection(evidenceId) : undefined;
-        const recovery = inspection ? options.recoveryAuthorization?.(record, operation, inspection) : undefined;
-        return WorkspaceLease.acquireReserved({ canonicalWorkspace: record.path, owner, operationId: operation.operationId, ...(recovery ? { recovery } : {}) });
+        try { return WorkspaceLease.acquireReserved({ canonicalWorkspace: record.path, owner, operationId: operation.operationId }); }
+        catch (error) {
+          if (!inspection || !(error instanceof Error) || !("code" in error) || error.code !== "HOST_ALREADY_OWNED") throw error;
+          return WorkspaceLease.recoverReserved({ canonicalWorkspace: record.path, owner, operationId: operation.operationId,
+            authorize: (ownership) => options.recoveryAuthorization?.(record, operation, inspection, ownership) });
+        }
       },
       producerStopped: async (operation) => Boolean(await this.stopProof(operation)),
       clearLeaseRetention: (record, operation, inspection, handle) => {
-        const authorization = options.recoveryAuthorization?.(record, operation, inspection);
+        const authorization = options.recoveryAuthorization?.(record, operation, inspection, (handle as WorkspaceLease).ownership());
         if (!authorization) throw new WorktreeError("WORKTREE_RECOVERY_PROOF_REQUIRED", "Retained checkout lease requires committed recovery authorization");
         (handle as WorkspaceLease).clearRetention(authorization.proof, authorization.verifyProof);
+      },
+      beforeExecution: async (record, operation) => {
+        const binding = this.executing.get(operation.operationId);
+        if (binding?.method === "worktree.resume") await options.recoverRepositoryMetadata?.(record, operation, this.store.inspection(binding.evidenceId!));
       },
       onBoundary: async (boundary, moment, operation) => {
         this.assertWritable(); if (moment === "dispatched") this.assertExecutionReady(); await options.onBoundary?.(boundary, moment, operation);
@@ -295,6 +305,50 @@ export class HostWorktrees {
   }
   /** The currently executing helper's actual context; safe for concurrent different worktrees. */
   currentExecution(): WorktreeExecutionContext | undefined { return this.nativeContext.getStore(); }
+  /** Synchronous authorization over the committed current resume gate, never inspection.canResume alone. */
+  ownershipRecoveryAuthorization(record: ManagedWorktreeRecord, operation: WorktreeOperationRecord, inspection: StoredWorktreeInspection,
+    attest: (original: DispatchContext, successors: readonly DispatchContext[]) => WorktreeProducerStopProof | undefined,
+    ownership?: { ownerId: string; ownerGeneration: number; resourceKey: string },
+    metadata?: { resourceKey: string; purposeOperationId: string }): OwnershipRecoveryAuthorization | undefined {
+    const binding = this.executing.get(operation.operationId);
+    if (!binding || binding.method !== "worktree.resume" || binding.evidenceId !== inspection.evidenceId || !binding.gate) return undefined;
+    const original = this.originalBinding(operation).dispatchContext;
+    const resourceKey = metadata?.resourceKey ?? `workspace:${record.path}`;
+    const proof = { ownerId: ownership?.ownerId ?? original.hostOwnerId, ownerGeneration: ownership?.ownerGeneration ?? original.hostOwnerGeneration,
+      evidenceId: inspection.evidenceId, turnId: metadata?.purposeOperationId ?? operation.operationId, attemptId: original.attemptId, resourceKeys: [resourceKey] };
+    if (ownership && ownership.resourceKey !== resourceKey) return undefined;
+    const verify = (): boolean => {
+      try {
+        this.assertWritable(); this.assertExecutionReady(); this.assertDevice(operation.actorId, "session:write");
+        const current = this.store.operation(operation.operationId), currentRecord = this.store.require(record.worktreeId), currentInspection = this.store.inspection(inspection.evidenceId);
+        const currentBinding = this.executing.get(operation.operationId), intent = this.execution.get(binding.intentId);
+        if (currentBinding?.intentId !== binding.intentId || !intent || intent.state !== "dispatching" || intent.claimOwnerId !== this.options.owner.ownerId || intent.claimOwnerGeneration !== this.options.owner.generation) return false;
+        const durableBinding = this.bindingFor(intent).binding;
+        if (JSON.stringify(durableBinding) !== JSON.stringify(binding)) return false;
+        if (!["outcome_unknown", "pending", "running"].includes(current.state) || current.worktreeId !== record.worktreeId || current.actorId !== operation.actorId
+          || currentRecord.revision !== binding.gate!.revision || currentRecord.path !== record.path || currentRecord.repositoryRoot !== record.repositoryRoot || currentRecord.rootIdentity !== record.rootIdentity
+          || !currentInspection.canResume || !currentInspection.producerStopped || currentInspection.operationId !== current.operationId || currentInspection.expiresAt <= this.store.now()
+          || currentInspection.observationsDigest !== binding.gate!.observationsDigest || currentInspection.expiresAt !== binding.gate!.expiresAt) return false;
+        const root = lstatSync(record.managedRoot);
+        if (!root.isDirectory() || root.isSymbolicLink() || `${root.dev}:${root.ino}` !== record.rootIdentity || realpathSync(record.repositoryRoot) !== record.repositoryRoot
+          || this.options.workspaces.resolveRepository(record.repositoryId).worktreeRoot !== record.repositoryRoot) return false;
+        const contexts = this.writerContexts(current, binding.intentId);
+        if (!contexts.some((context) => context.hostOwnerId === proof.ownerId && context.hostOwnerGeneration === proof.ownerGeneration)) return false;
+        if (metadata) {
+          if (!resourceKey.startsWith("repository:") || ![current.operationId, current.facts.captureId].includes(metadata.purposeOperationId)) return false;
+          const launches = this.options.catalog.db.prepare(`SELECT b.proof_json FROM managed_processes p JOIN managed_process_boundaries b ON b.process_id=p.id WHERE p.owner_id=? AND p.owner_generation=? AND p.turn_id=?`)
+            .all(proof.ownerId, proof.ownerGeneration, record.worktreeId) as Array<{ proof_json: string }>;
+          if (!launches.some((row) => { const launch = JSON.parse(row.proof_json) as { kind?: string; operationId?: string }; return launch.kind === "managed-git-launch-plan" && launch.operationId === metadata.purposeOperationId; })) return false;
+        }
+        const stopped = attest(contexts[0]!, contexts.slice(1));
+        return Boolean(stopped && stopped.operationId === current.operationId && stopped.dispatchContextDigest === binding.gate!.originalContextDigest
+          && stopped.writerContextsDigest === binding.gate!.proof.writerContextsDigest && stopped.sourceId === binding.gate!.proof.sourceId && stopped.contractId === binding.gate!.proof.contractId);
+      } catch { return false; }
+    };
+    if (!verify()) return undefined;
+    return { proof, verifyProof: (supplied, context) => JSON.stringify(supplied) === JSON.stringify(proof) && context.resourceKey === resourceKey
+      && context.purpose === (metadata ? `repository:${metadata.purposeOperationId}` : `workspace:${operation.operationId}`) && context.ownerId === proof.ownerId && context.ownerGeneration === proof.ownerGeneration && verify() };
+  }
   private driverContext(operation: WorktreeOperationRecord, binding: CommandBinding, readOnly: boolean): WorktreeExecutionContext {
     const record = this.store.require(operation.worktreeId);
     return Object.freeze({ operationId: operation.operationId, worktreeId: operation.worktreeId, sessionId: binding.sessionId, method: binding.method, readOnly,
@@ -369,7 +423,9 @@ export class HostWorktrees {
         let inspection: WorktreeInspection | undefined;
         let next: WorktreeOperationRecord;
         if (binding.method === "worktree.reconcile") { inspection = await this.service.reconcile(operation.operationId, operation.actorId); next = this.store.operation(operation.operationId); }
-        else if (binding.method === "worktree.resume") next = await this.service.resumeVerified(operation.operationId, binding.evidenceId!, operation.actorId);
+        else if (binding.method === "worktree.resume") {
+          next = await this.service.resumeVerified(operation.operationId, binding.evidenceId!, operation.actorId);
+        }
         else next = await this.service.execute(operation.operationId);
         const response = resultFor(this.store, next, inspection);
         this.options.catalog.db.transaction(() => {

@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { realpathSync } from "node:fs";
 import { ExclusiveFileLock, HostOwnershipError, assertHostOwner, canonicalPath, defaultCoordinationDirectory, type HostOwnerHandle, type OwnershipRecoveryAuthorization, type OwnershipRecoveryProof, type OwnershipRecoveryVerifier } from "../lifecycle/host-owner.js";
 import { SystemProcessInspector, type ProcessInspector } from "../lifecycle/process-inspector.js";
+import { assertCheckoutLockOrder } from "./repository-metadata-lock.js";
 
 export type WorkspaceLeaseOptions = {
   workspace: string;
@@ -23,6 +24,7 @@ export class WorkspaceLease {
   }
 
   static acquire(options: WorkspaceLeaseOptions): WorkspaceLease {
+    assertCheckoutLockOrder();
     assertHostOwner(options.owner);
     const workspace = realpathSync(options.workspace);
     return this.acquireAt(options,workspace);
@@ -30,6 +32,7 @@ export class WorkspaceLease {
 
   /** Trusted local managed-record seam; RPC callers must never supply this path. */
   static acquireReserved(options: Omit<WorkspaceLeaseOptions,"workspace"> & {canonicalWorkspace:string}): WorkspaceLease {
+    assertCheckoutLockOrder();
     assertHostOwner(options.owner);
     const workspace=canonicalPath(options.canonicalWorkspace);
     if(workspace!==options.canonicalWorkspace)throw new HostOwnershipError("OWNER_RECOVERY_EVIDENCE_INVALID","Reserved checkout must use its exact original canonical managed path.");
@@ -53,6 +56,9 @@ export class WorkspaceLease {
   }
 
   assertActive(): void { this.owner.assertActive(); this.lock?.assertActive(); }
+  ownership(): { ownerId: string; ownerGeneration: number; resourceKey: string } {
+    return this.lock?.ownership() ?? { ownerId: this.owner.ownerId, ownerGeneration: this.owner.generation, resourceKey: this.resourceKey };
+  }
   retain(reason: string): void { this.lock?.retain(reason); }
   clearRetention(proof: OwnershipRecoveryProof, verifyProof: OwnershipRecoveryVerifier): void {
     this.assertActive();
@@ -63,6 +69,23 @@ export class WorkspaceLease {
   }
   static reclaimAfterRecovery(options: WorkspaceLeaseOptions & { recovery: OwnershipRecoveryAuthorization }): WorkspaceLease {
     return this.acquire(options);
+  }
+  /** Explicit resumed-operation recovery holds the old lock while inspecting the original exited owner and authorization. */
+  static recoverReserved(options: Omit<WorkspaceLeaseOptions, "workspace" | "recovery"> & { canonicalWorkspace: string;
+    authorize(ownership: { ownerId: string; ownerGeneration: number; resourceKey: string; purpose: string }): OwnershipRecoveryAuthorization | undefined;
+  }): WorkspaceLease {
+    assertCheckoutLockOrder(); assertHostOwner(options.owner);
+    const workspace = canonicalPath(options.canonicalWorkspace);
+    if (workspace !== options.canonicalWorkspace || !options.operationId) throw new HostOwnershipError("OWNER_RECOVERY_EVIDENCE_INVALID", "Recovery requires the exact original checkout operation");
+    const lock = ExclusiveFileLock.acquireRetainedForMaintenance({ directory: options.coordinationDirectory ?? options.owner.coordinationDirectory ?? defaultCoordinationDirectory(),
+      resourceKey: `workspace:${workspace}`, inspector: options.inspector ?? new SystemProcessInspector(), allowUnretainedCrash: true });
+    try {
+      const authorization = options.authorize(lock.ownership());
+      if (!authorization || authorization.proof.turnId !== options.operationId || authorization.proof.resourceKeys.length !== 1 || authorization.proof.resourceKeys[0] !== `workspace:${workspace}`) throw new HostOwnershipError("OWNER_RECOVERY_EVIDENCE_INVALID", "Committed recovery must cover the original checkout operation");
+      lock.validateRecovery(authorization.proof, authorization.verifyProof);
+      lock.clearRetention(authorization.proof, authorization.verifyProof); lock.release();
+    } finally { lock.closeMaintenance(); }
+    return this.acquireAt({ ...options, workspace }, workspace);
   }
   release(): void { this.lock?.release(); }
 }

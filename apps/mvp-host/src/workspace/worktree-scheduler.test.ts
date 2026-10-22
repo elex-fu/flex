@@ -140,6 +140,7 @@ describe("bounded worktree intent scheduler", () => {
     const gate = f.gate(running.id);
     expect(scheduler.scan()).toBe(2);
     expect(scheduler.active).toBe(1); expect(scheduler.queued).toBe(1);
+    await flush();
     scheduler.seal(); scheduler.seal();
     expect(scheduler.isSealed).toBe(true); expect(scheduler.queued).toBe(0);
     scheduler.accepted(left);
@@ -165,6 +166,29 @@ describe("bounded worktree intent scheduler", () => {
     expect(f.execution.get(failing.id)?.resultCode).toBeUndefined();
     expect(f.store.getCommandReceipt(failing.authSubjectId, failing.commandId)?.state).toBe("accepted");
     expect(f.execution.get(next.id)?.state).toBe("settled");
+  });
+
+  it("never invokes a dispatch reserved before the synchronous shutdown fence", async () => {
+    const f = fixture(), scheduler = f.make(), intent = f.seed();
+    scheduler.accepted(intent); scheduler.seal();
+    expect(await scheduler.drain(100)).toBe(true);
+    expect(f.calls).toEqual([]); expect(f.execution.get(intent.id)?.state).toBe("pending");
+  });
+
+  it("revalidates a queued intent after another dispatcher claims it", async () => {
+    const f = fixture(), scheduler = f.make({ limit: 1 });
+    const first = f.seed(), later = f.seed(), gate = f.gate(first.id);
+    scheduler.scan(); await flush();
+    f.execution.claim(later.id, f.owner);
+    gate.resolve(); await scheduler.drain(100);
+    expect(f.calls).toEqual([first.id]); expect(f.execution.get(later.id)?.state).toBe("claimed");
+  });
+
+  it("finds current work beyond one thousand unrelated pending rows", async () => {
+    const f = fixture(), scheduler = f.make();
+    f.store.db.transaction(() => { for (let index = 0; index < 1001; index++) f.seed({ ownerId: "old-owner" }); })();
+    const current = f.seed(); expect(scheduler.scan()).toBe(1);
+    await scheduler.drain(100); expect(f.calls).toEqual([current.id]);
   });
 
   it("keeps the permit moving when the failure observer itself throws", async () => {

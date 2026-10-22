@@ -170,8 +170,11 @@ export class ManagedWorkspaceQuery {
   private preparation: Promise<ManagedWorkspaceQueryReadiness> | undefined;
   private drainPromise: Promise<ManagedWorkspaceQueryCloseReport> | undefined;
   private readonly operations = new Set<Promise<unknown>>();
+  private producerStop: Promise<{ producerStopped: boolean; clean: boolean }> | undefined;
   readonly shutdownService = {
-    drain: async (deadlineMs: number): Promise<void> => { await this.drain(deadlineMs); },
+    stopProducers: (deadlineAt: number) => this.stopProducers(deadlineAt),
+    drain: async (deadlineAt: number): Promise<boolean> => (await this.drain(deadlineAt)).clean,
+    seal: (): void => this.seal(),
     close: async (): Promise<void> => { await this.close(); },
   };
   constructor(private readonly options: ManagedWorkspaceQueryOptions) {}
@@ -210,22 +213,21 @@ export class ManagedWorkspaceQuery {
     return work;
   };
 
+  stopProducers(deadlineAt = Date.now() + LIMIT_TIME_MS): Promise<{ producerStopped: boolean; clean: boolean }> {
+    this.accepting = false;
+    return this.producerStop ??= (async () => {
+      if (!this.options.executor) return { producerStopped: true, clean: true };
+      try { return await withinDeadline(this.options.executor.closeAndWait(Math.max(0, deadlineAt - Date.now())), deadlineAt, { producerStopped: false, clean: false }); }
+      catch { return { producerStopped: false, clean: false }; }
+    })();
+  }
   drain(deadlineMs = Date.now() + LIMIT_TIME_MS): Promise<ManagedWorkspaceQueryCloseReport> {
     if (!Number.isFinite(deadlineMs)) invalid();
     this.accepting = false;
     this.drainPromise ??= (async () => {
-      await this.preparation;
-      // Stop producers first: an injected executor owns the real stop evidence.
-      let stop: { producerStopped: boolean; clean: boolean };
-      if (this.options.executor) {
-        try { stop = await this.options.executor.closeAndWait(deadlineMs); }
-        catch { stop = { producerStopped: false, clean: false }; }
-      } else {
-        // No production process was launched; this is an empty producer set,
-        // not a proof derived from a process group or missing PID.
-        stop = { producerStopped: true, clean: true };
-      }
-      await Promise.allSettled([...this.operations]);
+      // Executor close uses a duration; this service receives one absolute Host deadline.
+      const stop = await this.stopProducers(deadlineMs);
+      await withinDeadline(Promise.allSettled([...this.operations]), deadlineMs, []);
       return Object.freeze({ closed: true as const, producerStopped: stop.producerStopped, clean: stop.clean && this.operations.size === 0 });
     })();
     return this.drainPromise;
@@ -259,4 +261,10 @@ export class ManagedWorkspaceQuery {
 
 export function createManagedWorkspaceQuery(options: ManagedWorkspaceQueryOptions): ManagedWorkspaceQuery {
   return new ManagedWorkspaceQuery(options);
+}
+
+async function withinDeadline<T>(work: Promise<T>, deadlineAt: number, fallback: T): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try { return await Promise.race([work, new Promise<T>((resolve) => { timer = setTimeout(() => resolve(fallback), Math.max(0, deadlineAt - Date.now())); })]); }
+  finally { if (timer) clearTimeout(timer); }
 }

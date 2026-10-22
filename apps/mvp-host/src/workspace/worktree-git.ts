@@ -226,7 +226,7 @@ export class WorktreeGitDriver implements WorktreeGit {
     const indexStat = await stat(indexPath); if (!indexStat) return undefined;
     if (!indexStat.isFile() || indexStat.isSymbolicLink()) throw new WorktreeError("WORKTREE_INDEX_CONFLICT", "Git index is not a plain file");
     const gitDirectory = (await this.git(path, ["rev-parse", "--absolute-git-dir"])).toString("utf8").trim();
-    const temp = await mkdtemp(join(tmpdir(), "flyx-worktree-index-"));
+    const temp = await realpath(await mkdtemp(join(tmpdir(), "flyx-worktree-index-")));
     try {
       const handle = await open(indexPath, constants.O_RDONLY | constants.O_NOFOLLOW);
       try { await writeFile(join(temp, "index"), await handle.readFile(), { flag: "wx", mode: 0o600 }); } finally { await handle.close(); }
@@ -236,7 +236,7 @@ export class WorktreeGitDriver implements WorktreeGit {
   private async writeIndex(path: string, tree: string): Promise<void> {
     const gitDirectory = (await this.git(path, ["rev-parse", "--absolute-git-dir"])).toString("utf8").trim();
     const indexPath = (await this.git(path, ["rev-parse", "--path-format=absolute", "--git-path", "index"])).toString("utf8").trim();
-    const temp = await mkdtemp(join(tmpdir(), "flyx-worktree-raw-index-"));
+    const temp = await realpath(await mkdtemp(join(tmpdir(), "flyx-worktree-raw-index-")));
     try { await this.git(temp, ["read-tree", tree], undefined, { GIT_DIR: gitDirectory, GIT_INDEX_FILE: indexPath, GIT_WORK_TREE: temp }); }
     finally { await rm(temp, { recursive: true, force: true }); }
   }

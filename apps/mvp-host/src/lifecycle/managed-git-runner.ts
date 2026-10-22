@@ -8,7 +8,7 @@ import type { CheckpointGitOperation, CheckpointGitRunRequest, CheckpointGitRunn
 import type { GitServiceRunner } from "../git/git-service.js";
 import {
   MANAGED_QUERY_ENV, managedWorkspaceQueryShape,
-  type ManagedWorkspaceQueryPlan,
+  type ManagedWorkspaceQueryPlan, type ManagedWorkspaceQueryExecutor,
 } from "./managed-workspace-query.js";
 import {
   ManagedProcessRegistry, processIdentityDigest,
@@ -47,11 +47,15 @@ export type ManagedGitErrorCode =
   | "MANAGED_GIT_SUPERVISOR_UNAVAILABLE" | "MANAGED_GIT_PURPOSE_UNKNOWN" | "MANAGED_GIT_INPUT_INVALID"
   | "MANAGED_GIT_EXECUTABLE_UNTRUSTED" | "MANAGED_GIT_CWD_INVALID" | "MANAGED_GIT_ENV_INVALID" | "MANAGED_GIT_ARGV_INVALID"
   | "MANAGED_GIT_CLOSED" | "MANAGED_GIT_SPAWN_FAILED" | "MANAGED_GIT_OUTPUT_BUDGET_EXCEEDED" | "MANAGED_GIT_TIMEOUT"
-  | "MANAGED_GIT_ABORTED" | "MANAGED_GIT_TREE_STOP_UNPROVEN";
+  | "MANAGED_GIT_ABORTED" | "MANAGED_GIT_TREE_STOP_UNPROVEN" | "MANAGED_GIT_METADATA_LOCK_REQUIRED";
 export type ManagedGitErrorState = "not_spawned" | "stopped" | "unknown";
+export type ManagedGitErrorEvidence = Readonly<{
+  processId?: string; launchDigest: string; purpose: ManagedGitPurpose; policyId: string;
+  operationId?: string; stepId?: string; bindingDigest?: string;
+}>;
 export class ManagedGitError extends Error {
   readonly retryable = false;
-  constructor(readonly code: ManagedGitErrorCode, readonly state: ManagedGitErrorState) {
+  constructor(readonly code: ManagedGitErrorCode, readonly state: ManagedGitErrorState, readonly evidence?: ManagedGitErrorEvidence) {
     super(code); this.name = "ManagedGitError";
   }
 }
@@ -68,6 +72,12 @@ export type ManagedGitStopBackend = Readonly<{
   contractId: string;
   verifiedDescendantStop: true;
   verify(record: ManagedProcessRecord): ProcessTreeStopEvidence | undefined | Promise<ProcessTreeStopEvidence | undefined>;
+  /** Required for production: original launch is controlled by the same proven backend. */
+  platform?: NodeJS.Platform;
+  spawn?: (registry: ManagedProcessRegistry, request: {
+    command: string; args: readonly string[]; cwd: string; env: Readonly<Record<string, string>>;
+    evidence: { proof: Readonly<object>; launchDigest: string };
+  }) => ManagedChildHandle;
 }>;
 
 export type ManagedGitRunnerOptions = {
@@ -83,6 +93,8 @@ export type ManagedGitRunnerOptions = {
   gitExecutable?: string;
   pythonExecutable?: string;
   stopDeadlineMs?: number;
+  /** Short common-directory lock around validated mutating Git commands only. */
+  repositoryMetadata?: <T>(input: Readonly<{ purpose: ManagedGitPurpose; cwd: string; args: readonly string[]; env: Readonly<Record<string,string>>; operationId?: string }>, action: () => Promise<T>) => Promise<T>;
   /** Deterministic fixture seams forwarded to the managed process registry. */
   groupExists?: (pid: number) => "present" | "absent" | "unknown";
   identify?: ConstructorParameters<typeof ManagedProcessRegistry>[0]["identify"];
@@ -267,7 +279,7 @@ function buildPolicies(options: { git: ManagedGitExecutableIdentity; python: Man
  */
 export class ManagedGitRunner {
   private readonly policies: Readonly<Record<ManagedGitPurpose, ManagedGitPolicy>>;
-  private readonly stops = new Map<string, () => Promise<ProcessStopResult>>();
+  private readonly stops = new Map<string, (deadlineMs?: number) => Promise<ProcessStopResult>>();
   private readonly registries = new Map<string, ManagedProcessRegistry>();
   private readonly runs = new Set<Promise<unknown>>();
   private runCounter = 0;
@@ -283,7 +295,7 @@ export class ManagedGitRunner {
     }
     if (backend.kind === "fixture" && options.allowFixtureStopBackend !== true) throw new ManagedGitError("MANAGED_GIT_FIXTURE_BACKEND_FORBIDDEN", "not_spawned");
     // The supervisor contract is a per-kernel proof; there is no macOS supervisor.
-    if (backend.kind === "supervisor" && process.platform !== "linux") throw new ManagedGitError("MANAGED_GIT_SUPERVISOR_UNAVAILABLE", "not_spawned");
+    if (backend.kind === "supervisor" && (process.platform !== "linux" || backend.platform !== process.platform || typeof backend.spawn !== "function")) throw new ManagedGitError("MANAGED_GIT_SUPERVISOR_UNAVAILABLE", "not_spawned");
     this.stopBackend = backend;
     const git = trustedExecutable(options.gitExecutable ?? GIT_EXECUTABLE);
     const python = trustedExecutable(options.pythonExecutable ?? PYTHON_EXECUTABLE);
@@ -296,6 +308,14 @@ export class ManagedGitRunner {
     return policy;
   }
 
+  readonly shutdownService = {
+    stopProducers: async (deadlineAt: number): Promise<{ producerStopped: boolean; clean: boolean }> => {
+      const report = await this.closeAndWait(Math.max(0, deadlineAt - Date.now()));
+      return { producerStopped: report.producerStopped, clean: report.clean };
+    },
+    drain: async (deadlineAt: number): Promise<boolean> => (await this.closeAndWait(Math.max(0, deadlineAt - Date.now()))).clean,
+    seal: (): void => this.sealJournal(),
+  };
   /** Stop every active run's process tree first, then drain bounded by the same deadline, then seal journals. */
   closeAndWait(deadlineMs = 5_000): Promise<ManagedGitRunnerCloseReport> {
     this.closing = true;
@@ -307,7 +327,9 @@ export class ManagedGitRunner {
     this.sealed = true; this.closing = true;
     for (const [runId, stop] of [...this.stops]) {
       const registry = this.registries.get(runId);
-      void stop().then(() => registry?.sealJournal(), () => { registry?.sealJournal(); });
+      // Fence now even if a verifier never settles; stopping cannot extend Store ownership.
+      registry?.sealJournal();
+      void stop(0).catch(() => undefined);
     }
     for (const [runId, registry] of [...this.registries]) if (!this.stops.has(runId)) registry.sealJournal();
   }
@@ -338,7 +360,7 @@ export class ManagedGitRunner {
   }
 
   /** Validate an already-planned Workspace query and execute it under the fixed read-only policy. */
-  workspaceQueryPort(): { run(plan: ManagedWorkspaceQueryPlan): Promise<{ stdout: string }>; closeAndWait(deadlineMs: number): Promise<{ producerStopped: boolean; clean: boolean }> } {
+  workspaceQueryPort(): ManagedWorkspaceQueryExecutor {
     return {
       run: async (plan) => {
         if (this.closing || this.sealed) throw closed();
@@ -385,7 +407,7 @@ export class ManagedGitRunner {
         bindingDigest: digest(stableJson({ hostOwnerId: binding.hostOwnerId, hostOwnerGeneration: binding.hostOwnerGeneration, workspaceId: binding.workspaceId, operation: request.operation })),
         signal: request.signal,
       });
-      return { stdout: result.stdout, exitCode: result.exitCode };
+      return { stdout: result.stdout, exitCode: result.exitCode, producer: { processId: result.processId, launchDigest: result.launchDigest, purpose: result.purpose, policyId: result.policyId, ...(request.operation.kind === "verify" || "checkpointId" in request.operation ? { operationId: request.operation.checkpointId } : {}) } };
     };
   }
 
@@ -466,13 +488,14 @@ export class ManagedGitRunner {
       const deadlineAt = Date.now() + deadlineMs;
       // 1. Stop every active producer before draining any completion.
       const stops = [...this.stops.values()];
-      const stopped = (await Promise.all(stops.map((stop) => stop().then((result) => result.treeStopped, () => false)))).every(Boolean);
+      const observations = Promise.all(stops.map((stop) => stop(Math.max(0, deadlineAt - Date.now())).then((result) => result.stopped && result.treeStopped, () => false)));
+      const stopped = await waitForSettled([observations], Math.max(0, deadlineAt - Date.now())) && (await observations).every(Boolean);
       // 2. Drain the actual run promises, bounded by the same deadline.
       const runs = [...this.runs];
       const drained = await waitForSettled(runs, Math.max(0, deadlineAt - Date.now()));
       // 3. Fence late journal writes for every registry this runner owns.
       for (const registry of [...this.registries.values()]) registry.sealJournal();
-      return Object.freeze({ closed: true as const, producerStopped: stopped, clean: stopped && drained && runs.length === 0, runs: runs.length });
+      return Object.freeze({ closed: true as const, producerStopped: stopped, clean: stopped && drained && this.runs.size === 0, runs: runs.length });
     })();
   }
   private runRegistry(input: { purpose: ManagedGitPurpose; operationId?: string; stepId?: string }): ManagedProcessRegistry {
@@ -490,13 +513,28 @@ export class ManagedGitRunner {
   private spawn(registry: ManagedProcessRegistry, policy: ManagedGitPolicy, argv: readonly string[], cwd: string, env: Readonly<Record<string, string>>, evidence: { proof: Readonly<object>; launchDigest: string } | undefined): ManagedChildHandle {
     if (!sameIdentity(policy.executable)) throw new ManagedGitError("MANAGED_GIT_EXECUTABLE_UNTRUSTED", "not_spawned");
     try {
+      if (this.stopBackend.kind === "supervisor") {
+        if (!evidence || !this.stopBackend.spawn) throw new ManagedGitError("MANAGED_GIT_SUPERVISOR_UNAVAILABLE", "not_spawned");
+        return this.stopBackend.spawn(registry, { command: policy.executable.path, args: argv, cwd, env, evidence });
+      }
       return registry.spawn(policy.executable.path, [...argv], { cwd, env: { ...env }, stdio: ["pipe", "pipe", "pipe"] }, evidence);
     } catch (error) {
       if (error instanceof ManagedGitError) throw error;
-      throw new ManagedGitError("MANAGED_GIT_SPAWN_FAILED", "not_spawned");
+      const record = registry.records()[0];
+      throw new ManagedGitError("MANAGED_GIT_SPAWN_FAILED", record?.pid !== undefined ? "unknown" : "not_spawned");
     }
   }
-  private async dispatch(input: {
+  private async dispatch(input: Parameters<ManagedGitRunner["dispatchManaged"]>[0]): Promise<ManagedGitRunResult> {
+    const tail = input.argv.slice(input.policy.config.length * 2);
+    const mutatesMetadata = input.kind === "git" && (tail[0] === "update-ref" || tail[0] === "worktree" && ["add", "move", "remove"].includes(tail[1] ?? ""));
+    if (!mutatesMetadata) return this.dispatchManaged(input);
+    if (!this.options.repositoryMetadata) {
+      if (this.stopBackend.kind !== "fixture") throw new ManagedGitError("MANAGED_GIT_METADATA_LOCK_REQUIRED", "not_spawned");
+      return this.dispatchManaged(input);
+    }
+    return this.options.repositoryMetadata(Object.freeze({ purpose: input.policy.purpose, cwd: input.cwd, args: Object.freeze([...input.argv]), env: Object.freeze({ ...input.env }), ...(input.operationId ? {operationId:input.operationId} : {}) }), () => this.dispatchManaged(input));
+  }
+  private async dispatchManaged(input: {
     kind: "git" | "helper"; policy: ManagedGitPolicy; argv: readonly string[]; cwd: string; env: Readonly<Record<string, string>>;
     input: { data: string; bytes: number } | undefined; maxOutputBytes: number; timeoutMs: number;
     operationId?: string; stepId?: string; bindingDigest?: string; signal?: AbortSignal; stdin: "open" | "close";
@@ -528,11 +566,12 @@ export class ManagedGitRunner {
       try { stopped = await stop(); }
       catch { throw new ManagedGitError("MANAGED_GIT_TREE_STOP_UNPROVEN", "unknown"); }
       const record = registry.records()[0];
-      if (!record) throw new ManagedGitError("MANAGED_GIT_SPAWN_FAILED", "not_spawned");
-      if (record.state === "not_spawned" || collected.kind === "spawn") throw new ManagedGitError("MANAGED_GIT_SPAWN_FAILED", "not_spawned");
+      if (!record) throw new ManagedGitError("MANAGED_GIT_SPAWN_FAILED", "unknown");
+      if (record.state === "not_spawned") throw new ManagedGitError("MANAGED_GIT_SPAWN_FAILED", "not_spawned");
       if (!stopped.treeStopped || record.state !== "stopped" || !record.stopProof) {
         throw new ManagedGitError("MANAGED_GIT_TREE_STOP_UNPROVEN", "unknown");
       }
+      if (collected.kind === "spawn") throw new ManagedGitError("MANAGED_GIT_SPAWN_FAILED", "stopped");
       if (collected.kind === "output") throw new ManagedGitError("MANAGED_GIT_OUTPUT_BUDGET_EXCEEDED", "stopped");
       if (collected.kind === "timeout") throw new ManagedGitError("MANAGED_GIT_TIMEOUT", "stopped");
       if (collected.kind === "aborted") throw new ManagedGitError("MANAGED_GIT_ABORTED", "stopped");
@@ -543,6 +582,13 @@ export class ManagedGitRunner {
     })();
     this.runs.add(work);
     try { return await work; }
+    catch (error) {
+      const record = registry.records()[0];
+      const evidence: ManagedGitErrorEvidence = Object.freeze({ ...(record ? { processId: record.id } : {}), launchDigest, purpose: policy.purpose, policyId: policy.policyId,
+        ...(input.operationId ? { operationId: input.operationId } : {}), ...(input.stepId ? { stepId: input.stepId } : {}), ...(input.bindingDigest ? { bindingDigest: input.bindingDigest } : {}) });
+      if (error instanceof ManagedGitError) throw new ManagedGitError(error.code, error.state, evidence);
+      throw new ManagedGitError("MANAGED_GIT_TREE_STOP_UNPROVEN", record?.state === "not_spawned" ? "not_spawned" : "unknown", evidence);
+    }
     finally {
       this.stops.delete(runId); this.registries.delete(runId); this.runs.delete(work);
       // Late SQL never happens: the per-run journal is sealed before the result is observed.

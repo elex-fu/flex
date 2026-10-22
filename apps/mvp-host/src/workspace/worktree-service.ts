@@ -27,6 +27,8 @@ export interface WorktreeServiceOptions {
   producerStopped(operation: WorktreeOperationRecord): Promise<boolean>;
   /** Reload committed recovery proof before clearing an earlier retained lease. */
   clearLeaseRetention?(record: ManagedWorktreeRecord, operation: WorktreeOperationRecord, evidence: StoredWorktreeInspection, lease: WorktreeLeaseHandle): void;
+  /** Recover short shared-metadata gates only after checkout ownership, before any Git mutation. */
+  beforeExecution?(record: ManagedWorktreeRecord, operation: WorktreeOperationRecord): Promise<void>;
   onBoundary?(boundary: string, moment: "dispatched" | "applied" | "committed", operation: WorktreeOperationRecord): Promise<void>;
 }
 function digest(value: unknown): string { return createHash("sha256").update(JSON.stringify(value)).digest("hex"); }
@@ -126,6 +128,7 @@ export class WorktreeService {
       const lease = this.leases.get(id) ?? this.options.acquireLease(record, this.store.operation(id), existing);
       this.leases.set(id, lease); lease.assertActive();
       this.options.catalog.assertNoWriterOrRuntime(record.workspaceId, id);
+      await this.options.beforeExecution?.(record, this.store.operation(id));
       if (current.kind === "archive") await this.archive(this.store.operation(id), record);
       else await this.createOrRestore(this.store.operation(id), record);
       lease.assertActive(); lease.release(); this.leases.delete(id);

@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import Database from "better-sqlite3";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   createManagedWorkspaceQuery,
   macosWorkspaceQueryReadOnlyProfile,
@@ -104,6 +104,19 @@ describe("fail-closed Workspace query port", () => {
       await runner.closeAndWait(1_000);
       runner.sealJournal();
     }
+  });
+
+  it("converts the shared absolute Host deadline to an executor duration and bounds hung work", async () => {
+    vi.useFakeTimers();
+    try {
+      const close = vi.fn(() => new Promise<{ producerStopped: boolean; clean: boolean }>(() => {}));
+      const service = createManagedWorkspaceQuery({ journal: { save() {} }, context: () => context, assertActive() {}, privateRoots: [privateRoot],
+        executor: { run: async () => ({ stdout: "" }), closeAndWait: close } });
+      const closing = service.drain(Date.now() + 30);
+      expect(close).toHaveBeenCalledWith(30); await vi.advanceTimersByTimeAsync(31);
+      expect(await closing).toEqual({ closed: true, producerStopped: false, clean: false });
+      service.seal(); await expect(service.readOnlyGit(input(workspace))).rejects.toMatchObject({ code: "WORKSPACE_QUERY_CLOSED" });
+    } finally { vi.useRealTimers(); }
   });
 
   it.runIf(process.platform === "darwin")("rebuilds only the exact bounded rev-parse plans with a controlled environment", () => {

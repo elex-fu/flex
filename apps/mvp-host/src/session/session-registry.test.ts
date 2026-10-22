@@ -64,6 +64,31 @@ describe("Session catalog and lazy runtime routing",()=>{
     expect(()=>f.registry.createNew({authSubjectId:"legacy-device",commandId:"old"},{workspaceId:"workspace-one",providerInstanceId:"instance-claude",title:"first"})).toThrow("COMMAND_ID_REUSED");
     expect(hashCatalogRequest("session.startTurn",{sessionId:first.sessionId,prompt:"same"},f.registry.requestContext(first.sessionId))).not.toBe(hashCatalogRequest("session.startTurn",{sessionId:second.sessionId,prompt:"same"},f.registry.requestContext(second.sessionId)));
   });
+  it("resolves only an already loaded control channel after Native verification is withdrawn", async () => {
+    const f=await fixture(),session=f.create("control-continuity");
+    expect(()=>f.registry.resolveControlContext(session.sessionId)).toThrow("RUNTIME_CONTROL_UNAVAILABLE");
+    const runtime=await f.registry.ensureLoaded(session.sessionId);
+    f.providers.recordVerification("instance-claude",{state:"unverified",capabilities:[]});
+    const workspace=f.catalog.workspace("workspace-one")!;
+    f.catalog.putWorkspace({...workspace,state:"needs_verification"});
+    expect(f.registry.resolveControlContext(session.sessionId).runtime).toBe(runtime);
+    expect(()=>f.registry.resolveExecutionContext(session.sessionId)).toThrow();
+    expect(f.runtimeFactory).toHaveBeenCalledOnce();
+  });
+  it("creates and edits registered Session metadata without granting Native execution", async () => {
+    const f=await fixture();
+    f.catalog.putWorkspace({...f.catalog.workspace("workspace-one")!,state:"needs_verification"});
+    f.catalog.putProvider({...f.catalog.provider("instance-claude")!,state:"unconfigured",verification:{state:"unverified",capabilities:[]}});
+    const session=f.create("registered-only");
+    expect(session.residency).toBe("unloaded"); await expect(f.registry.ensureLoaded(session.sessionId)).rejects.toThrow();
+    const renamed=f.registry.rename({authSubjectId:"primary-device",commandId:"rename-registered"},{sessionId:session.sessionId,expectedRevision:session.revision,title:"Registered metadata"}).summary;
+    const archived=f.registry.archive({authSubjectId:"primary-device",commandId:"archive-registered"},{sessionId:session.sessionId,expectedRevision:renamed.revision}).summary;
+    expect(archived.status).toBe("archived");
+    const active=f.registry.unarchive({authSubjectId:"primary-device",commandId:"restore-registered"},{sessionId:session.sessionId,expectedRevision:archived.revision}).summary;
+    expect(active.status).toBe("active"); expect(f.runtimeFactory).not.toHaveBeenCalled();
+    f.catalog.putProvider({...f.catalog.provider("instance-claude")!,state:"disabled"});
+    expect(()=>f.create("disabled-resource")).toThrow("RESOURCE_SCOPE_MISMATCH");
+  });
   it("keeps legacy session.create a pure default snapshot after newer Sessions and browser selections",async()=>{
     const f=await fixture();const first=f.create("default");f.catalog.setLegacyDefaultOnce(first.sessionId);
     const later=f.create("later","codex");const facade=new LegacySessionFacade(f.registry);

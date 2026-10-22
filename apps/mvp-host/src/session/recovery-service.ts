@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { RecoveryEvidence, RecoveryInspectPayload, RecoveryOperation, SessionEvent } from "@flyx/mvp-protocol";
-import type { NativeHandle, NativeTurnObservation } from "../provider/native-history.js";
+import type { NativeHandle, NativeTurnObservation, NativeInspectionExecutionEvidence } from "../provider/native-history.js";
 import type { PlannedEvent } from "../orchestration/command-contract.js";
 import type { SqliteStore } from "../storage/db.js";
 import { RecoveryError, RecoveryStore, digest } from "../storage/recovery-store.js";
@@ -12,6 +12,7 @@ export type RecoveryServiceOptions = {
   inspectExecution?: (target: RecoveryTarget) => Promise<ExecutionRecoveryObservation>;
   /** Read-only: never resume/start a conversation or repeat the original command. */
   inspectNative?: (handle: NativeHandle) => Promise<NativeTurnObservation>;
+  verifyNativeInspectionEvidence?: (handle: NativeHandle, evidence: NativeInspectionExecutionEvidence) => boolean;
   now?: () => string;
   id?: () => string;
   evidenceTtlMs?: number;
@@ -113,12 +114,18 @@ export class RecoveryService {
       const { target, evidence } = this.recovery.validateEvidence(input, this.now());
       const observed = await this.observe(target);
       this.assertOpen();
-      if (digest(observed.execution) !== digest(evidence.execution) || digest(observed.native) !== digest(evidence.native) || digest(observed.committedOutcome ?? null) !== digest(evidence.committedOutcome ?? null)) {
+      const inspectedOwnerJournal = target.context ? this.recovery.ownerJournalFingerprint(target.context.hostOwnerId, target.context.hostOwnerGeneration) : undefined;
+      for (const inspection of [evidence.native.inspectionExecution, observed.native.inspectionExecution]) {
+        if (inspection && (!target.nativeHandle || !this.options.verifyNativeInspectionEvidence?.(target.nativeHandle, inspection))) throw new RecoveryError("RECOVERY_EVIDENCE_STALE");
+      }
+      const nativeBusiness = ({ inspectionExecution: _inspection, ...business }: NativeTurnObservation) => business;
+      if (digest(observed.execution) !== digest(evidence.execution) || digest(nativeBusiness(observed.native)) !== digest(nativeBusiness(evidence.native)) || digest(observed.committedOutcome ?? null) !== digest(evidence.committedOutcome ?? null)) {
         throw new RecoveryError("RECOVERY_EVIDENCE_STALE");
       }
       const rechecked = continuation ? continuation() : this.options.assertCommandAuthorized?.(input);
       if (rechecked !== undefined) throw new RecoveryError("SYNCHRONOUS_RECOVERY_AUTHORIZATION_REQUIRED");
       this.assertOpen();
+      if (target.context && inspectedOwnerJournal !== this.recovery.ownerJournalFingerprint(target.context.hostOwnerId, target.context.hostOwnerGeneration)) throw new RecoveryError("RECOVERY_EVIDENCE_STALE");
       const release = this.canRelease(observed.execution);
       if (action === "reconcile" && observed.native.state !== "terminal" && !(observed.committedOutcome && release)
         || action === "acknowledge" && (!release || observed.native.state === "terminal")) {
@@ -126,7 +133,22 @@ export class RecoveryService {
         this.publish(blocked.events);
         return blocked.result;
       }
-      const settled = this.recovery.finishOperation(input, journal, evidence, observed.native, release, this.now());
+      let finalInput = input;
+      let finalEvidence = evidence;
+      if (observed.native.inspectionExecution) {
+        const auditedAt = this.now();
+        const recheck: StoredRecoveryEvidence & { inspectionRecheckFor: string } = {
+          ...evidence, ...observed, view: { ...evidence.view, evidenceId: this.id(), observedAt: auditedAt },
+          inspectionRecheckFor: journal.id,
+          ...(observed.execution.evidence ? { ownerJournalFingerprint: this.recovery.ownerJournalFingerprint(observed.execution.evidence.ownerId, observed.execution.evidence.ownerGeneration) } : {}),
+        };
+        // Save the new helper invocation as separate audit evidence. The original
+        // evidence remains immutable and the command still consumes its exact ID.
+        this.recovery.saveEvidence(target, recheck);
+        finalInput = { ...input, evidenceId: recheck.view.evidenceId };
+        finalEvidence = recheck;
+      }
+      const settled = this.recovery.finishOperation(finalInput, journal, finalEvidence, observed.native, release, this.now());
       this.publish(settled.events);
       return settled.result;
     } catch (error) {
@@ -145,16 +167,78 @@ export class RecoveryService {
 
   private async observe(target: RecoveryTarget): Promise<{ execution: ExecutionRecoveryObservation; native: NativeTurnObservation; committedOutcome?: NotDispatchedRecoveryOutcome }> {
     this.assertOpen();
-    const [execution, native] = await Promise.allSettled([
-      this.options.inspectExecution ? this.options.inspectExecution(target) : Promise.resolve(defaultExecutionObservation(target)),
-      target.nativeHandle && this.options.inspectNative ? this.options.inspectNative(target.nativeHandle) : Promise.resolve<NativeTurnObservation>({ state: "unknown", reason: "native_history_inspection_unavailable" }),
-    ]);
+    const prior = this.savedInspectionEvidence(target);
+    let native: NativeTurnObservation;
+    let nativeInspectionFailed = false;
+    try { native = target.nativeHandle && this.options.inspectNative ? await this.options.inspectNative(target.nativeHandle) : { state: "unknown", reason: "native_history_inspection_unavailable" }; }
+    catch { nativeInspectionFailed = true; native = { state: "unknown", reason: "native_history_read_failed" }; }
     this.assertOpen();
-    return {
-      execution: this.normalizeExecution(target, execution.status === "fulfilled" ? execution.value : { state: "unknown", workspaceState: "unknown", reason: "process_inspection_failed" }),
-      ...(target.committedOutcome ? { committedOutcome: target.committedOutcome } : {}),
-      native: this.normalizeNative(target, native.status === "fulfilled" ? native.value : { state: "unknown", reason: "native_history_read_failed" }),
+    const inspection = this.combineInspectionEvidence(target, [...prior, ...(native.inspectionExecution ? [native.inspectionExecution] : [])]);
+    if (inspection) native = { ...native, inspectionExecution: inspection };
+    const assertOriginal = () => {
+      const current = this.recovery.target(target.session.id, target.turn.id, target.turn.attemptId);
+      const helperIds = this.inspectionIds(target, inspection);
+      const priorIds = new Set(prior.flatMap((saved) => saved.helpers.flatMap((helper) => [...helper.processRecordIds])));
+      if (current.factsFingerprint !== target.factsFingerprint || target.processes.some((record) => helperIds.has(record.id))
+        || digest(current.ownerProcesses.filter((record) => !helperIds.has(record.id))) !== digest(target.ownerProcesses.filter((record) => !priorIds.has(record.id)))) throw new RecoveryError("RECOVERY_EVIDENCE_STALE");
     };
+    // An inspection may launch only explicitly owned successors. It cannot
+    // silently replace the original identity or pair an old proof with a new inventory.
+    assertOriginal();
+    let execution: ExecutionRecoveryObservation;
+    const verifiedHelpers = this.inspectionIds(target, inspection);
+    const executionTarget = { ...target, ownerProcesses: target.ownerProcesses.filter((record) => !verifiedHelpers.has(record.id)) };
+    try { execution = this.options.inspectExecution ? await this.options.inspectExecution(executionTarget) : defaultExecutionObservation(executionTarget); }
+    catch { execution = { state: "unknown", workspaceState: "unknown", reason: "process_inspection_failed" }; }
+    this.assertOpen(); assertOriginal();
+    if (nativeInspectionFailed || native.state === "unknown" && native.reason === "native_history_helper_stop_unverified"
+      || inspection && (inspection.version !== 1 || inspection.state !== "stopped" || inspection.originalContextDigest !== digest(target.context)
+        || !target.nativeHandle || !this.options.verifyNativeInspectionEvidence?.(target.nativeHandle, inspection)
+        || !inspection.helpers.length || inspection.helpers.some((helper) => !helper.launchId || !/^[a-f0-9]{64}$/.test(helper.launchDigest)
+          || !helper.processRecordIds.length || !helper.sourceId || !helper.contractId))) {
+      execution = { state: "unknown", workspaceState: "unknown", reason: "native_history_helper_stop_unverified" };
+    }
+    return {
+      execution: this.normalizeExecution(target, execution),
+      ...(target.committedOutcome ? { committedOutcome: target.committedOutcome } : {}),
+      native: this.normalizeNative(target, native),
+    };
+  }
+
+  private inspectionIds(target: RecoveryTarget, inspection: NativeInspectionExecutionEvidence | undefined): Set<string> {
+    if (!inspection || inspection.state !== "stopped" || !target.nativeHandle
+      || !this.options.verifyNativeInspectionEvidence?.(target.nativeHandle, inspection)) return new Set();
+    return new Set(inspection.helpers.flatMap((helper) => [...helper.processRecordIds]));
+  }
+  private savedInspectionEvidence(target: RecoveryTarget): NativeInspectionExecutionEvidence[] {
+    if (!target.nativeHandle) return [];
+    const rows = this.options.store.db.prepare("SELECT evidence_json FROM recovery_evidence WHERE session_id=? AND turn_id=? AND attempt_id=? ORDER BY observed_at DESC LIMIT 1000")
+      .all(target.session.id, target.turn.id, target.turn.attemptId ?? null) as { evidence_json: string }[];
+    const saved: NativeInspectionExecutionEvidence[] = [];
+    for (const row of rows) {
+      const evidence = JSON.parse(row.evidence_json) as StoredRecoveryEvidence;
+      const inspection = evidence.native.inspectionExecution;
+      if (!inspection || inspection.state !== "stopped") continue;
+      if (inspection.originalContextDigest !== digest(target.context) || !this.options.verifyNativeInspectionEvidence?.(target.nativeHandle, inspection)) throw new RecoveryError("RECOVERY_EVIDENCE_STALE");
+      saved.push(inspection);
+    }
+    return saved;
+  }
+  private combineInspectionEvidence(target: RecoveryTarget, inspections: readonly NativeInspectionExecutionEvidence[]): NativeInspectionExecutionEvidence | undefined {
+    if (!inspections.length) return undefined;
+    const helpers = new Map<string, NativeInspectionExecutionEvidence["helpers"][number]>();
+    let stopped = true;
+    for (const inspection of inspections) {
+      if (inspection.version !== 1 || inspection.originalContextDigest !== digest(target.context)) throw new RecoveryError("RECOVERY_EVIDENCE_STALE");
+      stopped &&= inspection.state === "stopped";
+      for (const helper of inspection.helpers) {
+        const previous = helpers.get(helper.launchId);
+        if (previous && digest(previous) !== digest(helper)) throw new RecoveryError("RECOVERY_EVIDENCE_STALE");
+        helpers.set(helper.launchId, helper);
+      }
+    }
+    if (helpers.size > 64) throw new RecoveryError("RECOVERY_EVIDENCE_STALE");
+    return { version: 1, state: stopped ? "stopped" : "unknown", originalContextDigest: digest(target.context), helpers: [...helpers.values()].sort((left, right) => left.launchId.localeCompare(right.launchId)) };
   }
 
   private normalizeExecution(target: RecoveryTarget, observation: ExecutionRecoveryObservation): ExecutionRecoveryObservation {

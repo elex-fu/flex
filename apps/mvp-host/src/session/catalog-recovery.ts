@@ -2,6 +2,7 @@ import type { SessionEvent } from "@flyx/mvp-protocol";
 import { RecoveryCapability } from "@flyx/mvp-protocol";
 import type { HostCatalog, CatalogExecutionRuntime } from "../catalog/host-catalog.js";
 import type { AppServerClient } from "../codex/app-server-client.js";
+import type { NativeHistoryReaderFactory } from "../provider/native-history-reader.js";
 import type { CatalogGlobalService } from "../lifecycle/catalog-host-lifecycle.js";
 import type { HostRecoveryRequestLifecycle } from "./host-recovery.js";
 import type { DispatchContext, ProviderId } from "../provider/types.js";
@@ -40,7 +41,7 @@ export type ExistingCatalogRecoveryReader = Readonly<{
   client: Pick<AppServerClient, "request">;
 }>;
 export type CatalogRuntimeRecoveryOptions = Pick<HostRecoveryOptions,
-  "resolveResource" | "checkoutRoot" | "assertCommandAuthorized" | "processInspector" | "inspectBoundary" | "inspectWorkspace" | "codexReader" | "supersedeInteractions" | "companionEvents">;
+  "resolveResource" | "checkoutRoot" | "assertCommandAuthorized" | "processInspector" | "inspectBoundary" | "inspectWorkspace" | "codexReader" | "nativeHistoryReader" | "verifyNativeInspectionEvidence" | "supersedeInteractions" | "companionEvents">;
 export type CatalogRecoveryOptions = {
   catalog: HostCatalog;
   /** Global admission permits original retained recovery, but rejects Host drain. */
@@ -51,6 +52,8 @@ export type CatalogRecoveryOptions = {
   verifiedManifestForInstance?: (identity: CatalogRecoveryIdentity) => CachedCatalogRecoveryManifest | undefined;
   /** Select an actual existing connection. Absence stays unknown; no reconnect/resume/start. */
   existingCodexReader?: (identity: CatalogRecoveryIdentity, original: DispatchContext) => ExistingCatalogRecoveryReader | undefined;
+  /** Recovery-only port. Supplying it does not make public history construct Native. */
+  nativeHistoryReaderFactory?: Pick<NativeHistoryReaderFactory, "inspect"> & Partial<Pick<NativeHistoryReaderFactory, "verifyInspectionEvidence">>;
   processInspector?: HostRecoveryOptions["processInspector"];
   inspectBoundary?: HostRecoveryOptions["inspectBoundary"];
   inspectWorkspace?: HostRecoveryOptions["inspectWorkspace"];
@@ -295,6 +298,15 @@ export class CatalogRecoveryBindings {
         return () => { assertOriginal(); try { continuation(); } catch (error) { denied(error); } };
       },
       codexReader: (handle) => selected?.context === digest(handle.context) ? selected.reader.client : undefined,
+      ...(this.options.nativeHistoryReaderFactory ? { nativeHistoryReader: async (handle) => {
+        this.assertIdentity(identity);
+        const observed = await this.options.nativeHistoryReaderFactory!.inspect(handle, identity.checkoutRoot);
+        this.assertIdentity(identity);
+        return observed;
+      }, verifyNativeInspectionEvidence: (handle, evidence) => {
+        this.assertIdentity(identity);
+        return this.options.nativeHistoryReaderFactory!.verifyInspectionEvidence?.(handle, evidence) === true;
+      } } : {}),
       inspectWorkspace: async (target) => {
         this.assertIdentity(identity);
         const state = await this.options.inspectWorkspace?.(target) ?? "unknown";

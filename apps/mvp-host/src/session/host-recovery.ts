@@ -5,7 +5,7 @@ import type { HostOwnerHandle } from "../lifecycle/host-owner.js";
 import { processIdentityDigest } from "../lifecycle/managed-process-evidence.js";
 import { SystemProcessInspector, type ProcessIdentity, type ProcessInspector } from "../lifecycle/process-inspector.js";
 import type { AdapterEvent, DispatchContext, ProviderId } from "../provider/types.js";
-import type { NativeHandle, NativeTurnObservation } from "../provider/native-history.js";
+import type { NativeHandle, NativeTurnObservation, NativeInspectionExecutionEvidence } from "../provider/native-history.js";
 import { inspectNativeBoundaryStop } from "../lifecycle/native-boundary-proof.js";
 import type { PlannedEvent } from "../orchestration/command-contract.js";
 import type { SqliteStore } from "../storage/db.js";
@@ -45,6 +45,9 @@ export type HostRecoveryOptions = {
   inspectWorkspace?: (target: RecoveryTarget) => Promise<"clear" | "held" | "unknown">;
   /** An existing read-only client. Recovery never constructs or resumes a Provider. */
   codexReader?: (handle: NativeHandle) => Pick<AppServerClient, "request"> | undefined;
+  /** Explicit recovery inspection only; never used by ordinary history queries. */
+  nativeHistoryReader?: (handle: NativeHandle) => Promise<NativeTurnObservation>;
+  verifyNativeInspectionEvidence?: (handle: NativeHandle, evidence: NativeInspectionExecutionEvidence) => boolean;
   canReleaseWorkspace?: (context: DispatchContext) => boolean;
   onCommit?: (events: readonly SessionEvent[]) => void;
   onBlocked?: (context: DispatchContext, reason: string) => void;
@@ -75,6 +78,7 @@ export class HostRecovery {
       verifiedVersions: [] }));
     this.service = new RecoveryService({ store: options.store, inspectExecution: (target) => this.inspectExecution(target),
       inspectNative: (handle) => this.inspectNative(handle), assertCommandAuthorized: (input) => this.authorizeCommand(input),
+      ...(options.verifyNativeInspectionEvidence ? { verifyNativeInspectionEvidence: options.verifyNativeInspectionEvidence } : {}),
       ...(options.onCommit ? { onCommit: options.onCommit } : {}),
       ...(options.companionEvents ? { companionEvents: options.companionEvents } : {}) });
   }
@@ -174,6 +178,7 @@ export class HostRecovery {
   private afterCommitted(operation: RecoveryOperation, evidenceId: string): void {
     this.assertOpen();
     if (operation.state !== "completed") return;
+    evidenceId = this.recovery.operation(operation.operationId)?.evidenceId ?? evidenceId;
     const target = this.recovery.target(operation.sessionId, operation.turnId, operation.attemptId);
     const evidence = this.recovery.evidence(evidenceId);
     if (operation.recoveryRevision !== target.session.recoveryRevision
@@ -225,6 +230,14 @@ export class HostRecovery {
     const resource = this.resource(handle.context, handle.provider);
     if (resource.providerInstanceId !== handle.providerInstanceId || resource.configurationFingerprint !== handle.configurationFingerprint
       || !resource.verifiedVersions.includes(handle.verifiedVersion)) return { state: "unknown", reason: "native_history_configuration_unverified" };
+    if (this.options.nativeHistoryReader) {
+      const observed = await this.options.nativeHistoryReader(handle);
+      this.assertOpen();
+      if (observed.state === "terminal" && (observed.nativeSessionId !== handle.nativeSessionId
+        || observed.nativeTurnId !== undefined && observed.nativeTurnId !== handle.nativeTurnId
+        || observed.evidence.verifiedVersion !== handle.verifiedVersion)) return { state: "unknown", reason: "native_history_binding_mismatch" };
+      return observed;
+    }
     if (handle.provider === "codex") {
       const client = this.options.codexReader?.(handle);
       if (!client || !resource.readerVersion) return { state: "unknown", reason: "native_history_reader_unavailable" };

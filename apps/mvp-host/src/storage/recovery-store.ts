@@ -210,8 +210,8 @@ export class RecoveryStore {
           .run(target.session.id, target.turn.id, target.session.recoveryRevision);
         if (changed.changes !== 1) throw new RecoveryError("RECOVERY_EVIDENCE_STALE");
       }
-      this.store.db.prepare("UPDATE recovery_operations SET phase = 'completed', result_json = ?, completed_revision = ?, updated_at = ? WHERE id = ? AND phase IN ('marked','checking')")
-        .run(JSON.stringify(result), committed.sessionRevision, now, journal.id);
+      this.store.db.prepare("UPDATE recovery_operations SET phase = 'completed', evidence_id = ?, result_json = ?, completed_revision = ?, updated_at = ? WHERE id = ? AND phase IN ('marked','checking')")
+        .run(evidence.view.evidenceId, JSON.stringify(result), committed.sessionRevision, now, journal.id);
       return { result, events: committed.events };
     });
   }
@@ -254,7 +254,10 @@ export class RecoveryStore {
         || evidence.ownerJournalFingerprint !== this.ownerJournalFingerprint(proof.ownerId, proof.ownerGeneration)) return false;
       if (!resource.purpose.startsWith("workspace:")) {
         const ownerRecords = this.processes("owner_id = ? AND owner_generation = ?", [proof.ownerId, proof.ownerGeneration]);
-        if (ownerRecords.some((record) => !stop.processRecordIds?.includes(record.id))
+        const inspection = evidence.native.inspectionExecution;
+        const inspectionIds = inspection?.version === 1 && inspection.state === "stopped" && inspection.originalContextDigest === digest(this.nativeHandle(proof.turnId, proof.attemptId)?.context)
+          ? new Set(inspection.helpers.flatMap((helper) => [...helper.processRecordIds])) : new Set<string>();
+        if (ownerRecords.some((record) => !stop.processRecordIds?.includes(record.id) && !inspectionIds.has(record.id))
           || this.store.db.prepare("SELECT 1 FROM sessions WHERE active_turn_id IS NOT NULL OR recovery_state = 'blocked' LIMIT 1").get()) return false;
       }
       const rows = this.store.db.prepare("SELECT * FROM recovery_operations WHERE evidence_id = ? AND phase = 'completed'")

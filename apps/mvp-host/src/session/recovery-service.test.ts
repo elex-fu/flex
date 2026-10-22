@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { SqliteStore } from "../storage/db.js";
 import { RecoveryService } from "./recovery-service.js";
-import { RecoveryStore } from "../storage/recovery-store.js";
+import { RecoveryStore, digest } from "../storage/recovery-store.js";
 import type { ExecutionRecoveryObservation, RecoveryCommandInput } from "../storage/recovery-store.js";
 import type { DispatchContext } from "../provider/types.js";
 import type { NativeTurnObservation } from "../provider/native-history.js";
@@ -65,6 +65,77 @@ function addControlIntent(f: ReturnType<typeof fixture>) {
 }
 
 describe("recovery observation lifecycle", () => {
+  it.each(["reconcile", "acknowledge"] as const)("accounts for every stopped same-owner inspection helper across inspect and %s", async (action) => {
+    const f = fixture(); let launches = 0;
+    const service = new RecoveryService({ store: f.store, now: () => new Date(clockStart).toISOString(),
+      inspectExecution: async (target) => {
+        expect(target.ownerProcesses.map((record) => record.id)).toEqual(["process-original"]);
+        return { ...stopped(), evidence: { ...stopped().evidence!, processRecordIds: target.ownerProcesses.map((record) => record.id) } };
+      },
+      inspectNative: async () => {
+        const id = `inspection-${++launches}`;
+        f.store.db.prepare(`INSERT INTO managed_processes(id,owner_id,owner_generation,runtime_id,runtime_generation,attempt_id,session_id,turn_id,pid,process_group,tree_control,state,updated_at)
+          VALUES(?,'original-owner',2,?,1,?,?,'original-turn',?,?,'process_group','stopped','now')`)
+          .run(id, `inspection-runtime-${launches}`, `inspection-attempt-${launches}`, f.session.id, 200 + launches, 200 + launches);
+        const business: NativeTurnObservation = action === "reconcile" ? terminal() : { state: "unknown", reason: "original_result_unknown" };
+        return { ...business, inspectionExecution: { version: 1, state: "stopped", originalContextDigest: digest(f.context),
+          helpers: [{ launchId: id, launchDigest: digest(id), processRecordIds: [id], sourceId: `fixture-stop:${id}`, contractId: "fixture-full-tree-v1" }] } };
+      },
+      verifyNativeInspectionEvidence: (handle, evidence) => evidence.state === "stopped" && evidence.originalContextDigest === digest(handle.context)
+        && evidence.helpers.every((helper) => helper.launchDigest === digest(helper.launchId) && helper.sourceId === `fixture-stop:${helper.launchId}` && helper.contractId === "fixture-full-tree-v1"
+          && helper.processRecordIds.length === 1 && helper.processRecordIds[0] === helper.launchId
+          && !!f.store.db.prepare("SELECT 1 FROM managed_processes WHERE id=? AND owner_id='original-owner' AND owner_generation=2 AND state='stopped' AND session_id=? AND turn_id='original-turn' AND runtime_id <> 'original-runtime'").get(helper.launchId, f.session.id)),
+    });
+    const view = await service.inspect({ sessionId: f.session.id, turnId: "original-turn", attemptId: "original-attempt" });
+    expect(view.processState).toBe("stopped");
+    const input = { ...f.input(view), commandId: `same-owner-${action}` };
+    const result = action === "reconcile" ? await service.reconcile(input) : await service.acknowledge({ ...input, acknowledgeUnknown: true });
+    expect(result).toMatchObject({ state: "completed", gate: "released" }); expect(launches).toBe(2);
+    const journal = service.recovery.operation(result.operationId)!;
+    expect(journal.evidenceId).not.toBe(view.evidenceId);
+    const final = service.recovery.evidence(journal.evidenceId)!;
+    expect(final.native.inspectionExecution?.helpers.map((helper) => helper.launchId)).toEqual(["inspection-1", "inspection-2"]);
+    const proof = service.recovery.releaseProof(journal.evidenceId)!;
+    expect(service.recovery.verifyReleaseProof(proof, { ownerId: "original-owner", ownerGeneration: 2, resourceKey: "db:key", purpose: "host" })).toBe(true);
+    f.store.db.prepare("UPDATE managed_processes SET state='running' WHERE id='inspection-1'").run();
+    expect(service.recovery.verifyReleaseProof(proof, { ownerId: "original-owner", ownerGeneration: 2, resourceKey: "db:key", purpose: "host" })).toBe(false);
+  });
+  it("rejects an unrelated same-owner successor rather than excluding it as an inspection helper", async () => {
+    const f = fixture();
+    const service = new RecoveryService({ store: f.store, inspectExecution: async () => stopped(), inspectNative: async () => {
+      f.store.db.prepare(`INSERT INTO managed_processes(id,owner_id,owner_generation,runtime_id,runtime_generation,attempt_id,session_id,turn_id,pid,process_group,tree_control,state,updated_at)
+        VALUES('unrelated','original-owner',2,'unrelated-runtime',1,'unrelated-attempt',?,'original-turn',333,333,'process_group','running','now')`).run(f.session.id);
+      return terminal();
+    } });
+    await expect(service.inspect({ sessionId: f.session.id, turnId: "original-turn", attemptId: "original-attempt" })).rejects.toMatchObject({ code: "RECOVERY_EVIDENCE_STALE" });
+    expect(f.store.db.prepare("SELECT 1 FROM recovery_evidence").get()).toBeUndefined();
+  });
+  it("never acknowledges original stopped execution while an inspection helper stop is unknown", async () => {
+    const f = fixture({ native: { state: "unknown", reason: "native_history_helper_stop_unverified" }, execution: stopped() });
+    const view = await f.inspect();
+    expect(view).toMatchObject({ processState: "unknown", workspaceState: "unknown", nativeState: "unknown" });
+    expect(view.nextSteps).not.toContain("acknowledge");
+    await expect(f.service.acknowledge({ ...f.input(view), acknowledgeUnknown: true })).resolves.toMatchObject({ gate: "blocked", state: "blocked" });
+    expect(f.store.getSession(f.session.id)?.recoveryState).toBe("blocked");
+    expect(f.store.getActiveTurn(f.session.id)?.id).toBe("original-turn");
+  });
+  it("blocks typed successor stop evidence when its durable verifier is absent", async () => {
+    const f = fixture({ execution: stopped() });
+    f.setNative({ state: "unknown", reason: "native_result_unreadable", inspectionExecution: {
+      version: 1, state: "stopped", originalContextDigest: digest(f.context), helpers: [{ launchId: "helper", launchDigest: "a".repeat(64), processRecordIds: ["current-owner-helper"], sourceId: "stop", contractId: "tree-stop-v1" }],
+    } });
+    expect(await f.inspect()).toMatchObject({ processState: "unknown", workspaceState: "unknown" });
+  });
+  it("rejects original target changes while a native inspection is pending", async () => {
+    const f = fixture(); let release!: () => void; f.holdNative(new Promise<void>((yes) => { release = yes; }));
+    const execution = vi.fn(async () => stopped());
+    const service = new RecoveryService({ store: f.store, inspectExecution: execution, inspectNative: async () => { await new Promise<void>((yes) => { release = yes; }); return terminal(); } });
+    const pending = service.inspect({ sessionId: f.session.id, turnId: "original-turn", attemptId: "original-attempt" });
+    const denied = expect(pending).rejects.toMatchObject({ code: "RECOVERY_EVIDENCE_STALE" });
+    f.store.db.prepare("UPDATE native_turn_bindings SET native_turn_id='changed',revision=revision+1 WHERE turn_id='original-turn'").run();
+    release(); await denied; expect(execution).not.toHaveBeenCalled();
+    expect(f.store.db.prepare("SELECT 1 FROM recovery_evidence").get()).toBeUndefined();
+  });
   it("seals a deferred inspect before Store close without any late evidence SQL", async () => {
     const f = fixture(); let release!: () => void;
     f.holdNative(new Promise<void>((yes) => { release = yes; }));

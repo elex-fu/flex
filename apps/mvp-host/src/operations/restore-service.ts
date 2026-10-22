@@ -17,6 +17,8 @@ export const RestoreReadinessGateSchema = z.object({
   possibleDispatchIntents: z.number().int().nonnegative(),
   reasonCodes: z.tuple([z.literal("RESTORE_GIT_STATE_UNVERIFIED"), z.literal("RESTORE_PROVIDER_HISTORY_UNVERIFIED")]),
   relayRegistrationInvalidated: z.boolean(),
+  /** Exact installed backup. Legacy gates without this binding require a fresh restore. */
+  backupManifestDigest: z.string().regex(/^[a-f0-9]{64}$/).optional(),
 }).strict();
 export type RestoreReadinessGate = z.infer<typeof RestoreReadinessGateSchema>;
 
@@ -198,6 +200,7 @@ export class RestoreService {
         v: 1, status: "external_state_unverified", restoredAt: timestamp, backupCreatedAt: manifest.createdAt,
         possibleDispatchIntents: 0, reasonCodes: ["RESTORE_GIT_STATE_UNVERIFIED", "RESTORE_PROVIDER_HISTORY_UNVERIFIED"],
         relayRegistrationInvalidated: Boolean(options.relay || manifest.relay),
+        backupManifestDigest: digest(JSON.stringify(manifest)),
       };
       try {
         restored.pragma("foreign_keys = ON");

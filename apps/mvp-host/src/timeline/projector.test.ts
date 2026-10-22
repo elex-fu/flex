@@ -8,6 +8,18 @@ afterEach(() => { for (const value of fixtures.splice(0)) value.close(); });
 function ref(item: ProjectedItem): string { if (!("ref" in item.content)) throw new Error("Expected immutable body"); return item.content.ref; }
 
 describe("authoritative timeline projector", () => {
+  it("projects bounded public checkpoint references and excludes private capture facts", () => {
+    const f = fixture();
+    const summary = { checkpointId: "before", sessionId: f.session.id, workspaceId: "workspace", phase: "before", turnId: "turn", attemptId: "attempt",
+      status: "complete", policyVersion: 1, capturedAt: "2026-10-22T00:00:00.000Z", samplingConsistency: "stable", unsupportedCount: 0, warnings: [] };
+    f.commit([{ type: "checkpoint.captured", payload: { ...summary, nativeHandle: { nativeSessionId: "private-native" }, lease: { leaseId: "private-lease" } } }]);
+    const item = f.query().tail(f.session.id).items[0]!;
+    expect(item).toMatchObject({ itemId: "checkpoint-before", kind: "system", status: "complete" });
+    expect(item.content).toEqual({ inline: { ...summary, eventType: "checkpoint.captured", projectionKind: "checkpoint.captured" } });
+    expect(JSON.stringify(item)).not.toContain("private-native"); expect(JSON.stringify(item)).not.toContain("private-lease");
+    f.commit([{ type: "checkpoint.captured", payload: { ...summary, checkpointId: "other", sessionId: "another-session" } }]);
+    expect(f.query().tail(f.session.id).items).toHaveLength(1);
+  });
   it("appends deltas, replaces final text, distinguishes tool snapshots from deltas, and keeps display order", () => {
     const f = fixture();
     f.commit([{ type: "assistant.message.delta", payload: { itemId: "assistant", text: "Hello" } }]);

@@ -1,10 +1,10 @@
 import type Database from "better-sqlite3";
 import { createHash, randomUUID } from "node:crypto";
-import type { ProjectedItem, SessionEvent } from "@flyx/mvp-protocol";
+import { CheckpointSummarySchema, type ProjectedItem, type SessionEvent } from "@flyx/mvp-protocol";
 import { publicValue } from "../api/public-projection.js";
 import { inTransaction, record, TimelineError, type ContentReference, type TimelineCommitStore, type TimelineContentStore } from "./contracts.js";
 
-export const TIMELINE_PROJECTOR_VERSION = 3;
+export const TIMELINE_PROJECTOR_VERSION = 4;
 export type TimelineEpoch = { sessionId: string; epoch: string; projectorVersion: number; indexedSequence: number; state: "building" | "active" | "retired" };
 export type ItemVersionRow = {
   session_id: string; epoch: string; item_id: string; revision: number;
@@ -201,6 +201,15 @@ function normalizeEvent(event: SessionEvent): ItemChange | undefined {
     return { itemId: itemId ?? `interaction-${String(payload.interactionId ?? payload.id ?? interaction.id ?? event.id)}`, kind, status, metadata: { ...metadata, interactionKind: kind }, ...(typeof payload.text === "string" ? { mode: "replace", field: "text", text } as const : {}) };
   }
   switch (event.type) {
+    case "checkpoint.captured": {
+      // Select public fields before parsing: never project private manifest,
+      // native handle or lease data accidentally attached to the source event.
+      const summary = CheckpointSummarySchema.safeParse(Object.fromEntries(Object.keys(CheckpointSummarySchema.shape)
+        .filter((key) => Object.hasOwn(payload, key)).map((key) => [key, payload[key]])));
+      if (!summary.success || summary.data.sessionId !== event.sessionId) return undefined;
+      return { itemId: `checkpoint-${summary.data.checkpointId}`, kind: "system", status: summary.data.status,
+        metadata: { ...summary.data, eventType: "checkpoint.captured", projectionKind: "checkpoint.captured" } };
+    }
     case "user.message.created": return { itemId: itemId ?? `user-${String(payload.turnId ?? event.id)}`, kind: "user_message", status: "completed", metadata, mode: "replace", field: "text", text };
     case "assistant.message.delta": return itemId ? { itemId, kind: "assistant_message", status: "streaming", metadata, mode: "append", field: "text", text } : undefined;
     case "assistant.message.completed": return itemId ? { itemId, kind: "assistant_message", status: payload.aborted ? "aborted" : "completed", metadata, mode: "replace", field: "text", text } : undefined;

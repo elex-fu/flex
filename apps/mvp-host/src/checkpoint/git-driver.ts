@@ -6,7 +6,8 @@ import { lstat, mkdtemp, open, readFile, readlink, realpath, rm, writeFile } fro
 import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { CheckpointError } from "./types.js";
-import type { CheckpointDiffEntry, CheckpointEntry, CheckpointFingerprint, CheckpointManifest, CheckpointStatusEntry, GitCapture } from "./types.js";
+import { ManagedGitError } from "../lifecycle/managed-git-runner.js";
+import type { CheckpointDiffEntry, CheckpointEntry, CheckpointFingerprint, CheckpointManifest, CheckpointProducerFailure, CheckpointStatusEntry, GitCapture } from "./types.js";
 
 const OID = /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/;
 const ID = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/;
@@ -35,7 +36,7 @@ export type CheckpointGitRunRequest = Readonly<{
   maxInputBytes: number; maxBuffer: number; timeoutMs: number; signal: AbortSignal;
   operation: CheckpointGitOperation;
 }>;
-export type CheckpointGitRunResult = { stdout: Uint8Array; exitCode: number };
+export type CheckpointGitRunResult = { stdout: Uint8Array; exitCode: number; producer?: CheckpointProducerFailure["helper"] };
 /** Trusted prelaunch runner journals before spawn and proves its own lifecycle/containment contract. */
 export type CheckpointGitRunner = (request: CheckpointGitRunRequest) => Promise<CheckpointGitRunResult>;
 export type CheckpointGitDriverOptions = {
@@ -47,6 +48,11 @@ export type CheckpointGitDriverOptions = {
 
 export function digest(value: string | Uint8Array): string { return createHash("sha256").update(value).digest("hex"); }
 export function bindingDigest(value: unknown): string { return digest(stableJson(value)); }
+function gitRequestBinding(request:CheckpointGitRunRequest):string {
+  return bindingDigest({command:request.command,operation:request.operation,workspace:request.workspace,cwd:request.cwd,args:request.args,env:request.env,
+    input:request.input?{bytes:request.input.bytes,sha256:digest(Buffer.from(request.input.data,"base64"))}:null,
+    maxInputBytes:request.maxInputBytes,maxBuffer:request.maxBuffer,timeoutMs:request.timeoutMs});
+}
 function stableJson(value: unknown): string {
   if (value === undefined) return "null";
   if (value === null || typeof value !== "object") return JSON.stringify(value);
@@ -127,7 +133,7 @@ export class CheckpointGitDriver {
   }
   private async captureSnapshot(checkpointId: string, additionalPaths: readonly string[]): Promise<GitCapture> {
     if (!ID.test(checkpointId)) throw new CheckpointError("INVALID_CHECKPOINT_ID", "Checkpoint refs must use a generated ID");
-    const repo = await this.repo(); const temp = await mkdtemp(join(tmpdir(), "flyx-checkpoint-"));
+    const repo = await this.repo(); const temp = await realpath(await mkdtemp(join(tmpdir(), "flyx-checkpoint-")));
     const copiedIndex = join(temp, "index"); const workspaceIndex = join(temp, "workspace-index");
     try {
       const before = await this.sample(repo, copiedIndex, true, additionalPaths);
@@ -190,7 +196,7 @@ export class CheckpointGitDriver {
     return this.operation({ kind: "fingerprint" }, () => this.sampleFingerprint(additionalPaths));
   }
   private async sampleFingerprint(additionalPaths: readonly string[]): Promise<CheckpointFingerprint> {
-    const repo = await this.repo(); const temp = await mkdtemp(join(tmpdir(), "flyx-checkpoint-sample-"));
+    const repo = await this.repo(); const temp = await realpath(await mkdtemp(join(tmpdir(), "flyx-checkpoint-sample-")));
     try {
       const sample = await this.sample(repo, join(temp, "index"), false, additionalPaths);
       if (sample.readRaced || sample.unsupported.length) throw new CheckpointError("CAPTURE_UNAVAILABLE", "Current workspace cannot be sampled completely");
@@ -398,7 +404,7 @@ export class CheckpointGitDriver {
     // Git can otherwise reuse/refresh a matching worktree file and run its clean filter, including write-tree.
     // Empty cwd/worktree prevents racy-index refresh from resolving real files; an isolated index prevents Diff reuse.
     const gitDirectory = decode((await this.git(["rev-parse", "--absolute-git-dir"]))!).trim();
-    const temp = await mkdtemp(join(tmpdir(), "flyx-checkpoint-object-query-"));
+    const temp = await realpath(await mkdtemp(join(tmpdir(), "flyx-checkpoint-object-query-")));
     try { return (await this.git(args, { ...options, gitDirectory, worktree: temp, index: options.index ?? join(temp, "empty-index") }))!; }
     finally { await rm(temp, { recursive: true, force: true }); }
   }
@@ -423,14 +429,20 @@ export class CheckpointGitDriver {
     try { result = await runner(request); }
     catch (error) {
       if (error instanceof CheckpointError) throw error;
-      throw new CheckpointError("GIT_OPERATION_FAILED", `Checkpoint Git ${args[0] ?? "operation"} failed`);
+      const managed=error instanceof ManagedGitError;
+      const state=managed ? error.state : "unknown",code=managed ? error.code : "GIT_OPERATION_FAILED";
+      const producerFailure:CheckpointProducerFailure={code,state,producerStopped:state!=="unknown",requestBinding:gitRequestBinding(request),operation:request.operation};
+      const evidence=managed ? (error as {evidence?:CheckpointProducerFailure["helper"]}).evidence : undefined;
+      if(evidence)producerFailure.helper=structuredClone(evidence);
+      throw new CheckpointError(code, `Checkpoint Git ${args[0] ?? "operation"} failed`, {cause:error,producerFailure});
     }
     if (this.lifecycle.signal.aborted) throw new CheckpointError("CHECKPOINT_GIT_SEALED", "Checkpoint Git execution is sealed");
     if (!result || !Number.isSafeInteger(result.exitCode) || result.exitCode < 0 || result.exitCode > 255 || !(result.stdout instanceof Uint8Array)) throw new CheckpointError("GIT_RUNNER_RESULT_INVALID", "Git runner returned an invalid completion result");
     if (result.stdout.length > request.maxBuffer) throw new CheckpointError("GIT_OUTPUT_BUDGET_EXCEEDED", "Git runner exceeded its output budget");
     if (result.exitCode !== 0) {
       if (options.allowFailure) return undefined;
-      throw new CheckpointError("GIT_OPERATION_FAILED", `Checkpoint Git ${args[0] ?? "operation"} failed`);
+      const producerFailure:CheckpointProducerFailure={code:"GIT_OPERATION_FAILED",state:"stopped",producerStopped:true,requestBinding:gitRequestBinding(request),operation:request.operation,...(result.producer?{helper:result.producer}:{})};
+      throw new CheckpointError("GIT_OPERATION_FAILED", `Checkpoint Git ${args[0] ?? "operation"} failed`,{producerFailure});
     }
     return Buffer.from(result.stdout);
   }

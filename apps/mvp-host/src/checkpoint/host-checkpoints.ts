@@ -28,14 +28,14 @@ import { validateViewsSchema } from "../storage/migrations/006-views-schema.js";
 import type { HostViews } from "../timeline/host-views.js";
 import type { WorkspaceLease } from "../workspace/workspace-lease.js";
 import type { WorkspaceRegistry } from "../workspace/workspace-registry.js";
-import { CheckpointService } from "./checkpoint-service.js";
+import { CheckpointService, type CheckpointServiceOptions } from "./checkpoint-service.js";
 import { CheckpointStore } from "./checkpoint-store.js";
 import { ControlledRestore, type ControlledRestoreOptions } from "./controlled-restore.js";
 import { bindingDigest, CheckpointGitDriver, validateCheckpointPath, type CheckpointGitDriverOptions, type CheckpointGitRunner, type CheckpointGitRunRequest, type CheckpointGitRunResult } from "./git-driver.js";
 import { CheckpointPreviewService, type CheckpointPreviewContext, type LeaseSuccession } from "./preview-service.js";
 import { REVERT_INTENT_KIND, RevertService, type RevertServiceOptions } from "./revert-service.js";
 import { CheckpointError, type CheckpointContext, type CheckpointPhase } from "./types.js";
-import type { NativeRevertPreparation } from "./revert-types.js";
+import type { NativeRevertDriver, NativeRevertPreparation } from "./revert-types.js";
 
 export type CheckpointScope = "session:read" | "session:write";
 /** These facts come from a loaded runtime and actual lease manager, never an RPC body. */
@@ -44,7 +44,7 @@ export type VerifiedRewindCapability = Extract<NativeRevertPreparation, { suppor
 export type HostRevertPorts = Pick<RevertServiceOptions,
   "dispatchContextFor" | "proveQuiescence" | "projectSuccess" | "assertRestoreWriteReady"
 > & Partial<Pick<RevertServiceOptions,
-  "native" | "verifyLeaseSuccession" | "verifyWorkerRevision" | "nativeTimeoutMs" | "evidenceTtlMs"
+  "native" | "nativeFactory" | "verifyLeaseSuccession" | "verifyWorkerRevision" | "nativeTimeoutMs" | "evidenceTtlMs"
 >> & {
   acquire(input: Parameters<RevertServiceOptions["acquire"]>[0]): Promise<{ lease: WorkspaceLease; succession?: LeaseSuccession }>;
   /** Reload actual versioned evidence. Absence of this port never enables native rewind. */
@@ -66,9 +66,12 @@ export type HostCheckpointsOptions = {
   views: Pick<HostViews, "store" | "content" | "projector">;
   /** Must synchronously recheck current device revocation and Session scope inside Engine commits. */
   authorizeSession(sessionId: string, actorId: string, scope: CheckpointScope): void;
-  runtimeState(sessionId: string, actorId: string): CheckpointRuntimeState | Promise<CheckpointRuntimeState>;
+  runtimeState(sessionId: string, actorId: string, purpose: "preview" | "revert"): CheckpointRuntimeState | Promise<CheckpointRuntimeState>;
   leaseForContext(context: CheckpointContext): WorkspaceLease;
   captureStateFor(intent: ExecutionIntentRow, dispatch: DispatchContext, lease: WorkspaceLease): Omit<CheckpointRuntimeState, "lease">;
+  previewAborted?(sessionId: string, actorId: string): void;
+  previewCreated?(sessionId: string, actorId: string, expiresAt: string): void;
+  captureNativeAnchor?: CheckpointServiceOptions["captureNativeAnchor"];
   revert?: HostRevertPorts;
   restoreOptions?: Omit<ControlledRestoreOptions, "fault">;
   now?: () => Date;
@@ -158,28 +161,31 @@ export class HostCheckpoints {
     this.checkpoints = new CheckpointService({ store: new CheckpointStore(options.store.db), content,
       driverFor: (id) => this.driver(id), assertLease: (context) => this.assertLease(context),
       publicRootsForSession: (id) => this.publicRoots(id),
+      ...(options.captureNativeAnchor ? { captureNativeAnchor: options.captureNativeAnchor } : {}),
       ...(options.now ? { now: options.now } : {}),
     });
     this.previews = new CheckpointPreviewService({ checkpoints: this.checkpoints, resolveContext: (id, actor) => this.resolveContext(id, actor, "session:read"),
       ...(options.revert?.verifyLeaseSuccession ? { verifyLeaseSuccession: options.revert.verifyLeaseSuccession } : {}), ...(options.now ? { now: options.now } : {}),
     });
     const ports = options.revert;
+    const guardedNative = (native: NativeRevertDriver): NativeRevertDriver => ({
+      prepare: async (input) => {
+        const target = this.checkpoints.store.get(input.checkpointId);
+        if (!target) throw new CheckpointError("CAPTURE_UNAVAILABLE", "Native target checkpoint is unavailable");
+        const before = this.resource(target.sessionId);
+        const preparation = await native.prepare(input); this.assertOpen();
+        if (preparation.supported) {
+          const current = this.resource(target.sessionId);
+          if (current.providerInstance.providerInstanceId !== before.providerInstance.providerInstanceId || current.providerInstance.policyVersion !== before.providerInstance.policyVersion || current.providerInstance.verification.state !== "verified" || current.providerInstance.verification.runtimeVersion !== preparation.capability.verifiedVersion) throw new CheckpointError("PROVIDER_CAPABILITY_UNVERIFIED", "Native preparation does not match the registered Provider version");
+        }
+        return preparation;
+      },
+      apply: (request) => native.apply(request), query: (request) => native.query(request),
+    });
     this.revert = ports ? new RevertService({ engine: new CommandEngine(options.store, { publish: (event) => options.registry.publishCommittedEvents([event]) }), checkpoints: this.checkpoints, previews: this.previews, restore: this.restore,
       ...ports, resolveContext: (id, actor) => this.resolveContext(id, actor),
-      ...(ports.native ? { native: {
-        prepare: async (input) => {
-          const target = this.checkpoints.store.get(input.checkpointId);
-          if (!target) throw new CheckpointError("CAPTURE_UNAVAILABLE", "Native target checkpoint is unavailable");
-          const before = this.resource(target.sessionId);
-          const preparation = await ports.native!.prepare(input); this.assertOpen();
-          if (preparation.supported) {
-            const current = this.resource(target.sessionId);
-            if (current.providerInstance.providerInstanceId !== before.providerInstance.providerInstanceId || current.providerInstance.policyVersion !== before.providerInstance.policyVersion || current.providerInstance.verification.state !== "verified" || current.providerInstance.verification.runtimeVersion !== preparation.capability.verifiedVersion) throw new CheckpointError("PROVIDER_CAPABILITY_UNVERIFIED", "Native preparation does not match the registered Provider version");
-          }
-          return preparation;
-        },
-        apply: (request) => ports.native!.apply(request), query: (request) => ports.native!.query(request),
-      } } : {}),
+      ...(ports.native ? { native: guardedNative(ports.native) } : {}),
+      ...(ports.nativeFactory ? { nativeFactory: (journal) => guardedNative(ports.nativeFactory!(journal)) } : {}),
       dispatchContextFor: (context, operationId, attemptId) => {
         const dispatch = sync(ports.dispatchContextFor(context, operationId, attemptId));
         if (dispatch.hostOwnerId !== options.owner.ownerId || dispatch.hostOwnerGeneration !== options.owner.generation || dispatch.sessionId !== context.sessionId || dispatch.flyxTurnId !== operationId || dispatch.runtimeGeneration !== context.runtimeGeneration || dispatch.attemptId !== attemptId || !dispatch.runtimeId) throw new CheckpointError("CHECKPOINT_CONTEXT_INVALID", "Generic intent requires the actual original Host binding");
@@ -259,7 +265,9 @@ export class HostCheckpoints {
   private resource(sessionId: string) {
     this.assertOpen();
     const resolved = this.options.registry.resolve(sessionId), session = this.options.store.getSession(sessionId);
-    const workspace = this.options.workspaces.require(resolved.session.workspaceId);
+    // Persisted Diff/content reads use catalog identity only. Requiring a
+    // fresh Native activation here would hide history after evidence expires.
+    const workspace = resolved.workspace;
     if (!session || resolved.session.sessionId !== sessionId || session.workspaceId !== workspace.workspaceId || session.workspacePath !== workspace.canonicalRoot || resolved.workspace.worktreeRoot !== workspace.worktreeRoot || resolved.providerInstance.provider !== session.provider) throw new CheckpointError("CHECKPOINT_SCOPE_MISMATCH", "Registered Session binding changed");
     return { ...resolved, workspace };
   }
@@ -314,7 +322,7 @@ export class HostCheckpoints {
   }
   private async resolveContext(sessionId: string, actorId: string, scope: CheckpointScope = "session:write"): Promise<CheckpointPreviewContext> {
     this.authorize(sessionId, actorId, scope);
-    const state = await this.options.runtimeState(sessionId, actorId); this.assertOpen();
+    const state = await this.options.runtimeState(sessionId, actorId, scope === "session:read" ? "preview" : "revert"); this.assertOpen();
     this.authorize(sessionId, actorId, scope);
     const resource = this.resource(sessionId), session = this.options.store.getSession(sessionId)!;
     if (scope === "session:read" && session.recoveryState === "blocked") throw new CheckpointError("RECOVERY_BLOCKED", "Preview waits for workspace recovery");
@@ -361,7 +369,14 @@ export class HostCheckpoints {
         case "checkpoint.getTurnDiff": { const input = parse(CheckpointGetTurnDiffSchema); sessionId = input.sessionId; payload = CheckpointDiffPageSchema.parse(await this.checkpoints.getTurnDiff(pageInput(input))); break; }
         case "checkpoint.getSessionDiff": { const input = parse(CheckpointGetSessionDiffSchema); sessionId = input.sessionId; payload = CheckpointDiffPageSchema.parse(await this.checkpoints.getSessionDiff(pageInput(input))); break; }
         case "checkpoint.getFile": { const input = parse(CheckpointGetFileSchema); sessionId = input.sessionId; payload = CheckpointDiffFileSchema.parse(await this.checkpoints.getDiffFile(input)); break; }
-        case "checkpoint.previewRevert": { const input = parse(CheckpointPreviewRevertSchema); sessionId = input.sessionId; payload = CheckpointPreviewPageSchema.parse(await this.previews.createPreview({ ...input, actorId: context.subjectId })); break; }
+        case "checkpoint.previewRevert": {
+          const input = parse(CheckpointPreviewRevertSchema); sessionId = input.sessionId;
+          try {
+            const page = CheckpointPreviewPageSchema.parse(await this.previews.createPreview({ ...input, actorId: context.subjectId }));
+            this.options.previewCreated?.(sessionId, context.subjectId, page.expiresAt); payload = page;
+          } catch (error) { this.options.previewAborted?.(sessionId, context.subjectId); throw error; }
+          break;
+        }
         case "checkpoint.getPreview": { const input = parse(CheckpointGetPreviewSchema); sessionId = input.sessionId; payload = CheckpointPreviewPageSchema.parse(this.previews.getPreview({ ...pageInput(input), actorId: context.subjectId })); break; }
         case "checkpoint.executeRevert": {
           const input = parse(CheckpointExecuteRevertSchema); sessionId = input.sessionId; command(input);

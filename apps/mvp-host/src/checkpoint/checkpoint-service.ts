@@ -2,8 +2,9 @@ import { randomUUID } from "node:crypto";
 import type { CheckpointContentRef, CheckpointDiffFile, CheckpointDiffPage, CheckpointFileChange, CheckpointFileContent, CheckpointSummary } from "@flyx/mvp-protocol";
 import { bindingDigest, CheckpointGitDriver, digest } from "./git-driver.js";
 import { CheckpointStore } from "./checkpoint-store.js";
-import { CHECKPOINT_POLICY_VERSION, CheckpointError } from "./types.js";
+import { CHECKPOINT_POLICY_VERSION, CheckpointCaptureError, CheckpointError } from "./types.js";
 import type { AfterCheckpointContext, CheckpointContext, CheckpointDiffEntry, CheckpointManifest, CheckpointPhase } from "./types.js";
+import type { NativeRevertHandle } from "./native-revert-drivers.js";
 
 /** Structural R08 seam. putBytes/pin join the shared owner's short synchronous DB transaction. */
 export interface CheckpointContentPublisher {
@@ -20,6 +21,8 @@ export type CheckpointServiceOptions = {
   inlineBytes?: number;
   pageBytes?: number;
   publicRootsForSession?: (sessionId: string, workspace: string) => readonly string[];
+  /** Actual managed native-history sample under this same checkout lease. */
+  captureNativeAnchor?: (context:CheckpointContext,phase:CheckpointPhase)=>Promise<NativeRevertHandle|undefined>;
 };
 export type DiffQuery = { sessionId: string; beforeCheckpointId: string; afterCheckpointId: string; layer?: "workspace" | "index"; cursor?: string; limit?: number };
 export function checkpointSummary(manifest: CheckpointManifest): CheckpointSummary {
@@ -62,8 +65,10 @@ export class CheckpointService {
   seal():void {this.sealed=true;this.store.seal();}
   private assertOpen():void {if(this.sealed)throw new CheckpointError("CHECKPOINT_SEALED","Checkpoint publication is sealed");}
   /** Await this hook while holding the workspace lease, before native prompt dispatch. */
-  captureBefore(context: CheckpointContext & { turnId: string; attemptId: string }): Promise<CheckpointManifest> {
-    return this.capture(context, "before");
+  async captureBefore(context: CheckpointContext & { turnId: string; attemptId: string }): Promise<CheckpointManifest> {
+    const manifest=await this.capture(context, "before");
+    if(manifest.status==="failed")throw new CheckpointCaptureError(manifest);
+    return manifest;
   }
   /** Await after producer stop and terminal ingestion commit, before releasing the workspace lease. */
   captureAfter(context: AfterCheckpointContext): Promise<CheckpointManifest> {
@@ -213,14 +218,16 @@ export class CheckpointService {
     this.store.begin(initial);
     let manifest: CheckpointManifest;
     try {
+      const nativeHistoryHandle=await this.options.captureNativeAnchor?.(context,phase);
       const capture = await driver.capture(checkpointId, additionalPaths);
       await this.assertLease(context);this.assertOpen();
-      const capturedAt = this.now(); manifest = { ...initial, ...capture, unsupportedCount: capture.unsupported.length, capturedAt, completedAt: capturedAt };
+      const capturedAt = this.now(); manifest = { ...initial, ...capture, unsupportedCount: capture.unsupported.length, capturedAt, completedAt: capturedAt,...(nativeHistoryHandle?{nativeHistoryHandle}:{}) };
     } catch (error) {
       this.assertOpen();const code = error instanceof CheckpointError ? error.code : "CAPTURE_FAILED";
       const unsupported = code.startsWith("UNSUPPORTED_") ? [{ reason: code.toLowerCase() }] : [];
       manifest = { ...initial, status: unsupported.length ? "unsupported" : "failed", completedAt: this.now(),
-        errorCode: code, unsupported, unsupportedCount: unsupported.length, warnings: [code.toLowerCase()] };
+        errorCode: code, unsupported, unsupportedCount: unsupported.length, warnings: [code.toLowerCase()],
+        ...(error instanceof CheckpointError && error.producerFailure ? {producerFailure:structuredClone(error.producerFailure)}:{}) };
     }
     // Persistence failures propagate; only capture failure is separate from the Provider terminal fact.
     this.store.finish(manifest);

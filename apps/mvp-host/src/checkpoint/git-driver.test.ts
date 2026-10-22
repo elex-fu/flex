@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { CheckpointGitDriver, type CheckpointGitDriverOptions, type CheckpointGitRunRequest, type CheckpointGitRunResult } from "./git-driver.js";
 import { fixtureGit, removeFixture, temporaryRepository, userGitState } from "./test-support.js";
+import { ManagedGitError } from "../lifecycle/managed-git-runner.js";
 
 const roots: string[] = [];
 async function repository(unborn = false): Promise<string> { const root = await temporaryRepository(unborn); roots.push(root); return root; }
@@ -26,6 +27,11 @@ function makeDriver(root: string, options: Omit<CheckpointGitDriverOptions, "run
 }
 
 describe("controlled checkpoint Git driver", { timeout: 30_000 }, () => {
+  it.each(["unknown","stopped","not_spawned"] as const)("retains managed %s producer failure and original operation binding",async(state)=>{
+    const root=await repository(),checkpointId=randomUUID(),evidence={processId:"exact-original-process",launchDigest:"a".repeat(64),purpose:"checkpoint_read" as const,policyId:"checkpoint-policy",operationId:checkpointId,bindingDigest:"b".repeat(64)},cause=new ManagedGitError("MANAGED_GIT_TREE_STOP_UNPROVEN",state,evidence);
+    const driver=new CheckpointGitDriver(root,{runGit:async()=>{throw cause;}});
+    await expect(driver.capture(checkpointId)).rejects.toMatchObject({code:cause.code,cause,producerFailure:{code:cause.code,state,producerStopped:state!=="unknown",helper:evidence,operation:{kind:"capture",checkpointId},requestBinding:expect.stringMatching(/^[a-f0-9]{64}$/)}});
+  });
   it("registers immutable final Git requests before launch with isolated environment and stdin budgets", async () => {
     const root = await realpath(await repository()), records: CheckpointGitRunRequest[] = [], boundaries: string[] = [];
     const originalSecret = process.env.FLYX_CHECKPOINT_GIT_SECRET, originalIndex = process.env.GIT_INDEX_FILE;

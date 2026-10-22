@@ -11,6 +11,7 @@ import { applyCheckpointSchema } from "../storage/migrations/009-checkpoints.js"
 import { checkpointFixture, fixtureGit, removeFixture, temporaryRepository, userGitState } from "./test-support.js";
 import { rawCheckpointGitRunner } from "../test-support/managed-git-fixtures.js";
 import type { AfterCheckpointContext } from "./types.js";
+import { ManagedGitError } from "../lifecycle/managed-git-runner.js";
 
 const roots: string[] = []; const owners: SqliteStore[] = [];
 async function fixture() { const root = await temporaryRepository(); roots.push(root); const value = checkpointFixture(root); owners.push(value.owner); return { root, ...value }; }
@@ -95,7 +96,7 @@ describe("persistent exact checkpoint service", { timeout: 30_000 }, () => {
     const outsideRoot = join(root, "ordinary-directory"); await mkdir(outsideRoot);
     let unavailable = true;
     const service = new CheckpointService({ store, driverFor: () => unavailable ? new CheckpointGitDriver(outsideRoot, { runGit: rawCheckpointGitRunner() }) : driver, assertLease: () => {} });
-    const before = await service.captureBefore(context); expect(before.status).toBe("failed");
+    await expect(service.captureBefore(context)).rejects.toMatchObject({code:"CHECKPOINT_BEFORE_UNAVAILABLE",manifest:{status:"failed"}});
     owner.createTurn({ sessionId: context.sessionId, turnId: context.turnId, commandId: "cmd", requestHash: "hash", prompt: "done", generation: 1 });
     owner.commitEvent(context.sessionId, "turn.completed", {}, { turnId: context.turnId, turnStatus: "completed", activityState: "idle" });
     unavailable = false; const after = await service.captureAfter({ ...context, evidence });
@@ -104,6 +105,29 @@ describe("persistent exact checkpoint service", { timeout: 30_000 }, () => {
     await fixtureGit(root, ["update-ref", "-d", after.workspaceRef]);
     const page = await service.getDiffPage({ sessionId: context.sessionId, beforeCheckpointId: store.findAttempt(context.sessionId, freshContext.turnId, freshContext.attemptId, "before")!.checkpointId, afterCheckpointId: after.checkpointId });
     expect(page).toMatchObject({ status: "unavailable", unavailableReason: "capture_unavailable" });
+  });
+  it("persists unknown helper stop on the original after capture while retaining known Provider terminal", async () => {
+    const {store,context,driver,owner}=await fixture();
+    let fail=false;
+    const service=new CheckpointService({store,assertLease:()=>{},driverFor:()=>fail ? new CheckpointGitDriver(driver.workspace,{runGit:async(request)=>{throw new ManagedGitError("MANAGED_GIT_TREE_STOP_UNPROVEN","unknown",{processId:"original-after-helper",launchDigest:"a".repeat(64),purpose:"checkpoint_read",policyId:"checkpoint-policy",...("checkpointId" in request.operation?{operationId:request.operation.checkpointId}:{}),bindingDigest:"b".repeat(64)});}}):driver});
+    await service.captureBefore(context);
+    owner.createTurn({sessionId:context.sessionId,turnId:context.turnId,commandId:"known-terminal",requestHash:"hash",prompt:"done",generation:1});
+    owner.commitEvent(context.sessionId,"turn.completed",{},{turnId:context.turnId,turnStatus:"completed",activityState:"idle"});
+    fail=true;
+    const after=await service.captureAfter({...context,evidence});
+    expect(after).toMatchObject({status:"failed",errorCode:"MANAGED_GIT_TREE_STOP_UNPROVEN",producerFailure:{state:"unknown",producerStopped:false,operation:{kind:"capture",checkpointId:after.checkpointId},helper:{processId:"original-after-helper",operationId:after.checkpointId,launchDigest:"a".repeat(64),bindingDigest:"b".repeat(64)}}});
+    expect(store.require(after.checkpointId,context.sessionId).producerFailure).toEqual(after.producerFailure);
+    expect(owner.getTurn(context.turnId)!.status).toBe("completed");
+    expect((await service.getTurnDiff(context)).status).toBe("unavailable");
+  });
+  it.each(["not_spawned","stopped","unknown"] as const)("rejects a failed before capture with its %s producer state before caller prompt dispatch",async(state)=>{
+    const {store,context,root}=await fixture();let dispatched=false;
+    const service=new CheckpointService({store,assertLease:()=>{},driverFor:()=>new CheckpointGitDriver(root,{runGit:async()=>{throw new ManagedGitError("MANAGED_GIT_TREE_STOP_UNPROVEN",state);}})});
+    await expect(service.captureBefore(context).then(()=>{dispatched=true;})).rejects.toMatchObject({code:"CHECKPOINT_BEFORE_UNAVAILABLE",producerFailure:{state,producerStopped:state!=="unknown"}});
+    expect(dispatched).toBe(false);
+    const saved=store.findAttempt(context.sessionId,context.turnId,context.attemptId,"before")!;
+    expect(saved.status).toBe("failed");expect(saved.producerFailure!.operation).toEqual({kind:"capture",checkpointId:saved.checkpointId});
+    await expect(service.captureBefore(context)).rejects.toMatchObject({code:"CHECKPOINT_BEFORE_UNAVAILABLE",manifest:{checkpointId:saved.checkpointId}});
   });
   it("persists a capturing journal and protects refs when manifest persistence fails", async () => {
     const { service, store, context } = await fixture();

@@ -325,6 +325,9 @@ export class HostCatalog {
                 if (!isRecord(payload) || payload.sessionId !== sessionId)
                     throw new CatalogError("SESSION_SCOPE_MISMATCH");
                 if(!read){
+                    // Restore readiness is a host-wide gate: it must apply
+                    // before a response port is selected at all.
+                    this.assertRestoreReady();
                     const target=this.registry.resolveControlContext(sessionId);
                     const required=method==="question.respond"?"structuredQuestions":"interactiveApprovals";
                     const device=this.store.getDevice(actor.authSubjectId)!;
@@ -546,8 +549,10 @@ export class HostCatalog {
             throw new CatalogError("RECOVERY_BLOCKED");
         if ("expectedRevision" in input && input.expectedRevision !== undefined && snapshot?.revision !== input.expectedRevision)
             throw new CatalogError("SESSION_REVISION_CONFLICT");
-        const runtime = starting ? await this.registry.ensureLoaded(sessionId, authorization) : this.registry.loaded(sessionId);
-        if (!runtime) throw new CatalogError("RUNTIME_NOT_LOADED", "The original control channel is unavailable");
+        // Controls bind to the original runtime: an in-progress shared load is
+        // awaited (and its resource checks give the precise refusal) before
+        // the actor authority is rechecked post-load.
+        const runtime = await this.registry.ensureLoaded(sessionId, starting ? authorization : undefined);
         this.target(context, sessionId, scope);
         let current = this.registry.resolve(sessionId);
         if (starting) { this.options.assertNativeReady?.(current, authorization); current = this.registry.assertExecutionResources(sessionId, authorization); }

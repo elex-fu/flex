@@ -108,7 +108,9 @@ describe("owner-only SQL catalog bootstrap", () => {
         expect(f.store.getCommandReceipt("host-bootstrap", "catalog-legacy-default")).toMatchObject({ requestFormatVersion: 2, state: "completed", targetSessionId: id });
         expect(f.store.db.prepare("SELECT name,sql FROM sqlite_master ORDER BY name").all()).toEqual(schema);
         await expect(host.registry.ensureLoaded(id)).rejects.toMatchObject({ code: "WORKSPACE_NOT_VERIFIED" });
-        await expect(rpc(host, "session.rename", { sessionId: id, expectedRevision: host.registry.get(id).revision, title: "denied" }, "denied")).rejects.toMatchObject({ code: "WORKSPACE_NOT_VERIFIED" });
+        // Metadata writes no longer require workspace verification; loading the
+        // Provider runtime does (design §7.1 purpose split).
+        expect((await rpc(host, "session.rename", { sessionId: id, expectedRevision: host.registry.get(id).revision, title: "renamed" }, "metadata") as { session: { title: string } }).session.title).toBe("renamed");
         expect(f.runtimeFactory).not.toHaveBeenCalled();
         expect(f.readOnlyGit).not.toHaveBeenCalled();
         noProcesses();
@@ -214,10 +216,15 @@ describe("owner-only SQL catalog bootstrap", () => {
         expect(host.assertExecutionResources(id).workspace.worktreeRoot).toBe(f.missingRoot);
         await rpc(host, "session.rename", { sessionId: id, expectedRevision: host.registry.get(id).revision, title: "verified metadata" }, "rename");
         rmSync(executable);
-        for (const [method, payload] of [["session.rename", { sessionId: id, expectedRevision: host.registry.get(id).revision, title: "stale" }], ["session.startTurn", { sessionId: id, prompt: "stale" }], ["approval.respond", { sessionId: id, approvalId: "unknown", action: "deny" }]] as const)
-            await expect(rpc(host, method, payload, `stale-${method}`)).rejects.toMatchObject({ code: "PROVIDER_EXECUTABLE_CHANGED" });
+        // New prompts stay denied on the executable change...
+        await expect(rpc(host, "session.startTurn", { sessionId: id, prompt: "stale" }, "stale-turn")).rejects.toMatchObject({ code: "PROVIDER_EXECUTABLE_CHANGED" });
+        // ...a control command is denied by the shared-load resource checks
+        // (the stale executable), and metadata writes no longer depend on the
+        // Provider executable at all (design §7.1 purpose split).
+        await expect(rpc(host, "approval.respond", { sessionId: id, approvalId: "unknown", action: "deny" }, "stale-approval")).rejects.toMatchObject({ code: "PROVIDER_EXECUTABLE_CHANGED" });
+        expect((await rpc(host, "session.rename", { sessionId: id, expectedRevision: host.registry.get(id).revision, title: "stale metadata" }, "stale-rename") as { session: { title: string } }).session.title).toBe("stale metadata");
         await expect(host.registry.ensureLoaded(id)).rejects.toMatchObject({ code: "PROVIDER_EXECUTABLE_CHANGED" });
-        expect(SessionSnapshotV2Schema.parse(await rpc(host, "session.getSnapshot", { sessionId: id })).session.title).toBe("verified metadata");
+        expect(SessionSnapshotV2Schema.parse(await rpc(host, "session.getSnapshot", { sessionId: id })).session.title).toBe("stale metadata");
         expect(f.runtimeFactory).not.toHaveBeenCalled();
         expect(f.readOnlyGit).not.toHaveBeenCalled();
         noProcesses();

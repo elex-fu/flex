@@ -108,7 +108,9 @@ describe("production Host catalog binding", () => {
         const id=f.host.legacySessionId;
         expect(()=>f.host.readViewInteractions(id)).toThrow("SESSION_SCOPE_MISMATCH");
         const port=f.host.interactionsForSession(id)!;
-        expect(()=>port.rpc("question.respond",{sessionId:id,interactionId:"question",expectedVersion:1,answers:[]},{authSubjectId:"approver",commandId:"question"})).toThrow("PROVIDER_CAPABILITY_UNVERIFIED");
+        // Design §7.1 checks the original control binding before policy evidence:
+        // without a loaded runtime there is no channel to deliver a response to.
+        expect(()=>port.rpc("question.respond",{sessionId:id,interactionId:"question",expectedVersion:1,answers:[]},{authSubjectId:"approver",commandId:"question"})).toThrow("RUNTIME_CONTROL_UNAVAILABLE");
         f.store.db.prepare("INSERT INTO host_state VALUES('restore_readiness',?,?)").run("{}",new Date().toISOString());
         expect(()=>port.rpc("interaction.respondApproval",{sessionId:id,interactionId:"approval",expectedVersion:1,action:"deny"},{authSubjectId:"approver",commandId:"approval"})).toThrow("RESTORE_EXTERNAL_STATE_UNVERIFIED");
         expect(response).not.toHaveBeenCalled();expect(f.runtimeFactory).not.toHaveBeenCalled();

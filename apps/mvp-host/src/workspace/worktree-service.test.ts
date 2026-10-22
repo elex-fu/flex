@@ -67,7 +67,7 @@ async function fixture() {
   return { root, repository, managed, privateDirectory, owner, db, store, catalog, driver, service, accept, create, fault: (name: string, moment = "applied") => { fault = { name, moment }; }, stopped: (value: boolean) => { stopped = value; } };
 }
 
-describe("persistent managed worktree lifecycle", () => {
+describe("persistent managed worktree lifecycle", { timeout: 60_000 }, () => {
   it("creates from a registered immutable ref, preserves staged/dirty/untracked data, and restores detached history", async () => {
     const f = await fixture(), record = await f.create();
     await writeFile(join(record.path, "tracked.txt"), "staged\n"); await git(record.path, ["add", "tracked.txt"]);

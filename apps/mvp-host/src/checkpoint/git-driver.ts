@@ -57,7 +57,12 @@ function stableJson(value: unknown): string {
   if (value === undefined) return "null";
   if (value === null || typeof value !== "object") return JSON.stringify(value);
   if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`;
-  return `{${Object.entries(value as Record<string, unknown>).sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0).map(([key, item]) => `${JSON.stringify(key)}:${stableJson(item)}`).join(",")}}`;
+  // Explicitly-undefined own properties are skipped exactly like JSON.stringify:
+  // digests must stay invariant under the persistence round trip (SQLite JSON
+  // drops them), otherwise an in-memory operation holding e.g. `artifact:
+  // undefined` never matches its re-read journal row and fails closed as a
+  // false PLAN_STALE/outcome_unknown.
+  return `{${Object.entries(value as Record<string, unknown>).filter(([, item]) => item !== undefined).sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0).map(([key, item]) => `${JSON.stringify(key)}:${stableJson(item)}`).join(",")}}`;
 }
 function decode(bytes: Uint8Array): string {
   try { return new TextDecoder("utf-8", { fatal: true }).decode(bytes); }

@@ -1,5 +1,5 @@
 import Database from "better-sqlite3";
-import { chmodSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -123,6 +123,22 @@ describe("owner-only SQL catalog bootstrap", () => {
         expect(f.store.db.prepare("SELECT 1 FROM host_state WHERE key='legacyDefaultSessionId'").get()).toBeUndefined();
         remove();
         expect((await open(f)).legacySessionId).toBeTypeOf("string");
+        noProcesses();
+    });
+
+    it("canonicalizes a configured alias root at the producer while a missing root keeps its absolute form", async () => {
+        const f = fixture();
+        // A symlink alias (for example a macOS /var -> /private/var temp path)
+        // must never be journaled as canonicalRoot: every later identity
+        // comparison against the canonical form would fail as WORKSPACE_MOVED.
+        const checkout = join(f.root, "checkout");
+        mkdirSync(checkout);
+        const alias = join(f.root, "alias-checkout");
+        symlinkSync(checkout, alias);
+        const host = await open(f, { configuration: { ...f.configuration, workspaces: [{ ...f.configuration.workspaces[0]!, root: alias }] } });
+        expect(host.catalog.workspace(f.configuration.workspaces[0]!.workspaceId))
+            .toMatchObject({ canonicalRoot: checkout, worktreeRoot: "", state: "needs_verification" });
+        expect(host.registry.resolve(host.legacySessionId).workspace.canonicalRoot).toBe(checkout);
         noProcesses();
     });
 

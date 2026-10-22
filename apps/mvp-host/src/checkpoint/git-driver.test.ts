@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import { chmod, lstat, mkdir, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { CheckpointGitDriver, type CheckpointGitDriverOptions, type CheckpointGitRunRequest, type CheckpointGitRunResult } from "./git-driver.js";
+import { CheckpointGitDriver, bindingDigest, type CheckpointGitDriverOptions, type CheckpointGitRunRequest, type CheckpointGitRunResult } from "./git-driver.js";
 import { fixtureGit, removeFixture, temporaryRepository, userGitState } from "./test-support.js";
 import { ManagedGitError } from "../lifecycle/managed-git-runner.js";
 
@@ -27,6 +27,20 @@ function makeDriver(root: string, options: Omit<CheckpointGitDriverOptions, "run
 }
 
 describe("controlled checkpoint Git driver", { timeout: 30_000 }, () => {
+  it("keeps bindingDigest invariant under the persistence round trip and distinct from explicit nulls", () => {
+    // In-memory operations legitimately hold explicitly-undefined properties
+    // (for example a mkdir step's absent artifact); SQLite JSON persistence
+    // drops them. A digest that distinguishes the two forms would make every
+    // re-read journal row mismatch its in-memory original and fail closed as
+    // a false PLAN_STALE/outcome_unknown.
+    const inMemory = { a: 1, b: undefined, nested: { keep: "x", drop: undefined }, list: [{ stay: true, drop: undefined }] };
+    const persisted = JSON.parse(JSON.stringify(inMemory));
+    expect(bindingDigest(inMemory)).toBe(bindingDigest(persisted));
+    expect(bindingDigest({ b: undefined })).toBe(bindingDigest({}));
+    // An explicit null stays a meaningful value, never folded into absence.
+    expect(bindingDigest({ b: null })).not.toBe(bindingDigest({}));
+    expect(bindingDigest({ b: null })).not.toBe(bindingDigest({ b: undefined }));
+  });
   it.each(["unknown","stopped","not_spawned"] as const)("retains managed %s producer failure and original operation binding",async(state)=>{
     const root=await repository(),checkpointId=randomUUID(),evidence={processId:"exact-original-process",launchDigest:"a".repeat(64),purpose:"checkpoint_read" as const,policyId:"checkpoint-policy",operationId:checkpointId,bindingDigest:"b".repeat(64)},cause=new ManagedGitError("MANAGED_GIT_TREE_STOP_UNPROVEN",state,evidence);
     const driver=new CheckpointGitDriver(root,{runGit:async()=>{throw cause;}});

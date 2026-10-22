@@ -42,5 +42,15 @@ input, textarea, select { width: 100%; border: 1px solid #3a4659; border-radius:
 .endpoint button, .device-list button, .pending-command button { flex-shrink: 0; font-size: 12px; }
 .devices h3 { font-size: 14px; margin: 4px 0; }
 .revoke-all { margin-top: 12px; }.revoke-all p { font-size: 12px; color: #ffb8b3; line-height: 1.6; }
+.core-panels { display: grid; gap: 12px; margin: 12px 0; }
+.core-panels .card { padding: 16px; min-width: 0; }
+.core-panels .field-label { margin: 12px 0; }
+.core-panels input[type="checkbox"] { width: auto; justify-self: start; }
+.core-panels .core-group { border-top: 1px solid #303b4d; margin-top: 16px; padding-top: 16px; }
+.core-panels h3 { font-size: 14px; margin: 0 0 10px; }
+.core-panels p, .core-panels small { font-size: 12px; line-height: 1.6; overflow-wrap: anywhere; }
+.core-panels pre { overflow: auto; max-height: 480px; white-space: pre-wrap; overflow-wrap: anywhere; font: 12px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace; }
+.core-session-list { list-style: none; padding: 0; margin: 12px 0; display: grid; gap: 10px; }
+.core-session-list li { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
 .outbox { padding: 14px; margin: 12px 0; border-color: #6f5428; }.outbox p { font-size: 12px; line-height: 1.5; }
 @media (max-width: 560px) { .topbar-actions { align-items: flex-end; flex-direction: column; gap: 8px; }.pairing { margin-top: 36px; }.connection-details summary { flex-wrap: wrap; }.connection-details summary .muted { font-size: 11px; }.endpoint, .device-list li, .pending-command { align-items: flex-start; flex-wrap: wrap; }.section-head { align-items: flex-start; flex-wrap: wrap; }.section-actions { flex-wrap: wrap; }.status-grid strong { font-size: 17px; } }

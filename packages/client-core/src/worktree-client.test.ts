@@ -70,4 +70,12 @@ describe("typed explicit worktree client", () => {
     await expect(f.client.create({ sessionId: "source", repositoryId: "repo-one" }, "saved-command")).rejects.toThrow("connection lost");
     expect(f.rpc.calls.filter((call) => call.commandId === "saved-command")).toHaveLength(1);
   });
+  it("rejects recovery evidence belonging to a different original Worktree operation", async () => {
+    const f = fixture();
+    f.rpc.response = { ...value(), inspection: { evidenceId, operationId: "50000000-0000-4000-8000-000000000000", canResume: true, producerStopped: true, observed: "partial", expiresAt: "2099-10-22T00:00:00Z" } };
+    await expect(f.client.reconcile({ sessionId: "source", operationId }, "stable-command")).rejects.toMatchObject({ code: "INVALID_RPC_RESPONSE" });
+    const { commandId: _id, receiptState: _state, reused: _reused, ...result } = f.rpc.response as WorktreeCommandResult;
+    f.rpc.response = result;
+    await expect(f.client.getOperation({ sessionId: "source", operationId })).rejects.toMatchObject({ code: "INVALID_RPC_RESPONSE" });
+  });
 });

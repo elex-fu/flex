@@ -1,5 +1,5 @@
 import {
-  AttentionCapability, BOUNDED_CONTENT_CAPABILITY, RecoveryCapability, SESSION_CATALOG_CAPABILITY, INTERACTION_CAPABILITY, STRUCTURED_QUESTION_CAPABILITY, ContentChunkRequestSchema, ContentChunkSchema, MAX_APPLICATION_FRAME_BYTES,
+  AttentionCapability, BOUNDED_CONTENT_CAPABILITY, RecoveryCapability, SESSION_CATALOG_CAPABILITY, INTERACTION_CAPABILITY, STRUCTURED_QUESTION_CAPABILITY, CHECKPOINT_DIFF_CAPABILITY, CHECKPOINT_REVERT_CAPABILITY, WORKTREE_CAPABILITY, ContentChunkRequestSchema, ContentChunkSchema, MAX_APPLICATION_FRAME_BYTES,
   OpenViewRequestSchema, OpenViewResponseSchema, parseApplicationFrame, TIMELINE_PROJECTION_CAPABILITY,
   TimelinePageRequestSchema, TimelinePageSchema, TimelineSubscribeRequestSchema, TimelineSubscribeResponseSchema, TimelineUnsubscribeRequestSchema, TimelineUnsubscribeResponseSchema,
 } from "@flyx/mvp-protocol";
@@ -101,7 +101,7 @@ export class RpcClient {
       const timer = setTimeout(() => { this.helloPending = undefined; reject(new ClientError("HELLO_TIMEOUT", "Host did not finish protocol negotiation")); }, 10_000);
       this.helloPending = { resolve: (value) => resolve(value as ServerHelloV2), reject, timer };
     });
-    void this.send({ type: "client.hello", hostId: profile.hostId, clientId: "flyx-web", ...(deviceId ? { deviceId } : {}), protocol: { min: 2, max: 2 }, capabilities: ["heartbeat", "transport-neutral-rpc", "durable-outbox", "timeline-watermark", TIMELINE_PROJECTION_CAPABILITY, BOUNDED_CONTENT_CAPABILITY, ACCESS_RECEIPTS_CAPABILITY, RecoveryCapability, SESSION_CATALOG_CAPABILITY, INTERACTION_CAPABILITY, STRUCTURED_QUESTION_CAPABILITY, AttentionCapability], requiredCapabilities: [] }).catch((error: unknown) => {
+    void this.send({ type: "client.hello", hostId: profile.hostId, clientId: "flyx-web", ...(deviceId ? { deviceId } : {}), protocol: { min: 2, max: 2 }, capabilities: ["heartbeat", "transport-neutral-rpc", "durable-outbox", "timeline-watermark", TIMELINE_PROJECTION_CAPABILITY, BOUNDED_CONTENT_CAPABILITY, ACCESS_RECEIPTS_CAPABILITY, RecoveryCapability, SESSION_CATALOG_CAPABILITY, INTERACTION_CAPABILITY, STRUCTURED_QUESTION_CAPABILITY, AttentionCapability, CHECKPOINT_DIFF_CAPABILITY, CHECKPOINT_REVERT_CAPABILITY, WORKTREE_CAPABILITY, "host-execution-readiness-v1"], requiredCapabilities: [] }).catch((error: unknown) => {
       if (this.helloPending) { clearTimeout(this.helloPending.timer); this.helloPending.reject(error); this.helloPending = undefined; }
     });
     const hello = await response;

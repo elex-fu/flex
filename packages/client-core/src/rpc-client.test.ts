@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { AttentionCapability, BOUNDED_CONTENT_CAPABILITY, RecoveryCapability, SESSION_CATALOG_CAPABILITY, INTERACTION_CAPABILITY, STRUCTURED_QUESTION_CAPABILITY, TIMELINE_PROJECTION_CAPABILITY } from "@flyx/mvp-protocol";
+import { AttentionCapability, BOUNDED_CONTENT_CAPABILITY, RecoveryCapability, SESSION_CATALOG_CAPABILITY, INTERACTION_CAPABILITY, STRUCTURED_QUESTION_CAPABILITY, TIMELINE_PROJECTION_CAPABILITY, CHECKPOINT_DIFF_CAPABILITY, CHECKPOINT_REVERT_CAPABILITY, WORKTREE_CAPABILITY } from "@flyx/mvp-protocol";
 import { ACCESS_RECEIPTS_CAPABILITY, RpcClient } from "./rpc-client.js";
 import { TestTransport } from "./test-support.js";
 
@@ -68,7 +68,8 @@ describe("negotiated typed domain RPC", () => {
   }
   it("saves an immutable hello for this transport and enforces its frame budget", async () => {
     const { rpc, transport, hello } = await negotiated(512);
-    expect(transport.sent[0]?.capabilities).toEqual(expect.arrayContaining([TIMELINE_PROJECTION_CAPABILITY, BOUNDED_CONTENT_CAPABILITY, ACCESS_RECEIPTS_CAPABILITY, RecoveryCapability, SESSION_CATALOG_CAPABILITY, INTERACTION_CAPABILITY, STRUCTURED_QUESTION_CAPABILITY, AttentionCapability]));
+    expect(transport.sent[0]?.capabilities).toEqual(expect.arrayContaining([TIMELINE_PROJECTION_CAPABILITY, BOUNDED_CONTENT_CAPABILITY, ACCESS_RECEIPTS_CAPABILITY, RecoveryCapability, SESSION_CATALOG_CAPABILITY, INTERACTION_CAPABILITY, STRUCTURED_QUESTION_CAPABILITY, AttentionCapability, CHECKPOINT_DIFF_CAPABILITY, CHECKPOINT_REVERT_CAPABILITY, WORKTREE_CAPABILITY, "host-execution-readiness-v1"]));
+    for (const capability of [CHECKPOINT_DIFF_CAPABILITY, CHECKPOINT_REVERT_CAPABILITY, WORKTREE_CAPABILITY, "host-execution-readiness-v1"]) expect(rpc.supports(capability)).toBe(false);
     expect(rpc.supports(RecoveryCapability)).toBe(false); expect(rpc.supports(SESSION_CATALOG_CAPABILITY)).toBe(false); expect(rpc.supports(AttentionCapability)).toBe(false); expect(rpc.supports(INTERACTION_CAPABILITY)).toBe(false); expect(rpc.supports(STRUCTURED_QUESTION_CAPABILITY)).toBe(false);
     hello.capabilities.push("mutated"); rpc.getNegotiatedHello()!.capabilities.push("also-mutated");
     expect(rpc.supports("mutated")).toBe(false); expect(rpc.supports("also-mutated")).toBe(false);

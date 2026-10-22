@@ -7,6 +7,9 @@ export type Snapshot = {
     activityState: string;
     headSequence: number;
     providerSessionId?: string;
+    status?: "active" | "archived";
+    residency?: "unloaded" | "loading" | "loaded" | "closing" | "blocked";
+    title?: string;
   };
   // Keep the optional field explicitly undefined-able because the live
   // projection removes an active turn as soon as a terminal event arrives.

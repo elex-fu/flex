@@ -15,7 +15,7 @@ export function normalizeWebSnapshot(value:unknown):Snapshot {
   if (!isRecord(value) || !isRecord(value.session)) throw new Error("SNAPSHOT_RESPONSE_INVALID");
   if (typeof value.session.sessionId === "string") {
     const parsed = SessionSnapshotV2Schema.parse(value);
-    return {session:{id:parsed.session.sessionId,provider:parsed.session.provider,activityState:parsed.session.activityState,headSequence:parsed.session.headSequence},pendingApprovals:parsed.pendingApprovals as Snapshot["pendingApprovals"],...(parsed.activeTurn ? {activeTurn:{id:parsed.activeTurn.id,status:parsed.activeTurn.status,prompt:parsed.activeTurn.prompt}} : {})};
+    return {session:{id:parsed.session.sessionId,provider:parsed.session.provider,activityState:parsed.session.activityState,headSequence:parsed.session.headSequence,status:parsed.session.status,residency:parsed.session.residency,title:parsed.session.title},pendingApprovals:parsed.pendingApprovals as Snapshot["pendingApprovals"],...(parsed.activeTurn ? {activeTurn:{id:parsed.activeTurn.id,status:parsed.activeTurn.status,prompt:parsed.activeTurn.prompt}} : {})};
   }
   const session = value.session;
   if (typeof session.id !== "string" || (session.provider !== "claude" && session.provider !== "codex") || typeof session.activityState !== "string" || !Number.isSafeInteger(session.headSequence)) throw new Error("SNAPSHOT_RESPONSE_INVALID");

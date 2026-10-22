@@ -195,7 +195,12 @@ export function useHost(runtimes: WebHostRuntimes = getWebHostRuntimes()) {
     setSessions((current) => [...new Map([...current,...page.sessions].map((session) => [session.id,session])).values()]); setNextSessionId(page.nextSessionId);
   }), [run,client,runtimes,nextSessionId]);
   const sendPrompt = useCallback(() => run(() => drafts.submit(client.getNegotiatedHello()?.capabilities.includes(WEB_SESSION_CATALOG_CAPABILITY) ?? false)), [run,drafts,client]);
-  const queryCommandReceipt = useCallback((commandId:string) => run(() => client.queryCommandReceipt(commandId)), [client,run]);
+  const queryCommandReceipt = useCallback((commandId:string) => run(async () => {
+    const sessionId = sessionIdRef.current, generation = client.getState().transportGeneration;
+    const command = await client.queryCommandReceipt(commandId);
+    if (runtimes.getCurrent() === client && sessionIdRef.current === sessionId && client.getState().transportGeneration === generation && /^(?:session\.(?:recovery\.|createNew|rename|archive|unarchive|closeRuntime)|checkpoint\.|worktree\.)/.test(command.method)) await client.retrySynchronization();
+    return command;
+  }), [client,run,runtimes]);
   const sendSavedCommand = useCallback((commandId:string) => run(async () => {
     const command = await client.store.getCommand(commandId);
     if (!command || command.hostId !== client.getState().profile?.hostId || !canSendSavedCommand(command)) throw new Error("SAVED_COMMAND_NOT_DISPATCHABLE");

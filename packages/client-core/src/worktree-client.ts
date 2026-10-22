@@ -16,7 +16,7 @@ function parse<T>(schema: Schema<T>, value: unknown, code: "INVALID_PAYLOAD" | "
   const parsed = schema.safeParse(value); if (!parsed.success) throw new ClientError(code, "Managed worktree data is invalid"); return parsed.data;
 }
 function paired(result: WorktreeResult): WorktreeResult {
-  if (result.operation.worktreeId !== result.worktree.worktreeId) throw new ClientError("INVALID_RPC_RESPONSE", "Worktree result refers to different resources");
+  if (result.operation.worktreeId !== result.worktree.worktreeId || result.inspection && result.inspection.operationId !== result.operation.operationId) throw new ClientError("INVALID_RPC_RESPONSE", "Worktree result refers to different resources or recovery operations");
   return result;
 }
 /** Explicit commands only. Unknown saved commands are inspected; this helper never retries or drains an Outbox. */

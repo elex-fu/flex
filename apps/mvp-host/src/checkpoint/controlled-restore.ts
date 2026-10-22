@@ -72,7 +72,11 @@ export class ControlledRestore {
       const data = await driver.blob(entry.oid);
       if (!data || this.objectOid(data,entry.oid.length) !== entry.oid) throw new CheckpointError("TARGET_OBJECT_CORRUPT", "Retained index object is corrupt");
     }
-    const temp=await mkdtemp(join(tmpdir(),"flyx-revert-index-"));
+    // Canonicalize on the producer side (same as the checkpoint driver): on
+    // macOS `tmpdir()` is a /var -> /private/var alias, and the managed Git
+    // runner refuses non-canonical cwd/workspace paths, so an unnormalized
+    // temp root would fail closed at the first index query.
+    const temp=await realpath(await mkdtemp(join(tmpdir(),"flyx-revert-index-")));
     try {
       const operation=Object.freeze({kind:"verify" as const,checkpointId:manifest.checkpointId,layer:"index" as const});
       const index=join(temp,"index"); await this.objectGit(operation,capabilities.gitDirectory.path,temp,index,["read-tree",tree]);

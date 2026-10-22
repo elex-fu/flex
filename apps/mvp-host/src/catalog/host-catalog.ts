@@ -48,7 +48,7 @@ export type CatalogRuntimeServices = {
     workspaces: WorkspaceRegistry;
     providers: ProviderInstanceRegistry;
 };
-export type CatalogRuntimeOptions = Pick<OrchestratorOptions, "executionSetup" | "executionHooks" | "checkpoints" | "genericOperations" | "onExecutionBlocked" | "nativeStateRoots" | "nativeBoundaryFactory" | "revalidateDevice" | "interactionEvents" | "recovery" | "assertWriteReady" | "assertNativeReady" | "gitRunner" | "executionPermits" | "canReleaseAdditionalProducers" | "nativeScenePolicy" | "adapter" | "canReleaseWorkspace">;
+export type CatalogRuntimeOptions = Pick<OrchestratorOptions, "executionSetup" | "executionHooks" | "checkpoints" | "genericOperations" | "onExecutionBlocked" | "nativeStateRoots" | "nativeBoundaryFactory" | "revalidateDevice" | "interactionEvents" | "recovery" | "assertWriteReady" | "assertNativeReady" | "gitRunner" | "executionPermits" | "canReleaseAdditionalProducers" | "nativeScenePolicy" | "compatibilityRecorder" | "adapter" | "canReleaseWorkspace">;
 export type HostCatalogOptions = {
     store: SqliteStore;
     owner: HostOwnerHandle;

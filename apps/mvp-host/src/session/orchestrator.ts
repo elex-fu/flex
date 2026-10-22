@@ -85,6 +85,14 @@ export type OrchestratorOptions = {
   /** Native activation gate only for new Turn acceptance and dispatch. */
   assertNativeReady?: (input?: { authorization?: CompatibilityScenePermit; intent?: ExecutionIntentRow }) => void;
   nativeScenePolicy?: CompatibilityScenePolicy;
+  /**
+   * Compatibility fact recorder (design §6.3). The Orchestrator feeds it only
+   * the two facts it has independently proven for a Turn — a verified native
+   * process stop and a committed terminal state. Recording is observation
+   * only: it never dispatches, spawns or extends execution. Supplied by the
+   * isolated compatibility scenario; the online Host never injects one.
+   */
+  compatibilityRecorder?: CommittedNativeStopRecorder;
   executionPermits?: HostExecutionPermits;
   recovery?: Pick<HostRecoveryOptions, "resolveResource" | "checkoutRoot" | "assertCommandAuthorized" | "processInspector" | "inspectBoundary" | "inspectWorkspace" | "codexReader" | "supersedeInteractions" | "companionEvents">;
   runtimeId?: string;
@@ -109,6 +117,16 @@ export type OrchestratorOptions = {
 
 export type RuntimeCloseReport = { closed: boolean; producerStopped: boolean; clean: boolean; state: "stopped" | "recovery_required"; stopped: boolean; recoveryRequired: boolean };
 export type ShutdownService = { drain(deadlineMs: number): Promise<void | boolean>; seal?(): void; close?(): Promise<void> | void };
+
+/**
+ * Consumer of proven compatibility facts (design §6.3). Structurally compatible
+ * with the diagnostics committed recorder, but defined here so the event-source
+ * wiring depends on no diagnostics implementation.
+ */
+export type CommittedNativeStopRecorder = {
+  /** Records one verified native stop behind a committed Turn terminal state. */
+  afterCommittedNativeStop(context: DispatchContext): Promise<void>;
+};
 
 const MAX_PROMPT_BYTES = 16 * 1024;
 
@@ -161,6 +179,7 @@ export class SessionOrchestrator {
   private readonly permitWaits = new Map<string, AbortController>();
   private readonly preparingAttempts = new Set<string>();
   private readonly nativeScenePolicy: CompatibilityScenePolicy | undefined;
+  private readonly compatibilityRecorder: CommittedNativeStopRecorder | undefined;
   private readonly checkNativeReady: OrchestratorOptions["assertNativeReady"];
   private readonly checkWriteReady: OrchestratorOptions["assertWriteReady"];
   private degraded = false;
@@ -171,6 +190,7 @@ export class SessionOrchestrator {
     this.executionPermits = options.executionPermits;
     this.checkNativeReady = options.assertNativeReady;
     this.nativeScenePolicy = options.nativeScenePolicy;
+    this.compatibilityRecorder = options.compatibilityRecorder;
     this.checkpointProducerCheck = options.canReleaseAdditionalProducers;
     this.interactionEvents = options.interactionEvents;
     this.canReleaseWorkspace = (context) => (options.canReleaseWorkspace?.(context) ?? this.nativeRuntime?.canReleaseWorkspace(context) ?? false)
@@ -822,6 +842,13 @@ export class SessionOrchestrator {
       lease.assertActive();
       const terminal = this.store.getTurn(intent.turnId!);
       if (!terminal || !["completed", "failed", "cancelled"].includes(terminal.status)) throw new Error("TERMINAL_COMMIT_UNPROVEN");
+      // Design §6.3: a native terminal outcome with the verified stop above and
+      // the committed terminal state is the only fact source for compatibility
+      // capability records. The recorder observes; it never executes.
+      if (this.compatibilityRecorder && outcome.evidence.kind === "native-terminal") {
+        const recorded = await this.observeCommittedNativeStop(intent, context);
+        if (!recorded) return;
+      }
       if (this.checkpointBinding && this.capturedBefore.has(intent.id)) {
         const source = this.store.db.prepare(`SELECT sequence FROM session_events WHERE session_id = ?
           AND type IN ('turn.completed','turn.failed','turn.cancelled','turn.reconciled')
@@ -849,6 +876,24 @@ export class SessionOrchestrator {
       this.degraded = true;
       this.retainExecution(intent, "checkpoint_completion_unverified");
       throw error;
+    }
+  }
+
+  /**
+   * Feeds the proven native-stop fact to the compatibility recorder. The
+   * Turn's own stop and terminal facts stay proven regardless; a recorder
+   * failure only means the compatibility evidence chain is unverified, so the
+   * scene fails closed without fabricating a new Turn outcome.
+   */
+  private async observeCommittedNativeStop(intent: ExecutionIntentRow, context: DispatchContext): Promise<boolean> {
+    try {
+      await this.compatibilityRecorder!.afterCommittedNativeStop(context);
+      return true;
+    } catch (error) {
+      if (this.worker.isSealed || this.closed || !this.store.db.open) return true;
+      this.degraded = true;
+      this.retainExecution(intent, "compatibility_fact_unverified");
+      return false;
     }
   }
 

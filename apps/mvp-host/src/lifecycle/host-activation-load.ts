@@ -355,7 +355,8 @@ export function observeProvider(record: ProviderInstanceRecord, dependencies: Pr
     capabilities: Object.freeze([...record.policyCapabilities].sort()) }) });
 }
 
-function newestPassedArtifact(path: string, provider: ProviderInstanceRecord, trust?: import("../diagnostics/compatibility-evidence.js").CompatibilityEvidenceTrust): (CompatibilityEvidenceEntry & { artifact: CompatibilityEvidenceArtifact }) | undefined {
+/** Newest turn baseline that carries every required capability on one signed artifact, run and entry. */
+export function newestPassedArtifact(path: string, provider: ProviderInstanceRecord, trust?: import("../diagnostics/compatibility-evidence.js").CompatibilityEvidenceTrust): (CompatibilityEvidenceEntry & { artifact: CompatibilityEvidenceArtifact }) | undefined {
   let entries: readonly CompatibilityEvidenceEntry[];
   try { entries = loadTrustedCompatibilityEvidence(path, undefined, trust); } catch { return undefined; }
   const matches = entries.filter((entry): entry is CompatibilityEvidenceEntry & { artifact: CompatibilityEvidenceArtifact } =>

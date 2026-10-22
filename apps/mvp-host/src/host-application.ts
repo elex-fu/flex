@@ -39,6 +39,7 @@ import { WORKTREE_COMMAND_METHODS, WORKTREE_RPC_SCOPES, type WorktreeCommandMeth
 import { createManagedScheduledHostWorktrees } from "./workspace/managed-host-worktrees.js";
 import { createManagedRepositoryMetadata } from "./workspace/managed-repository-metadata.js";
 import { NativeHistoryReaderFactory } from "./provider/native-history-reader.js";
+import { createNativeHistoryManifestSource } from "./provider/native-history-manifest.js";
 
 export type HostApplicationOptions = Pick<HostCatalogOptions, "configuration" | "initialLegacySession"> & {
   store: SqliteStore;
@@ -156,8 +157,8 @@ export async function createHostApplication(options: HostApplicationOptions) {
         runtimeId: "host-git", runtimeGeneration: 1, attemptId: operationId ?? randomUUID() };
     },
   }) : undefined;
-  const observation = options.execution?.observation ?? localActivationFacts({ compatibilityEvidencePath, privateRoots: privateDirectories, ...options.execution?.facts,
-    compatibilityTrust: { destination: publicHostIdentity(identity), endorsementPath: options.compatibilityEndorsementPath ?? join(dirname(owner.databasePath), "compatibility-endorsement.json") } });
+  const activationTrust = { destination: publicHostIdentity(identity), endorsementPath: options.compatibilityEndorsementPath ?? join(dirname(owner.databasePath), "compatibility-endorsement.json") };
+  const observation = options.execution?.observation ?? localActivationFacts({ compatibilityEvidencePath, privateRoots: privateDirectories, ...options.execution?.facts, compatibilityTrust: activationTrust });
   const query = createManagedWorkspaceQuery({
     journal: new SqliteProcessJournal(store.db), privateRoots: privateDirectories,
     assertActive: () => { owner.assertActive(); store.assertWriterOwner(); },
@@ -299,7 +300,15 @@ export async function createHostApplication(options: HostApplicationOptions) {
           throw new CatalogError("NATIVE_HISTORY_BINDING_CHANGED");
       },
       // A versioned installed read contract is required before any Native read.
-      verifiedManifestForHandle: () => undefined,
+      // The manifest exists only when the signed compatibility artifact that
+      // verified the turn baseline also verified a read-only recovery
+      // inspection and still matches the live provider instance facts.
+      ...createNativeHistoryManifestSource({
+        compatibilityEvidencePath, compatibilityTrust: activationTrust,
+        ...(options.execution?.facts?.supervision ? { supervision: options.execution.facts.supervision } : {}),
+        ...(options.execution?.facts?.runtime ? { runtime: options.execution.facts.runtime } : {}),
+        resolveProvider: (providerInstanceId) => runningCatalog.catalog.provider(providerInstanceId),
+      }),
     });
     recovery = createCatalogRecoveryBindings({ catalog: runningCatalog,
       ...options.execution?.recovery,

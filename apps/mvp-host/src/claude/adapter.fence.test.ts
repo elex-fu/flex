@@ -12,7 +12,7 @@ beforeEach(() => queryMock.mockReset());
 
 const managed = {
   processRegistryFactory: (context: DispatchContext) => new ManagedProcessRegistry({ journal: { save() {} }, context: () => context }),
-  executionBoundary: async () => ({ ready: true as const, proof: { verifiedPrivateReadBoundary: true as const, verifiedDescendantStop: false }, boundary: { spawn: (registry: ManagedProcessRegistry, request: import("../provider/managed-runtime.js").NativeSpawnRequest) => { const { command, args, ...options } = request; return registry.spawn(command, args, options); } } }),
+  executionBoundary: async () => ({ ready: true as const, proof: { verifiedPrivateReadBoundary: true as const, verifiedDescendantStop: true }, boundary: { spawn: (registry: ManagedProcessRegistry, request: import("../provider/managed-runtime.js").NativeSpawnRequest) => { const { command, args, ...options } = request; return registry.spawn(command, args, options); } } }),
 };
 const workspace = resolve(process.cwd(), "../../packages/claude-fixtures");
 function context(turnId: string, generation: number): DispatchContext {

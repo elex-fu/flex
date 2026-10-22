@@ -20,7 +20,7 @@ function managedFixture() {
   const processSpawn = vi.fn((): never => { throw new Error("Fixture must not spawn an OS process"); });
   const registries: ManagedProcessRegistry[] = [];
   const options: ManagedRuntimeOptions = {
-    executionBoundary: async () => ({ ready: true, proof: { verifiedPrivateReadBoundary: true, verifiedDescendantStop: false }, boundary: { spawn: boundarySpawn } }),
+    executionBoundary: async () => ({ ready: true, proof: { verifiedPrivateReadBoundary: true, verifiedDescendantStop: true }, boundary: { spawn: boundarySpawn } }),
     processRegistryFactory: (fixed) => {
       expect(fixed).toEqual(context);
       const registry = new ManagedProcessRegistry({ journal: { save() {} }, context: () => fixed, spawn: processSpawn });

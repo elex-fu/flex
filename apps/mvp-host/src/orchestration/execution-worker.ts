@@ -20,6 +20,8 @@ export type ExecutionWorkerOptions = {
   revalidateDevice(intent: ExecutionIntentRow): void;
   assertWriteReady?(): void;
   onDispatch?(intent: ExecutionIntentRow, context: DispatchContext): Promise<void> | void;
+  /** Runs while the intent is still pending, before the claim; a queued task waiting here for host capacity stays cancellable. */
+  beforeClaim?(intent: ExecutionIntentRow): Promise<void> | void;
   beforeDispatch?(intent: ExecutionIntentRow, context: DispatchContext): Promise<void> | void;
   afterTerminal?(intent: ExecutionIntentRow, outcome: ProviderOutcome): Promise<void> | void;
   onStartOutcome(intent: ExecutionIntentRow, outcome: ProviderOutcome): Promise<void> | void;
@@ -32,6 +34,16 @@ export type ExecutionWorkerOptions = {
 };
 
 /** Durable dispatch markers are committed before invoking any native operation. */
+/**
+ * A start_turn intent settled with the terminal "cancelled" result while this
+ * worker still holds it pre-dispatch (pending/claimed, before the dispatching
+ * marker): the durable turn.cancelled event settled it first, so the queued
+ * task must finish as cancelled-before-dispatch without invoking its prompt.
+ */
+const cancelledBeforeDispatch = (row: { state?: string; resultCode?: string | null } | undefined | null): boolean =>
+  row?.state === "settled" && (row.resultCode === "CANCELLED_BEFORE_DISPATCH" || row.resultCode === "cancelled");
+
+
 export class ExecutionWorker {
   readonly controls = new ControlLane();
   private readonly controlSettlers = new Map<string, ExecutionWorkerOptions["onControlResult"]>();
@@ -134,7 +146,7 @@ export class ExecutionWorker {
       if (this.stopped) return;
       const latest = this.execution.get(intent.id);
       if (!latest || latest.state !== "pending") {
-        if (latest?.resultCode === "CANCELLED_BEFORE_DISPATCH") await this.options.afterTerminal?.(latest, { status: "cancelled", evidence: { kind: "not-dispatched" } });
+        if (cancelledBeforeDispatch(latest)) await this.options.afterTerminal?.(latest!, { status: "cancelled", evidence: { kind: "not-dispatched" } });
         return;
       }
       intent = latest;
@@ -142,15 +154,24 @@ export class ExecutionWorker {
       if (!intent.dispatchContext && !generic) throw new Error("DISPATCH_CONTEXT_MISSING");
       // Admission side effects (e.g. activation withdrawal) must commit outside the claim transaction.
       this.validateDevice(intent);
+      if (intent.kind === "start_turn" || this.options.beforeClaim) await this.options.beforeClaim?.(intent);
+      if (this.stopped) return;
+      const afterWait = this.execution.get(intent.id);
+      if (!afterWait || afterWait.state !== "pending") {
+        if (cancelledBeforeDispatch(afterWait)) await this.options.afterTerminal?.(afterWait!, { status: "cancelled", evidence: { kind: "not-dispatched" } });
+        return;
+      }
+      intent = afterWait;
+      this.validateDevice(intent);
       intent = this.execution.claim(intent.id, this.options.owner, (value) => this.validateDevice(value));
       await this.stage("after_claim", intent);
       if (this.stopped || this.execution.get(intent.id)?.state !== "claimed") {
-        if (!this.stopped && this.execution.get(intent.id)?.resultCode === "CANCELLED_BEFORE_DISPATCH") await this.options.afterTerminal?.(intent, { status: "cancelled", evidence: { kind: "not-dispatched" } });
+        if (!this.stopped && cancelledBeforeDispatch(this.execution.get(intent.id))) await this.options.afterTerminal?.(intent, { status: "cancelled", evidence: { kind: "not-dispatched" } });
         return;
       }
       if (intent.dispatchContext) await this.options.beforeDispatch?.(intent, intent.dispatchContext);
       if (this.stopped) return;
-      if (this.execution.get(intent.id)?.resultCode === "CANCELLED_BEFORE_DISPATCH") {
+      if (cancelledBeforeDispatch(this.execution.get(intent.id))) {
         await this.options.afterTerminal?.(intent, { status: "cancelled", evidence: { kind: "not-dispatched" } }); return;
       }
       this.validateDevice(this.execution.get(intent.id)!);
@@ -224,7 +245,7 @@ export class ExecutionWorker {
   private async recordFailure(intent: ExecutionIntentRow, error: unknown, invoked: boolean): Promise<void> {
     const reason = error instanceof Error ? error.message : String(error);
     const current = this.execution.get(intent.id);
-    if (!invoked && current?.state === "settled" && current.resultCode === "CANCELLED_BEFORE_DISPATCH") {
+    if (!invoked && cancelledBeforeDispatch(current)) {
       await this.options.afterTerminal?.(intent, { status: "cancelled", evidence: { kind: "not-dispatched" } }); return;
     }
     this.options.failed?.(error, intent);

@@ -25,7 +25,10 @@ describe("Host task permits at the Native dispatch boundary", () => {
     expect(host.store.getTurn(start.turnId)?.status).toBe("cancelled");
     expect(host.store.getCommandReceipt("actor", "queued-start")?.state).toBe("cancelled");
     expect(host.store.getCommandReceipt("actor", "queued-interrupt")?.state).toBe("completed");
-    expect(host.execution.forCommand("actor", "queued-start")[0]).toMatchObject({ state: "settled", resultCode: "CANCELLED_BEFORE_DISPATCH" });
+    // The durable turn.cancelled event settles the queued intent with the
+    // terminal result; the pre-dispatch cancellation is observable from the
+    // receipt's not-dispatched evidence and the untouched prompt.
+    expect(host.execution.forCommand("actor", "queued-start")[0]).toMatchObject({ state: "settled", resultCode: "cancelled" });
     other.release({ producerStopped: true });
   });
 });

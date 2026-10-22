@@ -53,15 +53,17 @@ export function decideInterrupt(facts: CommandFacts, request: CommandRequest, cl
   const original = facts.intents.find((value) => value.kind === "start_turn" && value.turnId === turn.id && value.attemptId === turn.attemptId
     && value.runtimeGeneration === turn.generation && ["pending", "claimed"].includes(value.state));
   const binding = request.dispatchBinding, dispatch = original?.dispatchContext;
+  // Only a still-pending task (waiting for host capacity, before its claim)
+  // is cancelled here. A claimed intent is already in preparation: its
+  // interrupt rides the original control lane and is delivered to the
+  // original runtime binding instead of cancelling the task.
   if (original && binding && dispatch && dispatch.hostOwnerId === binding.hostOwnerId && dispatch.hostOwnerGeneration === binding.hostOwnerGeneration
     && dispatch.runtimeId === binding.runtimeId && dispatch.sessionId === session.id && dispatch.flyxTurnId === turn.id
-    && (original.state === "pending" || original.claimOwnerId === binding.hostOwnerId && original.claimOwnerGeneration === binding.hostOwnerGeneration)) {
+    && original.state === "pending") {
     const response = { status: "cancelled", turnId: turn.id };
     return { result: response, expectedRevision: session.revision, receipts: [receipt(request, "completed", response)],
       receiptUpdates: [{ authSubjectId: original.authSubjectId, commandId: original.commandId, requestHash: original.requestHash,
         state: "cancelled", response: { turnId: turn.id, status: "cancelled", evidence: { kind: "not-dispatched" } }, required: true }],
-      intentUpdates: [{ id: original.id, expectedStates: ["settled"], state: "settled", resultCode: "CANCELLED_BEFORE_DISPATCH",
-        attemptId: original.attemptId, runtimeGeneration: original.runtimeGeneration }],
       events: [{ id: clock.id(), type: "turn.cancelled", payload: { turnId: turn.id, reason: "cancelled_before_dispatch", evidence: { kind: "not-dispatched" } },
         options: { activityState: "idle", turnId: turn.id, turnStatus: "cancelled" } }],
     };

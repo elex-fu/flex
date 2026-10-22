@@ -69,7 +69,7 @@ export type OrchestratorOptions = {
   databasePath?: string;
   provider?: ProviderId;
   adapter?: ProviderAdapter;
-  executionHooks?: Pick<ExecutionWorkerOptions, "beforeDispatch" | "afterTerminal" | "stage" | "track">;
+  executionHooks?: Pick<ExecutionWorkerOptions, "beforeClaim" | "beforeDispatch" | "afterTerminal" | "stage" | "track">;
   revalidateDevice?: (intent: ExecutionIntentRow) => void;
   /** Verified preparer/producer tree exit, independent of business terminal evidence. */
   canReleaseWorkspace?: (context: DispatchContext) => boolean;
@@ -324,21 +324,24 @@ export class SessionOrchestrator {
     this.worker = new ExecutionWorker(this.execution, this.runtimes, {
       owner: { id: this.hostOwnerId, generation: this.hostOwnerGeneration }, sessionId: this.session.id,
       ...options.executionHooks,
+      beforeClaim: async (intent) => {
+        if (intent.kind !== "start_turn" || !this.executionPermits) return;
+        // Capacity is waited for while the intent is still pending, so a
+        // queued task stays cancellable before dispatch and only turns into
+        // preparation (claimed) once the host can actually run it.
+        this.assertNativeReady({intent});
+        this.preparingAttempts.add(intent.attemptId);
+        const wait = new AbortController(); this.permitWaits.set(intent.attemptId, wait);
+        const permit = await this.executionPermits.acquire(intent.attemptId, { signal: wait.signal });
+        if (this.closed || this.worker.isSealed) { permit.release({ producerStopped: true }); throw new Error("HOST_DRAINING"); }
+        this.taskPermits.set(intent.attemptId, permit);
+        this.assertNativeReady({intent});
+        if (this.activeWorkspaceLease) throw new Error("WORKSPACE_BUSY");
+        this.activeWorkspaceLease = WorkspaceLease.acquire({ workspace: this.checkoutRoot, owner: this.owner, operationId: intent.turnId! });
+        await this.ensureBaseline();
+      },
       beforeDispatch: async (intent, context) => {
-        if (intent.kind === "start_turn") {
-          this.assertNativeReady({intent});
-          if (this.executionPermits) {
-            this.preparingAttempts.add(intent.attemptId);
-            const wait = new AbortController(); this.permitWaits.set(intent.attemptId, wait);
-            const permit = await this.executionPermits.acquire(intent.attemptId, { signal: wait.signal });
-            if (this.closed || this.worker.isSealed) { permit.release({ producerStopped: true }); throw new Error("HOST_DRAINING"); }
-            this.taskPermits.set(intent.attemptId, permit);
-            this.assertNativeReady({intent});
-            if (this.activeWorkspaceLease) throw new Error("WORKSPACE_BUSY");
-            this.activeWorkspaceLease = WorkspaceLease.acquire({ workspace: this.checkoutRoot, owner: this.owner, operationId: intent.turnId! });
-            await this.ensureBaseline();
-          }
-        }
+        if (intent.kind === "start_turn") this.assertNativeReady({intent});
         if (intent.kind === "start_turn" && this.checkpointBinding) await this.captureBefore(intent, context);
         if (this.worker.isSealed) return;
         await options.executionHooks?.beforeDispatch?.(intent, context);

@@ -52,7 +52,9 @@ export type CompatibilityVersionProbeOptions = Omit<CompatibilityScenePolicyOpti
   /** C0, owner/restore/recovery and checkout policy for the fixed local read-only probe. */
   assertBaseline(): void;
 };
-const fail = (code: string): never => { throw new OperationsError(code); };
+// Function declaration (not a const arrow): TS only applies never-returning
+// call narrowing to declared functions with an explicit never return type.
+function fail(code: string): never { throw new OperationsError(code); }
 const same = (left: unknown, right: unknown) => compatibilityDigest(left) === compatibilityDigest(right);
 const bytesDigest = (value: string | Uint8Array) => createHash("sha256").update(value).digest("hex");
 export function compatibilitySceneCommandIds(runId: string): readonly string[] {

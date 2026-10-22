@@ -5,16 +5,18 @@ import { expect, test, type Page } from "@playwright/test";
 import { clientRecords, storedCommands } from "./helpers.js";
 import type { ClientDraft } from "@flyx/client-core";
 
-type Stats = { sessions: number; processes: number; nativeSessions: number; loadedRuntimes: number };
-async function startCoreHost() {
-  const path = resolve(dirname(fileURLToPath(import.meta.url)), "core-host-main.ts");
+type Stats = { sessions: number; processes: number; nativeSessions: number; loadedRuntimes: number; writeReceipts: Array<{ method: string; count: number }> };
+/** Durable write families owned by the Recovery/Diff/Worktree panels. */
+const PANEL_WRITE_METHODS = /^(checkpoint\.|worktree\.|session\.recovery\.)/;
+async function startCoreHost(script = "core-host-main.ts", marker = "FLYX_CORE_BROWSER_READY") {
+  const path = resolve(dirname(fileURLToPath(import.meta.url)), script);
   const child = spawn(process.execPath, ["--import", "tsx", path], { cwd: resolve(dirname(path), "../../.."), env: process.env, stdio: ["ignore", "pipe", "pipe", "ipc"] });
   let errors = "";
   child.stderr!.on("data", (chunk: Buffer) => { errors = (errors + chunk.toString()).slice(-8000); });
   const ready = await new Promise<{ address: string; token: string }>((yes, no) => {
-    const timer = setTimeout(() => { child.kill("SIGTERM"); no(new Error(`Core browser Host readiness timeout: ${errors}`)); }, 20_000);
+    const timer = setTimeout(() => { child.kill("SIGTERM"); no(new Error(`Core browser Host readiness timeout: ${errors}`)); }, 30_000);
     let output = "";
-    child.stdout!.on("data", (chunk: Buffer) => { output += chunk.toString(); const match = /^FLYX_CORE_BROWSER_READY (.+)$/m.exec(output); if (match) { clearTimeout(timer); yes(JSON.parse(match[1]!) as { address: string; token: string }); output = ""; } });
+    child.stdout!.on("data", (chunk: Buffer) => { output += chunk.toString(); const match = new RegExp(`^${marker} (.+)$`, "m").exec(output); if (match) { clearTimeout(timer); yes(JSON.parse(match[1]!) as { address: string; token: string }); output = ""; } });
     child.once("error", (error) => { clearTimeout(timer); no(error); });
     child.once("exit", (code) => { clearTimeout(timer); no(new Error(`Core browser Host exited ${code}: ${errors}`)); });
   });
@@ -88,6 +90,95 @@ test.describe("real Gateway and Web core Session controls", () => {
       await expect(catalog).toContainText("PROVIDER_NOT_ACTIVATED");
       expect((await storedCommands(page)).some((command) => command.method === "session.startTurn")).toBe(false);
       expect(await fixture.stats()).toMatchObject({ sessions: 2, processes: 0, nativeSessions: 0, loadedRuntimes: 0 });
+    } finally { await fixture.stop(); }
+  });
+});
+
+test.describe("core panels without a Provider or Git backend", () => {
+  test("keeps the Recovery entry unavailable with a concrete reason and issues no recovery writes", async ({ page }) => {
+    const fixture = await startCoreHost();
+    try {
+      const catalog = await pairCore(page, fixture);
+      const recovery = page.getByRole("region", { name: "恢复核对", exact: true });
+      await expect(recovery).toBeVisible();
+      await expect(recovery.getByRole("button", { name: "检查原执行", exact: true })).toBeDisabled();
+      await expect(recovery).toContainText("当前快照没有待核对的原 Turn");
+      // Refreshing the authoritative snapshot must not conjure a recoverable Turn.
+      await catalog.getByRole("button", { name: "刷新目录与状态", exact: true }).click();
+      await expect(recovery.getByRole("button", { name: "检查原执行", exact: true })).toBeDisabled();
+      await expect(recovery).toContainText("当前快照没有待核对的原 Turn");
+      const commands = await storedCommands(page);
+      expect(commands.filter((command) => command.method === "session.interrupt" || command.method.startsWith("session.recovery."))).toEqual([]);
+      const stats = await fixture.stats();
+      expect(stats).toMatchObject({ sessions: 1, processes: 0, nativeSessions: 0, loadedRuntimes: 0 });
+      expect(stats.writeReceipts).toEqual([]);
+    } finally { await fixture.stop(); }
+  });
+
+  test("disables Turn Diff with a concrete reason when the Host has no checkpoint capability", async ({ page }) => {
+    const fixture = await startCoreHost();
+    try {
+      await pairCore(page, fixture);
+      const diff = page.getByRole("region", { name: "Turn 变更与回退", exact: true });
+      await expect(diff).toBeVisible();
+      await expect(diff).toContainText("此 Host 未提供检查点 Diff。现有 Workspace Diff 可查看当前未提交变更。");
+      await expect(diff).not.toContainText("查看所选任务 Diff");
+      expect((await storedCommands(page)).filter((command) => command.method.startsWith("checkpoint."))).toEqual([]);
+      const stats = await fixture.stats();
+      expect(stats).toMatchObject({ sessions: 1, processes: 0, nativeSessions: 0, loadedRuntimes: 0 });
+      expect(stats.writeReceipts).toEqual([]);
+    } finally { await fixture.stop(); }
+  });
+
+  test("disables the Worktree panel with a concrete reason and issues no worktree commands", async ({ page }) => {
+    const fixture = await startCoreHost();
+    try {
+      await pairCore(page, fixture);
+      const worktrees = page.getByRole("region", { name: "隔离工作区", exact: true });
+      await expect(worktrees).toBeVisible();
+      await expect(worktrees).toContainText("此 Host 未提供托管 Worktree。可在上方选择现有已登记工作区创建会话。");
+      await expect(worktrees.getByRole("button", { name: "刷新工作区", exact: true })).toBeDisabled();
+      await expect(worktrees).not.toContainText("创建隔离工作区");
+      expect((await storedCommands(page)).filter((command) => command.method.startsWith("worktree."))).toEqual([]);
+      const stats = await fixture.stats();
+      expect(stats).toMatchObject({ sessions: 1, processes: 0, nativeSessions: 0, loadedRuntimes: 0 });
+      expect(stats.writeReceipts).toEqual([]);
+    } finally { await fixture.stop(); }
+  });
+});
+
+test.describe("worktree creation uplink with a trusted local execution port", () => {
+  test("accepts a managed worktree creation and keeps exactly the original two receipts", async ({ page }) => {
+    const fixture = await startCoreHost("core-host-execution-main.ts", "FLYX_CORE_EXECUTION_READY");
+    try {
+      const catalog = await pairCore(page, fixture);
+      const worktrees = page.getByRole("region", { name: "隔离工作区", exact: true });
+      await expect(worktrees.getByRole("button", { name: "刷新工作区", exact: true })).toBeEnabled();
+      const create = worktrees.getByRole("button", { name: "创建隔离工作区", exact: true });
+      await expect(create).toBeEnabled();
+      await create.click();
+      const receipt = worktrees.getByText("工作区回执：");
+      await expect(receipt).toBeVisible();
+      // The accepted receipt holds the operation at admission time; poll the
+      // original operation until the managed checkout is confirmed complete.
+      await expect.poll(async () => {
+        await worktrees.getByRole("button", { name: "核对原工作区操作", exact: true }).click({ timeout: 2_000 }).catch(() => {});
+        return (await receipt.textContent()) ?? "";
+      }, { timeout: 60_000 }).toContain("completed");
+      // Two separate receipts: the worktree operation and the stable Session command.
+      const continueButton = worktrees.getByRole("button", { name: "使用上方 Provider 创建会话", exact: true });
+      await expect(continueButton).toBeEnabled();
+      await continueButton.click();
+      await expect(catalog.getByLabel("会话名称", { exact: true })).toHaveValue("Isolated session");
+      const commands = await storedCommands(page);
+      expect(commands.filter((command) => command.method === "worktree.create")).toHaveLength(1);
+      const sessionCreates = commands.filter((command) => command.method === "session.createNew");
+      expect(sessionCreates).toHaveLength(1);
+      expect(sessionCreates[0]!.commandId).toMatch(/^worktree-session:/);
+      const stats = await fixture.stats();
+      expect(stats).toMatchObject({ sessions: 2, nativeSessions: 0, loadedRuntimes: 0 });
+      expect(stats.writeReceipts).toEqual([{ method: "worktree.create", count: 1 }]);
+      await page.screenshot({ path: test.info().outputPath("core-worktree-uplink.png"), fullPage: true });
     } finally { await fixture.stop(); }
   });
 });

@@ -1,12 +1,12 @@
 # Flyx 核心能力交付技术方案
 
-> 版本：v1.0
-> 日期：2026-10-18（Asia/Shanghai）
-> 状态：设计待实施；macOS 执行契约为首要阻塞项
-> 基线：Flyx `c11e08d` 加当前工作树；Paseo `710851ccb`；T3 Code `4ba4871af`
+> 版本：v1.2（并行开发中的补充契约）
+> 日期：2026-10-23（Asia/Shanghai）；初版：2026-10-18
+> 状态：R1–R8 中央组合已在工作区接线（默认 main fail-closed），待全量验证；macOS 执行契约仍为首要阻塞项
+> 当前源码基线：Flyx `1108bed`；原分析基线：`c11e08d`；参考快照：Paseo `710851ccb`、T3 Code `4ba4871af`
 > 用户已明确：首版必须支持 macOS 本机执行，不能以 Linux Host 替代交付。
 
-本文负责上一轮差距分析后的**剩余核心交付**，作为接下来实施和验收的依据。[原对照方案](./paseo-t3code-comparison-and-optimization-technical-design.md)保留架构背景，[原实施记录](./flyx-optimization-implementation-plan.md)保留 R01–R18 的历史结果。本文中的新增接口、表和候选平台机制均为设计，不代表已实现。
+本文负责上一轮差距分析后的**剩余核心交付**，作为接下来实施和验收的依据。[原对照方案](./paseo-t3code-comparison-and-optimization-technical-design.md)保留架构背景，[原实施记录](./flyx-optimization-implementation-plan.md)保留 R01–R18 的历史结果。当前进度、剩余任务 R0–R9 的文件范围、实现步骤和证据见[核心实施计划](./core-capabilities-implementation-plan.md)。本文规定最终契约；仅进度表明确确认的范围属于已实施，候选平台机制与剩余接线不因写入方案而视为完成。
 
 ## 1. 交付目标与范围
 
@@ -27,20 +27,24 @@ macOS 监督组件只承担本项目启动的进程及其停止证据，不建�
 
 ## 2. 已有基础与确定缺口
 
-| 范围 | 当前源码事实 | 本轮补充 |
+下表左两列描述已提交的 `1108bed` 基线；右列为 2026-10-23 对未提交工作区的逐模块对照结论（详见[实施计划](./core-capabilities-implementation-plan.md) §2–§3、§7 末条）。工作区实现与独立验证持续记录在实施计划 §7，不以基线缺口推断工作区仍完全未实现，也不以新增文件推断已通过生产验收；"已接线"指组合代码存在于生产模块并有定向测试。
+
+| 范围 | 当前源码事实（`1108bed` 基线） | 工作区进展（2026-10-23 对照；未提交） |
 | --- | --- | --- |
-| 生产组合 | `createHostApplication` 已组合 Catalog、Views、Interaction、Recovery、Device、Attention、Relay、operations | 加入显式激活、真实执行器、Checkpoint、Revert 和 Worktree 的实际绑定 |
-| 启动 | SQL 历史启动不加载 Provider；资源被标为待验证 | 保留历史启动，增加本地验证和启用路径 |
-| 托管查询 | `ManagedWorkspaceQuery.prepare()` 始终不可用，`execute()` 最终抛错 | 实现实际受控执行和停止证明 |
-| macOS | 私有目录隔离已测试；全部后代停止、稳定身份绑定尚未成立 | 首先验证可交付的平台监督契约 |
-| 会话 | Catalog、V2 RPC、独立事件、延迟加载、公开 SessionClient 已有 | Web 新建/命名/归档/关闭运行时、资源选择和并行状态展示 |
-| 恢复 | inspect/reconcile/acknowledge、CLI 和 SDK 已有 | 真实检查端口、可信版本、备份恢复放行及 Web/手机界面 |
-| Git | Checkpoint、受控恢复、Worktree journal 与 typed client 已有 | 统一实际 runner，接入中央生命周期、RPC 和 UI |
-| 客户端 | 草稿、Outbox、权威副本、引用读取、审批、最小 Expo 平台已有 | 将实际 Host 的核心操作全部接通并做真机验收 |
+| 生产组合 | 已有 Catalog/Views/Interaction/Recovery 等；新增 ActivationLoad、doctor 与 readiness RPC，未构造 HostCheckpoints/HostWorktrees/Scheduler | 强制准入、执行器、Checkpoint/Revert/Worktree/permit/元数据锁中央绑定已在 host-application 接线并有组合级测试（checkpoint port 为首个 domain port）；默认 main 不注入受信 execution 端口，保持 fail-closed |
+| 启动/激活 | SQL 历史启动不加载 Provider；维护 CLI、v11 收据与激活加载/失效已实现 | 在线用途 gate 已实现（组合层 `assertNativeReady` 拆分，`restoreWriteReady` 收紧）；实际 supervision/runtime 事实与兼容产物闭环仍缺 |
+| 托管查询 | `prepare/execute` 已支持注入 executor；生产 main/Host 未注入，默认仍拒绝 | `ManagedWorkspaceQueryExecutor` 已实现并按 runner 注入；生产 backend 构造等待 R0 |
+| 进程/Git | 窄句柄、原始记录与受控 runner 已有模块验证；生产 supervisor 分支仍限定 Linux | 每 Turn 停止/续接、全局停止端口、共享关闭 deadline 已接线；mutating Git 套 repository 元数据锁；macOS backend 仍缺 |
+| macOS | 私有目录隔离已测试；全部后代停止、稳定身份绑定尚未成立 | 无新增证明，仍为首要阻塞（R0/C0） |
+| 会话 | Catalog、V2 RPC、独立事件、延迟加载、公开 SessionClient 已有 | Web 新建/命名/归档/关闭运行时与资源选择已接（CoreControls/四面板+真实 Host E2E）；并行状态展示待验收 |
+| 恢复 | inspect/reconcile/acknowledge、CLI 和 SDK 已有 | `NativeHistoryReaderFactory` 已注入 CatalogRecovery、restore inspect/confirm CLI 已注册；生产 manifest 恒 unknown、真实外部检查器占位；Web/手机 Recovery 面板已接 |
+| Worktree | journal/typed client 已有，调度器与关闭 fence 模块已验证 | 任务 permit（首版 2）、共享 common-dir 元数据锁、scheduler SQL 扫描修复与中央接线、归档/恢复互斥已实现；生产启用与真并行验收待 runner 注入 |
+| Checkpoint/回退 | 服务、受控恢复、journal 与 typed client 已有 | Checkpoint 中央组合（固定顺序捕获+projector v4 白名单投影）已接线；双 Provider 回退驱动与响应丢失 unknown 语义完成（仅 fixture），生产接线与真实回退待做 |
+| 客户端 | 草稿、Outbox、权威副本、引用读取、审批、最小 Expo 平台已有 | CoreControls/Web 四面板/手机最小面板已接通（真实 Host E2E 覆盖会话元数据/草稿/readiness）；剩余 Recovery/Diff/Worktree/Revert 浏览器 E2E 与真机验收 |
 
 核对入口：[Host application](../apps/mvp-host/src/host-application.ts)、[查询执行器](../apps/mvp-host/src/lifecycle/managed-workspace-query.ts)、[Catalog](../apps/mvp-host/src/catalog/host-catalog.ts)、[macOS 实测](./macos-native-stop-contract.md)、[查询契约](./managed-workspace-query-contract.md)。
 
-2026-10-18 的定向验证为 43 项中 36 通过、7 项在 5 秒期限内超时，并伴随 Worktree 清理报错。单独选择其中一个复杂用例，将测试期限改为 30 秒后通过，实际测试约 24 秒。这支持继续检查期限和超时清理，不能据此断言存在 7 个业务错误，也不能覆盖其余未复核用例。此前文档里的全套通过数属于历史证据。
+初版设计时（2026-10-18）曾观察到 43 项定向验证中 36 通过、7 项超时及 Worktree 清理报错；这是历史观测，不直接代表当前缺陷数。后续已完成 `HostWorktrees.seal()` 幂等 fence 与相关模块验证。2026-10-22 进展核查另有 9 文件 / 58 用例通过，覆盖 C1/C2、调度器、C3 和迁移；没有新增真实 Provider、完整产品套件或手机验收。历史全量、定向重跑与当前生产验收的适用范围分别见实施计划 §5–§6。
 
 ## 3. 固定架构与所有权
 
@@ -177,15 +181,15 @@ Host 进程本身也需要原始身份绑定，供 owner/lease 的崩溃回收�
 
 复用 `ManagedProcessRegistry`、`SqliteProcessJournal`、`HostManagedRuntime` 和原始 DispatchContext。新增一个小的启动适配层，将 macOS Supervisor 的 launch/stop 证据映射到这些对象。Linux 实现保留原路径；首版验收仍必须包含 macOS。
 
-当前 `ProviderExecutionBoundary.spawn()` 返回 Node `ChildProcess`；Claude SDK 接收 `SpawnedProcess`，Codex stdio client 也依赖 `ChildProcess`。远端监督服务并不产生 Node 原生 ChildProcess，不能用类型断言掩盖差异。
+原先 `ProviderExecutionBoundary.spawn()` 与 stdio client 依赖 Node `ChildProcess`；当前已改为 `ManagedChildHandle`，Claude SDK 通过锁定 facade 满足 `SpawnedProcess`。Node 适配已验证，macOS 监督服务适配仍待实现，不能用类型断言把 IPC 句柄伪装成原生 ChildProcess。
 
-改造方式：抽出各调用方真正使用的 `ManagedChildHandle`（stdin/stdout/stderr、exit/error 事件、原始 root PID、取消请求、关闭等待）。Node 和监督服务各实现一个适配器；Claude 适配器实现锁定 SDK 的 `SpawnedProcess` 契约；Codex 和版本查询依赖窄接口。
+固定接口：`ManagedChildHandle` 只暴露各调用方真正使用的 stdin/stdout/stderr、exit/error 事件、原始 root PID、取消请求和关闭等待。剩余改造在同一接口上增加监督服务适配，并验证实际 stream/取消/关闭语义；不重做已通过的 Node 路径。
 
 Claude 的同步 spawn 回调可以先返回有界 stream facade，异步完成 prepare/commit/release；在 release 前不得向负载交付 stdin。准备失败必须发 error，不能伪造 PID、成功 spawn 或正常 exit。stderr 末尾、EOF、abort、背压和 SDK 关闭顺序必须有真实回归。
 
 ### 5.2 托管 Git 的统一入口
 
-新增 `lifecycle/managed-git-runner.ts`，适配已有的三类用途，保留各自的 allowlist：
+已新增 `lifecycle/managed-git-runner.ts`，适配以下三类用途并保留各自 allowlist；剩余交付为 macOS backend 与中央实际注入：
 
 | 用途 | 现有输入 | 权限和资源 |
 | --- | --- | --- |
@@ -195,9 +199,11 @@ Claude 的同步 spawn 回调可以先返回有界 stream facade，异步完成 
 
 统一执行顺序：输入校验 → 实际路径/二进制/策略校验 → 持久 launching → 受控启动和原始身份提交 → 放行 → 有界输出 → 原停止证据 → 提交结果。每个 helper 也属于生产进程，不能因“只是 git --version”而跳过记录。
 
-`RawWorktreeGit`、`ControlledRestore.verifyRepository/objectGit` 和旧 `GitService` 的生产直启路径逐步改为注入该 runner；确定性 fixture 可保留显式 raw 实现。生产构造器缺 runner 时必须拒绝，不能静默走测试 fallback。将此限制覆盖到 `SessionRegistry.gitStatus/gitDiff`，避免旧 Diff 路径绕过新执行器。
+`RawWorktreeGit`、`ControlledRestore.verifyRepository/objectGit` 和旧 `GitService` 的生产端口已要求注入 runner；确定性 fixture 可保留显式 raw 实现。下一步由中央组合提供真实 runner，并复核 `SessionRegistry.gitStatus/gitDiff` 等全部调用方。生产构造器缺 runner 时继续拒绝，不能静默走测试 fallback。
 
 最终 argv/env/cwd、stdin 摘要、执行预算和 DispatchContext 必须在派发前固定。禁用用户 Git hooks、fsmonitor、external diff/textconv、隐式网络取对象及继承的 Git 配置；工作区查询和变更使用不同策略，不能复用一个无限制 shell runner。
+
+临时 index/object/worktree 目录同样先做真实路径规范化，再冻结到请求。macOS 的 `/var/folders` 与 `/private/var/folders` 别名不能由 runner 放宽校验来迁就；生产者应传入 canonical 路径。异常也保留原 processId、launchDigest、用途、操作/步骤与请求绑定，不能在 Git driver 中包装成丢失停止状态的普通错误。
 
 ### 5.3 首版进程驻留策略
 
@@ -211,19 +217,19 @@ Claude 的同步 spawn 回调可以先返回有界 stream facade，异步完成 
 
 普通 `start` 继续先开放历史与恢复查询。配对、页面打开、会话选择和读取 Timeline 不启动 Provider，也不触发付费预检。
 
-拟新增本地 CLI：
+当前已接入维护模式的本地 CLI。构建后由实际 main 调用，参数以 `activation-cli.ts` 为准：
 
-```text
-flyx verify --workspace <registeredId> --provider <instanceId>
-flyx activate --evidence <evidenceId> --command-id <id>
-flyx activation inspect <operationId>
+```sh
+rtk proxy node apps/mvp-host/dist/main.js activation verify --workspace <registeredId> --provider <instanceId> --command-id <verifyCommandId>
+rtk proxy node apps/mvp-host/dist/main.js activation activate --evidence <verifyOperationId> --command-id <activateCommandId>
+rtk proxy node apps/mvp-host/dist/main.js activation inspect <operationId>
 ```
 
-这些是将来 CLI 的语义，当前仓库尚无 `flyx` 可发布命令。实施时先接入现有 `start:host` 参数解析；安装包装只提供足以启动这一核心链路的命令。
+上例尖括号表示占位参数，运行时应替换为实际 ID；当前仓库尚无 `flyx` 可发布命令。`verify` 只匹配已有兼容证据并检查资源，不运行模型场景；缺实际查询后端/运行事实时拒绝并保留收据。CLI 能解析和记录拒绝不等于资源已经能够成功激活。
 
 首版在 Host 停止、持有 maintenance owner 时验证和激活；完成后正常启动。这样不新增一个远程管理写入口。不能启动第二个 writer，也不能通过 SQL 手工把 verification 改成 verified。读取普通 doctor 继续不产生副作用。
 
-维护 CLI 直接调用拟新增的 `HostActivationService` 和管理操作 Store，不构造运行态 HostCatalog，也不调用当前只接受 host owner 的 `revalidateConfiguration()`。真实兼容任务在独立 fixture Host 中执行；生产库中的管理/helper 记录使用 `ProcessLaunchContext` 可选 Session 字段，不创建假的用户 Turn。
+维护 CLI 已直接调用 `HostActivationService` 和管理操作 Store，不构造运行态 HostCatalog，也不调用当前只接受 host owner 的 `revalidateConfiguration()`。真实兼容任务在独立 fixture Host 中执行；生产库中的管理/helper 记录使用 `ProcessLaunchContext` 可选 Session 字段，不创建假的用户 Turn。
 
 ### 6.2 拆开三种证据
 
@@ -237,11 +243,24 @@ flyx activation inspect <operationId>
 
 ### 6.3 消除验证启动循环
 
-兼容 runner 在独立临时 Git 仓库、独立 Store/identity 中运行固定任务，使用受控验证入口；它不要求先激活用户的生产 Session。真实 Provider 调用由本地明确执行的 `verify` 或专用验收命令触发。
+兼容 runner 在独立临时 Git 仓库、独立 Store/identity 中运行固定任务，使用受控验证入口；它不要求先激活用户的生产 Session。真实 Provider 调用由专用兼容/验收命令显式触发，沿用 `--real` 与对应 `RUN_REAL_<PROVIDER>=1` 双条件；`activation verify` 消费已有产物，不隐含付费调用。
 
 产物分别记录 turn、approval、question、interrupt、reconnect、recovery、rewind 的实际支持和结果；不支持的可选能力明确标记。Claude 与 Codex 均有验收行。不能将版本查询或一条 OK 回复升级成全部能力验证。
 
 接通 `run-matrix.mjs` 的实际 readiness 产物与 `CompatibilityEvidenceRecorder`，补 Recovery 场景调度；`fully-verified` 由原始记录推导，拒绝仅修改矩阵状态。证据位于 Host 私有目录，使用规范化内容摘要及 Host 身份签名；签名用于校验来源和完整性，不能代替场景测试。
+
+当前 recorder 与真实 adapter/recovery 尚未组合，真实 main 也未写 runner 期待的 readiness 文件。补齐时，受限本地验证模式应以 runId、构建/入口、Host 身份、观察版本绑定原子写入的私有握手文件；不导出到公开 RPC，不用旧文件或测试入口冒充生产 main。验证入口只接受固定隔离场景与已验证后端，不提供远程绕过激活的通用开关。
+
+本轮细化为以下有界流程，相关模块与 CLI 正在集成，尚不代表真实验证已通过：
+
+1. `run-matrix --prepare` 在独立私有目录生成 source identity、runId 与构建准备信息，不调用 Provider。
+2. 生产 Host 停止后，由 maintenance CLI `compatibility authorize` 对独立 source 公钥、runId、Provider、构建/运行时/产物摘要和固定场景集签发短期授权。source Host 与生产 Host 身份不同，不能直接要求二者 fingerprint 相同。
+3. source main 验证授权及真实环境后，构造不对 RPC 暴露的 `CompatibilityScenePolicy`。它只允许该隔离 Session 的固定基本 prompt 和十条确定 commandId；受理在原 Engine 事务内持久保留，派发/实际 spawn 再核对原请求与 DispatchContext。只豁免“尚无旧兼容证据”的循环依赖，不豁免 owner、当前设备、restore、Recovery、checkout lease、真实进程边界或停止证明。不能永久把资源改成 activated，也不能仅凭 env 令 `assertNativeReady` 成功。
+4. 原启动前保存冻结的 executable/script/Node/Host build/配置测量，与原 processId 和 launchDigest 绑定；planned snapshot 不是内核执行映像证明。记录成功场景还必须核对真实 Native binding、已提交原生终态事件及原进程停止证据，不能只检查非空引用。Claude 使用真实 result UUID，Codex 使用真实 native Turn ID，不互相伪造。
+5. 专用 `--real` 命令仍要求相应 `RUN_REAL_<PROVIDER>=1`，运行后导出 source 签名 readiness、逐场景记录和原来源摘要；fixture/deterministic 签名域不能进入生产信任链。
+6. maintenance CLI `compatibility import` 核对预先签发的授权、原 source、run/build/场景与精确记录摘要，生成生产 Host 签名的 endorsement。激活消费该 endorsement，缺失时拒绝；自带公钥的自签名产物本身不建立信任。`activation verify` 不自动导入或运行模型。
+
+首个基本场景只发布实际完成的 `turn` 能力；审批、Question、中断、恢复、回退分别需要相应场景与真实证据，不能通过 import 给未运行能力背书。十次唯一成功按 Provider 的真实结果身份去重，不按客户端调用次数计数。
 
 能力验收随实施推进：C3 先验证任务/续接/审批/Question/中断/停止，C4 再加入真实恢复，C6 再加入完整回退。产物记录场景集版本和逐能力证据；`fully-verified` 只针对该产物声明的固定场景集，未完成能力不发布。这样 C3 不会反过来依赖尚未实现的 C4/C6，已验证的基本执行也不会被展示为回退已交付。
 
@@ -263,15 +282,19 @@ flyx activation inspect <operationId>
 
 将当前大范围 `assertBusinessReady()` 拆为少量明确函数，挂在已有服务边界，不建立新的通用策略引擎：
 
+截至 `1108bed`，该拆分和在线激活强制尚未完成：现有 admission 只执行原 producer/restore 等 gate，`HostActivationService.assertReadyForWrite` 没有在线调用。实施必须复用同一 observation/load 的断言与撤销逻辑，不能因当前环境无法激活而把这个缺口作为最终行为保留。
+
 | Gate | 适用 | 条件 |
 | --- | --- | --- |
 | history | SQL 历史、已保存回执、证据读取 | schema/权限可读、Store 未封闭 |
-| new-command | startTurn、新 worktree/revert 等 | 当前授权、Host admission、资源激活、无相关原始 gate、当前 lease |
+| new-command | startTurn、新 worktree/revert 等 | 当前授权、Host admission、该用途所需资源/后端验证、无相关原始 gate、当前 lease；Native 要求 workspace/provider 激活，纯 Worktree Git 不要求无关 Provider 激活 |
 | accepted-continuation | 已受理操作的下一步骤 | 原 operation/attempt、当前权限、原资源、有效 lease 和独立 restore 条件 |
 | recovery | inspect/reconcile/acknowledge | 原目标身份、当前权限、证据版本；不能要求目标已经恢复为 idle |
 | metadata-write | rename/archive/create 等 | 当前权限和必要资源条件；不随意加载 Provider |
 
 已受理 Revert 不能被自己建立的“有操作进行中”gate 阻止。例外必须绑定该 operation 与步骤，不能用全局 `bypass` 标志。
+
+新命令在受理前和实际副作用派发前分别复核，排队不能延长旧证据效力。尚未交付的 prompt 仍按新 Native 命令检查。中断/取消保留原 attempt 的独立控制路径，激活过期不能使停止不可用；审批/Question 继续核对当前权限、版本和原控制通道。详细接线与拒绝矩阵见实施计划 R2。
 
 保留 CommandEngine 的 receipt/event/intent 原子事务和提交后 worker 派发；保持 ControlLane 独立于长任务完成等待。支持当前权限重查，设备撤销后未交付的审批不能继续发出。无原生确认的响应只能显示“已受理/待核对”。
 
@@ -286,7 +309,9 @@ flyx activation inspect <operationId>
 5. 同步封闭 runtime/driver/Views/设备/传输的迟到 callback；这一步不依赖 drain 成功。
 6. 关闭连接与 Store。独立监督服务继续保留原始未决 launch 证据。
 
-`HostWorktrees.seal()` 改为幂等的同步 callback fence；不因 running/calls 未清空而在封闭前抛错。它不宣称 producerStopped，也不释放 lease。原始拒绝/未知结果应在关库前记录，关库后回调只结束本地 Promise，不写 SQL 或发布事件。
+`HostWorktrees.seal()` 已改为幂等的同步 callback fence；不因 running/calls 未清空而在封闭前抛错。它不宣称 producerStopped，也不释放 lease。原始拒绝/未知结果应在关库前记录，关库后回调只结束本地 Promise，不写 SQL 或发布事件。
+
+剩余中央接线需补上全局 Git/helper 的显式停止阶段：当前 `CatalogGlobalService` 仅有 drain/seal/close，Host 的 `stopProducers` 主要等待 Session runtime 关闭。新增最小停止端口或固定 runner 接点，必须先发停止再等待 operation/service drain，不能只把 Worktree/Checkpoint 加入 drain 列表。
 
 ## 8. 原始恢复与备份恢复
 
@@ -322,6 +347,8 @@ session.recovery.acknowledge
 - Codex allowlist 仅包含所需的 `thread/read` 等已验证只读查询；禁止偷偷发送 prompt 或恢复原 Turn。
 - Claude 读取原生 transcript 与锚点，不修改 transcript，不靠搜索“completed”字样裁决。
 - helper 自己也需要原始启动与停止证明，不能在 inspect 结束后留下无主进程。
+
+Native/helper 检查结束后再读取原执行停止事实；检查超时、构造拒绝或停止未知均阻止 acknowledge 放行。新检查 helper 不得伪装成旧 owner 的原始 launch；它以单独的、绑定原操作的已验证后继清单进入检查证据。inspect 与确认期间新增的同 owner 检查 helper 也要逐一验证、持久关联，不能因为使用新 helper ID 就永久使原业务结果无法核对；不在该清单中的 owner journal 变化继续判 stale。
 
 公开历史查询仍不构造 Native。只有显式恢复可触发上述有界检查。原生状态打不开或版本不匹配时显示当前能证明的事实和阻塞原因。
 
@@ -374,6 +401,8 @@ Web 使用现有公开 `SessionClient` 接通 workspace/provider 列表、新建
 - 保留当前各 Session Worker，仅对 Worktree operation 进行有限调度；不新增依赖图或跨 Agent 调度平台。
 
 并发上限通过 Host 内一个有界 permit 实现，不新增持久 job 表。已受理任务等待 permit/checkout lease 时仍是 queued；取得两者后才能提交 dispatching 并交付 prompt。审批、中断和恢复控制不等待普通任务 permit。关闭期间未派发等待项按原 intent 明确取消或留待显式核对。
+
+当前 WorktreeScheduler 的有界并发只覆盖 Worktree operation 模块，不是所有 Provider Turn 的 Host 上限；中央实例化、任务 permit 与共享 Git 锁仍属于剩余交付。
 
 具体接入一个 Host 级 `WorktreeScheduler`：`accepted` 回调只在提交后唤醒，扫描可派发的持久 pending intent；调用现有 `HostWorktrees.dispatchAccepted(intentId)`，由它执行唯一 claim/dispatch CAS。该 scheduler 不加载 source Session 的 Provider，也不再做一遍 claim。只处理当前 owner/generation 下未派发的固定 Worktree 方法；旧 owner 的 claimed/dispatching/unknown 转恢复检查。启动扫描与提交后唤醒共同避免丢失内存唤醒；关闭先封闭扫描和停止 Git。保留 `assertSourceIdle` 对本操作原始/恢复 binding 的精确排除，其余 intent 仍阻塞。
 
@@ -505,9 +534,9 @@ resourceRevisions 分别来自两个资源新增的 readiness_revision；更新�
 
 ### 13.2 最小数据库变更
 
-继续使用当前 schema 010 中的 Session/Catalog、receipt/intent、process evidence、Recovery、Checkpoint/Revert/Worktree 表。新增中央迁移 **011-execution-activation**，不在 factory 内执行 DDL。
+继续使用原 schema 010 中的 Session/Catalog、receipt/intent、process evidence、Recovery、Checkpoint/Revert/Worktree 表；中央迁移 **011-execution-activation** 已合入，当前 schema 为 v11，不在 factory 内执行 DDL。
 
-拟新增一张本地管理操作表，承载 activation 与 restore 外部检查，避免为每个步骤另建框架：
+011 已安装以下本地管理操作表，承载 activation 与后续 restore 外部检查，避免为每个步骤另建框架：
 
 ```sql
 CREATE TABLE host_execution_operations (
@@ -531,20 +560,22 @@ CREATE TABLE host_execution_operations (
 
 该表同时是本地管理回执；同一 actor/commandId 的请求摘要必须相同。细粒度进程仍写现有 managed_processes，不把管理操作伪装成用户 Session Turn。完成激活的资源状态变更、相关证据引用和管理回执在同一事务提交。
 
-Workspace/Provider verification 记录各增加 `activation_operation_id TEXT`、`activation_binding_digest TEXT`、`readiness_revision INTEGER NOT NULL DEFAULT 0`；前两者允许 NULL，引用管理操作表并在同一事务内维护，旧行默认为未验证。Provider 的现有 verification JSON 保留能力/版本事实，不承载伪造的实时停止证明。上述列与 validator 一并在 011 安装。
+Workspace/Provider verification 记录已增加 `activation_operation_id TEXT`、`activation_binding_digest TEXT`、`readiness_revision INTEGER NOT NULL DEFAULT 0`；前两者允许 NULL，引用管理操作表并在同一事务内维护，旧行默认为未验证。Provider 的现有 verification JSON 保留能力/版本事实，不承载伪造的实时停止证明。上述列与 validator 已在 011 安装。
 
-ProcessIdentity/NativeBoundaryProof 使用版本化 JSON 增加 macOS supervisor 变体，原始 birth 节点不可改写；exec 变化写监督服务的独立观察，Host 只保留可验证引用。Native rewind 锚点优先写已有 NativeHandle/Checkpoint 元数据，只有现有约束无法承载才在 011 中增加专用列。
+ProcessIdentity/NativeBoundaryProof 后续使用版本化 JSON 增加 macOS supervisor 变体，原始 birth 节点不可改写；exec 变化写监督服务的独立观察，Host 只保留可验证引用。Native rewind 锚点优先写已有 NativeHandle/Checkpoint 元数据。011 已合入，后续确需增加专用列时使用下一个中央迁移（当前为 012），不能回改 011 期待已迁移的库重新安装。
 
 旧 macOS unknown 记录不能因支持新变体而升级。没有记录的原生边界保持 legacy/inexact。迁移覆盖冻结 v10、空库和重新打开；旧程序看到 v11 必须拒绝写。回滚采用匹配的旧构建加迁移前备份，并重新执行外部状态复核，不自动 down migration。
 
 ## 14. 中央组合的具体改造
+
+当前已完成 activation 的启动加载、诊断、readiness RPC 与维护 CLI；下列列表是**最终组合目标**，不代表当前步骤都已实现。具体剩余接线拆为实施计划 R1–R7，客户端与验收为 R8–R9。
 
 按顺序修改现有 `createHostApplication`，不引入另一套 application factory：
 
 1. 在资源 owner 获取前准备可选的 macOS ProcessInspector/监督客户端；没有服务仍可走明确只读路径。
 2. owner/Store/identity 建立后，构造受控 runner 与激活证据读取器。
 3. SQL Catalog 登记身份并加载有效激活状态；过期或变更资源保持未验证。
-4. 构造 Views、Interaction、Recovery；注入可信 manifest、原始 launch 检查和 NativeHistoryReader。
+4. 构造 DeviceRegistry、Views、Interaction、Recovery；注入可信 manifest、原始 launch 检查和 NativeHistoryReader。
 5. 构造全局 HostCheckpoints/HostWorktrees，注入当前权限、实际 lease、runGit/restore helper 与有限 scheduler。
 6. `runtimeOptions` 为每 Session 注入 Interaction、Recovery、Checkpoint executionBinding；Worker 启动前绑定全部 handler。
 7. 将 Checkpoint/Worktree/只读 readiness 适配成现有 `RpcDomainPort`，沿用 Dispatcher 的 methodScopes/capability/context。
@@ -580,7 +611,7 @@ ProcessIdentity/NativeBoundaryProof 使用版本化 JSON 增加 macOS supervisor
 | C7 | Worktree 实际组合、关闭修复、Session 管理 | C2/C3 | 两个独立 checkout 真并行；同 checkout 互斥；归档/恢复正确 |
 | C8 | 当前 main 的 Web/Relay/手机最小验收 | C4–C7 | 第 16 节实际生产路径和物理手机用例通过 |
 
-C4 的纯 UI、C5 的 Diff 展示、C7 的 Session 管理和关闭修复可独立开发；它们不能将 C0 的平台阻塞改成“已解决”。不按未验证的原型给出首版发布日期。
+C4 的纯 UI、C5 的 Diff 展示、C7 的 Session 管理和关闭修复可独立开发；C1/C2 的窄接口与确定性模块也已先行验证，但其 macOS 后端仍依赖 C0。表中依赖约束的是完整交付，不能用先行模块结果越过平台门槛。不按未验证的原型给出首版发布日期；当前进度与后续实施顺序以实施计划 §2–§4 为准。
 
 ## 16. 验证矩阵与完成标准
 

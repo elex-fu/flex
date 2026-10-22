@@ -15,6 +15,7 @@ import { RevertStore, publicRevertOperation } from "./revert-store.js";
 import { CHECKPOINT_POLICY_VERSION, CheckpointError } from "./types.js";
 import type { CheckpointManifest, CheckpointPreviewPlan } from "./types.js";
 import { RevertCrash } from "./revert-types.js";
+import type { NativeRevertMutation, NativeRevertMutationJournal, NativeRevertMutationReceipt } from "./native-revert-drivers.js";
 import type { FileState, NativeRevertDriver, NativeRevertPreparation, NativeRevertProof, NativeRevertRequest, RestoreInspection, RestoreTarget, RevertAcceptInput, RevertAcquisition, RevertCommand, RevertOperation, RevertRecoveryEvidence, RevertStep } from "./revert-types.js";
 
 export const REVERT_INTENT_KIND = "checkpoint_revert";
@@ -27,6 +28,8 @@ export type RevertServiceOptions = {
   dispatchContextFor: (context:CheckpointPreviewContext,operationId:string,attemptId:string)=>DispatchContext;
   verifyLeaseSuccession?: (proof:LeaseSuccession)=>boolean|Promise<boolean>;
   native?: NativeRevertDriver;
+  /** Binds concrete managed drivers to this Service's Engine-owned durable journal. */
+  nativeFactory?: (journal: NativeRevertMutationJournal) => NativeRevertDriver;
   /** Must prove original helper/owner workspace writers stopped. A missing handle is not proof. */
   proveQuiescence: (operation:RevertOperation)=>Promise<{proven:boolean;proofId:string}>;
   /** Synchronous actual R09/native projection, using this same DB. Throwing or returning a Promise rolls back success. */
@@ -45,12 +48,17 @@ type RecoveryInput={sessionId:string;actorId:string;operationId:string;commandId
 /** SQL transactions surround facts, never external Git, filesystem or native waits. */
 export class RevertService {
   readonly store: RevertStore;
+  readonly nativeMutationJournal: NativeRevertMutationJournal;
+  private readonly native: NativeRevertDriver | undefined;
   private sealed=false;
   private readonly running=new Map<string,Promise<RevertOperationResult>>();
   private readonly producers=new Set<Promise<unknown>>();
   constructor(private readonly options:RevertServiceOptions) {
     if (options.engine.store.db !== options.checkpoints.store.db) throw new Error("REVERT_SHARED_STORE_REQUIRED");
     this.store=new RevertStore(options.engine.store.db);
+    this.nativeMutationJournal={claim:(mutation)=>this.claimNativeMutation(mutation),get:(operationId,requestId)=>this.getNativeMutation(operationId,requestId),record:(mutation,receipt)=>this.recordNativeMutation(mutation,receipt)};
+    if(options.native && options.nativeFactory)throw new Error("NATIVE_DRIVER_CONFIGURATION_CONFLICT");
+    this.native=options.nativeFactory?.(this.nativeMutationJournal) ?? options.native;
   }
   seal():void {this.sealed=true;this.store.seal();this.options.restore.seal();}
   private assertOpen():void {if(this.sealed)throw new CheckpointError("REVERT_SEALED","Revert execution is sealed");}
@@ -302,10 +310,11 @@ export class RevertService {
   }
   private async provider(operation:RevertOperation,step:RevertStep):Promise<RevertOperation> {
     if(!operation.workspaceProof)operation=await this.commitWorkspaceStage(operation);
-    if(!operation.nativePreparation.supported || !this.options.native)throw new CheckpointError("NEW_CONVERSATION_REQUIRED","Workspace restored; no verified Provider conversation transition is available");
+    if(!operation.nativePreparation.supported || !this.native)throw new CheckpointError("NEW_CONVERSATION_REQUIRED","Workspace restored; no verified Provider conversation transition is available");
     const request:NativeRevertRequest=step.request ?? {operationId:operation.operationId,requestId:randomUUID(),mode:operation.mode,originalHandle:operation.plan.nativeHandle,preparation:operation.nativePreparation};
     operation=this.dispatch(operation,step.stepId,(next)=>{next.request=request;});await this.boundary("provider.dispatch",operation,this.step(operation,step.stepId));
-    const result=await this.deadline(this.options.native.apply(request));this.checkNativeProof(result,request,true);
+    const result=await this.deadline(this.native.apply(request));this.checkNativeProof(result,request,true);
+    operation=this.refreshAfterNativeJournal(operation,step.stepId,request);
     await this.boundary("provider.external",operation,step);
     operation=this.applied(operation,step.stepId,result,(next)=>{next.nativeProof=result;next.stage="provider_rewound";next.lastCompletedStage="provider_rewound";});
     await this.boundary("provider_rewound",operation);return operation;
@@ -404,7 +413,12 @@ export class RevertService {
     this.assertOpen();const next=structuredClone(operation);next.revision++;next.sessionRevision=expectedSessionRevision+1;next.updatedAt=this.now();mutate(next);
     const eventId=randomUUID();const committed=this.project(eventId,()=>this.options.engine.store.commitCommand({sessionId:operation.sessionId,expectedRevision:expectedSessionRevision,
       build:()=>({result:undefined,events:[{id:eventId,type,payload:{operationId:operation.operationId,...payload},options:{activityState:"outcome_unknown"}}],...(receiptUpdates?{receiptUpdates}: {})})}),()=>{
-      if(type==="checkpoint.revert.step.dispatching")this.assertActor(operation);
+      if(type==="checkpoint.revert.step.dispatching" || type==="checkpoint.revert.native.claimed" || type==="checkpoint.revert.native.receipt")this.assertActor(operation);
+      if(type==="checkpoint.revert.native.claimed" || type==="checkpoint.revert.native.receipt") {
+        const mutation=next.steps.find((step)=>step.kind==="provider")?.attempts.at(-1)?.nativeMutation?.mutation;
+        if(!mutation)throw new CheckpointError("NATIVE_REQUEST_UNJOURNALLED","Native journal mutation is missing");
+        this.assertNativeMutationRequest(operation,mutation);
+      }
       this.store.assertGate(operation);this.store.save(next,operation.revision);
       if(next.safetyCheckpointId)this.options.checkpoints.store.pin(next.safetyCheckpointId,"revert",next.operationId);
     });this.publish(committed?.events ?? []);return next;
@@ -479,9 +493,107 @@ export class RevertService {
     return this.options.checkpoints.store.list(operation.sessionId,"safety").find((capture)=>capture.turnId===operation.operationId && capture.attemptId===operation.commands[0]!.attemptId && capture.status==="complete" && capture.samplingConsistency==="stable");
   }
   private attachSafety(operation:RevertOperation,safety:CheckpointManifest):void {operation.safetyCheckpointId=safety.checkpointId;}
+  /** Reads the same persisted request/attempt that Worker committed before apply.
+   * No parallel SQL journal, constructor DDL or alternate projection writer. */
+  private nativeOperation(operationId:string):RevertOperation {
+    this.assertOpen();
+    const row=this.store.db.prepare("SELECT session_id FROM checkpoint_revert_operations WHERE operation_id=?").get(operationId) as {session_id:string}|undefined;
+    if(!row)throw new CheckpointError("NATIVE_REQUEST_UNJOURNALLED","Native mutation has no accepted Revert operation");
+    return this.store.require(operationId,row.session_id);
+  }
+  private nativeRecord(operation:RevertOperation,requestId:string) {
+    const records=operation.steps.flatMap((step)=>step.kind==="provider" ? step.attempts.filter((attempt)=>attempt.nativeMutation?.mutation.requestId===requestId).map((attempt)=>({step,attempt,record:attempt.nativeMutation!})):[]);
+    if(records.length>1)throw new CheckpointError("NATIVE_REQUEST_REBOUND","Native request has multiple durable dispatch claims");
+    return records[0];
+  }
+  private async getNativeMutation(operationId:string,requestId:string) {
+    const operation=this.nativeOperation(operationId),record=this.nativeRecord(operation,requestId)?.record;
+    if(operation.steps.some((step)=>step.kind==="provider" && step.attempts.some((attempt)=>attempt.nativeMutation && attempt.nativeMutation.mutation.requestId!==requestId)))throw new CheckpointError("NATIVE_REQUEST_REBOUND","Operation is already bound to a different original native request");
+    if(!record)return undefined;
+    if(record.mutation.operationId!==operationId)throw new CheckpointError("NATIVE_REQUEST_REBOUND","Native request belongs to another operation");
+    return structuredClone({mutation:record.mutation,...(record.receipt?{receipt:record.receipt}:{})});
+  }
+  /** Original execution context, stable across Service recreation and owner takeover.
+   * Query inspects these old rows; execute separately requires the active owner. */
+  nativeMutationContext(mutation:NativeRevertMutation):DispatchContext {
+    const operation=this.nativeOperation(mutation.operationId),found=this.nativeRecord(operation,mutation.requestId);
+    if(!found||bindingDigest(found.record.mutation)!==bindingDigest(mutation))throw new CheckpointError("NATIVE_REQUEST_REBOUND","Native helper context has no exact original claim");
+    const command=operation.commands.find((item)=>item.intentId===found.attempt.commandIntentId);
+    if(!command)throw new CheckpointError("NATIVE_REQUEST_REBOUND","Original helper command binding is unavailable");
+    return {...structuredClone(command.dispatchContext),flyxTurnId:mutation.operationId,attemptId:mutation.requestId,runtimeId:`${command.dispatchContext.runtimeId}:native-revert`};
+  }
+  /** Synchronous final pre-spawn/pre-RPC authorization. Concrete managed ports also
+   * assert the actual in-memory checkout lease and current executable identity. */
+  assertNativeMutationDispatch(mutation:NativeRevertMutation):void {
+    this.assertOpen();
+    this.store.db.transaction(()=>{
+      this.options.engine.store.assertWriterOwner();
+      const operation=this.nativeOperation(mutation.operationId),found=this.nativeRecord(operation,mutation.requestId);
+      if(!found||bindingDigest(found.record.mutation)!==bindingDigest(mutation)||operation.status!=="running"||found.step.state!=="dispatching"||found.attempt.state!=="dispatching"||found.attempt.attemptId!==found.step.attempts.at(-1)!.attemptId||this.options.engine.store.getSession(operation.sessionId)?.revision!==operation.sessionRevision)throw new CheckpointError("NATIVE_OUTCOME_UNKNOWN","Original native mutation no longer owns its dispatch gate");
+      this.assertNativeMutationRequest(operation,mutation);this.assertActor(operation);this.store.assertGate(operation);
+    })();
+  }
+  private assertNativeMutationRequest(operation:RevertOperation,mutation:NativeRevertMutation):RevertStep {
+    const step=operation.steps.find((item)=>item.kind==="provider"),attempt=step?.attempts.at(-1),request=step?.request;
+    if(!request || !attempt?.request || request.operationId!==operation.operationId || mutation.operationId!==operation.operationId ||
+      request.requestId!==mutation.requestId || bindingDigest(request)!==mutation.requestDigest || bindingDigest(attempt.request)!==mutation.requestDigest ||
+      attempt.commandIntentId!==operation.commands.at(-1)!.intentId || bindingDigest(attempt.lease)!==bindingDigest(operation.lease))throw new CheckpointError("NATIVE_REQUEST_REBOUND","Native mutation differs from its exact persisted Provider step");
+    // JSON1 lookup is read-only; uniqueness is enforced under the Engine's owned
+    // writer and gate before the following transaction commits the actual claim.
+    const rows=this.store.db.prepare("SELECT operation_id FROM checkpoint_revert_step_attempts WHERE json_extract(attempt_json,'$.request.requestId')=? OR json_extract(attempt_json,'$.nativeMutation.mutation.requestId')=?").all(mutation.requestId,mutation.requestId) as {operation_id:string}[];
+    if(rows.some((row)=>row.operation_id!==operation.operationId))throw new CheckpointError("NATIVE_REQUEST_REBOUND","Request identity is already bound to another operation");
+    return step;
+  }
+  private async claimNativeMutation(input:NativeRevertMutation):Promise<"claimed"|"existing"> {
+    const mutation=structuredClone(input),operation=this.nativeOperation(mutation.operationId);
+    const existing=this.nativeRecord(operation,mutation.requestId);
+    if(existing) {
+      if(bindingDigest(existing.record.mutation)!==bindingDigest(mutation))throw new CheckpointError("NATIVE_REQUEST_REBOUND","Native dispatch identity changed after its durable claim");
+      return "existing";
+    }
+    const step=this.assertNativeMutationRequest(operation,mutation),attempt=step.attempts.at(-1)!;
+    if(operation.status!=="running" || step.state!=="dispatching" || attempt.state!=="dispatching" || attempt.nativeMutation)throw new CheckpointError("NATIVE_REQUEST_UNJOURNALLED","Only the active original dispatch attempt may claim a native mutation");
+    await this.authoritative(operation);
+    this.update(operation,"checkpoint.revert.native.claimed",operation.sessionRevision,(next)=>{
+      this.step(next,step.stepId).attempts.at(-1)!.nativeMutation={mutation,claimOperationRevision:next.revision,claimSessionRevision:next.sessionRevision,claimedAt:this.now()};
+    },{stepId:step.stepId,requestId:mutation.requestId});
+    return "claimed";
+  }
+  private async recordNativeMutation(input:NativeRevertMutation,inputReceipt:NativeRevertMutationReceipt):Promise<void> {
+    const mutation=structuredClone(input),receipt=structuredClone(inputReceipt),operation=this.nativeOperation(mutation.operationId);
+    const found=this.nativeRecord(operation,mutation.requestId);
+    if(!found || bindingDigest(found.record.mutation)!==bindingDigest(mutation) || receipt.operationId!==mutation.operationId || receipt.requestId!==mutation.requestId || receipt.requestDigest!==mutation.requestDigest || !receipt.sourceId || !["completed","not_dispatched","unknown"].includes(receipt.state))throw new CheckpointError("NATIVE_EVIDENCE_MISMATCH","Native receipt is not bound to the original durable claim");
+    if(found.record.receipt) {
+      if(bindingDigest(found.record.receipt)!==bindingDigest(receipt))throw new CheckpointError("NATIVE_EVIDENCE_MISMATCH","A persisted original helper receipt cannot be replaced");
+      return;
+    }
+    const step=this.assertNativeMutationRequest(operation,mutation);
+    if(operation.status!=="running" || step.state!=="dispatching" || found.attempt.attemptId!==step.attempts.at(-1)!.attemptId)throw new CheckpointError("NATIVE_OUTCOME_UNKNOWN","Original native dispatch is no longer active");
+    await this.authoritative(operation);
+    this.update(operation,"checkpoint.revert.native.receipt",operation.sessionRevision,(next)=>{
+      const record=this.step(next,step.stepId).attempts.at(-1)!.nativeMutation!;
+      record.receipt=receipt;record.receiptOperationRevision=next.revision;record.receiptSessionRevision=next.sessionRevision;
+    },{stepId:step.stepId,requestId:mutation.requestId});
+  }
+  private refreshAfterNativeJournal(previous:RevertOperation,stepId:string,request:NativeRevertRequest):RevertOperation {
+    const current=this.store.require(previous.operationId,previous.sessionId,previous.actorId),before=this.step(previous,stepId).attempts.at(-1)!,after=this.step(current,stepId).attempts.at(-1)!;
+    if(after.attemptId!==before.attemptId || bindingDigest(after.request)!==bindingDigest(request))throw new CheckpointError("NATIVE_REQUEST_REBOUND","Provider attempt changed during its native wait");
+    const first=before.nativeMutation,last=after.nativeMutation;
+    const claimAdded=!first&&Boolean(last),receiptAdded=!first?.receipt&&Boolean(last?.receipt),count=Number(claimAdded)+Number(receiptAdded);
+    const normalized=(value:RevertOperation)=>{
+      const copy=structuredClone(value);copy.revision=0;copy.sessionRevision=0;copy.updatedAt="";
+      delete this.step(copy,stepId).attempts.at(-1)!.nativeMutation;return copy;
+    };
+    if(current.revision!==previous.revision+count || current.sessionRevision!==previous.sessionRevision+count || bindingDigest(normalized(current))!==bindingDigest(normalized(previous)) ||
+      claimAdded && (last!.claimOperationRevision!==previous.revision+1 || last!.claimSessionRevision!==previous.sessionRevision+1) ||
+      receiptAdded && (last!.receiptOperationRevision!==previous.revision+count || last!.receiptSessionRevision!==previous.sessionRevision+count) ||
+      first && last && (bindingDigest(first.mutation)!==bindingDigest(last.mutation) || first.claimOperationRevision!==last.claimOperationRevision || first.claimSessionRevision!==last.claimSessionRevision) ||
+      last && (last.mutation.requestDigest!==bindingDigest(request) || last.mutation.requestId!==request.requestId))throw new CheckpointError("PLAN_STALE","Operation changed outside the exact native journal commits");
+    this.store.assertGate(current);return current;
+  }
   private async prepareNative(mode:RevertOperation["mode"],plan:CheckpointPreviewPlan,target:CheckpointManifest):Promise<NativeRevertPreparation> {
-    if(!this.options.native)return {supported:false,reason:"provider_transition_unavailable"};
-    const preparation=await this.options.native.prepare({mode,originalHandle:plan.nativeHandle,targetHandle:target.nativeHandle,checkpointId:target.checkpointId,checkpointPhase:target.phase});
+    if(!this.native)return {supported:false,reason:"provider_transition_unavailable"};
+    const preparation=await this.native.prepare({mode,originalHandle:plan.nativeHandle,targetHandle:target.nativeHandle,checkpointId:target.checkpointId,checkpointPhase:target.phase});
     if(preparation.supported && (preparation.originalBinding!==plan.nativeHandleBinding || preparation.targetBinding!==bindingDigest({checkpointId:target.checkpointId,nativeHandle:target.nativeHandle,phase:target.phase}) ||
       !preparation.capability.evidenceId || !preparation.capability.verifiedVersion || !preparation.capability.driverVersion || preparation.capability.kind!==(mode==="revert"?"conversation-rewind":"new-conversation")))throw new CheckpointError("PROVIDER_CAPABILITY_UNVERIFIED","Native transition has no exact verified binding");
     return preparation;
@@ -492,8 +604,8 @@ export class RevertService {
     if(requireApplied && (proof.state!=="applied" || !proof.quiescent || proof.pendingRequest || proof.nativeHandle===undefined || request.mode==="workspaceRestore" && bindingDigest(proof.nativeHandle)===request.preparation.originalBinding))throw new CheckpointError("NATIVE_OUTCOME_UNKNOWN","Provider did not prove its conversation transition completed");
   }
   private async queryNative(request:NativeRevertRequest):Promise<NativeRevertProof> {
-    if(!this.options.native)throw new CheckpointError("PROVIDER_REWIND_UNSUPPORTED","Native request cannot be queried");
-    return this.deadline(this.options.native.query(request));
+    if(!this.native)throw new CheckpointError("PROVIDER_REWIND_UNSUPPORTED","Native request cannot be queried");
+    return this.deadline(this.native.query(request));
   }
   private async deadline<T>(work:Promise<T>):Promise<T> {
     this.producers.add(work);void work.finally(()=>this.producers.delete(work)).catch(()=>{});

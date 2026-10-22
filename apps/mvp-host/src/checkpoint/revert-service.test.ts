@@ -130,7 +130,7 @@ describe("raw restore and safety rollback",()=>{
       await rm(join(root,"nested"),{recursive:true});await rename(join(root,"old name.txt"),join(root,"new name.txt"));await fixtureGit(root,["update-index","--remove","--","old name.txt"]);await stageRaw(root,"new name.txt","target rename\n");
       await writeFile(join(root,"new-current-only.txt"),"planned deletion\n");
     }});
-    const operation=await f.accept();const result=await f.dispatch(operation.operationId);expect(result.status).toBe("settled");
+    const operation=await f.accept();const result=await f.dispatch(operation.operationId);expect(result.status,result.resultCode).toBe("settled");
     expect(await readFile(join(f.root,"binary.bin"))).toEqual(Buffer.from([0,1,2,255]));expect((await fixtureGit(f.root,["show",":binary.bin"]))).toEqual(Buffer.from([0,3,9,255]));
     const {lstat,readlink}=await import("node:fs/promises");expect((await lstat(join(f.root,"execute.sh"))).mode&0o111).not.toBe(0);expect(await readlink(join(f.root,"link"))).toBe("tracked.txt");
     expect(await readFile(join(f.root,"nested/new.txt"),"utf8")).toBe("target nested\n");expect(await readFile(join(f.root,"old name.txt"),"utf8")).toBe("target rename\n");

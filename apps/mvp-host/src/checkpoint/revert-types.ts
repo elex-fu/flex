@@ -1,6 +1,7 @@
 import type { DispatchContext } from "../provider/types.js";
 import type { CheckpointPreviewContext, LeaseSuccession } from "./preview-service.js";
 import type { CheckpointLease, CheckpointPreviewPlan } from "./types.js";
+import type { NativeRevertHandle, NativeRevertMutation, NativeRevertMutationReceipt } from "./native-revert-drivers.js";
 
 export type RevertStage = "validated" | "safety_captured" | "workspace_restored" | "provider_rewound" | "projection_committed" | "partial_failure";
 export type RevertMode = "revert" | "workspaceRestore";
@@ -20,6 +21,8 @@ export type NativeRevertProof = {
   state: "applied" | "not_applied" | "unknown"; requestId: string;
   originalBinding: string; targetBinding: string; proofId: string; observedAt: string;
   quiescent: boolean; pendingRequest: boolean; nativeHandle?: unknown;
+  /** Private versioned native anchors, persisted separately from canonical Catalog handle. */
+  nativeHistoryHandle?: NativeRevertHandle;
 };
 export type NativeRevertRequest = { operationId: string; requestId: string; mode: RevertMode; originalHandle: unknown; preparation: Extract<NativeRevertPreparation, { supported: true }> };
 export interface NativeRevertDriver {
@@ -27,7 +30,10 @@ export interface NativeRevertDriver {
   apply(request: NativeRevertRequest): Promise<NativeRevertProof>;
   query(request: NativeRevertRequest): Promise<NativeRevertProof>;
 }
-export type RevertStepAttempt = { attemptId: string; dispatchAt: string; state: "dispatching" | "applied" | "outcome_unknown"; commandIntentId: string; lease: CheckpointLease; completedAt?: string; result?: unknown; errorCode?: string; inputBinding?: string; request?: NativeRevertRequest };
+export type RevertStepAttempt = { attemptId: string; dispatchAt: string; state: "dispatching" | "applied" | "outcome_unknown"; commandIntentId: string; lease: CheckpointLease; completedAt?: string; result?: unknown; errorCode?: string; inputBinding?: string; request?: NativeRevertRequest;
+  nativeMutation?: { mutation: NativeRevertMutation; claimOperationRevision: number; claimSessionRevision: number; claimedAt: string;
+    receipt?: NativeRevertMutationReceipt; receiptOperationRevision?: number; receiptSessionRevision?: number };
+};
 export type RevertStep = {
   stepId: string; ordinal: number; kind: "safety_capture" | "mkdir" | "workspace_file" | "index" | "provider" | "owned_cleanup";
   state: "pending" | "dispatching" | "applied" | "outcome_unknown";

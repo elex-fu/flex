@@ -285,7 +285,11 @@ export class CatalogInteractionBindings {
   }
   private effective(entry: RuntimeEntry, capability: "interactiveApprovals" | "structuredQuestions"): boolean {
     const target = this.resource(entry.identity.sessionId);
-    return this.options.catalog.providers.effectiveCapabilities(target.providerInstance.providerInstanceId, { adapter: [capability], workspace: target.workspace.capabilities, deviceScopes: ["approval:write"] }).includes(capability);
+    // Existing response channels retain their original acceptance. Fresh activation
+    // governs new prompts; current policy and workspace scope still govern control.
+    return target.providerInstance.policyCapabilities.includes(capability) && target.workspace.capabilities.includes(capability)
+      && (capability === "interactiveApprovals" ? typeof entry.host?.adapter.respondApproval === "function"
+        : entry.host?.adapter.structuredQuestionsAvailable?.() === true);
   }
   private questionReady(entry: RuntimeEntry): boolean {
     try {
@@ -303,7 +307,8 @@ export class CatalogInteractionBindings {
       if (this.state !== "active")
         return false;
       synchronous(this.options.assertAdmission() as unknown);
-      const target = this.options.catalog.registry.resolveExecutionContext(entry.identity.sessionId), raw = this.options.catalog.store.getSession(entry.identity.sessionId)!;
+      const target = this.options.catalog.registry.resolveControlContext(entry.identity.sessionId), raw = this.options.catalog.store.getSession(entry.identity.sessionId)!;
+      if (target.runtime !== entry.host || target.runtimeId !== entry.identity.runtimeId) return false;
       if (target.session.status !== "active" || target.session.residency !== "loaded" || raw.recoveryState === "blocked" || this.options.catalog.catalog.runtimeCloseForSession(entry.identity.sessionId))
         return false;
       entry.host!.worker.assertAdmission("control");

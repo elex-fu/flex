@@ -1,3 +1,5 @@
+import { generateHostIdentity } from "../identity/host-identity.js";
+import { signCompatibilityPayload } from "../diagnostics/compatibility-integrity.js";
 import { createHash } from "node:crypto";
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -83,7 +85,7 @@ export function createActivationFixture() {
     return Object.freeze({
       workspace: (record: WorkspaceRecord) => observeLocalWorkspace(record, []),
       provider: (record: ProviderInstanceRecord) => observeProvider(record, {
-        compatibilityEvidencePath: input.evidencePath, supervision: input.supervision, runtime: input.runtime,
+        compatibilityEvidencePath: input.evidencePath, supervision: input.supervision, runtime: input.runtime, compatibilityTrust: {domain:"fixture",now:now.getTime()},
       }),
     });
   }
@@ -119,22 +121,7 @@ export function createActivationFixture() {
     });
   }
   function writePassedEvidence(overrides: Record<string, unknown> = {}): void {
-    const record = catalog.provider("provider")!;
-    const artifact = {
-      providerVersion: ACTIVATION_FIXTURE_PROVIDER_VERSION,
-      executablePath: record.executable,
-      executableDigest: sha256File(record.executable),
-      configFingerprint: providerConfigurationFingerprint(record),
-      supervisionContractId: ACTIVATION_FIXTURE_SUPERVISION,
-      sdkVersion: "fixture-sdk.v1",
-      adapterId: "fixture-adapter",
-      adapterVersion: "1",
-      ...overrides,
-    };
-    writeFileSync(evidencePath, `${JSON.stringify({
-      v: 1, source: "native", runId: "fixture-run-1", provider: "claude", kind: "turn", result: "passed",
-      nativeEvent: "turn.completed", evidenceCode: "TURN_COMPLETED", attemptIdHash: "a".repeat(64), artifact, at: "2026-10-17T12:00:00.000Z",
-    })}\n`);
+    writeFileSync(evidencePath, signedActivationFixtureEvidence(catalog.provider("provider")!, now.toISOString(), overrides).map((record)=>JSON.stringify(record)).join("\n")+"\n");
     chmodSync(evidencePath, 0o600);
   }
   const configuration = { workspaces: [{ workspaceId: "workspace", root: canonicalRoot }], providerInstances: [{ providerInstanceId: "provider", provider: "claude" as const, executable, policyCapabilities: ["streamingText", "workspaceWrite", "interrupt"] }] };
@@ -147,3 +134,16 @@ export function createActivationFixture() {
 }
 
 export type ActivationFixture = ReturnType<typeof createActivationFixture>;
+
+/** Explicit signed test domain; production trust never accepts these records. */
+export function signedActivationFixtureEvidence(record: ProviderInstanceRecord, at: string, overrides: Record<string,unknown> = {}): readonly Record<string,unknown>[] {
+  const identity=generateHostIdentity();
+  const artifact={ providerVersion:ACTIVATION_FIXTURE_PROVIDER_VERSION,executablePath:record.executable,executableDigest:sha256File(record.executable),
+    configFingerprint:providerConfigurationFingerprint(record),supervisionContractId:ACTIVATION_FIXTURE_SUPERVISION,sdkVersion:"fixture-sdk.v1",adapterId:"fixture-adapter",adapterVersion:"1",
+    runtimeVersion:"fixture-host.v1",runtimeDigest:"b".repeat(64),nodeVersion:process.version,os:process.platform,...overrides };
+  return (["turn","interrupt"] as const).map((kind)=>signCompatibilityPayload({v:2,source:"native",domain:"fixture",runId:"fixture-run-1",provider:record.provider,
+    kind,capability:kind,result:"passed",nativeEvent:kind==="turn"?"turn.completed":"turn.interrupted",evidenceCode:kind==="turn"?"TURN_COMPLETED":"TURN_INTERRUPTED",
+    attemptIdHash:"a".repeat(64),artifact,at,sceneVersion:"flyx-c3-basic-v1",entryDigest:"c".repeat(64),launchRef:"fixture-launch",
+    nativeSessionIdHash:"d".repeat(64),...(record.provider==="claude"?{nativeResultIdHash:"e".repeat(64)}:{nativeTurnIdHash:"e".repeat(64)}),
+    ...(kind==="interrupt"?{stopRef:"fixture-stop"}:{})},identity));
+}

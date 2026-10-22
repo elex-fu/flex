@@ -95,6 +95,19 @@ async function fixture(change: {
 }
 function response(id: string, sessionId: string) { return { sessionId, interactionId: id, expectedVersion: 0, action: "deny" as const }; }
 describe("Catalog interaction bindings", () => {
+  it("keeps the original approval channel after verification withdrawal while preserving scope and attempt checks", async () => {
+    const f = await fixture(), a = await f.start(); await f.approval(a, "original-approval");
+    const ensure = vi.spyOn(f.catalog.registry, "ensureLoaded");
+    f.catalog.providers.recordVerification("provider", { state: "unverified", capabilities: [] });
+    expect(() => f.catalog.registry.resolveExecutionContext(f.first)).toThrow();
+    const port = a.host.interactionRpcPort!;
+    expect(() => port.rpc("interaction.respondApproval", response("original-approval", f.first), { authSubjectId: f.reader.id, commandId: "scope-denied" })).toThrow();
+    expect(port.rpc("interaction.respondApproval", response("original-approval", f.first), { authSubjectId: f.approver.id, commandId: "original-answer" })).toMatchObject({ status: "accepted" });
+    await a.host.worker.drainDispatch(); expect(a.deliver).toHaveBeenCalledOnce();
+    expect(ensure).not.toHaveBeenCalled(); expect(f.runtimeFactory).toHaveBeenCalledOnce();
+    expect(a.adapter.status).not.toHaveBeenCalled(); expect(a.adapter.preflight).not.toHaveBeenCalled();
+    await f.finish(a);
+  });
   it("anchors pure SQL10 metadata before Attention without loading a Provider or creating another projection hook", async () => {
     const f = await fixture();
     const ensure = vi.spyOn(f.catalog.registry, "ensureLoaded");

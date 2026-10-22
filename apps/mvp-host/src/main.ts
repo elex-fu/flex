@@ -1,6 +1,7 @@
 import { mkdir, stat } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
+import { fileURLToPath } from "node:url";
 import type { ProviderId } from "@flyx/mvp-protocol";
 import QRCode from "qrcode";
 import { DeviceRegistry } from "./auth/device-registry.js";
@@ -19,6 +20,11 @@ import { HostActivationLoad, localActivationFacts } from "./lifecycle/host-activ
 import { createHostActivationService, privateRootsFor, type ManagedQueryExecutorFactory } from "./lifecycle/host-activation-service.js";
 import { createManagedWorkspaceQuery } from "./lifecycle/managed-workspace-query.js";
 import { OperationSnapshotLane } from "./operations/host-operations.js";
+import { OperationsError, operationOwnerFromHost, readPrivateFile, assertPrivateDirectory } from "./operations/operation-files.js";
+import { RestoreExternalCheckService, runRestoreExternalCheckCli } from "./operations/restore-external-check.js";
+import { SUPPORTED_SCHEMA_VERSION } from "./storage/migrations/schema-version.js";
+import { writeCompatibilityReadiness } from "./diagnostics/compatibility-readiness.js";
+import { parseCompatibilityCommand, runCompatibilityCommand } from "./diagnostics/compatibility-cli.js";
 import { inspectCatalogStartupReadiness } from "./session/catalog-startup-readiness.js";
 import { createActivationOperationStore } from "./storage/activation-store.js";
 import { CatalogStore } from "./storage/catalog-store.js";
@@ -33,12 +39,52 @@ await main().catch((error: unknown) => {
 });
 
 async function main(): Promise<void> {
-  const command = parseHostCommand(process.argv.slice(2));
+  const args = process.argv.slice(2);
+  const compatibilityCommand = parseCompatibilityCommand(args);
+  if (compatibilityCommand) {
+    const databasePath = resolve(process.env.FLYX_DB ?? ".flyx/mvp.sqlite");
+    const identityDirectory = resolve(process.env.FLYX_IDENTITY_DIR ?? join(dirname(databasePath), "identity"));
+    await stat(databasePath);
+    const owner = HostOwnerLock.acquire({ databasePath, identityDirectory, mode: "maintenance" });
+    let compatibilityStore: SqliteStore | undefined;
+    try {
+      compatibilityStore = openForMaintenance({ databasePath: owner.databasePath, owner });
+      const mirror = compatibilityStore.getHostIdentityMirror();
+      if (!mirror) throw new OperationsError("COMPATIBILITY_MAINTENANCE_REQUIRED");
+      const identity = await loadOrCreateHostIdentity({ directory: owner.identityDirectory!, expectedMirror: mirror });
+      console.log(JSON.stringify(await runCompatibilityCommand(compatibilityCommand, { owner: operationOwnerFromHost(owner), identity, store: compatibilityStore }), null, 2));
+    } finally { compatibilityStore?.close(); owner.release(); }
+    return;
+  }
+  const restoreCheck = args[0] === "restore" && (args[1] === "inspect-state" || args[1] === "confirm-state");
+  if (restoreCheck) {
+    const backupDirectory = args[2];
+    if (!backupDirectory) throw new OperationsError("OPERATIONS_INVALID_COMMAND");
+    const databasePath = resolve(process.env.FLYX_DB ?? ".flyx/mvp.sqlite");
+    const identityDirectory = resolve(process.env.FLYX_IDENTITY_DIR ?? join(dirname(databasePath), "identity"));
+    await stat(databasePath);
+    const owner = HostOwnerLock.acquire({ databasePath, identityDirectory, mode: "maintenance" });
+    let restoredStore: SqliteStore | undefined;
+    try {
+      restoredStore = openForMaintenance({ databasePath: owner.databasePath, owner });
+      const service = new RestoreExternalCheckService({ db: restoredStore.db, owner, backupDirectory: resolve(backupDirectory),
+        identityDirectory: owner.identityDirectory!, supportedSchemaVersion: SUPPORTED_SCHEMA_VERSION,
+        withSnapshot: new OperationSnapshotLane(() => owner.assertActive()).withSnapshot,
+        // An incomplete platform ledger cannot establish coverage since backup.
+        // Keep the exact restore gate until an installed inspector can prove it.
+        inspectExternal: async () => { throw new OperationsError("RESTORE_EXTERNAL_INSPECTOR_UNAVAILABLE"); },
+      });
+      console.log(JSON.stringify(await runRestoreExternalCheckCli([args[1]!, ...args.slice(3)], service), null, 2));
+    } finally { restoredStore?.close(); owner.release(); }
+    return;
+  }
+  const command = parseHostCommand(args);
   if (command.kind === "help") {
     console.log("Flyx Host: start | devices list | devices revoke <deviceId> | devices revoke-all | identity show | identity rotate");
     console.log(`Operations: ${HOST_OPERATIONS_CLI_USAGE}`);
     console.log(`Catalog: ${CATALOG_IMPORT_CLI_USAGE}`);
     console.log(`Activation: ${ACTIVATION_CLI_USAGE}`);
+    console.log("Restore external check: restore inspect-state <backupDirectory> <commandId> | restore confirm-state <backupDirectory> <operationId> <evidenceId> <revision>");
     console.log("Recovery: recovery inspect <sessionId> <turnId> [--attempt <attemptId>] [--upgrade-metadata]");
     console.log("Recovery write: recovery reconcile|acknowledge <sessionId> <turnId> <evidenceId> <recoveryRevision> <commandId> [--attempt <attemptId>] [--acknowledge-unknown]");
     console.log("Select the existing Host using FLYX_DB and FLYX_IDENTITY_DIR. Key rotation requires confirmation in a local terminal.");
@@ -159,10 +205,31 @@ async function main(): Promise<void> {
     pairingConfirmation = createPairingConfirmation();
     application = await createHostApplication({ store, owner, identity, ...bootstrap, snapshotLane,
       compatibilityEvidencePath: compatibilityEvidencePathFor(owner.databasePath),
+      compatibilityEndorsementPath: compatibilityEndorsementPathFor(owner.databasePath),
       server: { pairingConfirmation, connectivity, ...(process.env.FLYX_WEB_ROOT ? { webRoot: process.env.FLYX_WEB_ROOT } : {}) },
     });
     server = application.server;
     const address = await application.start();
+    if (process.env.FLYX_COMPATIBILITY_MODE === "isolated") {
+      const artifact = application.compatibilityArtifact();
+      if (!artifact) throw new OperationsError("COMPATIBILITY_RUNTIME_FACTS_UNAVAILABLE");
+      const entry = { path: resolve(process.env.FLYX_COMPATIBILITY_READINESS_PATH ?? ""), baseUrl: address,
+        pairingToken: server.auth.pairingUrlToken, provider, identity, runId: process.env.FLYX_COMPATIBILITY_RUN_ID ?? "",
+        entryPath: fileURLToPath(import.meta.url), databasePath: owner.databasePath, identityDirectory: owner.identityDirectory!,
+        workspace, artifact, authMode: "unknown" as const };
+      const readControlledJson = async (path: string | undefined) => {
+        if (!path) throw new OperationsError("COMPATIBILITY_AUTHORIZATION_REQUIRED");
+        await assertPrivateDirectory(dirname(resolve(path)));
+        return JSON.parse((await readPrivateFile(resolve(path), 64 * 1024)).toString("utf8"));
+      };
+      await application.prepareCompatibilityScene({ authorization: await readControlledJson(process.env.FLYX_COMPATIBILITY_AUTHORIZATION_PATH),
+        expectedDestination: await readControlledJson(process.env.FLYX_COMPATIBILITY_DESTINATION_HOST_PATH), entry,
+        measureArtifact: () => {
+          const current = application!.compatibilityArtifact();
+          if (!current) throw new OperationsError("COMPATIBILITY_RUNTIME_FACTS_UNAVAILABLE"); return current;
+        } });
+      await writeCompatibilityReadiness(entry);
+    }
     const legacy = application.catalog.registry.resolve(application.catalog.legacySessionId);
     console.log(`Flyx MVP Host listening at ${address}`);
     console.log(`Workspace: ${legacy.workspace.canonicalRoot}`);
@@ -243,6 +310,9 @@ async function manageHost(command: HostCommand, store: SqliteStore, identity: Ho
 function compatibilityEvidencePathFor(databasePath: string): string {
   return resolve(process.env.FLYX_COMPATIBILITY_EVIDENCE_PATH ?? join(dirname(databasePath), "compatibility-evidence.jsonl"));
 }
+function compatibilityEndorsementPathFor(databasePath: string): string {
+  return resolve(process.env.FLYX_COMPATIBILITY_ENDORSEMENT_PATH ?? join(dirname(databasePath), "compatibility-endorsement.json"));
+}
 
 /**
  * Offline execution activation (design §6.3). The maintenance owner is the only
@@ -255,7 +325,11 @@ function compatibilityEvidencePathFor(databasePath: string): string {
 async function runActivationCommand(store: SqliteStore, owner: HostOwnerHandle, argv: readonly string[]): Promise<ActivationCliResult> {
   const privateDirectories = [dirname(owner.databasePath), owner.identityDirectory!, owner.coordinationDirectory!];
   const privateRoots = privateRootsFor({ owner }, privateDirectories);
-  const observation = localActivationFacts({ compatibilityEvidencePath: compatibilityEvidencePathFor(owner.databasePath), privateRoots });
+  const mirror = store.getHostIdentityMirror();
+  if (!mirror) throw new OperationsError("BACKUP_IDENTITY_MISMATCH");
+  const identity = await loadOrCreateHostIdentity({ directory: owner.identityDirectory!, expectedMirror: mirror });
+  const observation = localActivationFacts({ compatibilityEvidencePath: compatibilityEvidencePathFor(owner.databasePath), privateRoots,
+    compatibilityTrust: { destination: publicHostIdentity(identity), endorsementPath: compatibilityEndorsementPathFor(owner.databasePath) } });
   const catalog = new CatalogStore(store);
   try {
     const operations = createActivationOperationStore(

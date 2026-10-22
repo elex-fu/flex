@@ -7,6 +7,7 @@ import { openOwned } from "../storage/open-store.js";
 import { createHostServer } from "../server.js";
 import { SessionOrchestrator } from "../session/orchestrator.js";
 import type { ClaudeAdapter } from "../claude/adapter.js";
+import { writeTestReadiness } from "../diagnostics/test-readiness.js";
 import { DeterministicAdapter } from "./deterministic-adapter.js";
 
 /**
@@ -83,6 +84,10 @@ const server = createHostServer({
   port: 0,
 });
 const address = await server.start();
+if (process.env.FLYX_TEST_CONTROLLED_ENTRY === "1" && process.env.FLYX_TEST_READINESS_PATH) {
+  await writeTestReadiness({ path: process.env.FLYX_TEST_READINESS_PATH, baseUrl: address,
+    pairingToken: server.auth.pairingUrlToken, provider: "deterministic" });
+}
 
 // Every pairing exchange consumes a one-time grant, so mint one fresh token
 // per browser test (plus slack) and print them for the global setup to hand

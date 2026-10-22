@@ -1,17 +1,27 @@
 import { randomUUID } from "node:crypto";
+import { AsyncLocalStorage } from "node:async_hooks";
+import { WORKTREE_CAPABILITY } from "@flyx/mvp-protocol";
 import { dirname, join } from "node:path";
 import { DeviceRegistry } from "./auth/device-registry.js";
 import { AccessCommandReceipts } from "./api/access-command-receipts.js";
 import { createHostAttentionBindings, type HostAttention } from "./attention/host-attention.js";
 import { createHostCatalogReadBindings, type HostCatalog, type HostCatalogOptions } from "./catalog/host-catalog.js";
 import { createCatalogLegacyHost } from "./catalog/catalog-legacy-host.js";
+import { createCatalogCheckpoints } from "./checkpoint/catalog-checkpoints.js";
+import type { HostRevertPorts } from "./checkpoint/host-checkpoints.js";
 import { HOST_EXECUTION_READINESS_CAPABILITY, HOST_EXECUTION_READINESS_RPC_SCOPES, hostExecutionReadinessRpc } from "./diagnostics/activation-rpc.js";
+import type { NativeCompatibilityArtifact } from "./diagnostics/compatibility-evidence.js";
+import { createCompatibilityScenePolicy, type CompatibilityScenePolicy, type CompatibilityScenePolicyOptions } from "./diagnostics/compatibility-scene-policy.js";
+import { providerConfigurationFingerprint } from "./lifecycle/host-activation-load.js";
 import { createCatalogInteractionBindings } from "./interaction/catalog-interactions.js";
-import type { HostIdentityFileV1 } from "./identity/host-identity.js";
+import { publicHostIdentity, type HostIdentityFileV1 } from "./identity/host-identity.js";
 import { CatalogHostLifecycle } from "./lifecycle/catalog-host-lifecycle.js";
-import { activationReadinessPort, HostActivationLoad, localActivationFacts } from "./lifecycle/host-activation-load.js";
+import { activationReadinessPort, HostActivationLoad, localActivationFacts, type ActivationLoadFacts, type LocalActivationFactsOptions } from "./lifecycle/host-activation-load.js";
+import { createHostActivationService, type HostActivationService } from "./lifecycle/host-activation-service.js";
+import { ManagedGitRunner, type ManagedGitRunnerOptions } from "./lifecycle/managed-git-runner.js";
 import { assertHostOwner, type HostOwnerHandle } from "./lifecycle/host-owner.js";
-import { SqliteProcessJournal } from "./lifecycle/managed-process-registry.js";
+import { SqliteProcessJournal, type ProcessLaunchContext } from "./lifecycle/managed-process-registry.js";
+import { validateTreeStopEvidence } from "./lifecycle/managed-process-evidence.js";
 import { createManagedWorkspaceQuery } from "./lifecycle/managed-workspace-query.js";
 import { OperationRegistry } from "./lifecycle/operation-registry.js";
 import { createHostOperations, hostDiagnosticsRpc, HOST_DIAGNOSTICS_RPC_SCOPES, OperationSnapshotLane } from "./operations/host-operations.js";
@@ -24,6 +34,11 @@ import { createActivationOperationStore } from "./storage/activation-store.js";
 import { SqliteStore } from "./storage/db.js";
 import { CatalogError } from "./storage/catalog-store.js";
 import { HostViews } from "./timeline/host-views.js";
+import { HostExecutionPermits } from "./workspace/host-execution-permits.js";
+import { WORKTREE_COMMAND_METHODS, WORKTREE_RPC_SCOPES, type WorktreeCommandMethod } from "./workspace/host-worktrees.js";
+import { createManagedScheduledHostWorktrees } from "./workspace/managed-host-worktrees.js";
+import { createManagedRepositoryMetadata } from "./workspace/managed-repository-metadata.js";
+import { NativeHistoryReaderFactory } from "./provider/native-history-reader.js";
 
 export type HostApplicationOptions = Pick<HostCatalogOptions, "configuration" | "initialLegacySession"> & {
   store: SqliteStore;
@@ -33,6 +48,18 @@ export type HostApplicationOptions = Pick<HostCatalogOptions, "configuration" | 
   snapshotLane?: SnapshotCoordinator;
   /** Host-private compatibility evidence log (design §6.3); defaults to the Store directory. */
   compatibilityEvidencePath?: string;
+  compatibilityEndorsementPath?: string;
+  /** Trusted local composition ports. No environment or RPC can supply them. */
+  execution?: {
+    git?: Omit<ManagedGitRunnerOptions, "journal" | "context" | "roots" | "privateRoots">;
+    facts?: Pick<LocalActivationFactsOptions, "supervision" | "runtime">;
+    observation?: ActivationLoadFacts;
+    runtimeOptions?: HostCatalogOptions["runtimeOptions"];
+    revert?: HostRevertPorts;
+    compatibilityArtifact?: () => NativeCompatibilityArtifact | undefined;
+    worktreesRoot?: string;
+    recovery?: Pick<Parameters<typeof createCatalogRecoveryBindings>[0], "nativeHistoryReaderFactory" | "processInspector" | "inspectBoundary" | "inspectWorkspace" | "verifiedManifestForInstance" | "existingCodexReader">;
+  };
 };
 
 /** The production entry owns global services; a selected Session owns only its lazy runtime. */
@@ -45,7 +72,9 @@ export async function createHostApplication(options: HostApplicationOptions) {
   const compatibilityEvidencePath = options.compatibilityEvidencePath ?? join(dirname(owner.databasePath), "compatibility-evidence.jsonl");
   const withSnapshot = options.snapshotLane ?? new OperationSnapshotLane(() => owner.assertActive()).withSnapshot;
   const registry = new OperationRegistry();
+  const executionPermits = new HostExecutionPermits({ limit: 2 });
   let catalog: HostCatalog | undefined;
+  let openingCatalog: HostCatalog["catalog"] | undefined;
   let lifecycle: CatalogHostLifecycle | undefined;
   let server: HostServer | undefined;
   let attention: HostAttention | undefined;
@@ -53,6 +82,10 @@ export async function createHostApplication(options: HostApplicationOptions) {
   let recovery: ReturnType<typeof createCatalogRecoveryBindings> | undefined;
   let devices: DeviceRegistry | undefined;
   let activationLoad: HostActivationLoad | undefined;
+  let activation: HostActivationService | undefined;
+  let checkpointBindings: ReturnType<typeof createCatalogCheckpoints> | undefined;
+  let worktreeBindings: ReturnType<typeof createManagedScheduledHostWorktrees> | undefined;
+  let nativeScenePolicy: CompatibilityScenePolicy | undefined;
   let started: Promise<string> | undefined;
   let applicationStarting = false;
   let attentionStarted = false;
@@ -62,18 +95,11 @@ export async function createHostApplication(options: HostApplicationOptions) {
   };
   /** Original-producer proof only: the gate every write path already shared. */
   const producerReadiness = (): CatalogStartupReadiness => {
-    if (!catalog) return { ready: false, blockers: ["HOST_BOOTING"] };
-    return inspectCatalogStartupReadiness(catalog);
+    if (catalog) return inspectCatalogStartupReadiness(catalog);
+    if (openingCatalog) return inspectCatalogStartupReadiness({ store, owner, catalog: openingCatalog });
+    return { ready: false, blockers: ["HOST_BOOTING"] };
   };
-  /**
-   * The startup verdict (design §6.3 step 5): the same producer proof plus the
-   * explicit execution-activation load, so a drifted or missing activation is
-   * reported with its exact reason codes. Admission itself keeps the existing
-   * producer gate until the §7.1 purpose-split lands, because no shipped
-   * platform can currently satisfy a required activation (no installed
-   * supervisor/adapter facts and no proven managed-query executor), and
-   * enforcing it now would block every existing execution path.
-   */
+  /** Read-only readiness uses the same observations as the online write gate. */
   const startupReadiness = (): CatalogStartupReadiness => {
     if (!catalog) return { ready: false, blockers: ["HOST_BOOTING"] };
     const host = catalog, load = activationLoad;
@@ -87,16 +113,57 @@ export async function createHostApplication(options: HostApplicationOptions) {
     if (owner.retainedReason || !producerReadiness().ready) throw new CatalogError("HOST_RECOVERY_REQUIRED");
     operations.assertWriteReady();
   };
+  const sceneBinding = (target: ReturnType<HostCatalog["registry"]["resolve"]>) => ({ sessionId: target.session.sessionId,
+    workspaceId: target.workspace.workspaceId, canonicalRoot: target.workspace.canonicalRoot, checkoutRoot: target.workspace.worktreeRoot,
+    providerInstanceId: target.providerInstance.providerInstanceId, provider: target.providerInstance.provider,
+    configurationFingerprint: providerConfigurationFingerprint(target.providerInstance) });
+  const assertNativeReady: NonNullable<HostCatalogOptions["assertNativeReady"]> = (target, authorization) => {
+    assertBusinessReady();
+    if (authorization) {
+      if (!nativeScenePolicy) throw new CatalogError("COMPATIBILITY_SCENE_UNAVAILABLE");
+      nativeScenePolicy.assertResource(authorization, sceneBinding(target)); return;
+    }
+    if (!activation) throw new CatalogError("ACTIVATION_SCHEMA_UNAVAILABLE");
+    activation.assertReadyForWrite({ workspaceId: target.workspace.workspaceId, providerInstanceId: target.providerInstance.providerInstanceId });
+  };
   const startAttentionIfReady = () => {
     if (!attention || attentionStarted || !applicationStarting || lifecycle?.readiness !== "ready" || owner.retainedReason || !producerReadiness().ready
       || store.db.prepare("SELECT 1 FROM host_state WHERE key='restore_readiness'").get()) return;
     attention.start(); attentionStarted = true;
   };
+  const journal = new SqliteProcessJournal(store.db);
+  const gitContext = new AsyncLocalStorage<ProcessLaunchContext>();
+  const repositoryMetadata = createManagedRepositoryMetadata({ owner, runner: () => {
+    if (!runner) throw new CatalogError("MANAGED_GIT_BACKEND_UNAVAILABLE"); return runner;
+  } });
+  const runner = options.execution?.git ? new ManagedGitRunner({ ...options.execution.git, journal, privateRoots: privateDirectories,
+    repositoryMetadata: repositoryMetadata.run,
+    roots: () => [...(catalog?.catalog.workspaces().map((workspace) => workspace.worktreeRoot) ?? options.configuration.workspaces?.map((workspace) => workspace.root) ?? []),
+      ...(options.execution?.worktreesRoot ? [options.execution.worktreesRoot] : [])],
+    context: ({ operationId }) => {
+      const worktree = worktreeBindings?.worktrees.currentExecution()?.dispatchContext;
+      if (worktree) return worktree;
+      const scoped = gitContext.getStore(); if (scoped) return scoped;
+      const manifest = operationId ? checkpointBindings?.checkpoints.checkpoints.store.get(operationId) : undefined;
+      const host = manifest ? catalog?.registry.loaded(manifest.sessionId) : undefined;
+      if (manifest?.attemptId && manifest.turnId && host instanceof SessionOrchestrator) return {
+        hostOwnerId: owner.ownerId, hostOwnerGeneration: owner.generation, runtimeId: host.runtimeId,
+        runtimeGeneration: manifest.runtimeGeneration, sessionId: manifest.sessionId, flyxTurnId: manifest.turnId, attemptId: manifest.attemptId,
+      };
+      if (manifest && host instanceof SessionOrchestrator) return { hostOwnerId: owner.ownerId, hostOwnerGeneration: owner.generation,
+        runtimeId: host.runtimeId, runtimeGeneration: Math.max(1, manifest.runtimeGeneration), sessionId: manifest.sessionId, attemptId: manifest.checkpointId };
+      return { hostOwnerId: owner.ownerId, hostOwnerGeneration: owner.generation,
+        runtimeId: "host-git", runtimeGeneration: 1, attemptId: operationId ?? randomUUID() };
+    },
+  }) : undefined;
+  const observation = options.execution?.observation ?? localActivationFacts({ compatibilityEvidencePath, privateRoots: privateDirectories, ...options.execution?.facts,
+    compatibilityTrust: { destination: publicHostIdentity(identity), endorsementPath: options.compatibilityEndorsementPath ?? join(dirname(owner.databasePath), "compatibility-endorsement.json") } });
   const query = createManagedWorkspaceQuery({
     journal: new SqliteProcessJournal(store.db), privateRoots: privateDirectories,
     assertActive: () => { owner.assertActive(); store.assertWriterOwner(); },
     context: ({ operationId }) => ({ hostOwnerId: owner.ownerId, hostOwnerGeneration: owner.generation,
       runtimeId: "catalog-query", runtimeGeneration: 1, attemptId: operationId ?? randomUUID() }),
+    ...(runner ? { executor: runner.workspaceQueryPort() } : {}),
     trackOperation: (work) => {
       assertAdmission();
       void registry.track("producer", () => work).catch(() => {});
@@ -137,25 +204,66 @@ export async function createHostApplication(options: HostApplicationOptions) {
       // verify/activate flows (design §6.3 step 5): the bootstrap withdraws only
       // the verdicts the recorded facts no longer support.
       activationReadiness: (catalogStore) => {
+        openingCatalog = catalogStore;
         const operations = createActivationOperationStore(
           { db: catalogStore.db, workspace: (id) => catalogStore.workspace(id), provider: (id) => catalogStore.provider(id) },
           { guard: () => { owner.assertActive(); owner.assertStorePath(store.db.name); } },
         );
-        const load = new HostActivationLoad(operations, localActivationFacts({ compatibilityEvidencePath, privateRoots: privateDirectories }));
+        const load = new HostActivationLoad(operations, observation);
         activationLoad = load;
+        activation = createHostActivationService({ facts: { db: store.db, owner, catalog: catalogStore, readiness: producerReadiness },
+          operations, load, observation, actorId: "online-host", privateRoots: privateDirectories });
         return activationReadinessPort(load, () => ({ workspaces: catalogStore.workspaces(), providers: catalogStore.providers() }));
       },
-      restoreWriteReady: () => { operations.assertWriteReady(); if (lifecycle) assertBusinessReady(); },
+      restoreWriteReady: () => {
+        owner.assertActive(); store.assertWriterOwner(); operations.assertWriteReady();
+        if (owner.retainedReason || !producerReadiness().ready) throw new CatalogError("HOST_RECOVERY_REQUIRED");
+        // Local metadata configuration precedes the transport admission phase.
+        if (lifecycle && lifecycle.readiness !== "booting") assertAdmission();
+      },
+      assertNativeReady,
+      nativeScenePolicy: () => nativeScenePolicy,
       readViewInteractions: (sessionId, after) => {
         if (!interactions) throw new CatalogError("HOST_BOOTING");
         return interactions.readViewInteractions(sessionId, after);
       },
-      runtimeOptions: (context) => {
-        if (!interactions || !recovery) throw new CatalogError("HOST_BOOTING");
+      runtimeOptions: (context, services) => {
+        if (!interactions || !recovery || !checkpointBindings) throw new CatalogError("HOST_BINDINGS_INCOMPLETE");
         const hooks = interactions.runtimeOptions(context);
-        return { ...hooks, recovery: recovery.runtimeRecoveryOptions(context),
-          assertWriteReady: assertBusinessReady,
+        const extra = options.execution?.runtimeOptions?.(context, services);
+        return { ...extra, ...hooks, recovery: recovery.runtimeRecoveryOptions(context),
+          checkpoints: checkpointBindings.checkpoints.executionBinding,
+          executionPermits,
+          ...(nativeScenePolicy ? { nativeScenePolicy } : {}),
+          canReleaseAdditionalProducers: (dispatch) => {
+            owner.assertActive();
+            const records = store.db.prepare(`SELECT p.state,p.pid,i.identity_json,b.launch_digest,s.proof_json FROM managed_processes p
+              LEFT JOIN managed_process_identities i ON i.process_id=p.id
+              LEFT JOIN managed_process_boundaries b ON b.process_id=p.id
+              LEFT JOIN managed_process_stop_proofs s ON s.process_id=p.id
+              WHERE p.owner_id=? AND p.owner_generation=? AND p.runtime_id=? AND p.session_id=? AND
+                (p.turn_id IS NULL OR (p.runtime_generation=? AND p.turn_id=? AND p.attempt_id=?))`)
+              .all(owner.ownerId, owner.generation, dispatch.runtimeId, dispatch.sessionId, dispatch.runtimeGeneration, dispatch.flyxTurnId, dispatch.attemptId) as Array<{ state: string; pid: number | null; identity_json: string | null; launch_digest: string | null; proof_json: string | null }>;
+            return records.every((record) => {
+              if (record.state === "not_spawned" && record.pid === null) return true;
+              if (record.state !== "stopped" || !record.identity_json || !record.proof_json || !record.launch_digest) return false;
+              try { validateTreeStopEvidence(JSON.parse(record.proof_json), JSON.parse(record.identity_json)); return true; } catch { return false; }
+            }) && (extra?.canReleaseAdditionalProducers?.(dispatch) ?? true);
+          },
+          gitRunner: async (request) => {
+            if (!runner) throw new CatalogError("MANAGED_GIT_BACKEND_UNAVAILABLE");
+            const host = services.registry.loaded(context.session.sessionId);
+            if (!(host instanceof SessionOrchestrator)) throw new CatalogError("GIT_RUNTIME_BINDING_UNAVAILABLE");
+            const active = store.getActiveTurn(context.session.sessionId);
+            return gitContext.run({ hostOwnerId: owner.ownerId, hostOwnerGeneration: owner.generation, runtimeId: host.runtimeId,
+              runtimeGeneration: active?.generation ?? 1, sessionId: context.session.sessionId,
+              attemptId: active?.attemptId ?? request.operationId ?? randomUUID(), ...(active ? { flyxTurnId: active.id } : {}) }, () => runner.gitServiceRunner()(request));
+          },
+          assertWriteReady: assertAdmission,
+          assertNativeReady: (input) => assertNativeReady(services.registry.resolve(context.session.sessionId), input?.authorization),
           executionSetup: (host) => {
+            checkpointBindings!.checkpoints.bindWorker(host.worker);
+            extra?.executionSetup?.(host);
             hooks.executionSetup?.(host);
             const detach = host.subscribe((event) => { void attention?.postCommitWake(event).catch(() => {}); });
             host.registerShutdownService({ drain: async () => {}, close: detach });
@@ -166,7 +274,9 @@ export async function createHostApplication(options: HostApplicationOptions) {
     const runningCatalog: HostCatalog = await createHostCatalogReadBindings(catalogOptions);
     catalog = runningCatalog;
     lifecycle = new CatalogHostLifecycle({ store, owner, catalog: runningCatalog, operations: registry,
-      services: [{ ...query.shutdownService, seal: () => query.seal() }],
+      services: [{ stopProducers: async () => { worktreeBindings?.stopAdmission(); }, drain: async () => true, seal: () => repositoryMetadata.seal() },
+        ...(runner ? [runner.shutdownService] : []), { ...query.shutdownService, seal: () => query.seal() },
+        { drain: (deadline) => executionPermits.drain(Math.max(0, deadline - Date.now())), seal: () => executionPermits.seal() }],
       afterTransportsClosed: () => { devices?.close(); views.close(); },
       sealJournals: () => {
         let failure: unknown;
@@ -177,9 +287,23 @@ export async function createHostApplication(options: HostApplicationOptions) {
       },
     });
     devices = new DeviceRegistry(store, identity.hostId);
-    interactions = createCatalogInteractionBindings({ catalog: runningCatalog, assertAdmission: assertBusinessReady });
+    checkpointBindings = createCatalogCheckpoints(runningCatalog, views, runner, options.execution?.revert);
+    lifecycle.registerService({ drain: (deadline) => checkpointBindings!.checkpoints.drain(Math.max(0, deadline - Date.now())), seal: () => checkpointBindings!.checkpoints.seal() });
+    interactions = createCatalogInteractionBindings({ catalog: runningCatalog, assertAdmission });
     const runningInteractions = interactions;
+    const nativeHistoryReaderFactory = options.execution?.recovery?.nativeHistoryReaderFactory ?? new NativeHistoryReaderFactory({
+      assertBinding: (handle, checkoutRoot) => {
+        owner.assertActive();
+        const target = runningCatalog.registry.resolve(handle.sessionId);
+        if (target.workspace.worktreeRoot !== checkoutRoot || target.providerInstance.providerInstanceId !== handle.providerInstanceId)
+          throw new CatalogError("NATIVE_HISTORY_BINDING_CHANGED");
+      },
+      // A versioned installed read contract is required before any Native read.
+      verifiedManifestForHandle: () => undefined,
+    });
     recovery = createCatalogRecoveryBindings({ catalog: runningCatalog,
+      ...options.execution?.recovery,
+      nativeHistoryReaderFactory,
       companionEvents: runningInteractions.companionEvents, supersedeInteractions: runningInteractions.supersedeInteractions,
       assertRecoveryAdmission: assertAdmission, trackRecovery: (work) => lifecycle!.trackOperation("control", work),
       onCommit: (events) => { startAttentionIfReady(); for (const event of events) void attention?.postCommitWake(event).catch(() => {}); },
@@ -195,6 +319,18 @@ export async function createHostApplication(options: HostApplicationOptions) {
     if (attention) { const runningAttention = attention; lifecycle.registerService({ ...runningAttention.shutdownService, seal: () => runningAttention.seal() }); }
     lifecycle.registerService(runningInteractions.shutdownService);
     lifecycle.registerService(recovery.shutdownService);
+    if (runner && options.execution?.worktreesRoot) {
+      worktreeBindings = createManagedScheduledHostWorktrees({ catalog: runningCatalog.catalog, workspaces: runningCatalog.workspaces,
+        sessions: runningCatalog.registry, devices, owner, managedRoot: options.execution.worktreesRoot, privateDirectories,
+        runner, stopContractId: options.execution.git!.stopBackend.contractId, assertWriteReady: assertBusinessReady,
+        repositoryMetadata,
+        executionReadiness: () => options.execution?.facts?.supervision?.()?.contractId === options.execution?.git?.stopBackend.contractId
+          ? { ready: true } : { ready: false, reasonCode: "SUPERVISION_CONTRACT_UNAVAILABLE" },
+        trackOperation: (_kind, work) => lifecycle!.trackOperation("producer", work),
+      });
+      lifecycle.registerService({ drain: async (deadline) => (await worktreeBindings!.closeAndWait(Math.max(0, deadline - Date.now()))).clean,
+        seal: () => worktreeBindings!.seal() });
+    }
     // Current helpers are legitimate during a request. Check their complete
     // persisted stop evidence only after every producer/service has drained.
     lifecycle.registerService({ drain: async () => inspectCatalogStartupReadiness(runningCatalog, { includeCurrentOwner: true }).ready });
@@ -219,7 +355,33 @@ export async function createHostApplication(options: HostApplicationOptions) {
       interactionCapabilities: runningInteractions.interactionCapabilities,
       recoveryForSession: recovery.recoveryForSession, recoveryCapabilities: recovery.recoveryCapabilities,
       ...(attention ? { attention } : {}),
-      domainPorts: [{ methodScopes: HOST_DIAGNOSTICS_RPC_SCOPES, ready: () => store.db.open, capabilities: () => [],
+      domainPorts: [checkpointBindings.port, { methodScopes: WORKTREE_RPC_SCOPES, ready: () => store.db.open,
+        capabilities: () => worktreeBindings?.worktrees.ready() ? [WORKTREE_CAPABILITY] : [],
+        dispatch: async (frame, context) => {
+          if (!Object.hasOwn(WORKTREE_RPC_SCOPES, frame.method)) return { handled: false };
+          if (!worktreeBindings) throw new CatalogError("WORKTREE_MANAGED_BACKEND_UNAVAILABLE");
+          context.assertAuthorized(frame.method);
+          if (!context.leaseId || context.transportGeneration === undefined || context.protocolVersion !== 2 || !context.capabilities) throw new CatalogError("AUTH_REQUIRED");
+          const sessionId = (frame.payload as { sessionId?: unknown } | undefined)?.sessionId;
+          if (typeof sessionId !== "string") throw new CatalogError("SESSION_SCOPE_MISMATCH");
+          const scope = WORKTREE_RPC_SCOPES[frame.method as keyof typeof WORKTREE_RPC_SCOPES];
+          const authorize = () => { context.assertSessionScope?.(sessionId, scope); runningCatalog.assertActorSession(context.subjectId, sessionId, scope); };
+          authorize();
+          const actor = { subjectId: context.subjectId, leaseId: context.leaseId, transportGeneration: context.transportGeneration, protocolVersion: 2, capabilities: context.capabilities };
+          const worktrees = worktreeBindings.worktrees;
+          let payload: unknown;
+          if (frame.method === "worktree.list") payload = worktrees.list(frame.payload, actor);
+          else if (frame.method === "worktree.getOperation") payload = worktrees.getOperation(frame.payload, actor);
+          else if (frame.method === "worktree.getReceipt") payload = worktrees.getReceipt(frame.payload, actor);
+          else {
+            if (!frame.commandId || !(WORKTREE_COMMAND_METHODS as readonly string[]).includes(frame.method)) throw new CatalogError("COMMAND_ID_REQUIRED");
+            payload = await worktrees.command(frame.method as WorktreeCommandMethod, frame.payload, frame.commandId, actor);
+          }
+          runningDevices.assertLease(actor.leaseId, actor.transportGeneration); authorize();
+          context.frameBudget?.assert(context.responseEnvelope?.(payload) ?? payload);
+          return { handled: true, payload };
+        },
+      }, { methodScopes: HOST_DIAGNOSTICS_RPC_SCOPES, ready: () => store.db.open, capabilities: () => [],
         dispatch: async (frame, context) => {
           if (!Object.hasOwn(HOST_DIAGNOSTICS_RPC_SCOPES, frame.method)) return { handled: false };
           if (!context.leaseId || context.transportGeneration === undefined) throw new CatalogError("AUTH_REQUIRED");
@@ -241,17 +403,33 @@ export async function createHostApplication(options: HostApplicationOptions) {
     const runningServer = server;
     return {
       catalog: runningCatalog, lifecycle: runningLifecycle, server: runningServer, devices: runningDevices,
-      interactions: runningInteractions, recovery, attention, operations,
+      interactions: runningInteractions, recovery, attention, operations, checkpoints: checkpointBindings.checkpoints, activation,
+      worktrees: worktreeBindings?.worktrees,
       start: () => started ??= (async () => {
         // This opens metadata/control admission. Original producer readiness
         // remains a separate current proof, so explicit recovery can release it.
         runningLifecycle.markReady();
+        worktreeBindings?.start();
         applicationStarting = true; startAttentionIfReady();
         return runningServer.start();
       })(),
       stop: () => runningServer.stop(),
       queryReadiness: () => query.prepare(),
       startupReadiness,
+      compatibilityArtifact: () => options.execution?.compatibilityArtifact?.(),
+      prepareCompatibilityScene: async (input: Pick<CompatibilityScenePolicyOptions, "authorization" | "expectedDestination" | "entry" | "measureArtifact">) => {
+        if (nativeScenePolicy || runningCatalog.catalog.allSessions().some((session) => runningCatalog.registry.loaded(session.sessionId))) throw new CatalogError("COMPATIBILITY_SCENE_ALREADY_STARTED");
+        if (!runner || options.execution?.git?.stopBackend.kind !== "supervisor" || options.execution.facts?.supervision?.()?.contractId !== options.execution.git.stopBackend.contractId) throw new CatalogError("SUPERVISION_CONTRACT_UNAVAILABLE");
+        nativeScenePolicy = await createCompatibilityScenePolicy({ ...input, store, owner,
+          currentBinding: () => sceneBinding(runningCatalog.registry.resolve(runningCatalog.legacySessionId)),
+          assertBaseline: (actorId, sessionId) => {
+            assertBusinessReady(); runningCatalog.assertActorSession(actorId, sessionId, "session:write");
+            const target = runningCatalog.registry.resolve(sessionId);
+            runningCatalog.workspaces.requireControl(target.workspace.workspaceId);
+            if (target.providerInstance.state === "disabled" || !target.providerInstance.policyCapabilities.includes("workspaceWrite") || !target.workspace.capabilities.includes("workspaceWrite")) throw new CatalogError("PROVIDER_CAPABILITY_UNVERIFIED");
+          },
+        });
+      },
     };
   } catch (error) {
     // No default path prepares a Native runtime. Once a lifecycle exists it

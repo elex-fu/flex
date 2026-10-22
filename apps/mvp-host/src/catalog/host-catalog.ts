@@ -3,6 +3,7 @@ import { ProtocolVersion, SESSION_CATALOG_CAPABILITY, TIMELINE_PROJECTION_CAPABI
 import type { HostOwnerHandle } from "../lifecycle/host-owner.js";
 import { assertHostOwner } from "../lifecycle/host-owner.js";
 import type { ActivationReadinessPort } from "../lifecycle/host-activation-load.js";
+import type { CompatibilityScenePolicy, CompatibilityScenePermit } from "../diagnostics/compatibility-scene-policy.js";
 import type { SqliteStore, CommandReceiptRow } from "../storage/db.js";
 import { CatalogError, CatalogStore, publicSessionSummary, type CatalogCommit, type CatalogSession, type ProviderVerification, type ProviderInstanceRecord } from "../storage/catalog-store.js";
 import { validateCatalogSchema } from "../storage/migrations/007-catalog.js";
@@ -47,7 +48,7 @@ export type CatalogRuntimeServices = {
     workspaces: WorkspaceRegistry;
     providers: ProviderInstanceRegistry;
 };
-export type CatalogRuntimeOptions = Pick<OrchestratorOptions, "executionSetup" | "executionHooks" | "checkpoints" | "genericOperations" | "onExecutionBlocked" | "nativeStateRoots" | "nativeBoundaryFactory" | "revalidateDevice" | "interactionEvents" | "recovery" | "assertWriteReady">;
+export type CatalogRuntimeOptions = Pick<OrchestratorOptions, "executionSetup" | "executionHooks" | "checkpoints" | "genericOperations" | "onExecutionBlocked" | "nativeStateRoots" | "nativeBoundaryFactory" | "revalidateDevice" | "interactionEvents" | "recovery" | "assertWriteReady" | "assertNativeReady" | "gitRunner" | "executionPermits" | "canReleaseAdditionalProducers" | "nativeScenePolicy" | "adapter" | "canReleaseWorkspace">;
 export type HostCatalogOptions = {
     store: SqliteStore;
     owner: HostOwnerHandle;
@@ -72,6 +73,9 @@ export type HostCatalogOptions = {
     runtimeFactory?: (context: SessionRuntimeContext, services: CatalogRuntimeServices) => Promise<CatalogExecutionRuntime> | CatalogExecutionRuntime;
     verifyProvider?: (context: SessionRuntimeContext, runtime: CatalogExecutionRuntime) => Promise<ProviderVerification>;
     restoreWriteReady?: (db: SqliteStore["db"]) => void;
+    /** New prompts only; controls act on their original loaded attempt. */
+    assertNativeReady?: (target: ResolvedSession, authorization?: CompatibilityScenePermit) => void;
+    nativeScenePolicy?: () => CompatibilityScenePolicy | undefined;
     assertSessionAccess?: (subjectId: string, target: ResolvedSession, scope: CatalogAccessScope) => void;
     assertWorkspaceAccess?: (subjectId: string, workspaceId: string, scope: "session:read" | "session:write") => void;
     readViewInteractions?: ViewInteractionReader;
@@ -132,7 +136,7 @@ export class HostCatalog {
         validateCatalogSchema(options.store.db);
         if (options.runtimeCloseDeadlineMs !== undefined && (!Number.isSafeInteger(options.runtimeCloseDeadlineMs) || options.runtimeCloseDeadlineMs < 1 || options.runtimeCloseDeadlineMs > 60000))
             throw new CatalogError("CATALOG_CONFIGURATION_INVALID");
-        this.registry = new SessionRegistry(catalog, workspaces, providers, { owner: options.owner, runtimeFactory: (context) => this.loadRuntime(context), sealRuntime: (runtime) => this.sealRuntime(runtime) });
+        this.registry = new SessionRegistry(catalog, workspaces, providers, { owner: options.owner, runtimeFactory: (context) => this.loadRuntime(context), sealRuntime: (runtime) => this.sealRuntime(runtime), ...(options.nativeScenePolicy ? { nativeScenePolicy: options.nativeScenePolicy } : {}) });
         this.legacy = new LegacySessionFacade(this.registry);
         this.legacyHost = new CatalogLegacyHost(this);
         this.interactionReader = CatalogInteractionReader.isAvailable(this.store) ? new CatalogInteractionReader(this.store, (id) => { this.owner.assertActive(); this.registry.resolve(id); }) : undefined;
@@ -180,6 +184,7 @@ export class HostCatalog {
         this.owner.assertActive();
         if (this.closed)
             throw new CatalogError("HOST_CLOSING");
+        this.options.assertNativeReady?.(this.registry.resolve(context.session.sessionId), context.nativeSceneAuthorization);
         const services = this.services();
         let runtime: CatalogExecutionRuntime | undefined;
         try {
@@ -190,7 +195,8 @@ export class HostCatalog {
                 const host = new SessionOrchestrator({ ...integrations, owner: this.owner, store: this.store, sessionId: context.session.sessionId, ownsStore: false, recoverOnStart: false, runtimeId: context.runtimeId,
                     workspace: context.workspace.canonicalRoot, checkoutRoot: context.workspace.worktreeRoot, provider: context.providerInstance.provider,
                     providerOptions: { executable: context.providerInstance.executable, environment: context.providerInstance.config.environment, ...(context.providerInstance.config.model ? { model: context.providerInstance.config.model } : {}) },
-                    ...(this.views ? { hostViews: this.views } : {}), ...(this.options.privateDirectories ? { privateDirectories: this.options.privateDirectories } : {}), assertWriteReady: () => { this.assertRestoreReady(); syncAssertion(integrations.assertWriteReady?.() as unknown); } });
+                    ...(this.views ? { hostViews: this.views } : {}), ...(this.options.privateDirectories ? { privateDirectories: this.options.privateDirectories } : {}), assertWriteReady: () => { syncAssertion(integrations.assertWriteReady?.() as unknown); },
+                    assertNativeReady: (input) => { this.assertRestoreReady(); this.options.assertNativeReady?.(this.registry.resolve(context.session.sessionId), input?.authorization); syncAssertion(integrations.assertNativeReady?.(input) as unknown); } });
                 runtime = host;
                 this.preparing.set(context.session.sessionId, { context, runtime });
                 const assessment = await host.prepareNativeRuntime();
@@ -318,10 +324,10 @@ export class HostCatalog {
                 if (!isRecord(payload) || payload.sessionId !== sessionId)
                     throw new CatalogError("SESSION_SCOPE_MISMATCH");
                 if(!read){
-                    this.assertRestoreReady();const target=this.registry.resolveExecutionContext(sessionId);
+                    const target=this.registry.resolveControlContext(sessionId);
                     const required=method==="question.respond"?"structuredQuestions":"interactiveApprovals";
                     const device=this.store.getDevice(actor.authSubjectId)!;
-                    if(!this.providers.effectiveCapabilities(target.providerInstance.providerInstanceId,{adapter:target.providerInstance.verification.capabilities,workspace:target.workspace.capabilities,deviceScopes:device.scopes}).includes(required))throw new CatalogError("PROVIDER_CAPABILITY_UNVERIFIED");
+                    if(!target.providerInstance.policyCapabilities.includes(required)||!target.workspace.capabilities.includes(required)||!device.scopes.includes("approval:write"))throw new CatalogError("PROVIDER_CAPABILITY_UNVERIFIED");
                 }
                 const readable=read&&this.summary(this.catalog.requireSession(sessionId)).residency!=="loaded"?this.interactionReader:undefined;
                 const selected=readable??port??this.interactionReader;
@@ -402,7 +408,7 @@ export class HostCatalog {
                 this.assertActor(context.subjectId, "session:write");
                 this.assertRestoreReady();
                 const input = CreateSessionV2Schema.parse(frame.payload);
-                this.workspaces.require(input.workspaceId);
+                this.workspaces.requireControl(input.workspaceId);
                 this.providers.require(input.providerInstanceId);
                 syncAssertion(this.options.assertWorkspaceAccess?.(context.subjectId, input.workspaceId, "session:write") as unknown);
                 const command = this.commandFor(frame, context);
@@ -498,12 +504,11 @@ export class HostCatalog {
         const sessionId = "sessionId" in input && typeof input.sessionId === "string" ? input.sessionId : this.legacySessionId;
         const scope = frame.method === "approval.respond" ? "approval:write" : "session:write";
         this.target(context, sessionId, scope);
-        this.assertRestoreReady();
-        const resolved = this.registry.assertExecutionResources(sessionId);
+        const starting = frame.method === "session.startTurn";
+        if (starting) this.assertRestoreReady();
+        let resolved = this.registry.resolve(sessionId);
         const required = frame.method === "session.startTurn" ? "workspaceWrite" : frame.method === "session.interrupt" ? "interrupt" : "interactiveApprovals";
         const device = this.store.getDevice(context.subjectId)!;
-        if (!this.providers.effectiveCapabilities(resolved.providerInstance.providerInstanceId, { adapter: resolved.providerInstance.verification.capabilities, workspace: resolved.workspace.capabilities, deviceScopes: device.scopes }).includes(required))
-            throw new CatalogError("PROVIDER_CAPABILITY_UNVERIFIED");
         const command = this.commandFor(frame, context);
         const legacyPayload = frame.method === "session.startTurn" ? { prompt: (input as {
                 prompt: string;
@@ -523,16 +528,26 @@ export class HostCatalog {
             }
             return this.executionResponse(prior.response, prior, sessionId, explicit);
         }
+        const scene = starting ? this.options.nativeScenePolicy?.() : undefined;
+        const authorization = scene?.authorizeStart({ actorId: command.authSubjectId, commandId: command.commandId,
+          method: frame.method, prompt: (input as { prompt: string }).prompt, requestHash: request.requestHash, sessionId });
+        if (starting) {
+            this.options.assertNativeReady?.(resolved, authorization);
+            resolved = this.registry.assertExecutionResources(sessionId, authorization);
+            if (!authorization && !this.providers.effectiveCapabilities(resolved.providerInstance.providerInstanceId, { adapter: resolved.providerInstance.verification.capabilities, workspace: resolved.workspace.capabilities, deviceScopes: device.scopes }).includes(required)) throw new CatalogError("PROVIDER_CAPABILITY_UNVERIFIED");
+        }
         const snapshot = this.store.getSession(sessionId);
-        if (snapshot?.recoveryState === "blocked")
+        if (starting && snapshot?.recoveryState === "blocked")
             throw new CatalogError("RECOVERY_BLOCKED");
         if ("expectedRevision" in input && input.expectedRevision !== undefined && snapshot?.revision !== input.expectedRevision)
             throw new CatalogError("SESSION_REVISION_CONFLICT");
-        const runtime = await this.registry.ensureLoaded(sessionId);
+        const runtime = starting ? await this.registry.ensureLoaded(sessionId, authorization) : this.registry.loaded(sessionId);
+        if (!runtime) throw new CatalogError("RUNTIME_NOT_LOADED", "The original control channel is unavailable");
         this.target(context, sessionId, scope);
-        const current = this.registry.assertExecutionResources(sessionId);
+        let current = this.registry.resolve(sessionId);
+        if (starting) { this.options.assertNativeReady?.(current, authorization); current = this.registry.assertExecutionResources(sessionId, authorization); }
         const currentDevice = this.store.getDevice(context.subjectId)!;
-        if (!this.providers.effectiveCapabilities(current.providerInstance.providerInstanceId, { adapter: current.providerInstance.verification.capabilities, workspace: current.workspace.capabilities, deviceScopes: currentDevice.scopes }).includes(required))
+        if (starting && !authorization && !this.providers.effectiveCapabilities(current.providerInstance.providerInstanceId, { adapter: current.providerInstance.verification.capabilities, workspace: current.workspace.capabilities, deviceScopes: currentDevice.scopes }).includes(required))
             throw new CatalogError("PROVIDER_CAPABILITY_UNVERIFIED");
         const result = frame.method === "session.startTurn" ? await runtime.startTurn(command.authSubjectId, command.commandId, (input as {
             prompt: string;

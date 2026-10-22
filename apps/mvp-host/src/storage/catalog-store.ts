@@ -171,7 +171,7 @@ export class CatalogStore {
   }
   create(command: CatalogCommand, input: {workspaceId:string;providerInstanceId:string;title:string}, context: {workspace:WorkspaceRecord;provider:ProviderInstanceRecord}): CatalogCommit {
     this.admit(command);
-    if(input.workspaceId!==context.workspace.workspaceId||input.providerInstanceId!==context.provider.providerInstanceId||context.workspace.state!=="active"||context.provider.state!=="configured")throw new CatalogError("RESOURCE_SCOPE_MISMATCH");
+    if(input.workspaceId!==context.workspace.workspaceId||input.providerInstanceId!==context.provider.providerInstanceId||!["active","needs_verification"].includes(context.workspace.state)||!["configured","unconfigured"].includes(context.provider.state))throw new CatalogError("RESOURCE_SCOPE_MISMATCH");
     const method = "session.createNew";
     const hash = hashCatalogRequest(method,input,{workspaceId:context.workspace.workspaceId,providerInstanceId:context.provider.providerInstanceId,provider:context.provider.provider});
     return this.db.transaction(() => {

@@ -14,13 +14,14 @@ import { openOwned } from "./storage/open-store.js";
 import { inspectCatalogStartupReadiness } from "./session/catalog-startup-readiness.js";
 import { SessionOrchestrator } from "./session/orchestrator.js";
 import { temporaryRepository, removeFixture } from "./checkpoint/test-support.js";
+import { WorkspaceRegistry } from "./workspace/workspace-registry.js";
 import { fixtureTreeStopBackend, rawWorkspaceGitQuery, trustedFixtureGit } from "./test-support/managed-git-fixtures.js";
 import type { ProviderAdapter, ProviderOutcome } from "./provider/types.js";
 
 const closes: Array<() => Promise<void>> = [];
 afterEach(async () => { for (const close of closes.splice(0).reverse()) await close(); });
 async function fixture(driftBeforeDispatch = false) {
-  const root = realpathSync(mkdtempSync(join(tmpdir(), "flyx-positive-main-"))), workspace = await temporaryRepository();
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "flyx-positive-main-"))), workspace = realpathSync(await temporaryRepository());
   mkdirSync(join(root, "data"));
   const executable = join(root, "provider"); writeFileSync(executable, "#!/bin/sh\nexit 0\n"); chmodSync(executable, 0o700);
   const databasePath = join(root, "data", "host.sqlite"), identityDirectory = join(root, "data", "identity");
@@ -49,6 +50,10 @@ async function fixture(driftBeforeDispatch = false) {
   });
   closes.push(async () => { await application.stop().catch(() => {}); await removeFixture(workspace); rmSync(root, { recursive: true, force: true }); });
   const operations = createActivationOperationStore({ db: store.db, workspace: (id) => application.catalog.catalog.workspace(id), provider: (id) => application.catalog.catalog.provider(id) }, { guard: () => owner.assertActive() });
+  // Workspace verification is a separate owner step in production: the
+  // read-only bootstrap never derives checkout identity from configuration.
+  await new WorkspaceRegistry(application.catalog.catalog, { owner, readOnlyGit: rawWorkspaceGitQuery() })
+    .registerLocal({ workspaceId: "workspace", root: workspace, capabilities: ["streamingText", "workspaceWrite"] });
   const load = new HostActivationLoad(operations, observation);
   const management = new HostActivationService({ facts: { db: store.db, owner, catalog: application.catalog.catalog, readiness: () => inspectCatalogStartupReadiness(application.catalog) }, operations, load, observation, actorId: "fixture-maintenance",
     executorFactory: async () => ({ readOnlyGit: rawWorkspaceGitQuery(), prepare: async () => ({ ready: true }), closeAndWait: async () => ({ producerStopped: true, clean: true }) }) });

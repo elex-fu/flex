@@ -183,7 +183,14 @@ export class HostActivationLoad {
     const local = providerLocalChanges(stored.provider, record);
     if (local.length) return this.verdict(kind, record.providerInstanceId, revision, "invalid", local, {});
     const observed = this.facts.provider(record);
-    if (!observed.ready) return this.verdict(kind, record.providerInstanceId, revision, "uncheckable", observed.reasonCodes, {});
+    if (!observed.ready) {
+      // An expired recorded binding whose compatibility log has aged out of
+      // the trust window is a definite stale verdict; the expiry of the
+      // recorded evidence is the fact, never a coarser observation refusal.
+      if (observed.reasonCodes.includes("PROVIDER_COMPATIBILITY_EVIDENCE_MISSING") && !validWindow(stored.validUntil, this.now()))
+        return this.verdict(kind, record.providerInstanceId, revision, "stale", ["ACTIVATION_EVIDENCE_EXPIRED"], {});
+      return this.verdict(kind, record.providerInstanceId, revision, "uncheckable", observed.reasonCodes, {});
+    }
     const reasons: ActivationReasonCode[] = [];
     if (observed.value.executablePath !== stored.provider.executablePath || observed.value.executableDigest !== stored.provider.executableDigest) reasons.push("PROVIDER_EXECUTABLE_CHANGED");
     if (observed.value.configFingerprint !== stored.provider.configFingerprint) reasons.push("PROVIDER_CONFIG_CHANGED");
@@ -191,7 +198,6 @@ export class HostActivationLoad {
     if (observed.value.runtimeVersion !== stored.provider.runtimeVersion || observed.value.runtimeArtifactDigest !== stored.provider.runtimeArtifactDigest) reasons.push("PROVIDER_RUNTIME_CHANGED");
     if (canonicalList(observed.value.capabilities) !== canonicalList(stored.provider.capabilities)) reasons.push("PROVIDER_RUNTIME_CHANGED");
     if (reasons.length) return this.verdict(kind, record.providerInstanceId, revision, "invalid", reasons, {});
-    if (!validWindow(stored.validUntil, this.now())) return this.verdict(kind, record.providerInstanceId, revision, "stale", ["ACTIVATION_EVIDENCE_EXPIRED"], {});
     return this.verdict(kind, record.providerInstanceId, revision, "valid", [], { evidenceId: referenced.id, validUntil: stored.validUntil });
   }
 

@@ -13,6 +13,7 @@ import {
 } from "./host-activation-load.js";
 import { HostActivationService, reconcileObservable, workspaceArgv, type ManagedQueryPort } from "./host-activation-service.js";
 import { registerCatalogReadMetadata, invalidateCatalogResourceReadiness } from "../catalog/catalog-read-bootstrap.js";
+import { signedActivationFixtureEvidence } from "../test-support/activation-fixture.js";
 
 const processes = vi.hoisted(() => ({
   execFile: vi.fn(() => { throw new Error("Subprocess forbidden in activation"); }),
@@ -78,6 +79,7 @@ function fixture() {
       workspace: (record: WorkspaceRecord) => observeLocalWorkspace(record, []),
       provider: (record: ProviderInstanceRecord) => observeProvider(record, {
         compatibilityEvidencePath: input.evidencePath, supervision: input.supervision, runtime: input.runtime,
+        compatibilityTrust: { domain: "fixture" as const, now: now.getTime() },
       }),
     });
   }
@@ -111,23 +113,11 @@ function fixture() {
       evidenceTtlMs: overrides.ttlMs ?? 24 * 60 * 60 * 1000,
     });
   }
-  function writePassedEvidence(overrides: Record<string, unknown> = {}): void {
-    const record = catalog.provider("provider")!;
-    const artifact = {
-      providerVersion: PROVIDER_VERSION,
-      executablePath: record.executable,
-      executableDigest: sha256File(record.executable),
-      configFingerprint: providerConfigurationFingerprint(record),
-      supervisionContractId: SUPERVISION_CONTRACT,
-      sdkVersion: "fixture-sdk.v1",
-      adapterId: "fixture-adapter",
-      adapterVersion: "1",
-      ...overrides,
-    };
-    writeFileSync(evidencePath, `${JSON.stringify({
-      v: 1, source: "native", runId: "fixture-run-1", provider: "claude", kind: "turn", result: "passed",
-      nativeEvent: "turn.completed", evidenceCode: "TURN_COMPLETED", attemptIdHash: "a".repeat(64), artifact, at: "2026-10-17T12:00:00.000Z",
-    })}\n`);
+  function writePassedEvidence(): void {
+    // Signed v2 fixture-domain records; the unsigned v1 shape no longer loads
+    // as trusted evidence and can never activate a binding.
+    writeFileSync(evidencePath, signedActivationFixtureEvidence(catalog.provider("provider")!, now.toISOString())
+      .map((record) => JSON.stringify(record)).join("\n") + "\n");
     chmodSync(evidencePath, 0o600);
   }
   const configuration = { workspaces: [{ workspaceId: "workspace", root: canonicalRoot }], providerInstances: [{ providerInstanceId: "provider", provider: "claude" as const, executable, policyCapabilities: ["streamingText", "workspaceWrite", "interrupt"] }] };

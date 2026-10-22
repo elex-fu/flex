@@ -3,6 +3,7 @@ import { ProtocolVersion, SESSION_CATALOG_CAPABILITY, TIMELINE_PROJECTION_CAPABI
 import type { HostOwnerHandle } from "../lifecycle/host-owner.js";
 import { assertHostOwner } from "../lifecycle/host-owner.js";
 import type { ActivationReadinessPort } from "../lifecycle/host-activation-load.js";
+import { ActivationServiceError } from "../lifecycle/host-activation-service.js";
 import type { CompatibilityScenePolicy, CompatibilityScenePermit } from "../diagnostics/compatibility-scene-policy.js";
 import type { SqliteStore, CommandReceiptRow } from "../storage/db.js";
 import { CatalogError, CatalogStore, publicSessionSummary, type CatalogCommit, type CatalogSession, type ProviderVerification, type ProviderInstanceRecord } from "../storage/catalog-store.js";
@@ -370,6 +371,10 @@ export class HostCatalog {
         catch (error) {
             if (error instanceof CatalogError)
                 throw new OrchestratorError(error.code, error.message, error.retryable);
+            // The activation write gate throws precise activation reason codes;
+            // they must surface as typed RPC errors, never as INTERNAL_ERROR.
+            if (error instanceof ActivationServiceError)
+                throw new OrchestratorError(error.code, error.message, false);
             if (error instanceof ZodError)
                 throw new OrchestratorError("INVALID_PARAMS", "Invalid Catalog request");
             throw error;

@@ -110,7 +110,9 @@ describe("production Host application graph", { timeout: 10000 }, () => {
       readiness: { status: "blocked", reasonCodes: expect.arrayContaining(["NATIVE_EXECUTION_UNVERIFIED"]) }, schema: { writable: false },
     });
     const write = await client.request("session.startTurn", { sessionId: f.sessionId, prompt: "must remain gated" }, "unverified-turn");
-    expect(write.ok).toBe(false); expect((write.error as { code: string }).code).toBe("WORKSPACE_NOT_VERIFIED");
+    // The purpose-split activation gate now rejects with its precise activation
+    // reason codes instead of the legacy verification-only error.
+    expect(write.ok).toBe(false); expect((write.error as { code: string }).code).toBe("PROVIDER_NOT_ACTIVATED");
     expect(f.store.getCommandReceipt(deviceId, "unverified-turn")).toBeUndefined();
     expect(f.store.getActiveTurn(f.sessionId)).toBeUndefined();
     expect(f.application.catalog.registry.loaded(f.sessionId)).toBeUndefined();

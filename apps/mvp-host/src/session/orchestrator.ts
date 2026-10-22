@@ -426,7 +426,8 @@ export class SessionOrchestrator {
       if (input.purpose !== "preview" || input.previousLease || this.activeWorkspaceLease) throw new OrchestratorError("REVERT_WORKSPACE_LEASE_REQUIRED", "Create a fresh preview before acquiring revert ownership");
       const lease = WorkspaceLease.acquire({ workspace: this.checkoutRoot, owner: this.owner, operationId: randomUUID() });
       const generation = (this.store.db.prepare("SELECT COALESCE(MAX(generation),0) AS generation FROM turns WHERE session_id=?").get(this.session.id) as { generation: number }).generation;
-      const context = this.operationContext(lease.operationId, lease.operationId, generation);
+      // An idle session may have no turns yet; a reservation context still needs a valid generation.
+      const context = this.operationContext(lease.operationId, lease.operationId, Math.max(1, generation));
       const timer = setTimeout(() => {
         if (this.callbacksSealed || !this.store.db.open) { lease.retain("Checkpoint reservation expired after callback fence"); return; }
         try { this.releaseCheckpointLease(lease.operationId); } catch { lease.retain("Checkpoint expiry release requires original ownership verification"); }

@@ -130,8 +130,11 @@ describe("actual main operations routing", { timeout: 30000 }, () => {
       const child = spawnSync(process.execPath, ["--import", "tsx", resolve("src/main.ts"), "start"], {
         env: { ...f.env, NODE_ENV: "production", FLYX_PROVIDER: "codex", FLYX_WORKSPACE: workspace, PORT: String(port) }, encoding: "utf8", timeout: 20000,
       });
-      expect(child.status).toBe(1); expect(child.stderr).toContain("EADDRINUSE");
-      expect(child.stderr).toContain("Host startup cleanup failed");
+      // The tightened restore gate refuses startup with an unresolved
+      // original producer before any bind attempt: recovery takes precedence
+      // over the incidental port conflict, and the unknown helper is left
+      // untouched for explicit recovery.
+      expect(child.status).toBe(1); expect(child.stderr).toContain("HOST_RECOVERY_REQUIRED");
       const readonly = openReadOnly(f.databasePath);
       try {
         expect(readonly.db.prepare("SELECT state FROM managed_processes WHERE id='original-startup-helper'").get()).toEqual({ state: "unknown" });

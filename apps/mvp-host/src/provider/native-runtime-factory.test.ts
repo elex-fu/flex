@@ -26,6 +26,14 @@ describe("production Host process factory", () => {
       if (process.platform === "darwin") expect(readiness.ready).toBe(true);
       const context = dispatchContextForTurn("fixture-turn", { hostOwnerId: owner.ownerId, hostOwnerGeneration: owner.generation, sessionId: session.id, flyxTurnId: "fixture-turn", runtimeId: "native-fixture", runtimeGeneration: 4, attemptId: "fixture-attempt" });
       if (!readiness.ready) { await expect(controller.prepare(context)).rejects.toThrow(readiness.code); expect(store.db.prepare("SELECT count(*) AS n FROM managed_processes").get()).toEqual({ n: 0 }); return; }
+      if (!readiness.proof.verifiedDescendantStop) {
+        // Production gate: a boundary whose proof variant does not verify
+        // descendant stop never prepares a Native runtime at all; nothing is
+        // journalled and no child exists to release (plan R1, pre-R0 fail-closed).
+        await expect(controller.prepare(context)).rejects.toThrow("NATIVE_DESCENDANT_STOP_UNVERIFIED");
+        expect(store.db.prepare("SELECT count(*) AS n FROM managed_processes").get()).toEqual({ n: 0 });
+        return;
+      }
       const runtime = await controller.prepare(context);
       const script = `const fs=require('node:fs');let denied=false;try{fs.readFileSync(${JSON.stringify(privateFile)})}catch{denied=true}process.stdout.write((denied?'denied ':'leaked ')+'ready');process.stdin.resume();process.stdin.on('end',()=>process.exit(0));`;
       const child = runtime.spawn({ command: process.execPath, args: ["-e", script], cwd: workspace, env: { PATH: process.env.PATH ?? "/usr/bin:/bin" }, stdio: ["pipe", "pipe", "pipe"] });

@@ -68,6 +68,10 @@ describe("Host management command isolation", () => {
       try {
         const store = openOwned({ databasePath, owner });
         try {
+          // The activation CLI binds to the host identity mirror; without it
+          // the command refuses before any verification attempt is recorded.
+          const identity = await loadOrCreateHostIdentity({ directory: identityDirectory });
+          store.setHostIdentityMirror(getHostIdentityMirror(identity));
           const catalog = new CatalogStore(store);
           try {
             await registerConfiguredCatalog(catalog, owner, { workspaces: [{ workspaceId: "workspace", root: workspace }],

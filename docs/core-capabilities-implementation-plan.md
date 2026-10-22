@@ -295,3 +295,14 @@ rtk proxy env RUN_REAL_CLAUDE=0 RUN_REAL_CODEX=0 RUN_REAL_CLAUDE_SPIKE=0 RUN_REA
 - R3 签名/隔离握手/authorize-import CLI 已接 main，recorder 事件源与 isolated-real 端到端仍缺；R4 结构接线完成但生产 manifest 恒 unknown、CLI 外部检查器占位；R6 驱动与受管 transport 完成（仅 fixture），生产接线、持久锚点与两项 unknown 回归待做；R8 CoreControls/Web 四面板/手机最小面板已接，浏览器 E2E 覆盖会话元数据/草稿/readiness，其余面板场景与真机未做。
 - 新登记缺口：`CompatibilityEvidenceRecorder.afterCommittedNativeStop` 零引用；`native-revert-anchors.ts` 零引用；main isolated 模式在无 execution 端口时不可用（`COMPATIBILITY_RUNTIME_FACTS_UNAVAILABLE`）；生产 supervisor backend 仍限 Linux 且无构造点。
 - 以上"已接线/已实现"均以工作区代码与既有定向测试记录为据，完整 `test:product`/typecheck 全量验收仍待 Luna 执行后提交；C0、真实 Provider、物理手机状态不变。
+
+**2026-10-23 收敛轮（提交并推送后）**：工作区经拆分提交（9 个模块提交至 `b79c759`）后进入全量验证收敛；期间按模块并行开发的三项 worktree 任务（R3 recorder 事件源 `db64380`、R6 unknown 定位+路径 canonicalize（5 commits）、R8 面板 E2E `b9be7f7`）已完成并合并推送。本收敛轮的验证与修复记录：
+
+- 全量验证首次暴露基线破坏：`compatibility-scene-policy.ts` 的 `const` 箭头 `fail()` 不被 TS never 收窄（函数声明才行）导致 host build 失败（`9ec893b` 修复）；测试类型三处 exactOptionalPropertyTypes/mock 缺字段（`66893e9`）。
+- R4 补齐：新增 `provider/native-history-manifest.ts` 可信 manifest 来源——仅在"验证过 turn 基线的同一签名产物/隔离 run/受控入口上还绑定通过的 recovery 只读检查,且产物仍匹配当前 provider 实例事实"时给出 manifest;接入 `NativeHistoryReaderFactory`,替换恒 `undefined` 占位（`d22b3e6`,6 个 fixture 用例）。
+- 激活判定修复：记录绑定过期且兼容日志同时老化时报告 `stale/ACTIVATION_EVIDENCE_EXPIRED` 而非 `uncheckable`（其余观察拒绝仍优先）；service 测试改用 v2 签名 fixture 证据+trust;activation 应用测试补 workspace `registerLocal` 验证与 realpath;`dispatchCatalog` 映射 `ActivationServiceError` 为类型化错误（`db00cfe`）。
+- 排队取消修复：`turn.cancelled` 事件的 `finalizeTurnIntentsInternal` 与计划显式 intent 更新冲突(恒 `EXECUTION_INTENT_TRANSITION_INVALID/STATE_CONFLICT`)——取消走持久事件路径,worker 各派发前检查点识别 settled+cancelled;新增 `beforeClaim` 钩子,容量等待(permit/lease/baseline)移到 claim 前使排队任务保持 pending 可取消,preparation 中的中断恢复走原控制通道（`276184f`）。
+- Catalog gate 顺序修复:控制命令恢复 `ensureLoaded`(加载资源检查给出精确拒绝、加载后复核 actor);interaction 响应端口先过 restore 全局门再选端口,无已加载 runtime 时原控制绑定拒绝优先于能力证据（`95a4f7d`）;bootstrap/integration 测试期望更新到用途拆分语义(rename 不依赖工作区验证/可执行文件)。
+- R6 worktree 结论已合并:复杂文件恢复 unknown 系 `stableJson` 对显式 `undefined` 序列化不一致的实现缺陷(已修);受管 Worktree 两项 unknown 在当前代码已修复;`controlled-restore`/`catalog-read-bootstrap` 生产者侧 realpath canonicalize(附回归测试);`native-revert-anchors` 记录为第三阶段差距。
+- R8 worktree 结论已合并:Recovery/Diff/Worktree 不可用面板与 worktree 正向上链路 4 个真实 Host E2E 场景(6/6);core-host-main fixture 修复(registerLocal+provider configured 提升);`entry.spec.ts` large Git Diff 一例为基线预存,另行跟进。
+- 验证日志:`/tmp/flyx-verify-{b79c759,9ec893b,66893e9,db00cfe,95a4f7d}.log`;secure-channel 262KB 帧用例曾因并发负载超时,单跑 48/48 通过。R6 受影响套件 113/113(串行,~8 分钟)。C0、真实 Provider、物理手机状态不变。

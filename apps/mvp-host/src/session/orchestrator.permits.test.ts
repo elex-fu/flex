@@ -11,7 +11,7 @@ afterEach(async () => { for (const f of fixtures.splice(0)) { await f.host.close
 describe("Host task permits at the Native dispatch boundary", () => {
   it("cancels an accepted task waiting for capacity without invoking its prompt or acquiring checkout", async () => {
     const root = await temporaryRepository(), permits = new HostExecutionPermits({ limit: 1 });
-    const other = await permits.acquire("other-running-attempt"), run = vi.fn(async () => ({ status: "completed" as const, evidence: { kind: "native-terminal" as const, sourceId: "result" } }));
+    const other = await permits.acquire("other-running-attempt"), run = vi.fn(async () => ({ status: "completed" as const, providerSessionId: "native-session", evidence: { kind: "native-terminal" as const, sourceId: "result" } }));
     const adapter: ProviderAdapter = { provider: "claude", workspace: root, status: async () => { throw new Error("unused"); }, preflight: async () => { throw new Error("unused"); },
       runTurn: run, interrupt: async () => "accepted", respondApproval: () => false };
     const host = new SessionOrchestrator({ workspace: root, adapter, executionPermits: permits, gitRunner: rawGitServiceRunner(), canReleaseWorkspace: () => true });

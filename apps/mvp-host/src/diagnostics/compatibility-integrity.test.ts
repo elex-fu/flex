@@ -42,8 +42,10 @@ describe("signed compatibility artifacts", () => {
     await new CompatibilityEvidenceRecorder(path, true, "run-1").record(observation);
     expect(readCompatibilityEvidence(path).entries).toHaveLength(1);
     expect(loadTrustedCompatibilityEvidence(path, undefined, { domain: "fixture" })).toEqual([]);
-    await expect(recorder.record({ ...observation, nativeSourceId: undefined })).rejects.toThrow("COMPATIBILITY_NATIVE_PROOF_MISSING");
-    await expect(new CompatibilityEvidenceRecorder(path, true, "run-1", { domain: "fixture", identity, artifact: { ...facts, runtimeDigest: undefined }, sceneVersion: "flyx-c3-basic-v1", entryDigest: hash("d") }).record(observation)).rejects.toThrow("COMPATIBILITY_ARTIFACT_INCOMPLETE");
+    const { nativeSourceId: _withoutProof, ...observationWithoutProof } = observation;
+    await expect(recorder.record(observationWithoutProof)).rejects.toThrow("COMPATIBILITY_NATIVE_PROOF_MISSING");
+    const { runtimeDigest: _withoutDigest, ...incompleteArtifact } = facts;
+    await expect(new CompatibilityEvidenceRecorder(path, true, "run-1", { domain: "fixture", identity, artifact: incompleteArtifact, sceneVersion: "flyx-c3-basic-v1", entryDigest: hash("d") }).record(observation)).rejects.toThrow("COMPATIBILITY_ARTIFACT_INCOMPLETE");
   });
   it("refuses real artifact signing without matching immutable journal provenance", async () => {
     const path = join(await root(), "native.jsonl");

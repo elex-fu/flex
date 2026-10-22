@@ -28,7 +28,7 @@ import { createHostOperations, hostDiagnosticsRpc, HOST_DIAGNOSTICS_RPC_SCOPES, 
 import type { SnapshotCoordinator } from "./operations/operation-files.js";
 import { createCatalogRecoveryBindings } from "./session/catalog-recovery.js";
 import { inspectCatalogStartupReadiness, type CatalogStartupReadiness } from "./session/catalog-startup-readiness.js";
-import { SessionOrchestrator } from "./session/orchestrator.js";
+import { SessionOrchestrator, type CommittedNativeStopRecorder } from "./session/orchestrator.js";
 import { createHostServer, type HostServer, type HostServerOptions } from "./server.js";
 import { createActivationOperationStore } from "./storage/activation-store.js";
 import { SqliteStore } from "./storage/db.js";
@@ -58,6 +58,9 @@ export type HostApplicationOptions = Pick<HostCatalogOptions, "configuration" | 
     runtimeOptions?: HostCatalogOptions["runtimeOptions"];
     revert?: HostRevertPorts;
     compatibilityArtifact?: () => NativeCompatibilityArtifact | undefined;
+    /** Design §6.3: compatibility fact recorder for the isolated compatibility
+     *  scenario only. The online Host never constructs or injects one. */
+    compatibilityRecorder?: () => CommittedNativeStopRecorder | undefined;
     worktreesRoot?: string;
     recovery?: Pick<Parameters<typeof createCatalogRecoveryBindings>[0], "nativeHistoryReaderFactory" | "processInspector" | "inspectBoundary" | "inspectWorkspace" | "verifiedManifestForInstance" | "existingCodexReader">;
   };
@@ -232,10 +235,13 @@ export async function createHostApplication(options: HostApplicationOptions) {
         if (!interactions || !recovery || !checkpointBindings) throw new CatalogError("HOST_BINDINGS_INCOMPLETE");
         const hooks = interactions.runtimeOptions(context);
         const extra = options.execution?.runtimeOptions?.(context, services);
+        const compatibilityRecorder = options.execution?.compatibilityRecorder?.();
         return { ...extra, ...hooks, recovery: recovery.runtimeRecoveryOptions(context),
           checkpoints: checkpointBindings.checkpoints.executionBinding,
           executionPermits,
           ...(nativeScenePolicy ? { nativeScenePolicy } : {}),
+          // The trusted Host port wins over any runtimeOptions extra of the same key.
+          ...(compatibilityRecorder ? { compatibilityRecorder } : {}),
           canReleaseAdditionalProducers: (dispatch) => {
             owner.assertActive();
             const records = store.db.prepare(`SELECT p.state,p.pid,i.identity_json,b.launch_digest,s.proof_json FROM managed_processes p

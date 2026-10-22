@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { realpathSync } from "node:fs";
 import { resolve } from "node:path";
 import { CreateSessionV2Schema } from "@flyx/mvp-protocol";
 import { assertHostOwner, type HostOwnerHandle } from "../lifecycle/host-owner.js";
@@ -63,6 +64,18 @@ function assertLocalOwner(catalog: CatalogStore, owner: HostOwnerHandle): void {
 }
 
 /**
+ * Producer-side canonicalization for the journaled canonicalRoot: a configured
+ * alias (for example a macOS /var -> /private/var temp path) must never be
+ * persisted, or every later `assertCurrent`/identity comparison against the
+ * canonical form fails as WORKSPACE_MOVED. A not-yet-existing root keeps its
+ * absolute form; verification still decides the checkout identity.
+ */
+function canonicalConfiguredRoot(root: string): string {
+    const absolute = resolve(root);
+    try { return realpathSync(absolute); } catch { return absolute; }
+}
+
+/**
  * Owner-only SQL bootstrap. No Git, executable lookup, Native process or DDL.
  * Existing identities remain authoritative; supplied config registers new IDs.
  */
@@ -80,7 +93,7 @@ export function registerCatalogReadMetadata(catalog: CatalogStore, owner: HostOw
         for (const input of parsed.workspaces) {
             if (catalog.workspace(input.workspaceId)) continue;
             // Unknown checkout identity is explicit. It is never derived from cwd.
-            catalog.putWorkspace({ workspaceId: input.workspaceId, canonicalRoot: resolve(input.root), worktreeRoot: "", checkoutKey: "", kind: "local", state: "needs_verification", repositoryId: input.repositoryId ?? input.workspaceId, capabilities: input.capabilities ?? [] });
+            catalog.putWorkspace({ workspaceId: input.workspaceId, canonicalRoot: canonicalConfiguredRoot(input.root), worktreeRoot: "", checkoutKey: "", kind: "local", state: "needs_verification", repositoryId: input.repositoryId ?? input.workspaceId, capabilities: input.capabilities ?? [] });
         }
         for (const input of providerInputs) {
             const existing = catalog.provider(input.providerInstanceId);

@@ -9,6 +9,7 @@ import { SessionOrchestrator } from "../session/orchestrator.js";
 import type { ClaudeAdapter } from "../claude/adapter.js";
 import { writeTestReadiness } from "../diagnostics/test-readiness.js";
 import { DeterministicAdapter } from "./deterministic-adapter.js";
+import { rawGitServiceRunner } from "./managed-git-fixtures.js";
 
 /**
  * Standalone E2E Host entry.  Runs the exact production server stack with a
@@ -75,6 +76,10 @@ const orchestrator = new SessionOrchestrator({
   // The fixture has only tracked in-process scenarios, never native OS producers.
   canReleaseWorkspace: () => true,
   adapter: adapter as unknown as ClaudeAdapter,
+  // The deterministic E2E host has no managed execution backend; the test-only
+  // raw runner keeps the legacy Workspace Diff read available. Production
+  // composes this from the managed runner and never spawns Git directly.
+  gitRunner: rawGitServiceRunner(),
 });
 orchestratorRef = orchestrator;
 const server = createHostServer({

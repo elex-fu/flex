@@ -1,7 +1,7 @@
 {
   "$id": "flyx/claude-compatibility-matrix",
   "version": 1,
-  "description": "Claude SDK / Claude CLI / Node 兼容矩阵（机器可读定义）。由 scripts/compatibility/run-matrix.mjs 读取并回写验证状态。人读文档见 docs/claude-compatibility-matrix.md。设计依据：docs/mvp-go-and-host-productionization-technical-design.md 第 5.6 节。",
+  "description": "Provider compatibility matrix. Verdicts are derived from signed native artifacts for the declared scene and capabilities; manual status is not execution evidence.",
   "matrixPrompt": {
     "id": "matrix-fixed-ok",
     "text": "回复 OK 两个字母，不要做任何其他事"
@@ -11,8 +11,9 @@
   },
   "realRequirements": {
     "turns": 10,
-    "approvals": 10,
-    "interrupts": 10
+    "approvals": 0,
+    "interrupts": 0,
+    "recoveries": 0
   },
   "verificationLevels": [
     "pending",
@@ -46,7 +47,26 @@
       "notes": [
         "初始状态：sdkVersion 取自 apps/mvp-host/package.json 的 @anthropic-ai/claude-agent-sdk@0.3.220；claudeCliVersion 取实际执行的 SDK bundled Claude Code 2.1.220；nodeVersion 为本机锁定版本。尚未完成兼容矩阵验证。",
         "2026-09-05：修正旧矩阵错误归因。Flyx 默认实际运行 SDK bundled 2.1.220，而不是 PATH 中的系统 Claude 2.1.216；旧的一次冒烟证据不迁移到新组合。"
+      ],
+      "provider": "claude",
+      "capabilities": [
+        "turn"
+      ],
+      "sceneVersion": "flyx-c3-basic-v1"
+    },
+    {
+      "id": "codex-measured-runtime-pending",
+      "provider": "codex",
+      "decision": "pending-measurement",
+      "status": "pending",
+      "sceneVersion": "flyx-c3-basic-v1",
+      "capabilities": [
+        "turn"
+      ],
+      "notes": [
+        "Exact CLI executable digest/version, Node/OS, adapter/runtime artifact and supervision contract must be measured before real evidence can qualify. No inferred compatibility from the Claude row."
       ]
     }
-  ]
+  ],
+  "sceneVersion": "flyx-c3-basic-v1"
 }

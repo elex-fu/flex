@@ -1,17 +1,20 @@
 #!/usr/bin/env node
 /** Controlled compatibility evidence. Real calls require --real AND RUN_REAL_<PROVIDER>=1. */
-import { spawn } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { createRequire } from "node:module";
 import { createHash, randomUUID } from "node:crypto";
-import { appendFile, chmod, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, cp, mkdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { arch, release } from "node:os";
 import { dirname, join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
-import { environmentMatches, evaluateVerification, parseArgs, parseNativeEvidence, readPrivateArtifact, readReadiness } from "./evidence.mjs";
+import { promisify } from "node:util";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import { compatibilitySceneCommandIds, environmentMatches, evaluateVerification, parseArgs, parseNativeEvidence, readPrivateArtifact, readReadiness } from "./evidence.mjs";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
+const SCENE_VERSION = "flyx-c3-basic-v1";
+const BASIC_PROMPT = "回复 OK 两个字母，不要做任何其他事";
 const TERMINALS = new Set(["turn.completed", "turn.failed", "turn.cancelled"]);
-const USAGE = "node scripts/compatibility/run-matrix.mjs [--deterministic-only | --real] [--combo id] [--turns 1-100] [--config path] [--evidence-root path]\nReal calls also require RUN_REAL_CLAUDE=1 or RUN_REAL_CODEX=1. Existing authentication and built artifacts are required.\n";
+const USAGE = "node scripts/compatibility/run-matrix.mjs [--prepare | --deterministic-only | --real] [--run-id id] [--combo id] [--turns 1-100] [--config path] [--evidence-root path]\nReal calls also require RUN_REAL_CLAUDE=1 or RUN_REAL_CODEX=1. Existing authentication and built artifacts are required.\n";
 const hash = (value) => createHash("sha256").update(value).digest("hex");
 const code = (error) => typeof error?.code === "string" && /^[A-Z][A-Z0-9_]{0,95}$/.test(error.code) ? error.code : "MATRIX_OPERATION_FAILED";
 const coded = (value) => Object.assign(new Error(value), { code: value });
@@ -22,11 +25,11 @@ async function writeJson(path, value) {
   await writeFile(path, JSON.stringify(value, null, 2) + "\n", { mode: 0o600 });
   await chmod(path, 0o600);
 }
-async function waitForReady(child, path, provider, timeoutMs) {
+async function waitForReady(child, path, expected, timeoutMs) {
   const until = Date.now() + timeoutMs;
   while (Date.now() < until) {
     if (!child.pid || child.exitCode !== null || child.signalCode !== null) throw coded("HOST_EXITED_BEFORE_READY");
-    try { return await readReadiness(path, { expectedProvider: provider }); }
+    try { return await readReadiness(path, { ...expected, expectedPid: child.pid }); }
     catch (error) { if (error?.code !== "ENOENT") throw error; }
     await new Promise((done) => setTimeout(done, 50));
   }
@@ -48,25 +51,39 @@ async function startHost({ layer, combo, scratch, nativePath, runId }) {
   await chmod(controlled, 0o700);
   await mkdir(join(controlled, "web"), { mode: 0o700 });
   const readinessPath = join(controlled, "ready.json");
+  const workspace = join(controlled, "workspace");
+  await cp(join(ROOT, "packages/claude-fixtures"), workspace, { recursive: true, filter: (path) => !path.split(/[\\/]/).includes(".git") });
+  const git = promisify(execFile);
+  await git("git", ["init", "--quiet", workspace]);
+  await git("git", ["-C", workspace, "add", "."]);
+  await git("git", ["-C", workspace, "-c", "user.name=Flyx compatibility", "-c", "user.email=compatibility@localhost", "commit", "--quiet", "-m", "isolated compatibility fixture"]);
   const real = layer === "real";
+  if (real && (!combo.authorizationPath || !combo.destinationHostPath)) throw coded("MATRIX_PREAUTHORIZED_RUN_REQUIRED");
+  const entryPath = real ? await realpath(join(ROOT, "apps/mvp-host/dist/main.js")) : undefined;
+  const entryDigest = real ? hash(await readFile(entryPath)) : undefined;
+  const expectedHost = real ? JSON.parse(await readPrivateArtifact(join(dirname(nativePath), "source-host.json"))) : undefined;
+  const startedAt = Date.now();
   const provider = combo.provider ?? "claude";
   const child = spawn(process.execPath, real ? [join(ROOT, "apps/mvp-host/dist/main.js")] : ["--import", "tsx", "src/test-support/e2e-main.ts"], {
     cwd: join(ROOT, "apps/mvp-host"),
     env: {
-      ...process.env, PORT: "0", FLYX_PROVIDER: provider, FLYX_WORKSPACE: join(ROOT, "packages/claude-fixtures"),
+      ...process.env, PORT: "0", FLYX_PROVIDER: provider, FLYX_WORKSPACE: workspace,
       FLYX_DB: join(controlled, "host.sqlite"), FLYX_IDENTITY_DIR: join(controlled, "identity"),
       FLYX_E2E_ROOT: join(controlled, "e2e"), FLYX_WEB_ROOT: join(controlled, "web"),
       FLYX_ALLOW_INSECURE_HTTP: "1", FLYX_REQUIRE_PAIRING_CONFIRM: "0",
       FLYX_CONNECTIVITY_MODE: "local", FLYX_RELAY_ENABLED: "0", FLYX_PUBLIC_BASE_URL: "", FLYX_SKIP_PREFLIGHT: "0",
-      FLYX_TEST_CONTROLLED_ENTRY: "1", FLYX_TEST_READINESS_PATH: readinessPath,
+      FLYX_TEST_CONTROLLED_ENTRY: "1", FLYX_TEST_READINESS_PATH: readinessPath, FLYX_COMPATIBILITY_READINESS_PATH: readinessPath,
       FLYX_COMPATIBILITY_EVIDENCE_PATH: nativePath, FLYX_COMPATIBILITY_RUN_ID: runId,
+      FLYX_COMPATIBILITY_MODE: "isolated", FLYX_COMPATIBILITY_ROOT: controlled,
+      FLYX_COMPATIBILITY_AUTHORIZATION_PATH: combo.authorizationPath ?? "", FLYX_COMPATIBILITY_DESTINATION_HOST_PATH: combo.destinationHostPath ?? "",
+      FLYX_COMPATIBILITY_REAL_ENABLED: real ? "1" : "0", FLYX_COMPATIBILITY_ENTRY_DIGEST: entryDigest ?? "",
       ...(provider === "claude" ? { FLYX_CLAUDE_EXECUTABLE: combo.executableSource === "sdk-bundled" ? "" : combo.executablePath ?? "claude" } : { FLYX_CODEX_EXECUTABLE: combo.executablePath ?? "codex" }),
     }, stdio: ["ignore", "ignore", "ignore"],
   });
   let spawnError;
   child.once("error", () => { spawnError = coded("HOST_SPAWN_FAILED"); });
   try {
-    const info = await waitForReady(child, readinessPath, real ? provider : "deterministic", real ? 180_000 : 60_000);
+    const info = await waitForReady(child, readinessPath, { expectedProvider: real ? provider : "deterministic", expectedRunId: runId, expectedEntryDigest: entryDigest, expectedEntryPath: entryPath, expectedHost, startedAt }, real ? 180_000 : 60_000);
     if (spawnError) throw spawnError;
     if (info.pid !== child.pid) throw coded("READINESS_PID_MISMATCH");
     return { child, info };
@@ -128,12 +145,12 @@ export async function openClient(info) {
   if (!subscribed.ok) { client.close(); throw coded("SUBSCRIBE_FAILED"); }
   return client;
 }
-async function runTurn(client, { layer, index, prompt, scenario = "turn" }) {
+async function runTurn(client, { layer, index, prompt, scenario = "turn", commandId }) {
   const start = Date.now();
   const record = { layer, scenario, index, promptHash: hash(prompt), startedAt: new Date(start).toISOString(), turnIdHash: null, terminalType: null, result: "failed", errorCode: null };
   let turnId;
   try {
-    const response = await client.call("session.startTurn", { prompt }, randomUUID());
+    const response = await client.call("session.startTurn", { prompt }, commandId ?? randomUUID());
     if (!response.ok || typeof response.payload?.turnId !== "string") throw coded(response.error?.code ?? "TURN_ADMISSION_FAILED");
     turnId = response.payload.turnId; record.turnIdHash = hash(turnId);
     if (scenario === "approval") {
@@ -166,18 +183,18 @@ async function runLayer(layer, combo, context) {
     const observed = { nodeVersion: process.versions.node, os: process.platform + " " + release() + " " + arch(), ...host.info.observed };
     if (layer === "real") {
       const match = environmentMatches(combo, observed);
-      if (!match.matched) return layerResult = { outcome: { status: "skipped", completed: 0, reasonCode: "RUNTIME_COMBINATION_UNVERIFIED", reasons: match.reasonCodes }, observed, records };
+      if (!match.matched) return layerResult = { outcome: { status: "skipped", completed: 0, reasonCode: "RUNTIME_COMBINATION_UNVERIFIED", reasons: match.reasonCodes }, observed, records, handshake: host.info };
     }
     const client = await openClient(host.info);
     try {
-      for (let index = 1; index <= context.turns; index += 1) records.push(await runTurn(client, { layer, index, prompt: context.prompt }));
+      for (let index = 1; index <= context.turns; index += 1) records.push(await runTurn(client, { layer, index, prompt: context.prompt, ...(layer === "real" ? { commandId: compatibilitySceneCommandIds(context.runId)[index - 1] } : {}) }));
       if (layer === "real") for (const scenario of ["approval", "interrupt"]) {
         const spec = context.scenarios?.[scenario];
         if (spec?.prompt) for (let index = 1; index <= (spec.repetitions ?? 1); index += 1) records.push(await runTurn(client, { layer, index, prompt: spec.prompt, scenario }));
       }
     } finally { client.close(); }
     const turns = records.filter((record) => record.scenario === "turn");
-    return layerResult = { records, observed, outcome: { status: records.some((record) => record.result !== "passed") ? "failed" : "passed", completed: turns.filter((record) => record.result === "passed").length, scenarioResults: Object.fromEntries(["approval", "interrupt", "recovery"].map((kind) => [kind, { status: records.some((record) => record.scenario === kind) ? records.filter((record) => record.scenario === kind).every((record) => record.result === "passed") ? "passed" : "failed" : "skipped", reasonCode: records.some((record) => record.scenario === kind) ? null : "SCENARIO_NOT_CONFIGURED" }])) } };
+    return layerResult = { records, observed, handshake: host.info, outcome: { status: records.some((record) => record.result !== "passed") ? "failed" : "passed", completed: turns.filter((record) => record.result === "passed").length, scenarioResults: Object.fromEntries(["approval", "interrupt", "recovery"].map((kind) => [kind, { status: records.some((record) => record.scenario === kind) ? records.filter((record) => record.scenario === kind).every((record) => record.result === "passed") ? "passed" : "failed" : "skipped", reasonCode: records.some((record) => record.scenario === kind) ? null : "SCENARIO_NOT_CONFIGURED" }])) } };
   } catch (error) { return layerResult = { records, observed: host?.info.observed ?? {}, outcome: { status: "blocked", completed: 0, reasonCode: code(error) } }; }
   finally {
     if (host) {
@@ -199,15 +216,17 @@ export async function main(argv = process.argv.slice(2)) {
   const combos = config.lockedCombinations ?? [];
   if (!Array.isArray(combos) || combos.some((combo) => !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(combo.id) || !["claude", "codex"].includes(combo.provider ?? "claude"))) throw coded("MATRIX_CONFIG_INVALID");
   const selected = options.combo ? combos.filter((combo) => combo.id === options.combo) : combos.filter((combo) => ["pending", "deterministic-verified"].includes(combo.status));
-  const runId = randomUUID();
+  const runId = options.runId ?? randomUUID();
   const evidenceRoot = resolve(options.evidenceRoot);
   await mkdir(evidenceRoot, { recursive: true, mode: 0o700 });
   if (selected.length === 0) {
     await writeJson(join(evidenceRoot, "run-" + runId + ".json"), { v: 1, runId, status: "skipped", reasonCode: "NO_SELECTED_COMBINATIONS" });
     log("skipped: NO_SELECTED_COMBINATIONS"); return options.combo ? 2 : 0;
   }
-  if (typeof config.matrixPrompt?.text !== "string" || !config.matrixPrompt.text) throw coded("MATRIX_PROMPT_MISSING");
+  if (config.sceneVersion !== SCENE_VERSION || config.matrixPrompt?.text !== BASIC_PROMPT) throw coded("MATRIX_FIXED_SCENE_REQUIRED");
+  if (config.realScenarios && Object.keys(config.realScenarios).length) throw coded("MATRIX_SCENE_UNSUPPORTED");
   const turns = options.turns ?? config.deterministicRequirements?.turns ?? 10;
+  if (options.real && turns !== 10) throw coded("MATRIX_REAL_SCENE_REQUIRES_TEN_TURNS");
   if (!Number.isInteger(turns) || turns < 1 || turns > 100) throw coded("MATRIX_CONFIG_INVALID");
   for (const kind of ["approval", "interrupt"]) {
     const spec = config.realScenarios?.[kind];
@@ -215,12 +234,24 @@ export async function main(argv = process.argv.slice(2)) {
   }
   let exitCode = 0;
   for (const original of selected) {
-    const combo = { ...original, provider: original.provider ?? "claude" };
+    const combo = { ...original, authorizationPath: options.authorization ? resolve(options.authorization) : undefined, destinationHostPath: options.destinationHost ? resolve(options.destinationHost) : undefined, provider: original.provider ?? "claude" };
     const directory = join(evidenceRoot, combo.id, runId);
     await mkdir(directory, { recursive: true, mode: 0o700 });
     await chmod(directory, 0o700);
     const scratch = join(directory, "scratch");
     const nativePath = join(directory, "native.jsonl");
+    if (options.prepare) {
+      const controlled = join(scratch, "real"); await mkdir(controlled, { recursive: true, mode: 0o700 }); await chmod(controlled, 0o700);
+      const { loadOrCreateHostIdentity, publicHostIdentity } = await import(pathToFileURL(join(ROOT, "apps/mvp-host/dist/identity/host-identity.js")).href);
+      const identity = await loadOrCreateHostIdentity({ directory: join(controlled, "identity") });
+      const sourceHost = publicHostIdentity(identity);
+      const entryPath = await realpath(join(ROOT, "apps/mvp-host/dist/main.js"));
+      const entryDigest = hash(await readFile(entryPath));
+      await writeJson(join(directory, "source-host.json"), sourceHost);
+      await writeJson(join(directory, "preparation.json"), { v: 1, runId, comboId: combo.id, provider: combo.provider, sourceHost, entryPath, entryDigest,
+        sourceHostPath: join(directory, "source-host.json"), commandIds: compatibilitySceneCommandIds(runId), note: "Authorize this source before --real --run-id; measure exact runtime/artifact digests for destination authorization. No model was called." });
+      log(combo.id + ": prepared run=" + runId); continue;
+    }
     const context = { scratch, nativePath, runId, turns, prompt: config.matrixPrompt.text, scenarios: config.realScenarios };
     let deterministic, real;
     try {
@@ -229,17 +260,21 @@ export async function main(argv = process.argv.slice(2)) {
       real = !allowed ? { records: [], observed: {}, outcome: { status: "skipped", completed: 0, reasonCode: "REAL_EXECUTION_NOT_ENABLED" } }
         : deterministic.outcome.status !== "passed" ? { records: [], observed: {}, outcome: { status: "skipped", completed: 0, reasonCode: "DETERMINISTIC_LAYER_NOT_PASSED" } }
           : await runLayer("real", combo, context);
+      if (real.handshake) {
+        const { token: _credential, ...signedReadiness } = real.handshake;
+        await writeJson(join(directory, "readiness.json"), signedReadiness);
+      }
       const records = [...deterministic.records, ...real.records];
       if (records.length) await writeFile(join(directory, "turns.jsonl"), records.map((record) => JSON.stringify(record)).join("\n") + "\n", { mode: 0o600 });
       let native = { records: [], invalid: 0 };
-      try { native = parseNativeEvidence(await readPrivateArtifact(nativePath, 8 * 1024 * 1024), { runId, provider: combo.provider }); }
+      try { native = parseNativeEvidence(await readPrivateArtifact(nativePath, 8 * 1024 * 1024), { runId, provider: combo.provider, host: real.handshake?.host, entryDigest: real.handshake?.entryDigest, sceneVersion: real.handshake?.sceneVersion, artifact: real.observed }); }
       catch (error) { if (error?.code !== "ENOENT") native = { records: [], invalid: 1 }; }
       const evaluation = evaluateVerification({ combo, deterministic: deterministic.outcome, real: real.outcome, native, observed: real.observed, requirements: { deterministic: config.deterministicRequirements, real: config.realRequirements } });
-      const summary = { v: 2, runId, comboId: combo.id, provider: combo.provider, ranAt: new Date().toISOString(), expected: { nodeVersion: combo.nodeVersion, os: combo.os, sdkVersion: combo.sdkVersion, cliVersion: combo.claudeCliVersion ?? combo.codexCliVersion, executableSource: combo.executableSource, capabilities: combo.capabilities ?? [] }, observed: real.observed, deterministicObserved: deterministic.observed, layers: { deterministic: deterministic.outcome, real: real.outcome }, nativeEvidence: { counts: evaluation.counts, invalid: evaluation.invalidEvidence, complete: evaluation.nativeComplete }, result: evaluation.currentVerification, persistedStatus: evaluation.status, environment: evaluation.environment };
+      const summary = { v: 2, runId, comboId: combo.id, provider: combo.provider, ranAt: new Date().toISOString(), expected: { nodeVersion: combo.nodeVersion, os: combo.os, sdkVersion: combo.sdkVersion, cliVersion: combo.claudeCliVersion ?? combo.codexCliVersion, executableSource: combo.executableSource, capabilities: combo.capabilities ?? [] }, observed: real.observed, deterministicObserved: deterministic.observed, layers: { deterministic: deterministic.outcome, real: real.outcome }, nativeEvidence: { counts: evaluation.counts, invalid: evaluation.invalidEvidence, complete: evaluation.nativeComplete, capabilities: evaluation.capabilities }, result: evaluation.currentVerification, persistedStatus: evaluation.status, environment: evaluation.environment };
       await writeJson(join(directory, "summary.json"), summary);
       original.status = evaluation.status;
       original.lastRun = { runId, at: summary.ranAt, deterministic: deterministic.outcome, real: real.outcome, result: evaluation.currentVerification, nativeEvidence: summary.nativeEvidence };
-      original.evidence = { summary: join(directory, "summary.json"), turns: join(directory, "turns.jsonl"), native: nativePath };
+      original.evidence = { readiness: join(directory, "readiness.json"), summary: join(directory, "summary.json"), turns: join(directory, "turns.jsonl"), native: nativePath };
       await writeJson(resolve(options.config), config);
       log(combo.id + ": det=" + deterministic.outcome.status + " real=" + real.outcome.status + " current=" + evaluation.currentVerification);
       if (evaluation.currentVerification === "broken") exitCode = 1;

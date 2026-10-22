@@ -4,6 +4,7 @@ import { lstatSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { chmod, mkdir, mkdtemp, readFile, readdir, readlink, rm, symlink, writeFile } from "node:fs/promises";
 import { release, tmpdir } from "node:os";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
+import { measurePlannedNativeArtifact, type PlannedNativeArtifact } from "../diagnostics/planned-native-artifact.js";
 import { SystemProcessInspector, type ProcessIdentity } from "./process-inspector.js";
 import type { ManagedChildHandle } from "./managed-child-handle.js";
 import { NativeBoundaryError, type NativeBoundaryBackend, type NativeBoundaryPlatform, type NativeBoundaryProof, type NativeBoundaryPublicSummary, type NativeBoundaryReadinessCode } from "./native-boundary-proof.js";
@@ -31,7 +32,7 @@ export type NativeBoundarySpawnRequest = {
   killSignal?: SpawnOptions["killSignal"];
   argv0?: string;
 };
-export type NativeBoundaryLaunchEvidence = { proof: NativeBoundaryProof; launchDigest: string };
+export type NativeBoundaryLaunchEvidence = { proof: NativeBoundaryProof; launchDigest: string; plannedArtifact?: PlannedNativeArtifact };
 export interface NativeBoundaryProcessRegistry {
   spawn(command: string, args: readonly string[], options: SpawnOptions, evidence: NativeBoundaryLaunchEvidence): ManagedChildHandle;
 }
@@ -41,6 +42,7 @@ export type NativeBoundaryLaunchPlan = {
   options: SpawnOptions;
   proof: NativeBoundaryProof;
   launchDigest: string;
+  plannedArtifact?: PlannedNativeArtifact;
 };
 export type NativeBoundaryAssessment =
   | { ready: true; boundary: NativeExecutionBoundary; proof: NativeBoundaryProof; summary: NativeBoundaryPublicSummary }
@@ -133,15 +135,15 @@ export class NativeExecutionBoundary {
     if (!inside(this.workspace.path, cwd)) throw new NativeBoundaryError("NATIVE_BOUNDARY_SPAWN_INVALID");
     const originalExecutable = resolveExecutable(request.command, cwd, env);
     if (this.privateRoots.some((root) => inside(root.path, originalExecutable))) throw new NativeBoundaryError("NATIVE_BOUNDARY_SPAWN_INVALID");
-    const args = this.wrap(request.command, request.args, cwd);
+    const args = this.wrap(originalExecutable, request.args, cwd);
     const options: SpawnOptions = { cwd: request.cwd, env, stdio: request.stdio ?? ["pipe", "pipe", "pipe"], signal: request.signal, windowsHide: request.windowsHide, killSignal: request.killSignal, argv0: request.argv0 };
     const launchDigest = hash(JSON.stringify({ version: VERSION, policyDigest: this.proof.policyDigest, backendDigest: this.backend.digest, command: originalExecutable, args: request.args, cwd, env: Object.entries(env).sort(([a], [b]) => a.localeCompare(b)), stdio: typeof options.stdio === "string" ? options.stdio : options.stdio?.map((item) => typeof item === "object" ? "stream" : item), argv0: request.argv0 }));
-    return { command: this.backend.path, args, options, proof: this.proof, launchDigest };
+    return { command: this.backend.path, args, options, proof: this.proof, launchDigest, plannedArtifact: measurePlannedNativeArtifact({ executable: originalExecutable, args: request.args, cwd, env }) };
   }
   /** The registry commits the fourth-argument evidence with its launching row before OS spawn. */
   spawn(registry: NativeBoundaryProcessRegistry, request: NativeBoundarySpawnRequest): ManagedChildHandle {
     const plan = this.plan(request);
-    return registry.spawn(plan.command, plan.args, plan.options, { proof: plan.proof, launchDigest: plan.launchDigest });
+    return registry.spawn(plan.command, plan.args, plan.options, { proof: plan.proof, launchDigest: plan.launchDigest, ...(plan.plannedArtifact ? { plannedArtifact: plan.plannedArtifact } : {}) });
   }
   async dispose(): Promise<void> {
     if (this.disposed) return;

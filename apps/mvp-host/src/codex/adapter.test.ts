@@ -131,6 +131,7 @@ describe("CodexAdapter", () => {
     });
     const first = state.adapter.runTurn("first-managed-turn", "task", undefined, context("first-managed-turn", 51)); await firstBound.promise;
     let finished = false; void first.then(() => { finished = true; }); complete(original!, "codex-turn-1"); await stopping.promise; expect(finished).toBe(false);
+    expect(state.events.some((event) => event.kind === "turn_completed" && event.turnId === "first-managed-turn")).toBe(false);
     stop.resolve({ stopped: true, treeStopped: true, records: [] }); expect(await first).toMatchObject({ status: "completed", evidence: { kind: "native-terminal" } });
     const next = state.adapter.runTurn("second-managed-turn", "continue", "codex-thread-new", context("second-managed-turn", 52)); await nextBound.promise;
     expect(state.client).not.toBe(original); expect(state.client.requests.find((request) => request.method === "thread/resume")?.params.threadId).toBe("codex-thread-new");

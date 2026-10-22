@@ -103,4 +103,28 @@ describe("global Catalog lifecycle boundary", () => {
     expect(other).toHaveBeenCalledOnce(); expect(sealed).toHaveBeenCalledOnce();
     expect(owner.retainedReason).toBeTruthy(); expect(store.db.open).toBe(false);
   });
+  it("starts every global producer stop before waiting for Session reports or operation drain", async () => {
+    const { owner, store } = fixture(); const calls: string[] = [];
+    const session = deferred<readonly RuntimeCloseReport[]>(), producer = deferred<boolean>();
+    const host = new CatalogHostLifecycle({ store, owner,
+      catalog: { closeAndWait: async () => { calls.push("sessions"); return session.promise; } },
+      services: [{ stopProducers: async () => { calls.push("producer-stop"); return producer.promise; }, drain: async () => { calls.push("drain"); } }],
+    });
+    const closing = host.closeAndWait(1000);
+    expect(calls).toEqual(["producer-stop", "sessions"]);
+    session.resolve([clean]); await Promise.resolve(); expect(calls).not.toContain("drain");
+    producer.resolve(true); expect(await closing).toMatchObject({ clean: true });
+    expect(calls).toEqual(["producer-stop", "sessions", "drain"]);
+  });
+  it("seals every global producer when its stop never settles", async () => {
+    vi.useFakeTimers(); const { owner, store } = fixture(); const sealed = vi.fn();
+    try {
+      const host = new CatalogHostLifecycle({ store, owner, catalog: { closeAndWait: async () => [clean] },
+        services: [{ stopProducers: () => new Promise(() => {}), drain: async () => false, seal: sealed }] });
+      const closing = host.closeAndWait(50); await vi.advanceTimersByTimeAsync(51);
+      expect(await closing).toMatchObject({ clean: false, closed: true, recoveryRequired: true });
+      expect(sealed).toHaveBeenCalledOnce(); expect(store.db.open).toBe(false); expect(owner.retainedReason).toBeTruthy();
+    } finally { vi.useRealTimers(); if (store.db.open) store.close(); }
+  });
+
 });

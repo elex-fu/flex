@@ -271,8 +271,8 @@ export class ExclusiveFileLock {
     }
   }
 
-  ownership(): { ownerId: string; ownerGeneration: number; resourceKey: string; retainedReason?: string } {
-    return { ownerId: this.record.ownerId, ownerGeneration: this.record.ownerGeneration, resourceKey: this.record.resourceKey,
+  ownership(): { ownerId: string; ownerGeneration: number; resourceKey: string; purpose: string; retainedReason?: string } {
+    return { ownerId: this.record.ownerId, ownerGeneration: this.record.ownerGeneration, resourceKey: this.record.resourceKey, purpose: this.record.purpose,
       ...(this.record.retainedReason ? { retainedReason: this.record.retainedReason } : {}) };
   }
 

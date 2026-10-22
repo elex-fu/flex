@@ -14,13 +14,15 @@ import type { ManagedRuntimeOptions } from "./managed-runtime.js";
 export class HostManagedRuntime {
   readonly options: ManagedRuntimeOptions;
   private readonly registries = new Set<ManagedProcessRegistry>();
+  private readonly turnRegistries = new Map<string, Set<ManagedProcessRegistry>>();
   private readonly stops = new Map<string, ProcessStopResult>();
   private assessment: Promise<NativeBoundaryAssessment> | undefined;
   private closing = false;
   private closePromise: Promise<ProcessStopResult> | undefined;
-  constructor(private readonly host: { store: SqliteStore; owner: HostOwnerHandle; sessionId: string; runtimeId: string; workspace: string; provider: ProviderId; privateRoots?: readonly string[]; nativeStateRoots?: readonly string[]; boundaryFactory?: typeof prepareNativeExecutionBoundary }) {
+  constructor(private readonly host: { store: SqliteStore; owner: HostOwnerHandle; sessionId: string; runtimeId: string; workspace: string; provider: ProviderId; privateRoots?: readonly string[]; nativeStateRoots?: readonly string[]; boundaryFactory?: typeof prepareNativeExecutionBoundary; assertDispatch?: (context:DispatchContext)=>void }) {
     this.options = {
       executionBoundary: () => this.prepare(),
+      ...(host.assertDispatch ? { assertDispatch: host.assertDispatch } : {}),
       inspectionContext: () => {
         const id = `probe-${randomUUID()}`;
         return dispatchContextForTurn(id, { hostOwnerId: host.owner.ownerId, hostOwnerGeneration: host.owner.generation, sessionId: host.sessionId, flyxTurnId: id, runtimeId: `${host.runtimeId}:probe`, runtimeGeneration: 1, attemptId: randomUUID() });
@@ -31,7 +33,9 @@ export class HostManagedRuntime {
         const fixed = dispatchContextForTurn(context.flyxTurnId, context);
         if (fixed.hostOwnerId !== host.owner.ownerId || fixed.hostOwnerGeneration !== host.owner.generation || fixed.sessionId !== host.sessionId) throw new Error("NATIVE_LAUNCH_CONTEXT_MISMATCH");
         const registry = new ManagedProcessRegistry({ journal: new SqliteProcessJournal(host.store.db), context: () => fixed, verifyDescendantStop: (record) => this.verifyStop(record) });
-        this.registries.add(registry); return registry;
+        this.registries.add(registry);
+        const registered = this.turnRegistries.get(key(fixed)) ?? new Set<ManagedProcessRegistry>();
+        registered.add(registry); this.turnRegistries.set(key(fixed), registered); return registry;
       },
       onProcessStop: (context, result) => this.stops.set(key(context), result),
     };
@@ -44,17 +48,31 @@ export class HostManagedRuntime {
     return this.assessment;
   }
   canReleaseWorkspace(context: DispatchContext): boolean {
+    // No per-attempt registry was ever created: the durable pre-invocation path
+    // owns an empty Provider set. Additional Git/helper proofs are checked by Host composition.
+    if (!this.turnRegistries.has(key(context))) return true;
     const proof = this.stops.get(key(context));
-    return !!proof?.stopped && proof.treeStopped && proof.records.every((record) => record.state === "not_spawned" || record.state === "stopped" && record.stopProof?.kind === "verified-tree-stop");
+    return !!proof?.stopped && proof.treeStopped && [...this.turnRegistries.get(key(context))!].every((registry)=>registry.records().every((record) => record.state === "not_spawned" || record.state === "stopped" && record.stopProof?.kind === "verified-tree-stop"));
+  }
+  async closeTurnAndWait(context: DispatchContext, deadlineMs = 5_000): Promise<ProcessStopResult> {
+    const results = await Promise.all([...(this.turnRegistries.get(key(context)) ?? [])].map((registry) => registry.closeAndWait(deadlineMs)));
+    const result = { stopped: results.every((value) => value.stopped), treeStopped: results.every((value) => value.treeStopped), records: results.flatMap((value) => value.records) };
+    this.stops.set(key(context), result); return result;
   }
   closeAndWait(deadlineMs = 5_000): Promise<ProcessStopResult> {
     this.closing = true;
     this.closePromise ??= (async () => {
-      // Boundary self-tests are preparers too: a late assessment cannot prove
-      // shutdown safe while its helper processes are still running.
-      await this.assessment;
-      const results = await Promise.all([...this.registries].map((registry) => registry.closeAndWait(deadlineMs)));
-      return { stopped: results.every((result) => result.stopped), treeStopped: results.every((result) => result.treeStopped), records: results.flatMap((result) => result.records) };
+      const deadlineAt=Date.now()+Math.max(0,deadlineMs);
+      // Start stopping known producers before awaiting any in-flight preparer.
+      const registryStops=Promise.all([...this.registries].map((registry)=>registry.closeAndWait(Math.max(0,deadlineAt-Date.now()))));
+      const preparer=this.assessment ? this.assessment.then(()=>true,()=>false) : Promise.resolve(true);
+      let timer:ReturnType<typeof setTimeout>|undefined;
+      try {
+        const completed=await Promise.race([Promise.all([preparer,registryStops]),new Promise<undefined>((resolve)=>{timer=setTimeout(()=>resolve(undefined),Math.max(0,deadlineAt-Date.now()));})]);
+        if(!completed)return {stopped:false,treeStopped:false,records:[...this.registries].flatMap((registry)=>registry.records())};
+        const [prepared,results]=completed;
+        return {stopped:prepared&&results.every((result)=>result.stopped),treeStopped:prepared&&results.every((result)=>result.treeStopped),records:results.flatMap((result)=>result.records)};
+      } finally {if(timer)clearTimeout(timer);}
     })();
     return this.closePromise;
   }

@@ -33,35 +33,37 @@ export class HostLifecycle {
     return this.shutdownPromise;
   }
   private async shutdownInternal(deadlineMs: number): Promise<ShutdownResult> {
+    const deadlineAt = Date.now() + Math.max(0, deadlineMs);
+    const remaining = () => Math.max(0, deadlineAt - Date.now());
     this.state = "draining";
     this.hooks.stopAdmission();
     this.hooks.stopDispatch();
     let safe = false;
     let failure: unknown;
     try {
-      const producers = await bounded(this.hooks.stopProducers(deadlineMs), deadlineMs, { stopped: false });
-      const ingestion = await bounded(this.hooks.drainIngestion(deadlineMs), deadlineMs, false);
-      const operations = await bounded(this.hooks.drainOperations(deadlineMs), deadlineMs, false);
-      const services = this.hooks.drainServices ? await bounded(this.hooks.drainServices(deadlineMs), deadlineMs, false) : true;
+      const producers = await bounded(this.hooks.stopProducers(remaining()), remaining(), { stopped: false });
+      const ingestion = await bounded(this.hooks.drainIngestion(remaining()), remaining(), false);
+      const operations = await bounded(this.hooks.drainOperations(remaining()), remaining(), false);
+      const services = this.hooks.drainServices ? await bounded(this.hooks.drainServices(remaining()), remaining(), false) : true;
       safe = producers.stopped && ingestion && operations && services;
       this.hooks.fenceCallbacks();
       if (!safe) {
         this.hooks.retainOwnership("SHUTDOWN_STOP_UNPROVEN");
-        await bounded(this.hooks.recordUnknown("SHUTDOWN_STOP_UNPROVEN"), deadlineMs, undefined);
+        await bounded(this.hooks.recordUnknown("SHUTDOWN_STOP_UNPROVEN"), remaining(), undefined);
       }
     } catch (error) {
       failure = error;
       this.hooks.fenceCallbacks();
       this.hooks.retainOwnership("SHUTDOWN_FAILED");
-      try { await bounded(this.hooks.recordUnknown("SHUTDOWN_FAILED"), deadlineMs, undefined); } catch { /* retained journal is the fallback */ }
+      try { await bounded(this.hooks.recordUnknown("SHUTDOWN_FAILED"), remaining(), undefined); } catch { /* retained journal is the fallback */ }
     }
-    try { await boundedOrThrow(this.hooks.closeTransports(), deadlineMs); }
+    try { await boundedOrThrow(this.hooks.closeTransports(), remaining()); }
     catch (error) { failure ??= error; safe = false; this.hooks.retainOwnership("SHUTDOWN_CLOSE_FAILED"); }
     try {
       this.hooks.sealJournal?.();
     } catch (error) { failure ??= error; safe = false; this.hooks.retainOwnership("SHUTDOWN_CLOSE_FAILED"); }
     try {
-      await boundedOrThrow(this.hooks.closeStore(), deadlineMs);
+      await boundedOrThrow(this.hooks.closeStore(), remaining());
       if (safe && !failure) this.hooks.releaseOwnership();
     } catch (error) { failure ??= error; safe = false; this.hooks.retainOwnership("SHUTDOWN_CLOSE_FAILED"); }
     this.state = safe && !failure ? "stopped" : "recovery_required";

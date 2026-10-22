@@ -133,15 +133,27 @@ export class ExecutionWorker {
       await this.stage("before_claim", intent);
       if (this.stopped) return;
       const latest = this.execution.get(intent.id);
-      if (!latest || latest.state !== "pending") return;
+      if (!latest || latest.state !== "pending") {
+        if (latest?.resultCode === "CANCELLED_BEFORE_DISPATCH") await this.options.afterTerminal?.(latest, { status: "cancelled", evidence: { kind: "not-dispatched" } });
+        return;
+      }
       intent = latest;
       const generic = this.operationHandlers.get(intent.kind);
       if (!intent.dispatchContext && !generic) throw new Error("DISPATCH_CONTEXT_MISSING");
+      // Admission side effects (e.g. activation withdrawal) must commit outside the claim transaction.
+      this.validateDevice(intent);
       intent = this.execution.claim(intent.id, this.options.owner, (value) => this.validateDevice(value));
       await this.stage("after_claim", intent);
-      if (this.stopped || this.execution.get(intent.id)?.state !== "claimed") return;
+      if (this.stopped || this.execution.get(intent.id)?.state !== "claimed") {
+        if (!this.stopped && this.execution.get(intent.id)?.resultCode === "CANCELLED_BEFORE_DISPATCH") await this.options.afterTerminal?.(intent, { status: "cancelled", evidence: { kind: "not-dispatched" } });
+        return;
+      }
       if (intent.dispatchContext) await this.options.beforeDispatch?.(intent, intent.dispatchContext);
       if (this.stopped) return;
+      if (this.execution.get(intent.id)?.resultCode === "CANCELLED_BEFORE_DISPATCH") {
+        await this.options.afterTerminal?.(intent, { status: "cancelled", evidence: { kind: "not-dispatched" } }); return;
+      }
+      this.validateDevice(this.execution.get(intent.id)!);
       intent = this.execution.transition({ id: intent.id, expectedStates: ["claimed"], state: "dispatching",
         expectedClaimOwnerId: this.options.owner.id, expectedClaimOwnerGeneration: this.options.owner.generation,
         attemptId: intent.attemptId, runtimeGeneration: intent.runtimeGeneration }, (value) => this.validateDevice(value));
@@ -211,6 +223,10 @@ export class ExecutionWorker {
   }
   private async recordFailure(intent: ExecutionIntentRow, error: unknown, invoked: boolean): Promise<void> {
     const reason = error instanceof Error ? error.message : String(error);
+    const current = this.execution.get(intent.id);
+    if (!invoked && current?.state === "settled" && current.resultCode === "CANCELLED_BEFORE_DISPATCH") {
+      await this.options.afterTerminal?.(intent, { status: "cancelled", evidence: { kind: "not-dispatched" } }); return;
+    }
     this.options.failed?.(error, intent);
     if (invoked && intent.dispatchContext) this.runtimes.retainUnknown(intent.dispatchContext);
     if (this.operationHandlers.has(intent.kind)) { await this.settleOperation(intent, {

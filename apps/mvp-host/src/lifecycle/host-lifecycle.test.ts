@@ -54,6 +54,19 @@ describe("HostLifecycle", () => {
     expect(lifecycle.readiness).toBe("recovery_required");
   });
 
+  it("shares one deadline across producer stop and ingestion instead of granting each a fresh timeout", async () => {
+    vi.useFakeTimers();
+    try {
+      const { hooks, calls } = fixture(); const budgets: number[] = [];
+      hooks.stopProducers = (duration) => { budgets.push(duration); return new Promise((resolve) => setTimeout(() => resolve({ stopped: true }), 30)); };
+      hooks.drainIngestion = (duration) => { budgets.push(duration); return new Promise((resolve) => setTimeout(() => resolve(true), 30)); };
+      const shutdown = new HostLifecycle(hooks).shutdown(50);
+      await vi.advanceTimersByTimeAsync(51);
+      expect(await shutdown).toEqual({ stopped: false, recoveryRequired: true });
+      expect(budgets).toEqual([50,20]); expect(calls).toContain("store"); expect(calls).not.toContain("release");
+    } finally { vi.useRealTimers(); }
+  });
+
   it("bounds an SDK stop hook which never resolves", async () => {
     vi.useFakeTimers();
     try {

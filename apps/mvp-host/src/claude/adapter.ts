@@ -238,6 +238,7 @@ export class ClaudeAdapter implements ProviderAdapter {
     let iteratorError: unknown;
 
     try {
+      this.runtimeOptions.assertDispatch?.(active.context);
       active.possibleDispatch = true;
       active.query = this.queryFactory({ prompt, options: this.buildOptions(active, resumeSessionId) });
       active.timer = setTimeout(() => {
@@ -260,7 +261,8 @@ export class ClaudeAdapter implements ProviderAdapter {
       if (active.interruptTimer) clearTimeout(active.interruptTimer);
       this.cleanupApprovals(active, "aborted");
       try { active.query?.close?.(); } catch { /* The managed stop proof remains authoritative. */ }
-      await active.runtime.closeAndWait();
+      // Cleanup failure retains the independent execution gate; it never erases a native business terminal.
+      try { await active.runtime.closeAndWait(); } catch { /* The orchestrator requires the original stop proof before release. */ }
     }
 
     const providerSessionId = active.providerSessionId;
@@ -322,6 +324,10 @@ export class ClaudeAdapter implements ProviderAdapter {
     }
 
     const message = iteratorError instanceof Error ? iteratorError.message : "stream_ended_without_result";
+    if (!active.possibleDispatch) {
+      this.emit(active,{kind:"diagnostic",code:"TURN_NOT_DISPATCHED",message}); this.clearActive(active);
+      return {status:"failed",error:message,evidence:{kind:"not-dispatched"}};
+    }
     // Interrupt delivery and iterator termination are not a native terminal fact.
     this.emit(active, { kind: "diagnostic", code: active.interruptRequested ? "INTERRUPT_UNCONFIRMED" : "TURN_DISPATCH_UNCONFIRMED", message });
     this.clearActive(active);
@@ -410,6 +416,9 @@ export class ClaudeAdapter implements ProviderAdapter {
     if (result === "accepted") return { status: "delivered", evidence: { kind: "local-delivery" } };
     if (result === "already_terminal" && active.nativeTerminal?.kind === "native-terminal") return { status: "already_terminal", evidence: active.nativeTerminal };
     return { status: "outcome_unknown", evidence: { kind: "unknown", reason: "INTERRUPT_DELIVERY_UNCONFIRMED" } };
+  }
+  closeTurnAndWait(context: DispatchContext, deadlineMs = 5_000): Promise<ProcessStopResult> {
+    return this.runtimes.closeTurnAndWait(context, deadlineMs);
   }
   close(): void { void this.closeAndWait().catch(() => {}); }
   closeAndWait(deadlineMs = 5_000): Promise<ProcessStopResult> {
@@ -862,7 +871,7 @@ function readPackageMetadata(entry: string): { version: string; claudeCodeVersio
   return { version: "unknown", claudeCodeVersion: "unknown" };
 }
 
-function restrictedEnvironment(overrides?: Readonly<Record<string, string>>): NodeJS.ProcessEnv {
+export function restrictedEnvironment(overrides?: Readonly<Record<string, string>>): NodeJS.ProcessEnv {
   const allowed = [
     "PATH",
     "HOME",

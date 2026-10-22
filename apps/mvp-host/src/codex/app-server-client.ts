@@ -67,6 +67,8 @@ export class StdioAppServerClient implements AppServerClient {
       env: NodeJS.ProcessEnv;
       args?: readonly string[];
       handlers: AppServerClientHandlers;
+      /** Managed helper revalidation, synchronously at the actual RPC write boundary. */
+      beforeRequest?: (method:string,params:JsonObject)=>void;
       processes?: ManagedProcessRegistry;
       spawn?: (command: string, args: readonly string[], options: SpawnOptions) => ManagedChildHandle;
     },
@@ -169,10 +171,11 @@ export class StdioAppServerClient implements AppServerClient {
         reject,
         timer,
       });
-      if (!this.write({ method, id, params })) {
-        clearTimeout(timer);
-        this.pending.delete(String(id));
-        reject(new Error(`Could not write Codex app-server request: ${method}`));
+      try {
+        this.options.beforeRequest?.(method,params);
+        if (!this.write({ method, id, params })) throw new Error(`Could not write Codex app-server request: ${method}`);
+      } catch(error) {
+        clearTimeout(timer); this.pending.delete(String(id)); reject(error);
       }
     });
   }

@@ -7,6 +7,8 @@ import type { RuntimeCloseReport as CatalogRuntimeCloseReport } from "../session
 
 /** Global services use an absolute deadline; Session runtimes use a remaining duration. */
 export type CatalogGlobalService = {
+  /** Absolute shared deadline. Start all producers before waiting for any drain. */
+  stopProducers?(deadlineAt: number): Promise<void | boolean | { producerStopped: boolean; clean?: boolean }>;
   drain(deadlineAt: number): Promise<void | boolean>;
   seal?(): void;
   close?(): Promise<void> | void;
@@ -30,6 +32,7 @@ export class CatalogHostLifecycle {
   private readonly transports = new Set<() => Promise<void>>();
   private readonly services: CatalogGlobalService[];
   private reports: Promise<readonly CatalogRuntimeCloseReport[]> | undefined;
+  private globalStops: Promise<boolean>[] = [];
   private closing: Promise<RuntimeCloseReport> | undefined;
   private deadlineAt = Infinity;
   private sealed = false;
@@ -46,20 +49,26 @@ export class CatalogHostLifecycle {
       stopAdmission: () => {
         this.admitting = false;
         this.operations.beginDrain();
+        // Invoke all global stop ports before awaiting Session close or operation drain.
+        this.globalStops = this.services.map((service) => {
+          try { return Promise.resolve(service.stopProducers?.(this.deadlineAt)).then((result) =>
+            typeof result === "object" ? result.producerStopped && result.clean !== false : result !== false, () => false); }
+          catch { return Promise.resolve(false); }
+        });
         // Calling Catalog close synchronously fences new runtime loads before any await.
         this.reports = options.catalog.closeAndWait(this.remaining());
       },
       stopDispatch: () => {}, // Catalog close owns every selected Session's Worker.
       stopProducers: async () => {
-        const reports = await this.reports!;
-        return { stopped: reports.every((report) => report.clean && report.producerStopped) && !options.owner.retainedReason };
+        const [reports, globals] = await this.withinDeadline(Promise.all([this.reports!, Promise.all(this.globalStops)]), [[], [false]] as [readonly CatalogRuntimeCloseReport[], boolean[]]);
+        return { stopped: globals.every(Boolean) && reports.every((report) => report.clean && report.producerStopped) && !options.owner.retainedReason };
       },
       drainIngestion: async () => true, // Each runtime's close report includes ingestion drain.
-      drainOperations: async () => this.operations.drain(["producer", "control", "ingestion", "checkpoint"], this.remaining()),
+      drainOperations: async () => this.withinDeadline(this.operations.drain(["producer", "control", "ingestion", "checkpoint"], this.remaining()), false),
       drainServices: async () => {
         let drained = true;
         for (const service of this.services) {
-          try { drained = await service.drain(this.deadlineAt) !== false && drained; }
+          try { drained = await this.withinDeadline(Promise.resolve(service.drain(this.deadlineAt)), false) !== false && drained; }
           catch { drained = false; }
         }
         return drained;
@@ -117,6 +126,11 @@ export class CatalogHostLifecycle {
       state: result.stopped && !result.recoveryRequired ? "stopped" : "recovery_required",
     }));
     return this.closing;
+  }
+  private async withinDeadline<T>(work: Promise<T>, fallback: T): Promise<T> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try { return await Promise.race([work, new Promise<T>((resolve) => { timer = setTimeout(() => resolve(fallback), this.remaining()); })]); }
+    finally { if (timer) clearTimeout(timer); }
   }
   private remaining(): number { return Math.max(0, this.deadlineAt - Date.now()); }
   private sealServices(): void {

@@ -79,6 +79,7 @@ export type ProviderObservationDependencies = Readonly<{
   compatibilityEvidencePath: string;
   supervision?: () => SupervisionContractFacts | undefined;
   runtime?: (provider: ProviderInstanceRecord) => ProviderRuntimeFacts | undefined;
+  compatibilityTrust?: import("../diagnostics/compatibility-evidence.js").CompatibilityEvidenceTrust;
 }>;
 
 export type ProviderObservationResult =
@@ -114,6 +115,7 @@ export type LocalActivationFactsOptions = Readonly<{
   compatibilityEvidencePath: string;
   supervision?: () => SupervisionContractFacts | undefined;
   runtime?: (provider: ProviderInstanceRecord) => ProviderRuntimeFacts | undefined;
+  compatibilityTrust?: import("../diagnostics/compatibility-evidence.js").CompatibilityEvidenceTrust;
 }>;
 
 /** The one shared fact source so verify, the write gate and startup load never diverge. */
@@ -337,7 +339,7 @@ export function observeProvider(record: ProviderInstanceRecord, dependencies: Pr
   if (!supervision?.contractId) return refuse("SUPERVISION_CONTRACT_UNAVAILABLE");
   const runtime = dependencies.runtime?.(record);
   if (!runtime?.providerVersion) return refuse("PROVIDER_RUNTIME_UNAVAILABLE");
-  const artifact = newestPassedArtifact(dependencies.compatibilityEvidencePath, record.provider);
+  const artifact = newestPassedArtifact(dependencies.compatibilityEvidencePath, record, dependencies.compatibilityTrust);
   if (!artifact) return refuse("PROVIDER_COMPATIBILITY_EVIDENCE_MISSING");
   const reasons: ActivationReasonCode[] = [];
   if (artifact.artifact.executablePath !== record.executable || artifact.artifact.executableDigest !== identity.digest) reasons.push("PROVIDER_EVIDENCE_CHANGED");
@@ -353,13 +355,28 @@ export function observeProvider(record: ProviderInstanceRecord, dependencies: Pr
     capabilities: Object.freeze([...record.policyCapabilities].sort()) }) });
 }
 
-function newestPassedArtifact(path: string, provider: "claude" | "codex"): (CompatibilityEvidenceEntry & { artifact: CompatibilityEvidenceArtifact }) | undefined {
+function newestPassedArtifact(path: string, provider: ProviderInstanceRecord, trust?: import("../diagnostics/compatibility-evidence.js").CompatibilityEvidenceTrust): (CompatibilityEvidenceEntry & { artifact: CompatibilityEvidenceArtifact }) | undefined {
   let entries: readonly CompatibilityEvidenceEntry[];
-  try { entries = loadTrustedCompatibilityEvidence(path); } catch { return undefined; }
+  try { entries = loadTrustedCompatibilityEvidence(path, undefined, trust); } catch { return undefined; }
   const matches = entries.filter((entry): entry is CompatibilityEvidenceEntry & { artifact: CompatibilityEvidenceArtifact } =>
-    entry.provider === provider && entry.artifact !== undefined && entry.result === "passed");
+    entry.provider === provider.provider && entry.artifact !== undefined && entry.result === "passed");
   matches.sort((left, right) => left.at < right.at ? -1 : left.at > right.at ? 1 : 0);
-  return matches.at(-1);
+  // One approval or a record from another build cannot activate general task
+  // execution. Bind the baseline and each requested native capability to the
+  // same signed artifact, isolated run and controlled entry.
+  const required = new Set<string>(["turn"]);
+  const scenarios: Readonly<Record<string, string>> = {
+    interrupt: "interrupt", interactiveApprovals: "approval", structuredQuestions: "question",
+    resumeConversation: "reconnect", conversationRewind: "rewind",
+  };
+  for (const capability of provider.policyCapabilities) if (scenarios[capability]) required.add(scenarios[capability]!);
+  for (const baseline of matches.filter((entry) => entry.kind === "turn" && entry.capability === "turn").reverse()) {
+    const digest = compatibilityEvidenceArtifactDigest(baseline.artifact);
+    if ([...required].every((capability) => matches.some((entry) => entry.kind === capability && entry.capability === capability
+      && entry.runId === baseline.runId && entry.entryDigest === baseline.entryDigest
+      && compatibilityEvidenceArtifactDigest(entry.artifact) === digest))) return baseline;
+  }
+  return undefined;
 }
 
 function sortedRecord(value: Record<string, string>): Record<string, string> {

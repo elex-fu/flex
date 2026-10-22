@@ -18,16 +18,16 @@ function barrier<T = void>() { let resolve!: (value: T) => void; const promise =
 const known: ProviderOutcome = { status: "completed", providerSessionId: "native", evidence: { kind: "native-terminal", sourceId: "native-result" } };
 const open: Array<{ host: SessionOrchestrator; root: string; outcome: ReturnType<typeof barrier<ProviderOutcome>> }> = [];
 afterEach(async () => { for (const value of open.splice(0)) { value.host.close(); value.outcome.resolve(known); await Promise.resolve(); await removeFixture(value.root); } });
-async function setup(options: { before?: () => Promise<void>; after?: () => Promise<void>; proof?: () => boolean; hook?: () => Promise<void>; gate?: () => void } = {}) {
+async function setup(options: { before?: () => Promise<void>; after?: () => Promise<void>; proof?: () => boolean; hook?: () => Promise<void>; gate?: () => void; unsupportedBefore?: boolean; stop?: () => Promise<import("../lifecycle/managed-process-registry.js").ProcessStopResult> } = {}) {
   const root = await temporaryRepository(); const outcome = barrier<ProviderOutcome>(); const calls: string[] = []; const blocked = vi.fn();
   let host!: SessionOrchestrator; let service!: CheckpointService; let checkpoints!: CheckpointStore;
   const driver = new CheckpointGitDriver(root, { runGit: rawCheckpointGitRunner() });
   const adapter: ProviderAdapter = { provider: "claude", workspace: root, status: async () => { throw new Error("not used"); }, preflight: async () => { throw new Error("no real Provider"); },
     runTurn: async () => { throw new Error("beginTurn required"); }, beginTurn: (_context, prompt) => { calls.push(prompt); return { outcome: outcome.promise }; },
-    interrupt: async () => "accepted", respondApproval: () => true };
+    interrupt: async () => "accepted", respondApproval: () => true, ...(options.stop ? { closeTurnAndWait: options.stop } : {}) };
   const binding: NonNullable<OrchestratorOptions["checkpoints"]> = {
     service: {
-      captureBefore: async (context) => { await options.before?.(); expect(host.workspaceLease).toBeDefined(); expect(calls).toHaveLength(0); return service.captureBefore(context); },
+      captureBefore: async (context) => { await options.before?.(); expect(host.workspaceLease).toBeDefined(); expect(calls).toHaveLength(0); const manifest = await service.captureBefore(context); return options.unsupportedBefore ? { ...manifest, status: "unsupported" as const } : manifest; },
       captureAfter: async (context) => {
         expect(host.workspaceLease).toBeDefined(); expect(host.store.getTurn(context.turnId)?.status).toBe("completed");
         const source = host.store.listEvents(host.sessionId).events.find((event) => event.sequence === context.evidence.terminalSequence);
@@ -131,4 +131,25 @@ describe("production checkpoint execution order", { timeout: 30_000 }, () => {
     await expect(f.host.startTurn("test-actor", "blocked", "edit")).rejects.toMatchObject({ code: "RESTORE_EXTERNAL_STATE_UNVERIFIED" });
     expect(f.host.store.getCommandReceipt("test-actor", "blocked")).toBeUndefined(); expect(f.calls).toHaveLength(0);
   });
+  it("waits for the original Turn close before after capture and preserves a known terminal on stop rejection", async () => {
+    const stop = barrier<import("../lifecycle/managed-process-registry.js").ProcessStopResult>(); const after = vi.fn(async () => {});
+    const f = await setup({ stop: () => stop.promise, after });
+    const accepted = await f.host.startTurn("test-actor", "stop-before-after", "edit"); await f.host.worker.drainDispatch();
+    f.outcome.resolve(known); await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(f.host.store.getTurn(accepted.turnId)?.status).toBe("completed"); expect(after).not.toHaveBeenCalled();
+    stop.resolve({ stopped: false, treeStopped: false, records: [] }); await f.host.worker.drainOperations();
+    expect(after).not.toHaveBeenCalled(); expect(f.host.workspaceLease).toBeDefined();
+    expect(f.host.store.getCommandReceipt("test-actor", "stop-before-after")?.state).toBe("completed");
+    expect(f.blocked).toHaveBeenCalledWith(expect.anything(), "producer_stop_unverified");
+  });
+
+  it("rejects an unusable before checkpoint before invoking the Provider prompt", async () => {
+    const f = await setup({ unsupportedBefore: true });
+    const accepted = await f.host.startTurn("test-actor", "unsupported-before", "must not run");
+    expect(await f.host.worker.drainOperations()).toBe(true);
+    expect(f.calls).toHaveLength(0); expect(f.host.store.getTurn(accepted.turnId)?.status).toBe("failed");
+    expect(f.host.store.getCommandReceipt("test-actor", "unsupported-before")?.state).toBe("failed");
+    expect(f.host.workspaceLease).toBeUndefined();
+  });
+
 });

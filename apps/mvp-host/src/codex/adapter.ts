@@ -50,7 +50,7 @@ const FORBIDDEN_ITEM_TYPES = new Set([
   "webSearch",
 ]);
 
-const APP_SERVER_SECURITY_ARGS = [
+export const APP_SERVER_SECURITY_ARGS = [
   "app-server",
   "-c", "features.apps=false",
   "-c", "features.browser_use=false",
@@ -107,6 +107,7 @@ type ActiveTurn = {
   errors: string[];
   interruptRequested: boolean;
   terminal: boolean;
+  terminalEvent?: AdapterEventPayload;
   timer?: NodeJS.Timeout;
   interruptTimer?: NodeJS.Timeout;
   resolve(outcome: TurnOutcome): void;
@@ -141,6 +142,7 @@ export class CodexAdapter implements ProviderAdapter {
   private readonly clientFactory: AppServerClientFactory | undefined;
   private readonly runtimes: ManagedRuntimeController;
   private readonly rotateClientEachTurn: boolean;
+  private readonly assertTaskDispatch: ManagedRuntimeOptions["assertDispatch"];
   private readonly clientRuntimes = new Map<AppServerClient, PreparedNativeRuntime>();
   private readonly clientStops = new Map<AppServerClient, Promise<ProcessStopResult>>();
   private closing = false;
@@ -175,7 +177,8 @@ export class CodexAdapter implements ProviderAdapter {
     this.workspaceRealpathPromise = realpath(options.workspace);
     this.clientFactory = options.clientFactory;
     this.runtimes = new ManagedRuntimeController(options);
-    this.rotateClientEachTurn = options.rotateClientEachTurn ?? (!!options.processRegistryFactory || !options.clientFactory);
+    this.assertTaskDispatch = options.assertDispatch;
+    this.rotateClientEachTurn = !!options.processRegistryFactory || !options.clientFactory || options.rotateClientEachTurn === true;
   }
 
   async status(): Promise<AdapterStatus> {
@@ -353,6 +356,11 @@ export class CodexAdapter implements ProviderAdapter {
     if (result === "accepted" && active.codexTurnId) return { status: "delivered", evidence: { kind: "native-ack", sourceId: `${active.codexTurnId}:interrupt` } };
     return { status: "outcome_unknown", evidence: { kind: "unknown", reason: "INTERRUPT_DELIVERY_UNCONFIRMED" } };
   }
+  async closeTurnAndWait(context: DispatchContext, deadlineMs = 5_000): Promise<ProcessStopResult> {
+    const active = this.active;
+    if (active && sameDispatchContext(active.context, context) && active.client) await this.retireClient(active.client, deadlineMs, true);
+    return this.runtimes.closeTurnAndWait(context, deadlineMs);
+  }
   close(): void { void this.closeAndWait().catch(() => {}); }
   closeAndWait(deadlineMs = 5_000): Promise<ProcessStopResult> {
     if (this.closePromise) return this.closePromise;
@@ -400,7 +408,12 @@ export class CodexAdapter implements ProviderAdapter {
       onRequest: (request: AppServerRequest) => this.handleRequest(client, request),
       onExit: (error: Error) => this.handleExit(client, error),
     };
-    client = this.clientFactory?.(handlers, context) ?? new StdioAppServerClient({ executable: this.executable, cwd: this.workspace, env: restrictedEnvironment(this.environment), args: APP_SERVER_SECURITY_ARGS, handlers, processes: runtime!.registry, spawn: (command, args, options) => runtime!.spawn({ command, args, ...options, cwd: typeof options.cwd === "string" ? options.cwd : this.workspace, env: options.env ?? restrictedEnvironment(this.environment) }) });
+    client = this.clientFactory?.(handlers, context) ?? new StdioAppServerClient({ executable: this.executable, cwd: this.workspace, env: restrictedEnvironment(this.environment), args: APP_SERVER_SECURITY_ARGS, handlers, beforeRequest:(method)=>{if(method==="turn/start") {
+      try {this.assertTaskDispatch?.(context);} catch(error) {
+        if(this.active&&sameDispatchContext(this.active.context,context))this.active.possibleDispatch=false;
+        throw error;
+      }
+    }}, processes: runtime!.registry, spawn: (command, args, options) => runtime!.spawn({ command, args, ...options, cwd: typeof options.cwd === "string" ? options.cwd : this.workspace, env: options.env ?? restrictedEnvironment(this.environment) }) });
     this.client = client; if (runtime) this.clientRuntimes.set(client, runtime);
     this.observedRequestIds.clear();
     try { await client.start(); return client; }
@@ -786,6 +799,10 @@ export class CodexAdapter implements ProviderAdapter {
     const normalized: TurnOutcome = outcome.evidence ? outcome : { ...outcome, evidence: { kind: "unknown", reason: "native_outcome_unconfirmed" } };
     const retiring = this.rotateClientEachTurn && active.client ? this.retireClient(active.client, 5_000, true) : Promise.resolve();
     void retiring.catch(() => {}).then(() => {
+      // Publish the known business terminal only after the original process stop
+      // attempt has settled, so normal retirement does not create a premature
+      // durable recovery gate. Failure still publishes the known result.
+      if (active.terminalEvent && !this.callbacksSealed) this.onEvent?.(fenceAdapterEvent(active.context, active.terminalEvent));
       if (this.active === active) this.active = undefined;
       active.resolve(normalized);
     });
@@ -801,6 +818,7 @@ export class CodexAdapter implements ProviderAdapter {
   }
 
   private emit(active: ActiveTurn, event: AdapterEventPayload): void {
+    if (["turn_completed", "turn_failed", "turn_cancelled"].includes(event.kind)) { active.terminalEvent = event; return; }
     if (!this.callbacksSealed) this.onEvent?.(fenceAdapterEvent(active.context, event));
   }
 
@@ -885,7 +903,7 @@ async function waitFor(predicate: () => boolean, timeoutMs: number): Promise<voi
   while (!predicate() && Date.now() < deadline) await new Promise<void>((resolvePromise) => setTimeout(resolvePromise, 10));
 }
 
-function restrictedEnvironment(overrides?: Readonly<Record<string, string>>): NodeJS.ProcessEnv {
+export function restrictedEnvironment(overrides?: Readonly<Record<string, string>>): NodeJS.ProcessEnv {
   const allowed = [
     "PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LC_ALL", "LC_CTYPE", "TMPDIR", "TMP", "TEMP", "TERM",
     "CODEX_HOME", "OPENAI_API_KEY", "HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY", "NO_PROXY", "SSL_CERT_FILE", "SSL_CERT_DIR",

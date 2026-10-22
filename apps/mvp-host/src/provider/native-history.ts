@@ -18,11 +18,17 @@ export type NativeHandle = Readonly<{
   updatedAt: string;
 }>;
 
-export type NativeTurnObservation =
+export type NativeInspectionExecutionEvidence = Readonly<{
+  version: 1;
+  state: "stopped" | "unknown";
+  originalContextDigest: string;
+  helpers: readonly Readonly<{ launchId: string; launchDigest: string; processRecordIds: readonly string[]; sourceId?: string; contractId?: string }>[];
+}>;
+export type NativeTurnObservation = (
   | { state: "terminal"; nativeSessionId: string; nativeTurnId?: string; status: "completed" | "failed" | "cancelled";
       evidence: { kind: "native-terminal"; sourceId: string; verifiedVersion: string; dispatchContext?: DispatchContext }; error?: string }
   | { state: "running"; nativeSessionId: string; nativeTurnId: string }
-  | { state: "unknown"; reason: string };
+  | { state: "unknown"; reason: string }) & { inspectionExecution?: NativeInspectionExecutionEvidence };
 
 /** SDK transcripts provide message history, not an authoritative Turn boundary. */
 export function inspectClaudeTranscript(_handle: NativeHandle, _messages: readonly unknown[]): NativeTurnObservation {

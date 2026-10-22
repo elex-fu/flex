@@ -18,7 +18,7 @@ function barrier() { let resolve!: () => void; const promise = new Promise<void>
 function managed(spawnChild?: (command: string, args: readonly string[], options: import("node:child_process").SpawnOptions) => ChildProcess) {
   const records: ManagedProcessRecord[] = []; const stops: Array<{ context: DispatchContext; result: ProcessStopResult }> = [];
   const options: ManagedRuntimeOptions = {
-    executionBoundary: async () => ({ ready: true, proof: { verifiedPrivateReadBoundary: true, verifiedDescendantStop: false }, boundary: { spawn: (registry, request: NativeSpawnRequest) => { const { command, args, ...options } = request; return registry.spawn(command, args, options, { proof: { fixture: true }, launchDigest: "a".repeat(64) }); } } }),
+    executionBoundary: async () => ({ ready: true, proof: { verifiedPrivateReadBoundary: true, verifiedDescendantStop: true }, boundary: { spawn: (registry, request: NativeSpawnRequest) => { const { command, args, ...options } = request; return registry.spawn(command, args, options, { proof: { fixture: true }, launchDigest: "a".repeat(64) }); } } }),
     processRegistryFactory: (fixed) => new ManagedProcessRegistry({ journal: { save: (record) => records.push(structuredClone(record)) }, context: () => fixed,
       ...(spawnChild ? { spawn: spawnChild as unknown as typeof spawn } : {}), groupExists: () => "absent", identify: (pid) => ({ pid, platform: "linux", birth: { kind: "linux", bootId: "12345678-1234-1234-1234-123456789abc", startTicks: "10" } }),
       verifyDescendantStop: (record) => ({ kind: "verified-tree-stop", sourceId: "controlled-exit", contractId: "fixture-tree-contract", identityDigest: processIdentityDigest(record.processIdentity!) }) }),
@@ -90,6 +90,14 @@ describe("managed SDK runtime integration", () => {
     const adapter = new ClaudeAdapter({ ...f.options, workspace, queryFactory, onEvent: (event) => events.push(event) });
     try { const turn = adapter.runTurn(context.flyxTurnId, "task", undefined, context); await started.promise; expect(await adapter.interrupt()).toBe("accepted"); ended.resolve(); expect(await turn).toMatchObject({ status: "outcome_unknown", evidence: { kind: "unknown" } }); expect(events.some((event) => event.kind === "turn_cancelled")).toBe(false); }
     finally { ended.resolve(); await adapter.closeAndWait(); }
+  });
+  it("refuses a private-read-only boundary without descendant stop before creating any production registry", async () => {
+    const factory = vi.fn(() => { throw new Error("must not create registry"); });
+    const controller = new ManagedRuntimeController({ processRegistryFactory: factory, executionBoundary: async () => ({
+      ready: true, proof: { verifiedPrivateReadBoundary: true, verifiedDescendantStop: false }, boundary: { spawn: () => { throw new Error("must not spawn"); } },
+    }) });
+    await expect(controller.prepare(context)).rejects.toThrow("NATIVE_DESCENDANT_STOP_UNVERIFIED");
+    expect(factory).not.toHaveBeenCalled(); expect(await controller.closeAndWait()).toMatchObject({ stopped: true, treeStopped: true, records: [] });
   });
   it("prevents a delayed boundary preparation from launching after close", async () => {
     const ready = barrier(); let factories = 0;

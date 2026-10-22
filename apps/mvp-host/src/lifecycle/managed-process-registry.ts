@@ -4,6 +4,8 @@ import type Database from "better-sqlite3";
 import { SystemProcessInspector, type ProcessIdentity } from "./process-inspector.js";
 import { validateTreeStopEvidence, type ProcessBoundaryEvidence, type ProcessTreeStopEvidence } from "./managed-process-evidence.js";
 import { adoptNodeChildProcess, type ManagedChildHandle } from "./managed-child-handle.js";
+import { savePlannedCompatibilityLaunch } from "../diagnostics/managed-native-provenance.js";
+import type { PlannedNativeArtifact } from "../diagnostics/planned-native-artifact.js";
 import { MANAGED_PROCESS_EVIDENCE_SCHEMA } from "../storage/migrations/005-process-evidence.js";
 export { MANAGED_PROCESS_SCHEMA } from "../storage/migrations/004-managed-process-schema.js";
 export { processIdentityDigest, type ProcessBoundaryEvidence, type ProcessTreeStopEvidence } from "./managed-process-evidence.js";
@@ -31,13 +33,17 @@ export type ManagedProcessRecord = ProcessLaunchContext & {
   stopProof?: ProcessTreeStopEvidence;
 };
 export type ProcessStopResult = { stopped: boolean; treeStopped: boolean; records: ManagedProcessRecord[] };
-export interface ProcessJournal { save(record: ManagedProcessRecord): void; }
+export interface ProcessJournal { save(record: ManagedProcessRecord): void; savePlannedLaunch?(record: ManagedProcessRecord, planned: PlannedNativeArtifact): void; }
 
 /** Compatibility export; production installs the complete 005 evidence metadata. */
 export const MANAGED_PROCESS_IDENTITY_SCHEMA = MANAGED_PROCESS_EVIDENCE_SCHEMA;
 
 export class SqliteProcessJournal implements ProcessJournal {
   constructor(private readonly db: Database.Database) {}
+  savePlannedLaunch(record: ManagedProcessRecord, planned: PlannedNativeArtifact): void {
+    if (!record.boundaryEvidence) throw new Error("COMPATIBILITY_PLANNED_LAUNCH_INVALID");
+    savePlannedCompatibilityLaunch(this.db, record.id, record.boundaryEvidence.launchDigest, planned);
+  }
   save(record: ManagedProcessRecord): void {
     this.db.transaction(() => {
     if (record.state === "stopped" && !record.stopProof) throw new Error("PROCESS_STOP_PROOF_REQUIRED");
@@ -101,7 +107,7 @@ export class ManagedProcessRegistry {
     verifyDescendantStop?: (record: ManagedProcessRecord) => ProcessTreeStopEvidence | undefined | Promise<ProcessTreeStopEvidence | undefined>;
   }) {}
 
-  spawn(command: string, args: readonly string[], options: SpawnOptions, boundaryEvidence?: ProcessBoundaryEvidence): ManagedChildHandle {
+  spawn(command: string, args: readonly string[], options: SpawnOptions, boundaryEvidence?: ProcessBoundaryEvidence & { plannedArtifact?: PlannedNativeArtifact }): ManagedChildHandle {
     if (this.closing) throw new Error("RUNTIME_CLOSING");
     const grouped = process.platform !== "win32";
     const record: ManagedProcessRecord = {
@@ -111,6 +117,7 @@ export class ManagedProcessRegistry {
     };
     // Commit launching before crossing the external spawn boundary.
     this.options.journal.save(record);
+    if (boundaryEvidence?.plannedArtifact) this.options.journal.savePlannedLaunch?.(record, boundaryEvidence.plannedArtifact);
     let child: ChildProcess;
     try { child = (this.options.spawn ?? spawn)(command, [...args], { ...options, detached: grouped }); }
     catch (error) {

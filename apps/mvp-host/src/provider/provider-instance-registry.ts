@@ -2,6 +2,9 @@ import { constants, accessSync, realpathSync } from "node:fs";
 import { delimiter, isAbsolute, join } from "node:path";
 import { z } from "zod";
 import { CatalogError, CatalogStore, type ProviderInstanceRecord, type ProviderVerification } from "../storage/catalog-store.js";
+import type { CompatibilityScenePermit, CompatibilityScenePolicy } from "../diagnostics/compatibility-scene-policy.js";
+
+export type CompatibilitySceneAuthority = Readonly<{ policy: CompatibilityScenePolicy; permit: CompatibilityScenePermit }>;
 
 const ENVIRONMENT_KEYS=new Set(["PATH","LANG","LC_ALL","LC_CTYPE","TERM","NO_COLOR"]);
 const Config=z.strictObject({model:z.string().min(1).max(256).optional(),environment:z.record(z.string(),z.string()).default({}),sandboxRequired:z.literal(true).default(true)});
@@ -26,9 +29,10 @@ export class ProviderInstanceRegistry {
   get(id:string) {return this.catalog.provider(id);}
   require(id:string):ProviderInstanceRecord {const provider=this.get(id);if(!provider)throw new CatalogError("PROVIDER_INSTANCE_NOT_FOUND");if(provider.state!=="configured")throw new CatalogError("PROVIDER_INSTANCE_UNAVAILABLE");return provider;}
   /** Current local executable plus trusted verification, before Native preparation. */
-  requireExecution(id:string):ProviderInstanceRecord {
+  requireExecution(id:string,scene?:CompatibilitySceneAuthority):ProviderInstanceRecord {
     const provider=this.require(id);
-    if(provider.verification.state!=="verified"||!provider.verification.runtimeVersion)throw new CatalogError("PROVIDER_CAPABILITY_UNVERIFIED");
+    if(scene)scene.policy.assertProvider(scene.permit,provider);
+    if(!scene&&(provider.verification.state!=="verified"||!provider.verification.runtimeVersion))throw new CatalogError("PROVIDER_CAPABILITY_UNVERIFIED");
     try {if(!isAbsolute(provider.executable)||realpathSync(provider.executable)!==provider.executable)throw new Error("changed");accessSync(provider.executable,constants.X_OK);}
     catch {throw new CatalogError("PROVIDER_EXECUTABLE_CHANGED","Configured Provider executable must be revalidated locally");}
     return provider;
@@ -52,9 +56,10 @@ export class ProviderInstanceRegistry {
     if(verification.capabilities.length>64||verification.capabilities.some((capability)=>!Object.hasOwn(CAPABILITY_SCOPES,capability)))throw new CatalogError("PROVIDER_VERIFICATION_INVALID");
     return this.catalog.putProvider({...provider,verification});
   }
-  effectiveCapabilities(id:string,context:{adapter:readonly string[];workspace:readonly string[];deviceScopes:ReadonlySet<string>|readonly string[]}):string[] {
-    const provider=this.require(id);if(provider.verification.state!=="verified")return [];
+  effectiveCapabilities(id:string,context:{adapter:readonly string[];workspace:readonly string[];deviceScopes:ReadonlySet<string>|readonly string[];scene?:CompatibilitySceneAuthority}):string[] {
+    const provider=this.require(id);if(context.scene)context.scene.policy.assertProvider(context.scene.permit,provider);else if(provider.verification.state!=="verified")return [];
     const scopes=context.deviceScopes instanceof Set?context.deviceScopes:new Set(context.deviceScopes);
-    return provider.verification.capabilities.filter((capability)=>Boolean(CAPABILITY_SCOPES[capability])&&context.adapter.includes(capability)&&context.workspace.includes(capability)&&provider.policyCapabilities.includes(capability)&&scopes.has(CAPABILITY_SCOPES[capability]!));
+    const capabilities=context.scene?["streamingText","resumeConversation"]:provider.verification.capabilities;
+    return capabilities.filter((capability)=>Boolean(CAPABILITY_SCOPES[capability])&&context.adapter.includes(capability)&&context.workspace.includes(capability)&&provider.policyCapabilities.includes(capability)&&scopes.has(CAPABILITY_SCOPES[capability]!));
   }
 }

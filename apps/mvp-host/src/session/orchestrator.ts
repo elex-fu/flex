@@ -1,3 +1,5 @@
+import type { CompatibilityScenePolicy, CompatibilityScenePermit } from "../diagnostics/compatibility-scene-policy.js";
+import type { HostExecutionPermits, HostExecutionPermit } from "../workspace/host-execution-permits.js";
 import { randomUUID } from "node:crypto";
 import { mkdirSync, realpathSync } from "node:fs";
 import { dirname } from "node:path";
@@ -71,6 +73,8 @@ export type OrchestratorOptions = {
   revalidateDevice?: (intent: ExecutionIntentRow) => void;
   /** Verified preparer/producer tree exit, independent of business terminal evidence. */
   canReleaseWorkspace?: (context: DispatchContext) => boolean;
+  /** Original-linked checkpoint/helper attempts must independently prove stop too. */
+  canReleaseAdditionalProducers?: (context: DispatchContext) => boolean;
   checkpoints?: ExecutionCheckpointBinding;
   genericOperations?: Readonly<Record<string, OperationIntentHandler>>;
   /** Synchronous setup runs before startup recovery and dispatch scanning. */
@@ -78,6 +82,10 @@ export type OrchestratorOptions = {
   /** Commits an R07 runtime gate without rewriting a known Provider terminal. */
   onExecutionBlocked?: (intent: ExecutionIntentRow, reason: string) => void;
   assertWriteReady?: () => void;
+  /** Native activation gate only for new Turn acceptance and dispatch. */
+  assertNativeReady?: (input?: { authorization?: CompatibilityScenePermit; intent?: ExecutionIntentRow }) => void;
+  nativeScenePolicy?: CompatibilityScenePolicy;
+  executionPermits?: HostExecutionPermits;
   recovery?: Pick<HostRecoveryOptions, "resolveResource" | "checkoutRoot" | "assertCommandAuthorized" | "processInspector" | "inspectBoundary" | "inspectWorkspace" | "codexReader" | "supersedeInteractions" | "companionEvents">;
   runtimeId?: string;
   owner?: HostOwnerHandle;
@@ -120,6 +128,9 @@ export class SessionOrchestrator {
   private readonly shutdownServices = new Set<ShutdownService>();
   private readonly transportClosers = new Set<() => Promise<void>>();
   private activeWorkspaceLease: WorkspaceLease | undefined;
+  private checkpointReservation: { lease: WorkspaceLease; actorId: string; expiresAt: number; context: DispatchContext; inFlight: number; timer: ReturnType<typeof setTimeout> } | undefined;
+  private checkpointReservationService = false;
+  private checkpointProducerCheck: OrchestratorOptions["canReleaseAdditionalProducers"];
   private closed = false;
   private callbacksSealed = false;
   readonly workspace: string;
@@ -144,14 +155,26 @@ export class SessionOrchestrator {
   private readonly checkpointBinding: ExecutionCheckpointBinding | undefined;
   private readonly onExecutionBlocked: OrchestratorOptions["onExecutionBlocked"];
   private readonly capturedBefore = new Set<string>();
+  private readonly finalizations = new Map<string, Promise<void>>();
+  private readonly executionPermits: HostExecutionPermits | undefined;
+  private readonly taskPermits = new Map<string, HostExecutionPermit>();
+  private readonly permitWaits = new Map<string, AbortController>();
+  private readonly preparingAttempts = new Set<string>();
+  private readonly nativeScenePolicy: CompatibilityScenePolicy | undefined;
+  private readonly checkNativeReady: OrchestratorOptions["assertNativeReady"];
   private readonly checkWriteReady: OrchestratorOptions["assertWriteReady"];
   private degraded = false;
   private baselinePromise: Promise<void> | undefined;
   private readonly session: SessionRow;
 
   constructor(options: OrchestratorOptions) {
+    this.executionPermits = options.executionPermits;
+    this.checkNativeReady = options.assertNativeReady;
+    this.nativeScenePolicy = options.nativeScenePolicy;
+    this.checkpointProducerCheck = options.canReleaseAdditionalProducers;
     this.interactionEvents = options.interactionEvents;
-    this.canReleaseWorkspace = options.canReleaseWorkspace ?? ((context) => this.nativeRuntime?.canReleaseWorkspace(context) ?? false);
+    this.canReleaseWorkspace = (context) => (options.canReleaseWorkspace?.(context) ?? this.nativeRuntime?.canReleaseWorkspace(context) ?? false)
+      && (options.canReleaseAdditionalProducers?.(context) ?? true);
     this.ownsStore = options.ownsStore ?? true;
     this.recoverOnStart = options.recoverOnStart ?? true;
     if (!this.ownsStore && (!options.owner || !options.store || !options.sessionId)) throw new Error("A shared Session runtime requires explicit owner, Store and Session ID");
@@ -237,7 +260,7 @@ export class SessionOrchestrator {
         },
       });
       this.git = new GitService(this.checkoutRoot, options.gitRunner ? { runner: options.gitRunner } : {});
-      if (!options.adapter) this.nativeRuntime = new HostManagedRuntime({ store: this.store, owner: this.owner, sessionId: this.session.id, runtimeId: this.runtimeId, workspace: canonicalWorkspace, provider,
+      if (!options.adapter) this.nativeRuntime = new HostManagedRuntime({ store: this.store, owner: this.owner, sessionId: this.session.id, runtimeId: this.runtimeId, workspace: canonicalWorkspace, provider, assertDispatch:(context)=>this.assertNativeDispatch(context),
         ...(options.privateDirectories ? { privateRoots: options.privateDirectories } : {}), ...(options.nativeStateRoots ? { nativeStateRoots: options.nativeStateRoots } : {}), ...(options.nativeBoundaryFactory ? { boundaryFactory: options.nativeBoundaryFactory } : {}) });
       const nativeOptions = { ...options.providerOptions, ...this.nativeRuntime?.options, workspace: canonicalWorkspace, onEvent: (event: AdapterEvent) => this.enqueueAdapterEvent(event) };
       this.adapter = options.adapter ?? (provider === "codex" ? new CodexAdapter(nativeOptions) : new ClaudeAdapter(nativeOptions));
@@ -282,6 +305,20 @@ export class SessionOrchestrator {
       owner: { id: this.hostOwnerId, generation: this.hostOwnerGeneration }, sessionId: this.session.id,
       ...options.executionHooks,
       beforeDispatch: async (intent, context) => {
+        if (intent.kind === "start_turn") {
+          this.assertNativeReady({intent});
+          if (this.executionPermits) {
+            this.preparingAttempts.add(intent.attemptId);
+            const wait = new AbortController(); this.permitWaits.set(intent.attemptId, wait);
+            const permit = await this.executionPermits.acquire(intent.attemptId, { signal: wait.signal });
+            if (this.closed || this.worker.isSealed) { permit.release({ producerStopped: true }); throw new Error("HOST_DRAINING"); }
+            this.taskPermits.set(intent.attemptId, permit);
+            this.assertNativeReady({intent});
+            if (this.activeWorkspaceLease) throw new Error("WORKSPACE_BUSY");
+            this.activeWorkspaceLease = WorkspaceLease.acquire({ workspace: this.checkoutRoot, owner: this.owner, operationId: intent.turnId! });
+            await this.ensureBaseline();
+          }
+        }
         if (intent.kind === "start_turn" && this.checkpointBinding) await this.captureBefore(intent, context);
         if (this.worker.isSealed) return;
         await options.executionHooks?.beforeDispatch?.(intent, context);
@@ -289,7 +326,7 @@ export class SessionOrchestrator {
       afterTerminal: (intent, outcome) => this.finalizeTurn(intent, outcome, options.executionHooks?.afterTerminal),
       assertWriteReady: () => this.assertWriteReady(),
       track: (kind, run) => this.operations.track(kind, () => options.executionHooks?.track ? options.executionHooks.track(kind, run) : run()),
-      revalidateDevice: (intent) => { this.revalidateIntentDevice(intent); return options.revalidateDevice?.(intent); },
+      revalidateDevice: (intent) => { if (intent.kind === "start_turn") this.assertNativeReady({intent}); this.revalidateIntentDevice(intent); return options.revalidateDevice?.(intent); },
       onDispatch: (intent, context) => {
         if (intent.turnId) this.dispatchContexts.set(intent.turnId, context);
         if (intent.kind === "start_turn") {
@@ -306,11 +343,12 @@ export class SessionOrchestrator {
           this.markExecutionBlocked(intent, "after_terminal_operation_unverified");
           options.onExecutionBlocked?.(intent, "after_terminal_operation_unverified");
         }
-        if (error instanceof Error && !/^(DEVICE_|SCOPE_|PRE_DISPATCH_|DISPATCH_)/.test(error.message)) this.degraded = true;
+        const failureCode = error && typeof error === "object" && "code" in error && typeof error.code === "string" ? error.code : error instanceof Error ? error.message : "";
+        if (error instanceof Error && !/^(DEVICE_|SCOPE_|PRE_DISPATCH_|DISPATCH_|ACTIVATION_|WORKSPACE_BUSY|HOST_EXECUTION_PERMIT|CHECKPOINT_BEFORE_UNAVAILABLE)/.test(failureCode)) this.degraded = true;
       },
     });
     this.lifecycle = new HostLifecycle({
-      stopAdmission: () => { this.closed = true; this.worker.stopAdmission(); },
+      stopAdmission: () => { this.closed = true; for (const wait of this.permitWaits.values()) wait.abort(); this.worker.stopAdmission(); },
       stopDispatch: () => this.worker.stopDispatch(),
       stopProducers: (deadline) => this.stopProducers(deadline),
       drainIngestion: async () => { await this.ingestion.drain(); return true; },
@@ -344,6 +382,81 @@ export class SessionOrchestrator {
   }
 
   get workspaceLease(): WorkspaceLease | undefined { return this.activeWorkspaceLease; }
+  /** A preview reserves an idle checkout; its exact lease survives acceptance. */
+  ensureCheckpointLease(input: { actorId: string; purpose: "preview" | "revert" | "recovery"; expectedSessionRevision?: number; previousLease?: { leaseId: string; generation: number } }): Promise<WorkspaceLease> {
+    return this.enqueueCommand(async () => {
+      this.owner.assertActive(); this.assertWritable();
+      const current = this.store.getSession(this.session.id)!;
+      const actor = this.store.getDevice(input.actorId);
+      if ((!actor && this.owner.mode !== "test") || actor && (actor.revokedAt || actor.expiresAt && actor.expiresAt <= new Date().toISOString())) throw new OrchestratorError("DEVICE_REVOKED", "Current actor is unavailable");
+      if (actor && !actor.scopes.includes("session:write")) throw new OrchestratorError("SCOPE_REQUIRED", "Preview requires checkout write permission");
+      if (input.expectedSessionRevision !== undefined && current.revision !== input.expectedSessionRevision) throw new OrchestratorError("SESSION_REVISION_CONFLICT", "Session changed before checkout reservation");
+      if (current.status !== "active" || this.store.getActiveTurn(this.session.id) || current.activityState !== "idle" || this.preparingAttempts.size) throw new OrchestratorError("WORKSPACE_BUSY", "Preview requires an idle original Session");
+      if (this.store.db.prepare("SELECT 1 FROM host_state WHERE key='restore_readiness'").get()) throw new OrchestratorError("RESTORE_EXTERNAL_STATE_UNVERIFIED", "Restore external state is unverified");
+      if (input.purpose === "preview") this.recovery.assertAdmission();
+      const reservation = this.checkpointReservation;
+      if (reservation) {
+        if (reservation.actorId !== input.actorId || Date.now() >= reservation.expiresAt) throw new OrchestratorError("PLAN_STALE", "Checkout reservation expired or belongs to another actor");
+        if (input.previousLease && (input.previousLease.leaseId !== reservation.lease.operationId || input.previousLease.generation !== this.owner.generation)) throw new OrchestratorError("PLAN_STALE", "Preview lease changed");
+        reservation.lease.assertActive(); return reservation.lease;
+      }
+      if (input.purpose !== "preview" || input.previousLease || this.activeWorkspaceLease) throw new OrchestratorError("REVERT_WORKSPACE_LEASE_REQUIRED", "Create a fresh preview before acquiring revert ownership");
+      const lease = WorkspaceLease.acquire({ workspace: this.checkoutRoot, owner: this.owner, operationId: randomUUID() });
+      const generation = (this.store.db.prepare("SELECT COALESCE(MAX(generation),0) AS generation FROM turns WHERE session_id=?").get(this.session.id) as { generation: number }).generation;
+      const context = this.operationContext(lease.operationId, lease.operationId, generation);
+      const timer = setTimeout(() => {
+        if (this.callbacksSealed || !this.store.db.open) { lease.retain("Checkpoint reservation expired after callback fence"); return; }
+        try { this.releaseCheckpointLease(lease.operationId); } catch { lease.retain("Checkpoint expiry release requires original ownership verification"); }
+      }, 5 * 60_000);
+      timer.unref();
+      this.checkpointReservation = { lease, actorId: input.actorId, expiresAt: Date.now() + 5 * 60_000, context, inFlight: 0, timer };
+      this.activeWorkspaceLease = lease;
+      if (!this.checkpointReservationService) {
+        this.checkpointReservationService = true;
+        this.registerShutdownService({ drain: async () => this.checkpointReservation ? this.releaseCheckpointLease(this.checkpointReservation.lease.operationId) : true,
+          seal: () => { if (this.checkpointReservation) clearTimeout(this.checkpointReservation.timer); } });
+      }
+      return lease;
+    });
+  }
+  /** Never releases a consumed/unknown reservation or infers helper stop. */
+  releaseCheckpointLease(leaseId: string, actorId?: string): boolean {
+    const reservation = this.checkpointReservation;
+    if (!reservation || reservation.lease.operationId !== leaseId || actorId && reservation.actorId !== actorId) return false;
+    clearTimeout(reservation.timer);
+    if (this.callbacksSealed || !this.store.db.open) { reservation.lease.retain("Checkpoint reservation requires external verification"); return false; }
+    if (reservation.inFlight) return false;
+    const open = this.store.db.prepare("SELECT 1 FROM checkpoint_revert_operations WHERE session_id=? AND status NOT IN ('completed','rolled_back') LIMIT 1").get(this.session.id);
+    const helpersStopped = this.checkpointProducerCheck ? this.checkpointProducerCheck(reservation.context) : this.owner.mode === "test";
+    if (open || this.store.getActiveTurn(this.session.id)) return false;
+    if (!helpersStopped) {
+      reservation.lease.retain("Checkpoint operation or helper stop remains unverified"); return false;
+    }
+    reservation.lease.release();
+    if (this.activeWorkspaceLease === reservation.lease) this.activeWorkspaceLease = undefined;
+    this.checkpointReservation = undefined; return true;
+  }
+  bindCheckpointPreviewExpiry(leaseId: string, expiresAt: string, actorId?: string): void {
+    const reservation = this.checkpointReservation, expiry = Date.parse(expiresAt);
+    if (!reservation || reservation.lease.operationId !== leaseId || actorId && reservation.actorId !== actorId || !Number.isFinite(expiry) || expiry <= Date.now() || expiry > Date.now() + 30 * 60_000) throw new OrchestratorError("PLAN_STALE", "Invalid preview reservation expiry");
+    clearTimeout(reservation.timer); reservation.expiresAt = expiry;
+    reservation.timer = setTimeout(() => { if (!this.callbacksSealed && this.store.db.open) { try { this.releaseCheckpointLease(leaseId); } catch { reservation.lease.retain("Checkpoint expiry release requires original ownership verification"); } } }, Math.max(1, expiry - Date.now()));
+    reservation.timer.unref();
+  }
+  cancelCheckpointPreviewForNewTask(): void {
+    const reservation = this.checkpointReservation;
+    if (reservation && !this.releaseCheckpointLease(reservation.lease.operationId)) throw new OrchestratorError("WORKSPACE_BUSY", "Preview helpers or a consumed revert still own this checkout");
+  }
+  beginCheckpointPreview(leaseId: string, actorId: string): void {
+    const reservation = this.checkpointReservation;
+    if (!reservation || reservation.lease.operationId !== leaseId || reservation.actorId !== actorId || Date.now() >= reservation.expiresAt) throw new OrchestratorError("PLAN_STALE", "Preview reservation is unavailable");
+    reservation.lease.assertActive(); reservation.inFlight += 1;
+  }
+  finishCheckpointPreview(leaseId: string, actorId: string): boolean {
+    const reservation = this.checkpointReservation;
+    if (!reservation || reservation.lease.operationId !== leaseId || reservation.actorId !== actorId || !reservation.inFlight) return false;
+    reservation.inFlight -= 1; return true;
+  }
   get interactionRpcPort(): InteractionRpcPort | undefined { return this.interactionEvents?.rpcPort(); }
 
   /** Created only at acceptance; old pending intents never receive a new fence. */
@@ -398,7 +511,7 @@ export class SessionOrchestrator {
     if (!this.nativeRuntime) return undefined;
     const assessment = await this.nativeRuntime.prepare();
     if (this.callbacksSealed) throw new OrchestratorError("HOST_DRAINING", "Host callbacks are sealed");
-    this.lifecycle.markReady(assessment.ready);
+    this.lifecycle.markReady(assessment.ready && assessment.proof.verifiedDescendantStop === true);
     return assessment;
   }
   private async stopProducers(deadlineMs: number): Promise<{ stopped: boolean }> {
@@ -534,14 +647,25 @@ export class SessionOrchestrator {
       if (this.store.getCommandReceipt(authSubjectId, commandId)) {
         return this.commandEngine.commitRequest<StartTurnResponse>(request, () => { throw new Error("RECEIPT_DISAPPEARED"); }).result;
       }
+      const authorization = this.nativeScenePolicy?.authorizeStart({actorId:authSubjectId,commandId,method:"session.startTurn",prompt,requestHash:request.requestHash,sessionId:this.session.id});
       if (this.degraded) throw new OrchestratorError("HOST_DEGRADED", "Host event persistence is degraded; restart the Host before starting a new Turn", true);
       this.recovery.assertAdmission();
+      this.assertNativeReady(authorization ? {authorization} : undefined);
       const current = this.snapshot();
       if (current.session.activityState !== "idle" || current.activeTurn) {
         throw new OrchestratorError("TURN_BUSY", "The current session already has an active turn", true);
       }
-      if (this.activeWorkspaceLease) throw new OrchestratorError("WORKSPACE_BUSY", "Checkout ownership remains retained", true);
+      this.cancelCheckpointPreviewForNewTask();
+      if (this.activeWorkspaceLease || this.preparingAttempts.size) throw new OrchestratorError("WORKSPACE_BUSY", "Checkout ownership remains retained", true);
       const leaseOperationId = randomUUID();
+      if (this.executionPermits) {
+        return this.commandEngine.commitRequest(request, (facts, clock) => {
+          this.assertWritable(); this.assertNativeReady(authorization ? {authorization} : undefined); this.worker.assertAdmission("start_turn"); this.recovery.assertAdmission();
+          const plan=decideAcceptTurn(facts, request, { prompt, turnId: leaseOperationId }, clock);
+          if(authorization)this.nativeScenePolicy!.assertAcceptInCommit(authorization,{request,plan});
+          return plan;
+        }).result;
+      }
       let lease: WorkspaceLease;
       try { lease = WorkspaceLease.acquire({ workspace: this.checkoutRoot, owner: this.owner, operationId: leaseOperationId }); }
       catch (error) { throw new OrchestratorError("WORKSPACE_BUSY", error instanceof Error ? error.message : "Workspace is owned by another write task", true); }
@@ -549,9 +673,11 @@ export class SessionOrchestrator {
       try {
         await this.ensureBaseline();
         const accepted = this.commandEngine.commitRequest(request, (facts, clock) => {
-          this.assertWritable(); this.worker.assertAdmission("start_turn");
+          this.assertWritable(); this.assertNativeReady(authorization ? {authorization} : undefined); this.worker.assertAdmission("start_turn");
           this.recovery.assertAdmission();
-          return decideAcceptTurn(facts, request, { prompt, turnId: leaseOperationId }, clock);
+          const plan=decideAcceptTurn(facts, request, { prompt, turnId: leaseOperationId }, clock);
+          if(authorization)this.nativeScenePolicy!.assertAcceptInCommit(authorization,{request,plan});
+          return plan;
         });
         if (accepted.reused) { lease.release(); this.activeWorkspaceLease = undefined; return accepted.result; }
         return accepted.result;
@@ -566,10 +692,14 @@ export class SessionOrchestrator {
   interrupt(authSubjectId: string, commandId: string, targetRequest?: CommandRequest): Promise<ControlResponse> {
     return this.enqueueCommand(async () => {
       const request = this.commandRequest(authSubjectId, commandId, "session.interrupt", {}, targetRequest);
-      return this.commandEngine.commitRequest(request, (facts, clock) => {
+      const result = this.commandEngine.commitRequest(request, (facts, clock) => {
         this.assertWritable(); this.recovery.assertAdmission(); this.worker.assertAdmission("control");
         return decideInterrupt(facts, request, clock);
       }).result;
+      if (result.status === "cancelled" && result.turnId) {
+        const turn = this.store.getTurn(result.turnId); if (turn?.attemptId) this.permitWaits.get(turn.attemptId)?.abort();
+      }
+      return result;
     });
   }
 
@@ -640,6 +770,7 @@ export class SessionOrchestrator {
     const manifest = await this.worker.track("checkpoint", () => this.checkpointBinding!.service.captureBefore(this.checkpointContext(intent, context, lease)));
     if (this.worker.isSealed) return;
     this.assertCheckpointManifest(intent, manifest, "before");
+    if (manifest.status !== "complete") throw new Error("CHECKPOINT_BEFORE_UNAVAILABLE");
     this.capturedBefore.add(intent.id);
     this.commit("checkpoint.captured", checkpointSummary(manifest));
   }
@@ -648,7 +779,7 @@ export class SessionOrchestrator {
       || manifest.runtimeGeneration !== intent.runtimeGeneration || manifest.phase !== phase || manifest.status === "capturing") throw new Error("CHECKPOINT_BINDING_MISMATCH");
   }
   private retainExecution(intent: ExecutionIntentRow, reason: string): void {
-    this.activeWorkspaceLease?.retain(reason); this.owner.retain(reason);
+    this.activeWorkspaceLease?.retain(reason); this.taskPermits.get(intent.attemptId)?.retain(reason); this.owner.retain(reason);
     if (intent.dispatchContext) this.runtimes.retainBinding(intent.dispatchContext);
     this.markExecutionBlocked(intent, reason);
     const blocked = this.onExecutionBlocked?.(intent, reason) as unknown;
@@ -657,11 +788,36 @@ export class SessionOrchestrator {
       throw new Error("EXECUTION_BLOCK_COMMIT_MUST_BE_SYNCHRONOUS");
     }
   }
-  private async finalizeTurn(intent: ExecutionIntentRow, outcome: ProviderOutcome, hook: ExecutionWorkerOptions["afterTerminal"]): Promise<void> {
+  private finalizeTurn(intent: ExecutionIntentRow, outcome: ProviderOutcome, hook: ExecutionWorkerOptions["afterTerminal"]): Promise<void> {
+    let work = this.finalizations.get(intent.attemptId);
+    if (!work) { work = this.finalizeTurnInternal(intent, outcome, hook); this.finalizations.set(intent.attemptId, work); }
+    return work;
+  }
+  private async finalizeTurnInternal(intent: ExecutionIntentRow, outcome: ProviderOutcome, hook: ExecutionWorkerOptions["afterTerminal"]): Promise<void> {
     if (this.worker.isSealed) return;
     const context = intent.dispatchContext; const lease = this.activeWorkspaceLease;
-    if (!lease) { if (intent.turnId) this.dispatchContexts.delete(intent.turnId); return; }
     try {
+      if (!context) { this.retainExecution(intent, "producer_stop_unverified"); return; }
+      // Close the immutable attempt before after-capture. Never terminal-close the reusable Session adapter.
+      let adapterStop: ProcessStopResult | undefined, managedStop: ProcessStopResult | undefined;
+      try {
+        const stopped = await boundedTurnStop(Promise.all([
+          this.adapter.closeTurnAndWait?.(context, 5_000), this.nativeRuntime?.closeTurnAndWait(context, 5_000),
+        ]), 5_000);
+        if (!stopped) { if (!this.worker.isSealed) this.retainExecution(intent, "producer_stop_unverified"); return; }
+        [adapterStop, managedStop] = stopped;
+      } catch { if (!this.worker.isSealed) this.retainExecution(intent, "producer_stop_unverified"); return; }
+      if (this.worker.isSealed) return;
+      if (adapterStop && (!adapterStop.stopped || !adapterStop.treeStopped) || managedStop && (!managedStop.stopped || !managedStop.treeStopped)) {
+        this.retainExecution(intent, "producer_stop_unverified"); return;
+      }
+      if (!lease) {
+        if (outcome.evidence.kind === "not-dispatched") {
+          if (!this.canReleaseWorkspace(context) && this.taskPermits.has(intent.attemptId)) { this.retainExecution(intent, "producer_stop_unverified"); return; }
+          this.releaseTaskPermit(intent);
+        }
+        if (intent.turnId) this.dispatchContexts.delete(intent.turnId); return;
+      }
       if (!context || !this.canReleaseWorkspace(context)) { this.retainExecution(intent, "producer_stop_unverified"); return; }
       lease.assertActive();
       const terminal = this.store.getTurn(intent.turnId!);
@@ -684,6 +840,7 @@ export class SessionOrchestrator {
       if (this.store.getSession(intent.sessionId)?.recoveryState === "blocked") { this.retainExecution(intent, "runtime_recovery_required"); return; }
       if (this.degraded) { this.retainExecution(intent, "terminal_commit_unverified"); return; }
       lease.assertActive(); lease.release();
+      this.releaseTaskPermit(intent);
       if (this.activeWorkspaceLease === lease) this.activeWorkspaceLease = undefined;
       if (intent.turnId) this.dispatchContexts.delete(intent.turnId);
       this.capturedBefore.delete(intent.id);
@@ -695,6 +852,34 @@ export class SessionOrchestrator {
     }
   }
 
+  private releaseTaskPermit(intent: ExecutionIntentRow): void { this.releaseTaskPermitAttempt(intent.attemptId); }
+  private releaseTaskPermitAttempt(attemptId: string): void {
+    this.permitWaits.delete(attemptId); this.preparingAttempts.delete(attemptId);
+    const permit = this.taskPermits.get(attemptId);
+    if (permit?.release({ producerStopped: true })) this.taskPermits.delete(attemptId);
+  }
+  private assertNativeDispatch(context: DispatchContext): void {
+    // Trusted Host-owned version/history inspections have their own managed attempt.
+    if (context.runtimeId === `${this.runtimeId}:probe` && context.flyxTurnId.startsWith("probe-")) return;
+    const intent = this.execution.list({sessionId:this.session.id,limit:1000}).find((value)=>value.kind==="start_turn"&&value.attemptId===context.attemptId
+      &&value.runtimeGeneration===context.runtimeGeneration&&value.dispatchContext&&sameDispatchContext(value.dispatchContext,context));
+    if(!intent||intent.state!=="dispatching")throw new Error("NATIVE_DISPATCH_CONTEXT_UNAVAILABLE");
+    this.owner.assertActive();this.assertWriteReady();this.revalidateIntentDevice(intent);this.assertNativeReady({intent});
+  }
+  private assertNativeReady(input?: {authorization?:CompatibilityScenePermit;intent?:ExecutionIntentRow}): void {
+    if(input?.intent&&this.nativeScenePolicy&&input.intent.dispatchContext) {
+      const intent=input.intent;
+      this.nativeScenePolicy.assertDispatch({intent,context:intent.dispatchContext!,phase:intent.state==="pending"?"before_claim":intent.state==="claimed"?"before_marker":"spawn"});
+      const prompt=(intent.payload as {prompt?:unknown}).prompt;
+      if(typeof prompt!=="string")throw new Error("COMPATIBILITY_SCENE_REQUEST_REJECTED");
+      input={...input,authorization:this.nativeScenePolicy.authorizeStart({actorId:intent.authSubjectId,commandId:intent.commandId,
+        method:"session.startTurn",prompt,requestHash:intent.requestHash,sessionId:intent.sessionId})};
+    }
+    const result = this.checkNativeReady?.(input) as unknown;
+    if (result && typeof (result as { then?: unknown }).then === "function") {
+      void Promise.resolve(result).catch(() => undefined); throw new Error("NATIVE_READINESS_MUST_BE_SYNCHRONOUS");
+    }
+  }
   private settleControl(intent: ExecutionIntentRow, outcome: ProviderControlOutcome): void {
     if (this.store.getCommandReceipt(intent.authSubjectId, intent.commandId)?.state !== "accepted") return;
     const payload = isRecord(intent.payload) ? intent.payload : {};
@@ -996,8 +1181,13 @@ export class SessionOrchestrator {
   }
 
   private releaseRecoveredOwnership(operation: import("@flyx/mvp-protocol").RecoveryOperation, evidenceId: string): void {
-    if (operation.gate !== "released") return;
+    if (operation.gate !== "released" || operation.sessionId !== this.session.id) return;
     try {
+      if (operation.attemptId && this.taskPermits.has(operation.attemptId)) {
+        const resourceKey = `workspace:${this.checkoutRoot}`, proof = this.recovery.recovery.releaseProof(evidenceId, [resourceKey]);
+        if (!proof || !this.recovery.recovery.verifyReleaseProof(proof, { resourceKey, ownerId: this.owner.ownerId,
+          ownerGeneration: this.owner.generation, purpose: `workspace:${operation.turnId}` })) throw new Error("RECOVERY_RELEASE_PROOF_INVALID");
+      }
       if (this.activeWorkspaceLease) {
         const proof = this.recovery.recovery.releaseProof(evidenceId, [this.activeWorkspaceLease.resourceKey]);
         if (!proof) throw new Error("RECOVERY_RELEASE_PROOF_INVALID");
@@ -1009,6 +1199,7 @@ export class SessionOrchestrator {
         if (!proof) throw new Error("RECOVERY_RELEASE_PROOF_INVALID");
         this.owner.clearRetention(proof, this.recovery.recovery.verifyReleaseProof);
       }
+      if (operation.attemptId) this.releaseTaskPermitAttempt(operation.attemptId);
     } catch {
       // An unlock failure must remain a durable admission gate as well as a file lock.
       let marker: SessionEvent | undefined;
@@ -1152,4 +1343,10 @@ function sameDispatchContext(expected: DispatchContext, actual: DispatchContext)
     && expected.runtimeId === actual.runtimeId
     && expected.runtimeGeneration === actual.runtimeGeneration
     && expected.attemptId === actual.attemptId;
+}
+
+async function boundedTurnStop<T>(work: Promise<T>, durationMs: number): Promise<T | undefined> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try { return await Promise.race([work, new Promise<undefined>((resolve) => { timer = setTimeout(() => resolve(undefined), durationMs); })]); }
+  finally { if (timer) clearTimeout(timer); }
 }

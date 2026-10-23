@@ -475,7 +475,10 @@ export class ClaudeAdapter implements ProviderAdapter {
       maxBudgetUsd: this.maxBudgetUsd,
       systemPrompt: { type: "preset" as const, preset: "claude_code" as const },
       sandbox: {
-        enabled: true,
+        // macOS cannot apply a second Seatbelt sandbox inside the Host's
+        // already verified workspace/private-data boundary. Use that boundary
+        // for Bash too; standalone and unverified paths keep the SDK sandbox.
+        enabled: active.runtime.workspaceWriteBoundary !== true,
         failIfUnavailable: true,
         autoAllowBashIfSandboxed: false,
         allowUnsandboxedCommands: false,
@@ -578,7 +581,6 @@ export class ClaudeAdapter implements ProviderAdapter {
       createdAt: new Date().toISOString(),
       dispatchContext: {nativeRequestId:options.toolUseID,nativeMethod:"canUseTool/approval"},
     };
-    this.emit(active, { kind: "approval_requested", request });
     return new Promise<PermissionResult>((resolve, reject) => {
       const timeout = setTimeout(() => {
         active.pending.delete(approvalId);
@@ -609,6 +611,9 @@ export class ClaudeAdapter implements ProviderAdapter {
           cleanup();
         },
       });
+      // Publish only after the response slot exists; a local controller may
+      // answer synchronously from its event callback.
+      this.emit(active, { kind: "approval_requested", request });
     });
   };
 

@@ -11,6 +11,7 @@
     "test": "vitest run",
     "test:spike": "vitest run src/claude/adapter.spike.test.ts",
     "test:codex-spike": "vitest run src/codex/adapter.spike.test.ts",
+    "test:macos-providers": "vitest run src/provider/macos-provider.acceptance.test.ts",
     "typecheck:tests": "tsc -p tsconfig.test.json --noEmit"
   },
   "dependencies": {

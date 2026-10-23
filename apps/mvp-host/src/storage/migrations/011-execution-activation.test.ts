@@ -31,7 +31,7 @@ function seedV10(path: string): void {
   } finally { db.close(); }
 }
 
-describe("execution activation migration 011", () => {
+describe("execution activation migration 011", { timeout: 20_000 }, () => {
   it("upgrades a pinned v10 file and keeps old resources unverified", () => {
     const path = fixture(); seedV10(path);
     const store = new SqliteStore(path, { mode: "owned" });

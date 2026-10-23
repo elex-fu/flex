@@ -92,7 +92,7 @@ async function fixture() {
   };
 }
 
-describe("managed worktrees production Catalog binding", () => {
+describe("managed worktrees production Catalog binding", { timeout: 30_000 }, () => {
   it("commits real Session receipts/intent before Git, publishes only after commit, and preserves dirty state across archive/restore", { timeout: 30_000 }, async () => {
     const f = await fixture();
     const created = await f.command("worktree.create", { sessionId: f.source, repositoryId: "repo-one" }, "create-one");

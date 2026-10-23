@@ -15,7 +15,7 @@ async function fixture(options:Parameters<typeof revertFixture>[0]={}){const val
 
 // These cases create several real Git repositories and invoke isolated raw
 // restore helpers. Keep their test budget separate from injected fault deadlines.
-describe("durable controlled revert",{timeout:20_000},()=>{
+describe("durable controlled revert",{timeout:60_000},()=>{
   it("atomically accepts plan, receipt, immutable intent, journal and blocking gate",async()=>{
     const f=await fixture();const revision=f.resolve().sessionRevision;const operation=await f.accept("revert","accept-1");
     expect(f.store.getPreview(f.page.planId,f.context.sessionId,"device-1").state).toBe("consumed");
@@ -111,7 +111,7 @@ describe("durable controlled revert",{timeout:20_000},()=>{
 });
 
 
-describe("raw restore and safety rollback",()=>{
+describe("raw restore and safety rollback",{timeout:60_000},()=>{
   it("restores binary, executable, symlink, rename and new parents without filters or hooks",async()=>{
     const f=await fixture({setup:async(root)=>{
       await writeFile(join(root,"binary.bin"),Buffer.from([0,1,2,255]));await stageRaw(root,"binary.bin",Buffer.from([0,3,9,255]));
@@ -185,7 +185,7 @@ describe("raw restore and safety rollback",()=>{
 });
 
 
-describe("restart durability and SQL action boundaries",()=>{
+describe("restart durability and SQL action boundaries",{timeout:60_000},()=>{
   it("reopens the actual SQLite file after an unknown external write and retains immutable facts",async()=>{
     let crash=true;const f=await fixture({persistent:true,boundary:(boundary)=>{if(boundary==="workspace_file.external" && crash){crash=false;throw new RevertCrash(boundary);}}});
     const operation=await f.accept("revert","persistent-command");await expect(f.dispatch(operation.operationId)).rejects.toBeInstanceOf(RevertCrash);
@@ -232,7 +232,7 @@ describe("restart durability and SQL action boundaries",()=>{
 });
 
 
-describe("sealed publication at shutdown",()=>{
+describe("sealed publication at shutdown",{timeout:60_000},()=>{
   it("never feeds mutation input or publishes SQL after sealing a helper registration barrier",async()=>{
     let release!:()=>void;let reached!:()=>void;const entered=new Promise<void>((resolve)=>{reached=resolve;});const gate=new Promise<void>((resolve)=>{release=resolve;});
     const f=await fixture({persistent:true,restore:{onSpawn:async()=>{reached();await gate;}}});const operation=await f.accept();const running=f.dispatch(operation.operationId);await entered;

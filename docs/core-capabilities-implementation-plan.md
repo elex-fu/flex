@@ -309,3 +309,13 @@ rtk proxy env RUN_REAL_CLAUDE=0 RUN_REAL_CODEX=0 RUN_REAL_CLAUDE_SPIKE=0 RUN_REA
 - 验证日志:`/tmp/flyx-verify-{b79c759,9ec893b,66893e9,db00cfe,95a4f7d}.log`;secure-channel 262KB 帧用例曾因并发负载超时,单跑 48/48 通过。R6 受影响套件 113/113(串行,~8 分钟)。C0、真实 Provider、物理手机状态不变。
 
 **2026-10-23 收敛完成**：第零阶段收敛完成,完整验证链一次全绿并已推送(`7cb015d` 基线,日志 `/tmp/flyx-verify-final.log`,`VERIFY_EXIT=0`):`pnpm build`/`typecheck`/`typecheck:tests`/`test:product` 全部通过——mvp-host 1305 passed/5 skipped(0 失败),mvp-protocol 56、mvp-relay 43、secure-channel 48、client-core 158、mobile 90、mvp-web node 套件全部通过;合并后主干的 core-capabilities Playwright E2E 6/6(会话元数据/草稿/Recovery·Diff·Worktree 不可用面板/worktree 正向上链路)。本收敛轮累计 12 个提交(含 3 个并行 worktree 任务合并),修复:TS never 收窄破坏、激活过期判定、排队取消与持久事件路径冲突、checkpoint 预留 generation 下限、catalog 控制绑定/门顺序、adapter fixture 的 stop-proof 变体、路径 canonicalize 与 stableJson 序列化缺陷;`entry.spec.ts` large Git Diff 一例仍为预存(另行跟进)。C0 阻塞不变,下一阶段进入 R0 证明(需 entitlement/签名/目标 Mac 前置)与 R1 生产 execution 端口注入等待 R0 结论。
+
+**2026-10-23 收敛验收（verify:clean 通过）**：收敛完成条目所遗留的收尾事项已全部处理完毕并推送，干净检出门禁一次通过（基线 `010e00d`，日志 `/tmp/flyx-verify-clean4.log`，`VERIFY_EXIT=0`）：
+
+- `entry.spec.ts` large Git Diff 一例已修复：E2E host 未注入 `gitRunner` 时 GitService 返回 `MANAGED_GIT_RUNNER_REQUIRED` 使面板显示 clean；`e2e-main.ts` 注入测试专用 `rawGitServiceRunner()`（8b6f648），生产组合纪律不变。
+- R8 interrupt 统一（e8229bf）：`webInterrupt()` 统一路由到 `host.controls` 单一实例，`use-core-controls.ts` 消费；core-controls 模块 +5、Web interrupt +5 用例。
+- R4 补测三例合并（c103776）：同 owner 重复 helper 检查正向恢复、停止记录缺失 fail-closed（`RECOVERY_EVIDENCE_STALE`）、supervisor ledger 三态门。
+- Web Playwright 全套 35/35；core-capabilities E2E 6/6。
+- verify:clean 前三次失败的三个根因均消除：并发负载超时（隔离重跑确认）、TMPDIR 磁盘 99% 满（清理 22G 陈旧临时副本）、真实 Git/迁移套件在干净检出版超时（describe 级显式超时 60s/30s/20s，仅测试期限，010e00d）。
+- 干净检出门禁最终结果：host 140 文件 1308 passed/5 skipped、protocol 56、relay 43、secure-channel 48、client-core 163、mobile 90、mvp-web 63 node 用例 + Playwright 全套；fixtures 1 通过 + 1 预期边界失败；204 个产品源码测试文件构建前后逐字节一致。
+- 第零阶段（R0–R9 工作区侧）至此全部收敛。剩余全部卡在 C0 用户前置（ES entitlement、Developer ID、目标 Mac 安装授权），后续顺序：R0 证明 → R1 生产 execution 端口 → R2 实际事实 → R3 isolated-real 端到端 → R4 真实外部检查器 → R6 生产接线+持久锚点 → R9 终验。

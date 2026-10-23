@@ -1,0 +1,186 @@
+{
+  "version": 1,
+  "scope": "platform-and-provider-adapter-acceptance",
+  "productionActivation": false,
+  "reports": [
+    {
+      "provider": "claude",
+      "at": "2026-10-23T16:43:41.666Z",
+      "node": "v24.18.0",
+      "platform": "darwin",
+      "os": "darwin 25.5.0 arm64",
+      "runtime": {
+        "providerVersion": "2.1.216",
+        "sdkVersion": "0.3.220",
+        "adapterId": "claude-agent-sdk",
+        "adapterVersion": "sha256-9b534aa1087df791fb912c77784d690f5d7300486bcef1bba1e37d26f8992e3e"
+      },
+      "contractId": "managed-process-group/v1/darwin",
+      "checks": [
+        "managed-version-query",
+        "native-tool-and-file",
+        "original-process-stopped",
+        "cross-process-native-resume",
+        "native-interrupt-and-cleanup"
+      ],
+      "clean": true,
+      "journal": [
+        {
+          "state": "stopped",
+          "count": 4
+        }
+      ],
+      "result": "passed",
+      "failure": null,
+      "launchSnapshots": [
+        {
+          "hostBuildDigest": "21a38f327cc64d41b86f8a115bb8a8e7c0782aa893447a11d868d69714027f9d",
+          "executableDigest": "d01b49210d72ecbe277a2665d104bacccddf2d22185be99446d2929e0edfc48d",
+          "snapshotDigest": "bf96ca7fd370b5c6188c7916cdc10f9a7d7fdd57707e36b81808d61a176679b6"
+        },
+        {
+          "hostBuildDigest": "21a38f327cc64d41b86f8a115bb8a8e7c0782aa893447a11d868d69714027f9d",
+          "executableDigest": "d01b49210d72ecbe277a2665d104bacccddf2d22185be99446d2929e0edfc48d",
+          "snapshotDigest": "f3d8f972215bad294569f9fb949b49fff1c52118dc83ec329581d30203991102"
+        },
+        {
+          "hostBuildDigest": "21a38f327cc64d41b86f8a115bb8a8e7c0782aa893447a11d868d69714027f9d",
+          "executableDigest": "d01b49210d72ecbe277a2665d104bacccddf2d22185be99446d2929e0edfc48d",
+          "snapshotDigest": "9abf4925809fab76b1c6ef4e622b66fd113fa83a7f3e32fb082003e77bbd408d"
+        },
+        {
+          "hostBuildDigest": "21a38f327cc64d41b86f8a115bb8a8e7c0782aa893447a11d868d69714027f9d",
+          "executableDigest": "d01b49210d72ecbe277a2665d104bacccddf2d22185be99446d2929e0edfc48d",
+          "snapshotDigest": "9abf4925809fab76b1c6ef4e622b66fd113fa83a7f3e32fb082003e77bbd408d"
+        }
+      ],
+      "stopRecords": [
+        {
+          "processHash": "3f86ec2ae922daaac4474d9e72d67d85517ffef5d6c11fe942762c8a0a67c960",
+          "attemptHash": "e640ccdd490aae91f2f500223a9e46ff91380c2ddd948171af0d0309075e1721",
+          "launchDigest": "ab430953dd2f8a2cbd1c99cf8d90d1c47442f8b6a11776c4461bbbd89bb23cc6",
+          "stopDigest": "ec87f44a03a37d9044587b92fb1ecf283483035030619528b9a1df43801ee46f",
+          "stopKind": "managed-group-stop"
+        },
+        {
+          "processHash": "cf3441f815df1d50687d605bdeec6938422700f132d32d1e4885a257dfa65611",
+          "attemptHash": "a13d826df63c47e82aa7b088c6cd786a656ce76d097111abb0296ba503ae5ecf",
+          "launchDigest": "fe16285f280eb618bd97b05253372d5dd4881ad26a813a7e596c9e9defe37afa",
+          "stopDigest": "e97bf060eb553767ab22b2fde3ab5e788f609143ab16fa52508801fd063b71c8",
+          "stopKind": "managed-group-stop"
+        },
+        {
+          "processHash": "831318f38498ca56ed5a627e0cb59587bcdc8a8a462d850161cf74c6435e17fc",
+          "attemptHash": "4f250bd7292c2404b4a3f7a5e3cc1d7b68ffbf6f1004bc5f25cc2d4368f09ed9",
+          "launchDigest": "be45d160cef9d9ab63b31ce2bde8491b4557860d461619682654955d2614fc28",
+          "stopDigest": "456530a3c58d3d80f7b0e23f58fd7ff5ea002aa7d4358ce94897f3f9f9d3b05c",
+          "stopKind": "managed-group-stop"
+        },
+        {
+          "processHash": "244a18f7f2e86e3cfaf7d82f589286c520452947d4a59a1568b232b43fd47566",
+          "attemptHash": "a70f8b4eb5ec0e5bd7b26cf5fe4f4e32b50e1dea355bef42bbb9fc8c0d842647",
+          "launchDigest": "be45d160cef9d9ab63b31ce2bde8491b4557860d461619682654955d2614fc28",
+          "stopDigest": "62b922ce6c24e11a309f7d04e0d957bd2f537432604ecdb7f66092ac2e692a7b",
+          "stopKind": "managed-group-stop"
+        }
+      ],
+      "nativeDiagnosticCounts": {}
+    },
+    {
+      "provider": "codex",
+      "at": "2026-10-23T16:49:59.417Z",
+      "node": "v24.18.0",
+      "platform": "darwin",
+      "os": "darwin 25.5.0 arm64",
+      "runtime": {
+        "providerVersion": "0.163.0-alpha.11.2",
+        "adapterId": "codex-app-server",
+        "adapterVersion": "sha256-b377fbca940cc9bf8f20743ca688171d85e2121d8975077be1b41a6adcb184b9"
+      },
+      "contractId": "managed-process-group/v1/darwin",
+      "checks": [
+        "managed-version-query",
+        "native-tool-and-file",
+        "original-process-stopped",
+        "cross-process-native-resume",
+        "native-interrupt-and-cleanup"
+      ],
+      "clean": true,
+      "journal": [
+        {
+          "state": "stopped",
+          "count": 5
+        }
+      ],
+      "result": "passed",
+      "failure": null,
+      "launchSnapshots": [
+        {
+          "hostBuildDigest": "21a38f327cc64d41b86f8a115bb8a8e7c0782aa893447a11d868d69714027f9d",
+          "executableDigest": "248ff9873b6fb35124a86bdffa013a09e1bd17f106385124e3dda73e9eb157ad",
+          "snapshotDigest": "00eb11a57e8239a004b297c947a3a8a32041a96117340b374ec14e5db08e3134"
+        },
+        {
+          "hostBuildDigest": "21a38f327cc64d41b86f8a115bb8a8e7c0782aa893447a11d868d69714027f9d",
+          "executableDigest": "248ff9873b6fb35124a86bdffa013a09e1bd17f106385124e3dda73e9eb157ad",
+          "snapshotDigest": "3db63786889b7d32f146ccc87975ce164ff2084d215872de56727ccf8800975f"
+        },
+        {
+          "hostBuildDigest": "21a38f327cc64d41b86f8a115bb8a8e7c0782aa893447a11d868d69714027f9d",
+          "executableDigest": "248ff9873b6fb35124a86bdffa013a09e1bd17f106385124e3dda73e9eb157ad",
+          "snapshotDigest": "3db63786889b7d32f146ccc87975ce164ff2084d215872de56727ccf8800975f"
+        },
+        {
+          "hostBuildDigest": "21a38f327cc64d41b86f8a115bb8a8e7c0782aa893447a11d868d69714027f9d",
+          "executableDigest": "248ff9873b6fb35124a86bdffa013a09e1bd17f106385124e3dda73e9eb157ad",
+          "snapshotDigest": "2aadd8617e206e397254a319ecd6bb2156ea68ae62a1acce3564fd357619c34f"
+        },
+        {
+          "hostBuildDigest": "8d0b93e5232414076f44d1d31f02924a427f9a67588d333416b5def6c06afbcf",
+          "executableDigest": "248ff9873b6fb35124a86bdffa013a09e1bd17f106385124e3dda73e9eb157ad",
+          "snapshotDigest": "e705973ca3469be5e9fcbce7a144d54d7ff7ef09b67c36ea3410e5a20ac99b29"
+        }
+      ],
+      "stopRecords": [
+        {
+          "processHash": "373ab0f47175a0cd337c7f48b1650a57328a4e21f6544ee95bfe4bee05653d3a",
+          "attemptHash": "e393bffd272f2b9cd4617617a7e27c7a93cdc1915f2b11c551413a3b016d5108",
+          "launchDigest": "279aa8077a4d39473204c310384972dfa641400c6723ea939c0f62271b030d66",
+          "stopDigest": "a99aefc97e9732dd05d23f24238e25e9974f3756b50c375c021889addd9531d3",
+          "stopKind": "managed-group-stop"
+        },
+        {
+          "processHash": "b584e40970ed33b38a632c5574b14efbb4a688b0946d8eb803c4857762cde4a0",
+          "attemptHash": "74048af4617ef081f6b19fc2ad07230b5125ea4d7133d93ac620a9f8fefdeead",
+          "launchDigest": "b069b206404de695d53f449d20a886a7196d8f43b612ef07b80e4cf74627b0d0",
+          "stopDigest": "80d805e4a33478b9daa8eae70e74d8af3611d572e0d6231b34086e53dfb9c915",
+          "stopKind": "managed-group-stop"
+        },
+        {
+          "processHash": "da4a6ae2264020bf794da1fcd7800c0768eae84f1c1280f39ca5c46729c14875",
+          "attemptHash": "8f77d15844409f3ba7afceaa4218ea81a38e350cc20b49f01a9e7e01aaf98ee0",
+          "launchDigest": "b069b206404de695d53f449d20a886a7196d8f43b612ef07b80e4cf74627b0d0",
+          "stopDigest": "711b61513939182555288cfeb414db0ef35054ef5bbf60b9b3bf80fbe36661b6",
+          "stopKind": "managed-group-stop"
+        },
+        {
+          "processHash": "44aaf718ca1cb8ce802db44cec2373d21c822ecdd744390cdb1ed8638d68d2e8",
+          "attemptHash": "b6ef6a55b66f61cd0363c16b5755ca9649399bf4c9c50b0f619621c565122b50",
+          "launchDigest": "6b66ae1a0d64477e050ce7f5211b995c4bfc80fbfa536cd35f8391be2dba0061",
+          "stopDigest": "5372bce14ff71f629db14e9e86ef28e63e25b78b17a341513f7656c56a944fea",
+          "stopKind": "managed-group-stop"
+        },
+        {
+          "processHash": "9e702e2c722cf59e278c1a4422c1a19ab222c030b74824e6534823c8e7bf9150",
+          "attemptHash": "3014742aed3f2586318f60cd4d39ceab10c2e84920f4fca16ffaeb9e79213b66",
+          "launchDigest": "6b66ae1a0d64477e050ce7f5211b995c4bfc80fbfa536cd35f8391be2dba0061",
+          "stopDigest": "17fa1c567146aba68583c8958ba2125823e31a92e471bddd5439a46e6446451c",
+          "stopKind": "managed-group-stop"
+        }
+      ],
+      "nativeDiagnosticCounts": {
+        "CODEX_TURN_ERROR": 12
+      }
+    }
+  ]
+}

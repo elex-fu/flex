@@ -1,5 +1,7 @@
 # macOS Native stop contract: actual local validation
 
+> Historical strong-contract research. On 2026-10-24 the user selected [ordinary macOS managed execution](./macos-managed-execution.md). The observations below still show why root/group cleanup cannot claim complete descendant termination; they no longer impose an ES/strong-closure prerequisite on the ordinary first release. Ordinary stopped records carry a separate contract, while `verifiedDescendantStop` remains false.
+
 The current unprivileged macOS private-file boundary does not prove Native descendant termination. Keep `treeIsolation: unverified`, `verifiedDescendantStop: false`, durable unknown process records, and retained writer ownership. A known business terminal remains distinct from producer-stop evidence. Do not release a canonical workspace lease from root exit, an absent process group, a missing PID, an SDK interrupt acknowledgement, or a successful checkpoint read.
 
 This result is scoped to the tested implementation and machine: macOS 26.5.2 / build 25F84, Darwin 25.5.0 / XNU 12377.121.10, Apple clang 21.0.0 and SDK 26.5. The sandbox executable SHA-256 was `8290e4be7387a0df83cd1559e86afd880464f269450573d012795761fe298f16`. The runner records exact helper, backend and generated-profile hashes for each run. Policy hashes vary because each fresh fixture has unique private paths.

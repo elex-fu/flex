@@ -1,3 +1,64 @@
+# Flyx 核心能力实施计划
+
+> 更新：2026-10-24（Asia/Shanghai）。**开发已按用户要求暂停**；已停止本轮最终回归，仅更新进度与剩余任务。当前采用普通 macOS 受管执行，契约以 [技术方案 §4](./core-capabilities-technical-design.md#4-macos-平台契约普通受管执行) 与 [普通执行专题](./macos-managed-execution.md) 为准。
+> 下方 2026-10-23 及以前内容保留为历史记录；其中 ES/签名前置和强停止闭包门槛已被本次决策替代，不再代表当前依赖。
+
+## 当前实施与验收（暂停检查点）
+
+| 任务 | 当前状态 | 实现方式与退出条件 |
+| --- | --- | --- |
+| M0 停止语义 / C0 | 平台与适配器实机通过 | 普通合同 `managed-process-group/v1/darwin`；新增独立 stop kind；普通结果完整树标记保持 false；旧记录不升级；实机覆盖正常退出、根退出后工具、强杀与 unknown。 |
+| M1 生产执行 | 后端接线与启动/关闭通过 | Node 受管进程组 + 原私有目录边界，按用途 Git/helper runner；生产 main、在线查询与维护查询统一构造可信端口。无后端/无激活继续拒绝 Native 派发。 |
+| M2 恢复与放行 | 契约/组合回归通过；真实恢复另验 | after checkpoint、metadata/checkout lease、startup readiness、inspect/reconcile/acknowledge 消费原契约绑定的停止记录；缺观察/超时/旧记录保持 unknown。 |
+| M3 真实 Provider | Claude/Codex 2/2 通过 | 独立临时 checkout/Store/identity；分别记录 CLI/SDK/Node/OS；真实任务与文件结果、中断、受管清理、跨进程续接；失败不登记通过。 |
+| M4 兼容证据 / 准入 | 普通合同消费已接；首份产物闭环待做 | 实际原始 launch/native terminal/stop 连接签名产物；版本查询与激活消费相同合同；未验证能力不发布；常规启动不调用模型。 |
+| G0 固定源码全量回归 | **用户暂停中断，未完成** | 最终冻结重跑在 50.33 秒后被 SIGINT 中断；前后 361 个源文件指纹一致，但未得到完整测试汇总。恢复后重新完整运行，不能以定向通过替代。 |
+| 后续 R4/R6/R9 | 仍待验收 | 真实恢复检查器、双 Provider Native 回退锚点/完整回退、备份后外部状态、完整主入口与物理手机。普通模式不自动使这些事项完成。 |
+
+恢复开发后的顺序：G0 固定源码完整回归 → M4 首份生产兼容产物闭环 → R4 真实恢复与备份外部复核 → R6 Native 回退 → R9 组合终验。M0–M3 的平台/适配器证据不替代这些事项。ES 强监督移为可选增强；Developer ID 留在桌面分发阶段，不作为 M0–M4 前置。
+
+暂停时源码基线为 `003faa3254a3fc76a2d624ed4a1c2d5fdf2c36c8`，本轮源码、测试和文档保留在当前未提交工作区。真实 Provider 调用已结束；本轮最终回归已停止，没有继续开发或测试。下述待办保留实现步骤，等待恢复开发后执行。
+
+### 本轮证据
+
+- 2026-10-24：普通合同、单层私有/工作区写边界、生产 main/维护 Git、恢复范围与停止门禁已实现。真实 Claude/Codex 2/2 通过（实际工具、跨进程续接、长命令开始后中断、清理）；生产 main 启动/关闭通过，未激活时零 Native 启动。详见 [阶段验收](./analysis/2026-10-24-macos-managed-execution-acceptance.md) 与 [版本/摘要 JSON](./analysis/2026-10-24-macos-managed-provider-results.json)。
+- 构建、全工作区 typecheck、Host 测试类型检查通过；protocol 56、client-core 163、mobile 90、Web Node 63 通过。Host 首轮全量 1303 passed / 13 failed / 7 skipped；相关修复已通过 37、2、40 项定向复测。第二轮为 1316 passed / 1 failed / 7 skipped，运行跨越源码修改；新合同隔离断言独立复测 5/5、最终相关定向 35/35 通过。各批次有重叠，不合计为唯一测试数，也未登记 Host 全量通过。
+- 暂停中断记录：`/private/tmp/flyx-macos-host-frozen-20261024.log` 与同名 `.json`；运行 50.33 秒，Vitest 退出码 130（SIGINT，包装进程记录 `-2`），`sameSource=true`。此结果只证明运行期间所检查源码未变，不能证明完整回归通过；本轮未重跑完整仓库/浏览器 E2E 或物理手机验收。
+
+## 剩余事项的具体实现方式
+
+### G0：固定源码完整回归（恢复后的首项）
+
+- 先确认保留工作区与当前文档一致，冻结 Host/protocol 源码；记录运行前后源码指纹。使用 `pnpm --filter @flyx/mvp-host exec vitest run --maxWorkers=1 --reporter=verbose` 完整运行并保存退出码、测试汇总和失败日志。
+- 若失败，先定位首个真实失败、完成必要修复和对应定向验证，再对新固定源码完成一次完整回归；运行期间继续修改源码的批次不登记为固定版本通过。
+- 真实 Claude/Codex 2/2 已有独立阶段证据。后续执行路径、合同或 adapter 若变化，再按影响范围安排真实复测；不将暂停中断算作 Provider 失败或重写已有结果。
+- 出口：当前固定版本取得完整结果，失败项有明确处置；随后进入 M4。即使 G0 全绿，也不能替代生产激活、真实恢复/回退与终验。
+
+### M4：首份生产兼容产物与显式激活（下一优先项）
+
+- 入口：`main.ts` isolated 分支、`diagnostics/compatibility-runtime-facts.ts`、`compatibility-scene-policy.ts`、`scripts/compatibility/run-matrix.mjs`。已有 `createVersionProbeAuthority` 尚须在真实入口组合；不能把本轮 adapter 报告直接塞进激活表。
+- 准备阶段固定 source/destination identity、runId、entry/runtime/executable/config 摘要和候选版本；候选不算已观察版本。校验私有授权文件后，仅允许受管 `--version`，用原始 query/stop 记录生成实际 runtime facts；候选不匹配即拒绝。
+- 向 isolated application 的 lazy runtime 注入真实 `CompatibilityCommittedRecorder` 与 artifact getter；只在 Engine 原终态提交且该 attempt 停止后记录。普通 contractId 与 stop kind 都进入 provenance 验证，不能设置强停止布尔值。
+- 第一份 scene 仍使用现有固定 prompt/commandId、独立 Store/identity/临时 Git 工作区与明确的真实调用开关。Workspace 本地受管核对和 Provider 旧产物激活必须分开，避免首次证据的循环依赖。
+- 先通过既有 ≥10 turns 的 basic scene/签名/import/verify/activate；之后分别扩展 interrupt、approval、reconnect 的固定场景。缺某能力的产物不得激活对应 policy capability；不降低计数或跳过 artifact/build/Node/OS 校验。
+- 出口：构建后的 main 在独立环境中完成授权 → 真实场景 → 签名产物 → 目标 Host 导入 → verify/activate → 当前权限下派发。普通启动、doctor、verify 不自动调用模型。
+
+### R4：真实恢复与备份恢复放行
+
+- 使用已接线的普通 stop scope；原始 owner/attempt、launchDigest、全部原及后继 helper、Native history 与 checkout clear 都必须匹配。缺原停止观察的崩溃窗口继续 unknown。
+- 在 `createCatalogRecoveryBindings` 注入实际 `verifiedManifestForInstance`、checkout inspector、只读 Native history/helper 与它的停止 verifier；分别验证 Claude 捕获 result 锚点、Codex thread/read，不能凭当前 CLI 版本或 transcript 结尾推定原终态。
+- 备份恢复不能依赖被恢复的 SQLite 自己证明备份后的活动。增加 Host 私有、独立于待恢复 DB 的受管 launch/stop 顺序日志，绑定 backup 截点/owner/attempt/合同；覆盖缺口、未决命令、磁盘错误继续阻塞。它只记录 Flyx 自己的执行，不引入 ES 系统审计。
+- `inspect → evidence/revision → reconcile/acknowledge` 保持 CAS、当前授权与未知命令不重放。confirm 只解除本次可核实 gate，保留 Worktree/回退其他阻塞。
+
+### R6/R9：保留的核心后续
+
+- Native 回退：把现有受管 transport、原停止合同与持久 checkpoint/native 锚点接入 `execution.revert`；分别实测 Codex rollback、Claude fork、响应丢失与部分失败。不能由普通中断/续接通过推导回退可用。
+- 终验：在已激活的生产 main 中串起任务 → before/after → Diff → 回退；独立 checkout 真并行；最后验证物理手机的网络切换/后台恢复。已有确定性与浏览器记录继续保留。
+
+---
+
+## 2026-10-23 及以前的历史计划与验收记录（不作为当前平台门槛）
+
 # Flyx 核心能力实施计划（C0–C8）
 
 > 依据：[核心能力交付技术方案](./core-capabilities-technical-design.md)（下称"方案"）。

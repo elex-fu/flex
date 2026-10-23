@@ -1,9 +1,9 @@
 # Flyx 核心能力交付技术方案
 
-> 版本：v1.2（并行开发中的补充契约）
-> 日期：2026-10-23（Asia/Shanghai）；初版：2026-10-18
-> 状态：R1–R8 中央组合已在工作区接线（默认 main fail-closed），待全量验证；macOS 执行契约仍为首要阻塞项
-> 当前源码基线：Flyx `1108bed`；原分析基线：`c11e08d`；参考快照：Paseo `710851ccb`、T3 Code `4ba4871af`
+> 版本：v1.3（普通 macOS 受管执行）
+> 日期：2026-10-24（Asia/Shanghai）；初版：2026-10-18
+> 状态：**开发已于 2026-10-24 按用户要求暂停**。普通 macOS 平台/适配器阶段已取得实机正向结果；最终固定源码全量回归被暂停中断，生产产物/激活与真实恢复/回退仍待验收，检查点和恢复顺序见实施计划顶部。
+> 本轮起点：Flyx `003faa3`；历史实现基线：`1108bed`；原分析基线：`c11e08d`；参考快照：Paseo `710851ccb`、T3 Code `4ba4871af`
 > 用户已明确：首版必须支持 macOS 本机执行，不能以 Linux Host 替代交付。
 
 本文负责上一轮差距分析后的**剩余核心交付**，作为接下来实施和验收的依据。[原对照方案](./paseo-t3code-comparison-and-optimization-technical-design.md)保留架构背景，[原实施记录](./flyx-optimization-implementation-plan.md)保留 R01–R18 的历史结果。当前进度、剩余任务 R0–R9 的文件范围、实现步骤和证据见[核心实施计划](./core-capabilities-implementation-plan.md)。本文规定最终契约；仅进度表明确确认的范围属于已实施，候选平台机制与剩余接线不因写入方案而视为完成。
@@ -23,11 +23,11 @@
 
 本轮不加入语音、更多 Provider、任务依赖图、自动 Agent 协作、完整编辑器、通用终端、Git 提交/PR 平台集成或新的云服务。手机仅覆盖核心远控和恢复；完整导航、复杂推送设置与桌面产品包装后置。
 
-macOS 监督组件只承担本项目启动的进程及其停止证据，不建设通用进程监控或文件审计产品。它是否能够满足现有契约，必须先完成第 4 节的实机验证。
+首版采用普通 macOS 受管进程组执行；ES 强监督后置。第 4 节与普通执行专题规定当前停止保证及实机验收。
 
 ## 2. 已有基础与确定缺口
 
-下表左两列描述已提交的 `1108bed` 基线；右列为 2026-10-23 对未提交工作区的逐模块对照结论（详见[实施计划](./core-capabilities-implementation-plan.md) §2–§3、§7 末条）。工作区实现与独立验证持续记录在实施计划 §7，不以基线缺口推断工作区仍完全未实现，也不以新增文件推断已通过生产验收；"已接线"指组合代码存在于生产模块并有定向测试。
+2026-10-24 更新：普通 backend、生产启动与双 Provider 适配器实测已通过；停止范围与恢复契约见第 4 节，当前剩余实现步骤见实施计划顶部。本节下表保留历史对照：左两列描述 `1108bed` 基线；右列为 2026-10-23 的逐模块对照结论（详见[实施计划](./core-capabilities-implementation-plan.md) §2–§3、§7 末条）。工作区实现与独立验证持续记录在实施计划 §7，不以基线缺口推断工作区仍完全未实现，也不以新增文件推断已通过生产验收；"已接线"指组合代码存在于生产模块并有定向测试。
 
 | 范围 | 当前源码事实（`1108bed` 基线） | 工作区进展（2026-10-23 对照；未提交） |
 | --- | --- | --- |
@@ -63,7 +63,7 @@ flowchart TD
   RUN --> PROC
   ACT[本地 verify / activate] --> PROC
   ACT --> CAT
-  PROC --> SUP[macOS Supervisor 候选后端]
+  PROC --> SUP[macOS Node 进程组 + 私有目录边界]
   SUP --> NATIVE[当前用户身份的 Provider / Git / helper]
   ENG --> DB[(唯一 owned SQLite Store)]
   REC --> DB
@@ -79,113 +79,48 @@ flowchart TD
 | SQLite writer、Host 身份、Views、Gateway、全局恢复与 Git 服务 | Host application | 启动至最终封闭 |
 | Provider adapter、对应控制通道 | Session runtime | 显式开始任务时加载，显式关闭或 Host 关闭时结束 |
 | checkout 写权限 | WorkspaceLease | 原 operation/attempt 持有；未知停止继续保留 |
-| Provider/Git/helper 原始启动 | supervisor launch 记录与 Engine dispatch context 联合绑定 | 从派发前记录到独立停止证明 |
+| Provider/Git/helper 原始启动 | 受管 launch 记录与 Engine dispatch context 联合绑定 | 从派发前记录到独立停止证明 |
 | 草稿、待核对命令、显示缓存 | 应用级 client-core runtime | React 卸载不关闭远程任务 |
 
 基础约束：命令受理、原生交付、业务终态、生产进程停止、工作区放行分别记录；不能互相推导。SQL 事务不覆盖 Provider 或文件系统副作用。外部网络调用、远程服务、已触发的系统副作用也不属于文件回退的保证范围。
 
 沿用 T3 的事务决策、提交后副作用、可排空 worker 思路；沿用 Paseo 的持久会话与按需加载分离。Flyx 已有对应实现，本轮直接复用，见参考 T01/T02/P01。
 
-## 4. macOS 平台契约：第一个交付门槛
+## 4. macOS 平台契约：普通受管执行
 
-### 4.1 已确认边界
+2026-10-24 用户已明确选择普通受管执行。此前 ES 监督服务的强停止闭包设计不再作为首版 C0 门槛；完整新契约、状态、恢复规则与验收见 [macOS 普通受管执行](./macos-managed-execution.md)。旧探针与 [监督契约审查](./analysis/2026-10-22-macos-supervisor-contract-review.md)保留为强保证边界证据，不将其结论改写成普通模式通过。
 
-现有本机探针证明：`setsid`、更换进程组、double fork 和 `posix_spawn(SETSID)` 可以使后代在根进程退出后继续写入。当前接口中的 kqueue `NOTE_TRACK` 不可用；普通权限 ES client 创建失败；rename/chmod 无法撤销已有可写文件描述符。[完整实测](./macos-native-stop-contract.md)。
+### 4.1 保证与范围
 
-因此，下列条件不能将 macOS 进程记录改成 `stopped`：SDK 收到 interrupt、根进程退出、进程组不存在、`ps` 没找到 PID、预检成功或私有目录读取被拒绝。
+普通模式管理本项目启动的根进程及进程组，记录原始启动和退出，SDK 中断后进行有界 SIGTERM/SIGKILL 清理。主动脱离组的后台后代、外部服务和远端副作用不属于完整停止保证。私有目录边界、原始启动记录、当前权限和工作区互斥保持。
 
-### 4.2 首选候选：签名的本地监督服务
+### 4.2 停止语义
 
-先做一个有明确成功/失败出口的原型：由签名的本地监督服务负责订阅 Endpoint Security、启动负载、保存原始进程谱系、停止和核对。Endpoint Security 的 entitlement、root 运行和用户 TCC 许可是实际前提；Apple 官方示例还包含签名和系统扩展启用流程，不能假定 clone 仓库即可具备。[Apple Client](https://developer.apple.com/documentation/endpointsecurity/client)、[Apple 示例](https://developer.apple.com/documentation/endpointsecurity/monitoring-system-events-with-endpoint-security)。
+新增 `managed-process-group/v1/darwin` 与 `managed-group-stop`，绑定原进程身份、launchDigest、processGroup、根退出和组不存在观察。`stopped` 表示原启动的契约满足；普通模式 `treeStopped=false`、`verifiedDescendantStop=false`。`verified-tree-stop` 继续仅表示完整后代隔离停止，不能复用为普通清理结果。
 
-**ES 能提供事件信息；它本身不是本文所需的完整停止证明。** 下面的启动绑定、事件完整性、身份变化和停止完成屏障，是候选方案必须另行证明的设计要求。没有证据时，原型结论必须是不可用。
+### 4.3 C0 门槛
 
-组件范围：
+C0 改为目标 Mac 上受管启动、私有目录保护、进程组清理、超时/异常 unknown、原始 journal、生产接线及双 Provider 真实任务/中断/跨进程续接验收。ES entitlement、Developer ID 与系统服务安装授权从首版依赖移除；桌面分发签名另行安排。
 
-- `native/macos-supervisor/`：拟新增的最小原生工程。实现本地 IPC、受控 launch、fork/exec/exit 记录、stop/query 和证据导出。
-- Host 侧 `lifecycle/macos-supervisor-client.ts`：拟新增的严格协议客户端；只接受已安装且身份验证通过的服务。
-- 服务拥有独立、受保护的顺序日志和签名密钥；不直接写 Flyx SQLite。
-- 实际 Provider/Git/helper 以调用用户 UID/GID 执行；Host 与编码任务不以 root 运行。
-- IPC 只向本机 Host 暴露固定方法。Gateway、Relay 和客户端不得携带任意 argv、路径或授权配置调用监督服务。
-- 服务验证调用方身份、绑定的 Host/owner 和固定执行策略；Host 验证服务身份与响应证据。单独检查 socket 路径或 Node 可执行文件签名不足以授权客户端。
-- 未归属本项目的进程只作瞬时关联判断，不持久化其命令行或活动历史。
+### 4.4 恢复与放行
 
-### 4.3 最小协议与证据
+只有与原 owner/attempt/launch 关联且通过相应契约验证的停止记录，才可参与 after checkpoint、checkout 放行与恢复。旧 macOS 记录没有普通合同或停止观察时仍 unknown，不迁移补造。inspect/reconcile/acknowledge 继续要求 Native 历史、checkout clear、当前授权和 revision/CAS；用户确认、SDK interrupt 或新激活不能代替停止记录。
 
-以下是新增内部协议草案，C0 验证后冻结；不是现有接口：
+### 4.5 异常与范围反例
 
-```ts
-interface MacSupervisor {
-  assess(): Promise<SupervisorAssessment>;
-  registerHost(request: HostRegistration): Promise<HostProcessBinding>;
-  prepareLaunch(plan: FrozenLaunchPlan): Promise<PreparedLaunch>;
-  releaseLaunch(launchId: string, binding: CommittedLaunchBinding): Promise<void>;
-  stopTree(launchId: string, remainingMs: number): Promise<StopObservation>;
-  inspectOriginal(launchId: string): Promise<StopObservation>;
-}
-```
-
-`FrozenLaunchPlan` 固定 `launchId`、原始 DispatchContext、用途、实际 executable/argv/env/cwd 的摘要、策略摘要、资源范围及调用用户。敏感 env 仅通过本地隔离通道传递，不写入证据。
-
-`StopObservation` 必须包含：原 launch/Host owner/attempt 绑定、监督器签名身份与 generation、boot 标识、原始根进程身份、谱系摘要、事件覆盖状态、停止动作结果、证据版本、`stopped | alive | unknown` 结论及原因。Host 重新校验证据后才映射到现有 `ProcessTreeStopEvidence`，不能直接信任远端布尔值。
-
-启动顺序必须满足：
-
-1. Host 在 SQLite 提交 `launching` 和最终启动计划摘要。
-2. Supervisor 已订阅必要事件并持久化 launch 预留。
-3. 负载进入受控启动屏障；任意业务代码和后代创建都不得抢在初始身份绑定之前。
-4. Host 持久化原始进程/监督绑定，再发 release。
-5. Supervisor 释放执行，记录后续 fork/exec/exit；stdio 使用独立通道传输。
-
-若第 3 步的原子屏障无法成立，就不能把“启动后立刻读取进程信息”当成替代。
-
-进程身份使用监督器内部节点与原始内核事件的关联，不把墙钟启动时间或一次 audit PID version 当成跨 exec 的永久身份。exec 前后 token 变化、PID 复用和父进程退出必须保留事件关系；这些边界需要复用本地探针扩展验证。[Apple Process](https://developer.apple.com/documentation/endpointsecurity/es_process_t)。
-
-### 4.4 完整性与停止完成条件
-
-Supervisor 需要观察 fork、exec、exit；若使用 AUTH_EXEC 控制受管进程的后续 exec，必须遵守消息 deadline，且不阻断无关进程。AUTH_EXEC 不能被解释为阻止全部 fork 或停止现存线程。
-
-按可用消息版本检查 `seq_num`/`global_seq_num`，出现丢失、监督器重连、持久化失败或不支持的消息版本，将受影响 launch 标为 `unknown`。Apple 将 global sequence 定义为检测该 client 丢事件的手段；序号连续和等待一段安静时间均不能单独证明停止闭包已经完成。[Apple global_seq_num](https://developer.apple.com/documentation/endpointsecurity/es_message_t/global_seq_num)。
-
-出具 stopped 的必要条件：
-
-1. 从初始启动屏障到原谱系关闭，必要事件覆盖完整。
-2. 对需要终止的节点使用与原身份绑定的停止机制；“重新查 PID 再 kill”存在的复用竞态必须被机制消除，而不是靠低概率接受。
-3. fork/exec 与 stop 并发时，能够证明新后代已纳入停止集合。
-4. 能够建立明确的事件完成屏障，证明集合中没有存活写入者或尚未归属的早期后代事件。
-5. 原始 launch、所有后继控制/helper 尝试和原 checkout 绑定一致；监督器日志已提交。
-
-**第 2、4 条目前没有得到本项目验证。** 官方资料支持事件与丢失检测，不直接保证这两项。C0 必须拿出实测与机制说明；若只有轮询、计时等待或进程组扫描，则候选失败。
-
-### 4.5 崩溃与原始证据
-
-- Host 崩溃：Supervisor 保留原 owner 的进程与日志，按原租约策略停止；新 Host 只能查询原 launch，不能用新预检覆盖它。
-- Supervisor 崩溃/事件丢失：该 generation 的开放 launch 保持 unknown；服务重启不能补造已丢失的谱系。
-- 主机重启：独立验证 boot 变化可以证明旧进程不再存活，仍需核对 Native 历史与 checkout；不能直接把旧业务结果改成成功。
-- 旧 macOS 记录缺可信原始身份：维持未知，不能由迁移自动升级成已停止。
-
-Host 进程本身也需要原始身份绑定，供 owner/lease 的崩溃回收使用。现有 `HostOwnerOptions.inspector` 是接入点。无监督器时仍允许新鲜资源上的 SQL 历史启动；涉及旧 owner 的回收必须返回不可核对，不能直接删除锁。
-
-### 4.6 C0 退出条件
-
-在实际目标 Mac、开启 SIP 的正常配置下，取得签名/权限前提，逐项验证 fork、setsid、setpgid、double fork、POSIX spawn、exec token 变化、PID 复用、快速 fork/exit、停止期间新后代、Host/监督器崩溃、事件丢失、磁盘错误和停止后的写入屏障。
-
-结果只有两类：
-
-- **可接受**：身份、启动屏障、事件覆盖、身份绑定终止和停止闭包均有证据，冻结 backend contract/version，再进入实际执行交付。
-- **阻塞**：任一项不能成立或授权前提拿不到，记录具体缺项，macOS 执行里程碑不能完成。后续基础/UI 可以开发，但不能宣布首版可执行。不得自动转为 Linux、弱化停止证明、关闭 SIP 或扩大成 VM/通用安全产品。
+组检查错误、超时、spawn/PID 持久化失败或已知外部写入者均保留 unknown/lease。根退出后仍存在的原进程组也需清理。逃逸探针保留为普通模式的已知限制，不宣称证明了全部逃逸后代停止。ES 后端未来若实现，独立验证其更强契约。
 
 ## 5. 统一受控执行：Provider、Git 与 helper
 
 ### 5.1 接入现有端口
 
-复用 `ManagedProcessRegistry`、`SqliteProcessJournal`、`HostManagedRuntime` 和原始 DispatchContext。新增一个小的启动适配层，将 macOS Supervisor 的 launch/stop 证据映射到这些对象。Linux 实现保留原路径；首版验收仍必须包含 macOS。
+复用 `ManagedProcessRegistry`、`SqliteProcessJournal`、`HostManagedRuntime` 和原始 DispatchContext。复用 Node 启动适配，在这些对象中新增普通进程组停止契约。Linux 实现保留原路径；首版验收仍必须包含 macOS。
 
-原先 `ProviderExecutionBoundary.spawn()` 与 stdio client 依赖 Node `ChildProcess`；当前已改为 `ManagedChildHandle`，Claude SDK 通过锁定 facade 满足 `SpawnedProcess`。Node 适配已验证，macOS 监督服务适配仍待实现，不能用类型断言把 IPC 句柄伪装成原生 ChildProcess。
+原先 `ProviderExecutionBoundary.spawn()` 与 stdio client 依赖 Node `ChildProcess`；当前已改为 `ManagedChildHandle`，Claude SDK 通过锁定 facade 满足 `SpawnedProcess`。Node 适配已验证，普通 macOS 契约与生产接线正在实施，不能用类型断言把 IPC 句柄伪装成原生 ChildProcess。
 
-固定接口：`ManagedChildHandle` 只暴露各调用方真正使用的 stdin/stdout/stderr、exit/error 事件、原始 root PID、取消请求和关闭等待。剩余改造在同一接口上增加监督服务适配，并验证实际 stream/取消/关闭语义；不重做已通过的 Node 路径。
+固定接口：`ManagedChildHandle` 只暴露各调用方真正使用的 stdin/stdout/stderr、exit/error 事件、原始 root PID、取消请求和关闭等待。剩余改造在同一接口上接入普通受管执行，并验证实际 stream/取消/关闭语义；不重做已通过的 Node 路径。
 
-Claude 的同步 spawn 回调可以先返回有界 stream facade，异步完成 prepare/commit/release；在 release 前不得向负载交付 stdin。准备失败必须发 error，不能伪造 PID、成功 spawn 或正常 exit。stderr 末尾、EOF、abort、背压和 SDK 关闭顺序必须有真实回归。
+Claude 的同步 spawn 回调复用 Node ManagedChildHandle facade：先提交 launching，再实际 spawn 并保存原 PID/观察；返回 facade 后才由 SDK 交付 stdin。普通模式不声称有内核级启动屏障；spawn 到身份持久化之间崩溃时保留 launching/unknown。准备失败必须发 error，不能伪造 PID、成功 spawn 或正常 exit。stderr、EOF、abort、背压和 SDK 关闭顺序分别回归。
 
 ### 5.2 托管 Git 的统一入口
 
@@ -197,7 +132,7 @@ Claude 的同步 spawn 回调可以先返回有界 stream facade，异步完成 
 | Checkpoint/对象读取 | `HostCheckpointGitRunRequest` | 冻结最终请求、checkout 身份、capture/operation 绑定和内容预算 |
 | Worktree/Restore 变更 | WorktreeExecutionContext / Restore step | 精确步骤、原始/后继 attempt、checkout lease 和必要 repository 元数据锁 |
 
-统一执行顺序：输入校验 → 实际路径/二进制/策略校验 → 持久 launching → 受控启动和原始身份提交 → 放行 → 有界输出 → 原停止证据 → 提交结果。每个 helper 也属于生产进程，不能因“只是 git --version”而跳过记录。
+统一执行顺序：输入校验 → 实际路径/二进制/策略校验 → 持久 launching → Node spawn 与原 PID/观察持久化 → 有界输出 → 所选合同的停止记录 → 提交结果。每个 helper 也属于生产进程，不能因“只是 git --version”而跳过记录。
 
 `RawWorktreeGit`、`ControlledRestore.verifyRepository/objectGit` 和旧 `GitService` 的生产端口已要求注入 runner；确定性 fixture 可保留显式 raw 实现。下一步由中央组合提供真实 runner，并复核 `SessionRegistry.gitStatus/gitDiff` 等全部调用方。生产构造器缺 runner 时继续拒绝，不能静默走测试 fallback。
 
@@ -207,7 +142,7 @@ Claude 的同步 spawn 回调可以先返回有界 stream facade，异步完成 
 
 ### 5.3 首版进程驻留策略
 
-为使停止证明与 checkout 放行一致，首版将实际 Provider 进程树归属到单个 Turn attempt。业务终态后关闭该 attempt 的 Provider/工具后代，再捕获 after checkpoint；下一 Turn 使用持久 NativeHandle 按需重启并续接对话。Claude Query 和 Codex app-server 都必须验证这一进程边界；不能将常驻 Codex peer 的 ready/idle 当成全部后代停止。
+为使停止证明与 checkout 放行一致，首版将实际 Provider 进程树归属到单个 Turn attempt。业务终态后关闭该 attempt 的受管 Provider/工具进程组，核对已登记生产者，再捕获 after checkpoint；下一 Turn 使用持久 NativeHandle 按需重启并续接对话。Claude Query 和 Codex app-server 都必须验证这一进程边界；不能将常驻 Codex peer 的 ready/idle 当成全部后代停止。
 
 任务启动的后台进程随该 attempt 关闭，长期开发服务不在首版后台保留范围内。Session runtime 可以保留轻量控制对象和历史绑定，不保留仍能写 checkout 的闲置负载。版本/历史查询和 Revert 各有独立受控 attempt。验收必须包含跨进程重启后的对话连续性，而不能只验证同一 app-server 内连发消息。
 
@@ -235,7 +170,7 @@ rtk proxy node apps/mvp-host/dist/main.js activation inspect <operationId>
 
 | 证据 | 内容 | 可以证明 | 不能证明 |
 | --- | --- | --- | --- |
-| 平台后端证据 | 当前 OS/kernel、监督器身份、策略和停止契约 | 当前后端满足已验证契约 | 某一次原始 launch 已停止 |
+| 平台后端证据 | 当前 OS/kernel、运行后端身份、策略和停止契约 | 当前后端满足已验证契约 | 某一次原始 launch 已停止 |
 | Provider 兼容证据 | 实际 executable/SDK/adapter/runtime/Node、场景结果 | 该版本组合支持已测试能力 | 任意版本、当前 checkout 或未知原尝试可放行 |
 | 当前资源激活 | canonical checkout、配置/策略版本、已验证版本引用 | 当前资源满足开始新命令条件 | 恢复或备份 restore gate 已解除 |
 
@@ -268,7 +203,7 @@ rtk proxy node apps/mvp-host/dist/main.js activation inspect <operationId>
 
 1. 验证 owner、原始未决生产者、restore gate；任何未解决的原始写入都保留阻塞。
 2. 通过托管 query 验证 canonicalRoot、checkoutRoot、git common dir 和目录身份；检查私有目录不重叠。
-3. 验证实际 Provider executable、SDK、adapter、配置指纹和后台监督契约，匹配真实兼容产物。
+3. 验证实际 Provider executable、SDK、adapter、配置指纹和受管执行契约，匹配真实兼容产物。
 4. 在一次短 SQL 事务中，CAS 校验资源版本并更新工作区/Provider readiness，记录激活证据 ID。
 5. 启动时重查资源绑定、二进制/配置/策略摘要、证据有效期与后端 readiness。匹配则加载当前就绪状态；不匹配只读启动并展示原因。
 
@@ -307,7 +242,7 @@ rtk proxy node apps/mvp-host/dist/main.js activation inspect <operationId>
 3. 等待已受理控制/恢复及允许完成的步骤；限定 deadline。
 4. 提交明确结果或 unknown，保留未停止资源所有权。
 5. 同步封闭 runtime/driver/Views/设备/传输的迟到 callback；这一步不依赖 drain 成功。
-6. 关闭连接与 Store。独立监督服务继续保留原始未决 launch 证据。
+6. 关闭连接与 Store。原始未决 launch 继续保留在私有 journal 中，未取得停止记录时保持 unknown。
 
 `HostWorktrees.seal()` 已改为幂等的同步 callback fence；不因 running/calls 未清空而在封闭前抛错。它不宣称 producerStopped，也不释放 lease。原始拒绝/未知结果应在关库前记录，关库后回调只结束本地 Promise，不写 SQL 或发布事件。
 
@@ -562,7 +497,7 @@ CREATE TABLE host_execution_operations (
 
 Workspace/Provider verification 记录已增加 `activation_operation_id TEXT`、`activation_binding_digest TEXT`、`readiness_revision INTEGER NOT NULL DEFAULT 0`；前两者允许 NULL，引用管理操作表并在同一事务内维护，旧行默认为未验证。Provider 的现有 verification JSON 保留能力/版本事实，不承载伪造的实时停止证明。上述列与 validator 已在 011 安装。
 
-ProcessIdentity/NativeBoundaryProof 后续使用版本化 JSON 增加 macOS supervisor 变体，原始 birth 节点不可改写；exec 变化写监督服务的独立观察，Host 只保留可验证引用。Native rewind 锚点优先写已有 NativeHandle/Checkpoint 元数据。011 已合入，后续确需增加专用列时使用下一个中央迁移（当前为 012），不能回改 011 期待已迁移的库重新安装。
+ProcessIdentity/NativeBoundaryProof 使用版本化 JSON 增加普通 macOS 合同与停止观察，原始 birth/launch 节点不可改写；旧记录不自动升级。Native rewind 锚点优先写已有 NativeHandle/Checkpoint 元数据。011 已合入，后续确需增加专用列时使用下一个中央迁移（当前为 012），不能回改 011 期待已迁移的库重新安装。
 
 旧 macOS unknown 记录不能因支持新变体而升级。没有记录的原生边界保持 legacy/inexact。迁移覆盖冻结 v10、空库和重新打开；旧程序看到 v11 必须拒绝写。回滚采用匹配的旧构建加迁移前备份，并重新执行外部状态复核，不自动 down migration。
 
@@ -572,7 +507,7 @@ ProcessIdentity/NativeBoundaryProof 后续使用版本化 JSON 增加 macOS supe
 
 按顺序修改现有 `createHostApplication`，不引入另一套 application factory：
 
-1. 在资源 owner 获取前准备可选的 macOS ProcessInspector/监督客户端；没有服务仍可走明确只读路径。
+1. 资源 owner/SQL 历史路径不启动 ps/sysctl 或 Provider。普通 launch 按需观察 macOS 身份并准备已验证边界；后端不可用时保留明确只读路径。
 2. owner/Store/identity 建立后，构造受控 runner 与激活证据读取器。
 3. SQL Catalog 登记身份并加载有效激活状态；过期或变更资源保持未验证。
 4. 构造 DeviceRegistry、Views、Interaction、Recovery；注入可信 manifest、原始 launch 检查和 NativeHistoryReader。
@@ -601,7 +536,7 @@ ProcessIdentity/NativeBoundaryProof 后续使用版本化 JSON 增加 macOS supe
 
 | 批次 | 范围 | 依赖 | 退出条件 |
 | --- | --- | --- | --- |
-| C0 | macOS Supervisor 最小原型与停止闭包验证 | entitlement/签名/目标 Mac | 第 4.6 节通过；否则明确阻塞 macOS 执行交付 |
+| C0 | 普通 macOS 受管启动、清理与未知边界 | 目标 Mac / 已安装 Provider | 第 4 节与普通执行专题验收通过；不依赖 ES 权限 |
 | C1 | 进程窄接口、原始证据变体、v11 基础 | C0 契约冻结 | Claude/Codex/helper 均无伪造 ChildProcess；原 launch 不可替换 |
 | C2 | 托管 query/Git/helper runner | C1 | 实际 Git 查询、异常输出/期限/停止证据与关库回归通过 |
 | C3 | 双 Provider 验证、兼容 recorder、显式激活 | C2 | 实际版本产物可追溯，启动加载与失效正确，真实任务可开始 |
@@ -645,7 +580,7 @@ C4 的纯 UI、C5 的 Diff 展示、C7 的 Session 管理和关闭修复可独�
 | A12 | Git/helper 超时且关库 deadline 到达 | 先停止再 drain；迟到 callback 无 SQL/发布；未知仍保留 |
 | A13 | 页面刷新、离线、Host/Session 快速切换 | 草稿保留、旧响应不覆盖、原 commandId 核对 |
 | A14 | 手机 Wi-Fi/蜂窝切换、后台 30 秒/5 分钟、杀进程重开 | 重新认证同步；没有重复任务或旧审批执行 |
-| A15 | 当前 macOS 版本的逃逸后代与事件丢失 | 只有满足 C0 契约才 stopped；错误时保留 owner/lease |
+| A15 | 当前 macOS 版本的进程组清理、异常与逃逸范围反例 | 只有满足 C0 契约才 stopped；错误时保留 owner/lease |
 
 首版真实矩阵每个 Provider 至少覆盖：10 次普通任务、10 次审批（包含拒绝）、10 次中断、3 次恢复与 3 次实际成功的完整回退；次数是验收目标，不是目前结果。Question 与 unsupported 分支单独记录，unsupported 不能计作该 Provider 完整回退已交付。所有原始调用使用隔离 fixture 和事先授权的认证，不在一般 CI 中开启付费 Provider。
 
@@ -658,13 +593,13 @@ C4 的纯 UI、C5 的 Diff 展示、C7 的 Session 管理和关闭修复可独�
 - 活跃任务初始并发 2；验证控制命令不被长任务占住，记录受理和交付延迟 P50/P95，不把模型响应耗时计入控制延迟。
 - 对锁定的中型 fixture 仓库记录 Checkpoint 时延、CPU、内存与磁盘增长；超预算明确 unavailable，不返回 clean。
 - 测试按文件串行执行有真实 Git/进程的套件。复杂 Git 场景可以有 30 秒测试总期限；产品 helper/关闭期限保持各自的明确预算。
-- 以事件屏障和 drain 同步；测试总期限必须覆盖动作与清理。即使超时，清理也先封闭回调并停止本用例持有的进程，不按名称杀进程或删除未知 owner 锁。
+- 以原生终态、退出观察和 drain 同步；测试总期限必须覆盖动作与清理。即使超时，清理也先封闭回调并停止本用例持有的进程，不按名称杀进程或删除未知 owner 锁。
 
 ### 16.4 发布门槛
 
-完成定义：C0–C8 的退出条件均满足，尤其包括目标 macOS 上真实双 Provider 和物理手机。交付清单包含精确构建/依赖/OS/监督器版本、兼容证据、原始 launch/停止证明摘要、主入口验收、回退/备份恢复演练和剩余限制。
+完成定义：C0–C8 的退出条件均满足，尤其包括目标 macOS 上真实双 Provider 和物理手机。交付清单包含精确构建/依赖/OS/执行契约版本、兼容证据、原始 launch/停止证明摘要、主入口验收、回退/备份恢复演练和剩余限制。
 
-最小运行手册覆盖：安装必要监督组件并核对其身份/权限、验证和激活、启动/停止 Host、配对手机、处理 unknown、备份恢复及升级失败回退。权限安装和真实 Provider 调用是将来实施阶段的显式本地操作，本方案没有安装服务、修改系统权限或发起真实模型请求。
+最小运行手册覆盖：检查本机 Node/Provider、私有目录边界与普通执行合同、验证和激活、启动/停止 Host、配对手机、处理 unknown、备份恢复及升级失败回退。权限安装和真实 Provider 调用是将来实施阶段的显式本地操作，本方案没有安装服务、修改系统权限或发起真实模型请求。
 
 ## 17. 参考代码与采用边界
 

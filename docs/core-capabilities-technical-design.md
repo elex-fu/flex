@@ -1,12 +1,12 @@
 # Flyx 核心能力交付技术方案
 
-> 版本：v1.3（普通 macOS 受管执行）
+> 版本：v1.3.1（普通 macOS 受管执行）
 > 日期：2026-10-24（Asia/Shanghai）；初版：2026-10-18
 > 状态：**开发已于 2026-10-24 按用户要求暂停**。普通 macOS 平台/适配器阶段已取得实机正向结果；最终固定源码全量回归被暂停中断，生产产物/激活与真实恢复/回退仍待验收，检查点和恢复顺序见实施计划顶部。
-> 本轮起点：Flyx `003faa3`；历史实现基线：`1108bed`；原分析基线：`c11e08d`；参考快照：Paseo `710851ccb`、T3 Code `4ba4871af`
+> 本轮起点：Flyx `003faa3`；本轮改动已全部提交入库并推送（`4af1af5` → `b60852c` → `0bbc950` → `0345f83`，`main` 与 `codex/flyx-optimization` 同点，工作区干净）；历史实现基线：`1108bed`；原分析基线：`c11e08d`；参考快照：Paseo `710851ccb`、T3 Code `4ba4871af`
 > 用户已明确：首版必须支持 macOS 本机执行，不能以 Linux Host 替代交付。
 
-本文负责上一轮差距分析后的**剩余核心交付**，作为接下来实施和验收的依据。[原对照方案](./paseo-t3code-comparison-and-optimization-technical-design.md)保留架构背景，[原实施记录](./flyx-optimization-implementation-plan.md)保留 R01–R18 的历史结果。当前进度、剩余任务 R0–R9 的文件范围、实现步骤和证据见[核心实施计划](./core-capabilities-implementation-plan.md)。本文规定最终契约；仅进度表明确确认的范围属于已实施，候选平台机制与剩余接线不因写入方案而视为完成。
+本文负责上一轮差距分析后的**剩余核心交付**，作为接下来实施和验收的依据。[原对照方案](./paseo-t3code-comparison-and-optimization-technical-design.md)保留架构背景，[原实施记录](./flyx-optimization-implementation-plan.md)保留 R01–R18 的历史结果。当前进度（M0–M3 已实机通过、G0 未完成）、剩余任务 G0/M4/R4/R6/R9 的文件范围、实现步骤和证据见[核心实施计划](./core-capabilities-implementation-plan.md)顶部暂停检查点。本文规定最终契约；仅进度表明确确认的范围属于已实施，候选平台机制与剩余接线不因写入方案而视为完成。
 
 ## 1. 交付目标与范围
 
@@ -27,15 +27,15 @@
 
 ## 2. 已有基础与确定缺口
 
-2026-10-24 更新：普通 backend、生产启动与双 Provider 适配器实测已通过；停止范围与恢复契约见第 4 节，当前剩余实现步骤见实施计划顶部。本节下表保留历史对照：左两列描述 `1108bed` 基线；右列为 2026-10-23 的逐模块对照结论（详见[实施计划](./core-capabilities-implementation-plan.md) §2–§3、§7 末条）。工作区实现与独立验证持续记录在实施计划 §7，不以基线缺口推断工作区仍完全未实现，也不以新增文件推断已通过生产验收；"已接线"指组合代码存在于生产模块并有定向测试。
+2026-10-24 更新：普通 backend、生产启动与双 Provider 适配器实测已通过，并已提交入库（`0345f83`，见[阶段验收](./analysis/2026-10-24-macos-managed-execution-acceptance.md)）；停止范围与恢复契约见第 4 节，当前剩余实现步骤与恢复顺序（G0 → M4 → R4 → R6 → R9）见实施计划顶部。本节下表保留历史对照：左两列描述 `1108bed` 基线；中列为 2026-10-23 的逐模块对照结论（详见[实施计划](./core-capabilities-implementation-plan.md) §2–§3、§7 末条），该批改动连同 2026-10-24 macOS 批次均已提交。工作区实现与独立验证持续记录在实施计划 §7，不以基线缺口推断工作区仍完全未实现，也不以新增文件推断已通过生产验收；"已接线"指组合代码存在于生产模块并有定向测试，"实机验收通过"仅限实施计划顶部明确登记的 M0–M3 事项。
 
-| 范围 | 当前源码事实（`1108bed` 基线） | 工作区进展（2026-10-23 对照；未提交） |
+| 范围 | 当前源码事实（`1108bed` 基线） | 工作区进展（2026-10-23 对照；连同 macOS 批次已于 2026-10-24 提交 `0345f83`） |
 | --- | --- | --- |
 | 生产组合 | 已有 Catalog/Views/Interaction/Recovery 等；新增 ActivationLoad、doctor 与 readiness RPC，未构造 HostCheckpoints/HostWorktrees/Scheduler | 强制准入、执行器、Checkpoint/Revert/Worktree/permit/元数据锁中央绑定已在 host-application 接线并有组合级测试（checkpoint port 为首个 domain port）；默认 main 不注入受信 execution 端口，保持 fail-closed |
 | 启动/激活 | SQL 历史启动不加载 Provider；维护 CLI、v11 收据与激活加载/失效已实现 | 在线用途 gate 已实现（组合层 `assertNativeReady` 拆分，`restoreWriteReady` 收紧）；实际 supervision/runtime 事实与兼容产物闭环仍缺 |
-| 托管查询 | `prepare/execute` 已支持注入 executor；生产 main/Host 未注入，默认仍拒绝 | `ManagedWorkspaceQueryExecutor` 已实现并按 runner 注入；生产 backend 构造等待 R0 |
-| 进程/Git | 窄句柄、原始记录与受控 runner 已有模块验证；生产 supervisor 分支仍限定 Linux | 每 Turn 停止/续接、全局停止端口、共享关闭 deadline 已接线；mutating Git 套 repository 元数据锁；macOS backend 仍缺 |
-| macOS | 私有目录隔离已测试；全部后代停止、稳定身份绑定尚未成立 | 无新增证明，仍为首要阻塞（R0/C0） |
+| 托管查询 | `prepare/execute` 已支持注入 executor；生产 main/Host 未注入，默认仍拒绝 | `ManagedWorkspaceQueryExecutor` 已实现并按 runner 注入；macOS 受管进程组 backend 已接线，生产 main 的在线查询与维护查询统一构造可信端口（M1 实机验收） |
+| 进程/Git | 窄句柄、原始记录与受控 runner 已有模块验证；生产 supervisor 分支仍限定 Linux | 每 Turn 停止/续接、全局停止端口、共享关闭 deadline 已接线；mutating Git 套 repository 元数据锁；普通 macOS backend 已实机验收（M0/M3） |
+| macOS | 私有目录隔离已测试；全部后代停止、稳定身份绑定尚未成立 | 普通受管执行实机验收通过（进程组清理、双 Provider 真实任务/中断/跨进程续接 2/2）；`treeStopped=false` 诚实标记，ES 强监督后置为可选增强，不再是 C0 门槛 |
 | 会话 | Catalog、V2 RPC、独立事件、延迟加载、公开 SessionClient 已有 | Web 新建/命名/归档/关闭运行时与资源选择已接（CoreControls/四面板+真实 Host E2E）；并行状态展示待验收 |
 | 恢复 | inspect/reconcile/acknowledge、CLI 和 SDK 已有 | `NativeHistoryReaderFactory` 已注入 CatalogRecovery、restore inspect/confirm CLI 已注册；生产 manifest 恒 unknown、真实外部检查器占位；Web/手机 Recovery 面板已接 |
 | Worktree | journal/typed client 已有，调度器与关闭 fence 模块已验证 | 任务 permit（首版 2）、共享 common-dir 元数据锁、scheduler SQL 扫描修复与中央接线、归档/恢复互斥已实现；生产启用与真并行验收待 runner 注入 |
@@ -116,7 +116,7 @@ C0 改为目标 Mac 上受管启动、私有目录保护、进程组清理、超
 
 复用 `ManagedProcessRegistry`、`SqliteProcessJournal`、`HostManagedRuntime` 和原始 DispatchContext。复用 Node 启动适配，在这些对象中新增普通进程组停止契约。Linux 实现保留原路径；首版验收仍必须包含 macOS。
 
-原先 `ProviderExecutionBoundary.spawn()` 与 stdio client 依赖 Node `ChildProcess`；当前已改为 `ManagedChildHandle`，Claude SDK 通过锁定 facade 满足 `SpawnedProcess`。Node 适配已验证，普通 macOS 契约与生产接线正在实施，不能用类型断言把 IPC 句柄伪装成原生 ChildProcess。
+原先 `ProviderExecutionBoundary.spawn()` 与 stdio client 依赖 Node `ChildProcess`；当前已改为 `ManagedChildHandle`，Claude SDK 通过锁定 facade 满足 `SpawnedProcess`。Node 适配已验证，普通 macOS 契约与生产接线已实施并通过实机验收（M0–M3，见[阶段验收](./analysis/2026-10-24-macos-managed-execution-acceptance.md)）；不能用类型断言把 IPC 句柄伪装成原生 ChildProcess。
 
 固定接口：`ManagedChildHandle` 只暴露各调用方真正使用的 stdin/stdout/stderr、exit/error 事件、原始 root PID、取消请求和关闭等待。剩余改造在同一接口上接入普通受管执行，并验证实际 stream/取消/关闭语义；不重做已通过的 Node 路径。
 
@@ -124,7 +124,7 @@ Claude 的同步 spawn 回调复用 Node ManagedChildHandle facade：先提交 l
 
 ### 5.2 托管 Git 的统一入口
 
-已新增 `lifecycle/managed-git-runner.ts`，适配以下三类用途并保留各自 allowlist；剩余交付为 macOS backend 与中央实际注入：
+已新增 `lifecycle/managed-git-runner.ts`，适配以下三类用途并保留各自 allowlist；macOS backend 与生产 main 的中央注入已完成（M1：在线查询与维护查询统一构造可信端口），剩余交付为真实恢复/回退场景的消费端实测复核（R4/R6）：
 
 | 用途 | 现有输入 | 权限和资源 |
 | --- | --- | --- |
@@ -134,7 +134,7 @@ Claude 的同步 spawn 回调复用 Node ManagedChildHandle facade：先提交 l
 
 统一执行顺序：输入校验 → 实际路径/二进制/策略校验 → 持久 launching → Node spawn 与原 PID/观察持久化 → 有界输出 → 所选合同的停止记录 → 提交结果。每个 helper 也属于生产进程，不能因“只是 git --version”而跳过记录。
 
-`RawWorktreeGit`、`ControlledRestore.verifyRepository/objectGit` 和旧 `GitService` 的生产端口已要求注入 runner；确定性 fixture 可保留显式 raw 实现。下一步由中央组合提供真实 runner，并复核 `SessionRegistry.gitStatus/gitDiff` 等全部调用方。生产构造器缺 runner 时继续拒绝，不能静默走测试 fallback。
+`RawWorktreeGit`、`ControlledRestore.verifyRepository/objectGit` 和旧 `GitService` 的生产端口已要求注入 runner；确定性 fixture 可保留显式 raw 实现。中央组合的注入已在生产 main 完成（M1）；`SessionRegistry.gitStatus/gitDiff` 等剩余调用方复核与真实恢复检查随 G0/R4 推进。生产构造器缺 runner 时继续拒绝，不能静默走测试 fallback。
 
 最终 argv/env/cwd、stdin 摘要、执行预算和 DispatchContext 必须在派发前固定。禁用用户 Git hooks、fsmonitor、external diff/textconv、隐式网络取对象及继承的 Git 配置；工作区查询和变更使用不同策略，不能复用一个无限制 shell runner。
 
@@ -546,7 +546,7 @@ ProcessIdentity/NativeBoundaryProof 使用版本化 JSON 增加普通 macOS 合�
 | C7 | Worktree 实际组合、关闭修复、Session 管理 | C2/C3 | 两个独立 checkout 真并行；同 checkout 互斥；归档/恢复正确 |
 | C8 | 当前 main 的 Web/Relay/手机最小验收 | C4–C7 | 第 16 节实际生产路径和物理手机用例通过 |
 
-C4 的纯 UI、C5 的 Diff 展示、C7 的 Session 管理和关闭修复可独立开发；C1/C2 的窄接口与确定性模块也已先行验证，但其 macOS 后端仍依赖 C0。表中依赖约束的是完整交付，不能用先行模块结果越过平台门槛。不按未验证的原型给出首版发布日期；当前进度与后续实施顺序以实施计划 §2–§4 为准。
+C4 的纯 UI、C5 的 Diff 展示、C7 的 Session 管理和关闭修复可独立开发；C1/C2 的窄接口与确定性模块也已先行验证，但其 macOS 后端仍依赖 C0。表中依赖约束的是完整交付，不能用先行模块结果越过平台门槛。不按未验证的原型给出首版发布日期；当前进度（M0–M3 已实机通过、G0 未完成）与恢复开发后的顺序（G0 → M4 → R4 → R6 → R9）以[实施计划](./core-capabilities-implementation-plan.md)顶部暂停检查点为准。
 
 ## 16. 验证矩阵与完成标准
 

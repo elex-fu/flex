@@ -1,9 +1,10 @@
-import { useEffect, useMemo, useState } from "react";
-import { CoreControls, type CoreControlState } from "@flyx/client-core";
+import { useEffect, useState } from "react";
+import type { CoreControlState } from "@flyx/client-core";
 import type { useHost } from "./use-host.js";
 
 export function useCoreControls(host: ReturnType<typeof useHost>) {
-  const controls = useMemo(() => new CoreControls(host.client), [host.client]);
+  // The Host hook owns the single CoreControls instance so every Web surface (panels, unified interrupt) shares one selection fence and Outbox view.
+  const controls = host.controls;
   const [observed, setObserved] = useState(() => ({ controls, state: controls.getState() }));
   useEffect(() => controls.observe((state) => setObserved({ controls, state })), [controls]);
   useEffect(() => {

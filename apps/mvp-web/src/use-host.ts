@@ -1,5 +1,5 @@
-import { useCallback, useEffect, useRef, useState } from "react";
-import { type ClientState, type HostProfile, type PendingCommand, type SessionReplicaState } from "@flyx/client-core";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { CoreControls, type ClientState, type FlyxClient, type HostProfile, type PendingCommand, type SessionReplicaState } from "@flyx/client-core";
 import { INTERACTION_CAPABILITY, InteractionListResponseSchema, InteractionResponseSchema, InteractionSchema, type Bootstrap, type Interaction, type InteractionRespondApprovalRequest, type InteractionResponse, type QuestionRespondRequest, type SessionEvent, type TimelineItem } from "@flyx/mvp-protocol";
 import { canonicalTimelineItem } from "./canonical-timeline.js";
 import { WebDraftController } from "./draft-controller.js";
@@ -19,6 +19,24 @@ type InteractionView = { interactions: Interaction[]; hasMore: boolean; sourceRe
 type LocalForgetState = { status: "idle" | "removing" | "removed" | "failed"; label?: string; error?: string };
 type RemoteRevokeState = { status: "idle" | "sending" | "acknowledged" | "unknown"; error?: string };
 function errorMessage(cause: unknown): string { return cause instanceof Error ? cause.message : "操作失败，请检查连接后重试"; }
+/**
+ * Unified Web interrupt. Catalog Hosts on the canonical projection go through CoreControls, which adds
+ * selection/generation fencing, the authoritative snapshot's expectedRevision, and Outbox duplicate review.
+ * Legacy fallback: CoreControls.interrupt requires the negotiated Session catalog and a typed snapshot;
+ * Hosts without it (or still on the legacy projection, where no typed snapshot exists) keep the previous
+ * raw command path with identical payload semantics.
+ */
+export async function webInterrupt(client: FlyxClient, controls: CoreControls, sessionId: string | undefined): Promise<unknown> {
+  const catalog = client.getNegotiatedHello()?.capabilities.includes(WEB_SESSION_CATALOG_CAPABILITY) ?? false;
+  if (catalog && client.getProjectionMode() === "canonical") {
+    const before = controls.getState().error;
+    await controls.interrupt();
+    const error = controls.getState().error;
+    if (error && error !== before) throw new Error(error);
+    return undefined;
+  }
+  return client.command("session.interrupt", catalog && sessionId ? { sessionId } : {});
+}
 export function connectionLabel(state: ClientState): string {
   if (state.error?.code === "DEVICE_REVOKED" || state.error?.code === "REVOKED") return "设备已撤销";
   if (state.pairingRequired) return "未配对";
@@ -54,6 +72,8 @@ export function useHost(runtimes: WebHostRuntimes = getWebHostRuntimes()) {
   const lifecycleRef = useRef(0), metadataGenerationRef = useRef<number | undefined>(undefined), replicaGenerationRef = useRef<number | undefined>(undefined);
   const resolvedContentRef = useRef(new Map<string, unknown>());
   const [fence] = useState(() => new WebSelectionFence());
+  // Single CoreControls instance per runtime; use-core-controls and the unified interrupt path share it.
+  const controls = useMemo(() => new CoreControls(client), [client]);
   const [drafts] = useState(() => new WebDraftController());
   const [draft, setDraft] = useState(() => drafts.getState());
   const [diffLoader] = useState(() => new SelectedWebLoader<WebWorkspaceDiff>(fence));
@@ -245,7 +265,7 @@ export function useHost(runtimes: WebHostRuntimes = getWebHostRuntimes()) {
     if (!value || !sessionId) throw new Error("DIFF_REFERENCE_UNAVAILABLE");
     return expandWorkspaceDiff(value,async (reference) => new TextDecoder("utf-8",{fatal:true}).decode(await client.readContent(reference,sessionId)));
   }), [client,diffLoader]);
-  const interrupt = useCallback(() => run(() => client.command("session.interrupt",client.getNegotiatedHello()?.capabilities.includes(WEB_SESSION_CATALOG_CAPABILITY) && sessionIdRef.current ? {sessionId:sessionIdRef.current} : {})), [client,run]);
+  const interrupt = useCallback(() => run(() => webInterrupt(client, controls, sessionIdRef.current)), [run, client, controls]);
   const respondInteraction = useCallback(async (method:string,request:InteractionRespondApprovalRequest | QuestionRespondRequest): Promise<InteractionResponse> => {
     if (request.sessionId !== sessionIdRef.current) throw new Error("INTERACTION_SELECTION_CHANGED");
     const response = InteractionResponseSchema.parse(await client.command(method,request));
@@ -256,7 +276,7 @@ export function useHost(runtimes: WebHostRuntimes = getWebHostRuntimes()) {
   const typedInteractionsAvailable = client.getProjectionMode() === "canonical" && Boolean(client.getNegotiatedHello()?.capabilities.includes(INTERACTION_CAPABILITY));
   const online = connection.connection === "online";
   const ready = online && connection.sync === "synced" && Boolean(selectedSessionId) && (client.getProjectionMode() === "legacy" || replicaState?.interactionsAuthoritative === true && !replicaState.stale);
-  return { client,connection,bootstrap,snapshot,items,hostStatus,profiles,pendingCommands,error,cacheError,replicaState,selectedSessionId,sessions,deviceScopes,draft,drafts,
+  return { client,controls,connection,bootstrap,snapshot,items,hostStatus,profiles,pendingCommands,error,cacheError,replicaState,selectedSessionId,sessions,deviceScopes,draft,drafts,
     status:connectionLabel(connection),online,ready,readOnly:!ready,typedInteractionsAvailable,
     pair,selectHost,selectSession,loadMoreSessions,nextSessionId,sendPrompt,queryCommandReceipt,sendSavedCommand,forgetLocalHost,forgetState,revokeRemoteSelf,remoteRevokeState,interrupt,
     loadItemContent,itemLoads,diffState,loadDiff,loadDiffReference,interactionState,refreshInteractions,

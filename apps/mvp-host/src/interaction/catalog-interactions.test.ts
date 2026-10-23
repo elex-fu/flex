@@ -332,10 +332,10 @@ describe("Catalog interaction bindings", () => {
     expect(() => f.bindings.runtimeOptions({ ...context, session: { ...context.session, providerInstanceId: "foreign" } })).toThrow("INTERACTION_RUNTIME_BINDING_INVALID");
     const options = f.bindings.runtimeOptions(context);
     expect(f.bindings.runtimeOptions(context)).toBe(options);
-    f.store.db.prepare("INSERT INTO schema_migrations(version,applied_at) VALUES(12,?)").run(new Date().toISOString());
+    f.store.db.prepare("INSERT INTO schema_migrations(version,applied_at) VALUES(13,?)").run(new Date().toISOString());
     expect(f.bindings.interactionCapabilities()).toEqual([]);
     expect(() => createCatalogInteractionBindings({ catalog: f.catalog, assertAdmission: () => { } })).toThrow();
-    f.store.db.prepare("DELETE FROM schema_migrations WHERE version=12").run();
+    f.store.db.prepare("DELETE FROM schema_migrations WHERE version=13").run();
     expect(f.runtimeFactory).not.toHaveBeenCalled();
   });
 });

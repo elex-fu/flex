@@ -40,6 +40,12 @@ import { createManagedScheduledHostWorktrees } from "./workspace/managed-host-wo
 import { createManagedRepositoryMetadata } from "./workspace/managed-repository-metadata.js";
 import { NativeHistoryReaderFactory } from "./provider/native-history-reader.js";
 import { createNativeHistoryManifestSource } from "./provider/native-history-manifest.js";
+import type { DispatchContext } from "./provider/types.js";
+import { GitService } from "./git/git-service.js";
+import { NativeTerminalReceiptStore } from "./storage/native-receipt-store.js";
+import type { RecoveryTarget } from "./storage/recovery-store.js";
+import type { CatalogRecoveryIdentity, ExistingCatalogRecoveryReader } from "./session/catalog-recovery.js";
+import { homedir } from "node:os";
 
 export type HostApplicationOptions = Pick<HostCatalogOptions, "configuration" | "initialLegacySession"> & {
   store: SqliteStore;
@@ -299,6 +305,16 @@ export async function createHostApplication(options: HostApplicationOptions) {
     lifecycle.registerService({ drain: (deadline) => checkpointBindings!.checkpoints.drain(Math.max(0, deadline - Date.now())), seal: () => checkpointBindings!.checkpoints.seal() });
     interactions = createCatalogInteractionBindings({ catalog: runningCatalog, assertAdmission });
     const runningInteractions = interactions;
+    // Design §8.2 trusted manifest source: shared by the Native read factory
+    // (handle-level, with transcript contract) and recovery admission
+    // (instance-level, no contract implied).
+    const manifestSource = createNativeHistoryManifestSource({
+      compatibilityEvidencePath, compatibilityTrust: activationTrust,
+      ...(options.execution?.facts?.supervision ? { supervision: options.execution.facts.supervision } : {}),
+      ...(options.execution?.facts?.runtime ? { runtime: options.execution.facts.runtime } : {}),
+      resolveProvider: (providerInstanceId) => runningCatalog.catalog.provider(providerInstanceId),
+    });
+    const nativeReceipts = new NativeTerminalReceiptStore(store.db);
     const nativeHistoryReaderFactory = options.execution?.recovery?.nativeHistoryReaderFactory ?? new NativeHistoryReaderFactory({
       assertBinding: (handle, checkoutRoot) => {
         owner.assertActive();
@@ -310,15 +326,59 @@ export async function createHostApplication(options: HostApplicationOptions) {
       // The manifest exists only when the signed compatibility artifact that
       // verified the turn baseline also verified a read-only recovery
       // inspection and still matches the live provider instance facts.
-      ...createNativeHistoryManifestSource({
-        compatibilityEvidencePath, compatibilityTrust: activationTrust,
-        ...(options.execution?.facts?.supervision ? { supervision: options.execution.facts.supervision } : {}),
-        ...(options.execution?.facts?.runtime ? { runtime: options.execution.facts.runtime } : {}),
-        resolveProvider: (providerInstanceId) => runningCatalog.catalog.provider(providerInstanceId),
-      }),
+      verifiedManifestForHandle: (handle) => manifestSource.verifiedManifestForHandle(handle),
+      // The production Claude transcript source is anchored only by the
+      // durable native result receipt journaled at SDK arrival time (table
+      // native_terminal_receipts); without that anchor the read stays unknown.
+      claudeTranscript: async (handle) => {
+        if (handle.provider !== "claude") return undefined;
+        owner.assertActive();
+        const receipt = nativeReceipts.find(handle.sessionId, handle.turnId, handle.attemptId);
+        if (!receipt || receipt.provider !== "claude" || receipt.nativeSessionId !== handle.nativeSessionId) return undefined;
+        const configRoot = process.env.CLAUDE_CONFIG_DIR ?? join(homedir(), ".claude");
+        const transcriptPath = join(configRoot, "projects", handle.workspacePath.split("/").join("-"), `${receipt.nativeSessionId}.jsonl`);
+        return Object.freeze({
+          path: transcriptPath, format: "claude-sdk-result-v1" as const, runtimeVersion: handle.verifiedVersion,
+          sessionId: handle.sessionId, providerInstanceId: handle.providerInstanceId, configurationFingerprint: handle.configurationFingerprint,
+          anchor: {
+            contextDigest: receipt.contextDigest, resultUuid: receipt.resultUuid, resultDigest: receipt.resultDigest,
+            ...(receipt.interruptAcknowledged ? { interruptAcknowledged: true as const } : {}),
+          },
+        });
+      },
     });
     recovery = createCatalogRecoveryBindings({ catalog: runningCatalog,
       ...options.execution?.recovery,
+      ...(options.execution?.recovery?.verifiedManifestForInstance ? {} : { verifiedManifestForInstance: (identity: CatalogRecoveryIdentity) => manifestSource.verifiedManifestForInstance(identity.provider, identity.providerInstanceId) }),
+      // The production existing-connection reader selects the loaded Session's
+      // live Codex connection only; absence stays unknown and it never
+      // reconnects, resumes or starts a provider (design §8.2).
+      ...(options.execution?.recovery?.existingCodexReader ? {} : { existingCodexReader: (identity: CatalogRecoveryIdentity, original: DispatchContext): ExistingCatalogRecoveryReader | undefined => {
+        if (identity.provider !== "codex") return undefined;
+        try {
+          owner.assertActive();
+          const host = runningCatalog.registry.loaded(identity.sessionId);
+          if (!(host instanceof SessionOrchestrator) || host.adapter.provider !== "codex") return undefined;
+          const reader = host.adapter.codexRecoveryReader?.(original);
+          if (!reader) return undefined;
+          return Object.freeze({ source: "existing-connection", sessionId: identity.sessionId,
+            providerInstanceId: identity.providerInstanceId, configurationFingerprint: identity.configurationFingerprint,
+            runtimeVersion: reader.runtimeVersion, client: reader.client });
+        } catch { return undefined; }
+      } }),
+      // Production workspace inspection reads the original checkout through
+      // the managed git runner; any refusal keeps the state unknown.
+      ...(options.execution?.recovery?.inspectWorkspace ? {} : { inspectWorkspace: async (target: RecoveryTarget): Promise<"clear" | "held" | "unknown"> => {
+        if (!runner) return "unknown";
+        try {
+          owner.assertActive();
+          const resolved = runningCatalog.registry.resolve(target.session.id);
+          const checkoutRoot = resolved.workspace.worktreeRoot ?? resolved.workspace.canonicalRoot;
+          const status = await new GitService(checkoutRoot, { runner: runner.gitServiceRunner() }).status();
+          if (!status.available) return "unknown";
+          return status.dirty ? "held" : "clear";
+        } catch { return "unknown"; }
+      } }),
       nativeHistoryReaderFactory,
       companionEvents: runningInteractions.companionEvents, supersedeInteractions: runningInteractions.supersedeInteractions,
       assertRecoveryAdmission: assertAdmission, trackRecovery: (work) => lifecycle!.trackOperation("control", work),

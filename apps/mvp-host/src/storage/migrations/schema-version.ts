@@ -7,8 +7,9 @@ import { validateInteractionSchema } from "./008-interactions.js";
 import { validateWorkspaceHistorySchema } from "./009-workspace-history.js";
 import { validateAttentionSchema } from "./010-attention.js";
 import { validateExecutionActivationSchema } from "./011-execution-activation.js";
+import { validateNativeReceiptsSchema } from "./012-native-receipts.js";
 
-export const SUPPORTED_SCHEMA_VERSION = 11;
+export const SUPPORTED_SCHEMA_VERSION = 12;
 
 export class StoreSchemaError extends Error {
   constructor(readonly code: "FUTURE_SCHEMA" | "SCHEMA_INVALID", message: string) {
@@ -126,7 +127,7 @@ export function inspectSchema(db: Database.Database, options: { maximumVersion?:
     }
     for (const [migration, validate] of [[5, validateRecoverySchema], [6, validateViewsSchema],
       [7, validateCatalogSchema], [8, validateInteractionSchema], [9, validateWorkspaceHistorySchema], [10, validateAttentionSchema],
-      [11, validateExecutionActivationSchema]] as const) {
+      [11, validateExecutionActivationSchema], [12, validateNativeReceiptsSchema]] as const) {
       if (version < migration) continue;
       if (!rows.some((row) => row.version === migration) || !rows.some((row) => row.version === migration - 1)) {
         throw new StoreSchemaError("SCHEMA_INVALID", `Declared schema is missing ordered migration ${migration}.`);

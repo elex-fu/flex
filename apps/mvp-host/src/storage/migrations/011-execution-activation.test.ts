@@ -37,7 +37,7 @@ describe("execution activation migration 011", { timeout: 20_000 }, () => {
     const store = new SqliteStore(path, { mode: "owned" });
     try {
       expect(inspectSchema(store.db).version).toBe(SUPPORTED_SCHEMA_VERSION);
-      expect(SUPPORTED_SCHEMA_VERSION).toBe(11);
+      expect(SUPPORTED_SCHEMA_VERSION).toBe(12);
       expect(store.db.prepare("SELECT version FROM schema_migrations ORDER BY version").all()).toEqual(
         Array.from({ length: SUPPORTED_SCHEMA_VERSION }, (_, index) => ({ version: index + 1 })));
       expect(store.db.prepare("SELECT id,state,activation_operation_id,activation_binding_digest,readiness_revision FROM workspaces").get())

@@ -10,7 +10,7 @@ import { ProtocolVersion } from "@flyx/mvp-protocol";
 import { checkpointSummary } from "../checkpoint/checkpoint-service.js";
 import type { CheckpointContext, CheckpointManifest } from "../checkpoint/types.js";
 import type { ExecutionCheckpointBinding } from "./execution-integrations.js";
-import { ClaudeAdapter } from "../claude/adapter.js";
+import { ClaudeAdapter, type ClaudeNativeTerminalReceipt } from "../claude/adapter.js";
 import { HostOwnerLock, assertHostOwner, assertWorkspacePrivacy, createTestHostOwner, type HostOwnerHandle } from "../lifecycle/host-owner.js";
 import { openOwned } from "../storage/open-store.js";
 import { HostLifecycle } from "../lifecycle/host-lifecycle.js";
@@ -33,6 +33,7 @@ import type { CommandRequest, ExecutionIntentRow } from "../orchestration/comman
 import type { HostInteractionHooks, InteractionRpcPort } from "../interaction/host-interactions.js";
 import type { ProviderControlOutcome, ProviderOutcome } from "../provider/types.js";
 import { ExecutionStore } from "../storage/execution-store.js";
+import { NativeTerminalReceiptStore } from "../storage/native-receipt-store.js";
 import {
   SqliteStore,
   type ApprovalRow,
@@ -180,6 +181,7 @@ export class SessionOrchestrator {
   private readonly permitWaits = new Map<string, AbortController>();
   private readonly preparingAttempts = new Set<string>();
   private readonly nativeScenePolicy: CompatibilityScenePolicy | undefined;
+  private readonly nativeReceipts: NativeTerminalReceiptStore | undefined;
   private readonly compatibilityRecorder: CommittedNativeStopRecorder | undefined;
   private readonly checkNativeReady: OrchestratorOptions["assertNativeReady"];
   private readonly checkWriteReady: OrchestratorOptions["assertWriteReady"];
@@ -266,6 +268,7 @@ export class SessionOrchestrator {
         this.views.prepareStoredSessions();
       }
       this.execution = new ExecutionStore(this.store);
+      this.nativeReceipts = new NativeTerminalReceiptStore(this.store.db);
       this.commandEngine = new CommandEngine(this.store, {
         publish: (event) => this.notify(event),
         wake: () => this.worker?.wake(),
@@ -283,7 +286,8 @@ export class SessionOrchestrator {
       this.git = new GitService(this.checkoutRoot, options.gitRunner ? { runner: options.gitRunner } : {});
       if (!options.adapter) this.nativeRuntime = new HostManagedRuntime({ store: this.store, owner: this.owner, sessionId: this.session.id, runtimeId: this.runtimeId, workspace: canonicalWorkspace, provider, assertDispatch:(context)=>this.assertNativeDispatch(context),
         ...(options.privateDirectories ? { privateRoots: options.privateDirectories } : {}), ...(options.nativeStateRoots ? { nativeStateRoots: options.nativeStateRoots } : {}), ...(options.nativeBoundaryFactory ? { boundaryFactory: options.nativeBoundaryFactory } : {}) });
-      const nativeOptions = { ...options.providerOptions, ...this.nativeRuntime?.options, workspace: canonicalWorkspace, onEvent: (event: AdapterEvent) => this.enqueueAdapterEvent(event) };
+      const nativeOptions = { ...options.providerOptions, ...this.nativeRuntime?.options, workspace: canonicalWorkspace, onEvent: (event: AdapterEvent) => this.enqueueAdapterEvent(event),
+        ...(provider === "claude" ? { onNativeTerminalReceipt: (receipt: ClaudeNativeTerminalReceipt) => this.recordNativeTerminalReceipt(receipt) } : {}) };
       this.adapter = options.adapter ?? (provider === "codex" ? new CodexAdapter(nativeOptions) : new ClaudeAdapter(nativeOptions));
     } catch (error) {
       // The Store is only assigned after ownership has been proven. A second
@@ -992,6 +996,16 @@ export class SessionOrchestrator {
       && event.turnId === context.flyxTurnId && event.generation === context.runtimeGeneration;
   }
   private enqueueAdapterEvent(event: AdapterEvent): void { this.eventTail = this.ingestion.enqueue(event); }
+
+  /**
+   * Journal the trusted native result receipt (design §8.2) at SDK arrival
+   * time. A refused write only leaves the anchor absent; recovery stays
+   * fail-closed instead of inferring a terminal from transcript text.
+   */
+  private recordNativeTerminalReceipt(receipt: ClaudeNativeTerminalReceipt): void {
+    if (this.callbacksSealed || !this.store.db.open || receipt.sessionId !== this.session.id) return;
+    this.nativeReceipts?.record({ ...receipt, provider: "claude" });
+  }
   private recordIngestionFailure(error: unknown): void {
     if (this.callbacksSealed || !this.store.db.open) return;
     this.degraded = true;

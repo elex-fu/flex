@@ -31,6 +31,7 @@ import { ManagedRuntimeController, inspectNativeVersion, type ManagedRuntimeOpti
 import type { ProcessStopResult } from "../lifecycle/managed-process-registry.js";
 import { sameDispatchContext } from "../provider/runtime-registry.js";
 import { dispatchContextForTurn, fenceAdapterEvent } from "./types.js";
+import { digest } from "../storage/recovery-store.js";
 
 import { ClaudeQuestionBridge } from "../interaction/native-question-bridge.js";
 import { parseClaudeQuestions } from "../interaction/native-question-codec.js";
@@ -88,16 +89,36 @@ export type ClaudeAdapterOptions = ManagedRuntimeOptions & {
   questionVerificationMode?: boolean;
   interactionEvidenceSource?: "native" | "fixture";
   onInteractionEvidence?: (evidence: InteractionEvidenceSample) => void;
+  /**
+   * Durable original result receipt anchor (design §8.2). Invoked synchronously
+   * when the SDK's actual result message arrives — before the business
+   * terminal commit — so recovery can verify a transcript without inferring
+   * the terminal from transcript text. A write refusal keeps the anchor
+   * absent; recovery then stays fail-closed.
+   */
+  onNativeTerminalReceipt?: (receipt: ClaudeNativeTerminalReceipt) => void;
   queryFactory?: typeof query;
   executable?: string;
   model?: string;
   environment?: Readonly<Record<string, string>>;
 };
 
+export type ClaudeNativeTerminalReceipt = Readonly<{
+  turnId: string;
+  attemptId: string;
+  sessionId: string;
+  nativeSessionId: string;
+  contextDigest: string;
+  resultUuid: string;
+  resultDigest: string;
+  interruptAcknowledged?: true;
+}>;
+
 export class ClaudeAdapter implements ProviderAdapter {
   readonly provider = "claude" as const;
   readonly workspace: string;
   private readonly onEvent: AdapterEventHandler | undefined;
+  private readonly onNativeTerminalReceipt: ((receipt: ClaudeNativeTerminalReceipt) => void) | undefined;
   private readonly maxBudgetUsd: number;
   private readonly workspaceRealpathPromise: Promise<string>;
   private active: ActiveQuery | undefined;
@@ -118,6 +139,7 @@ export class ClaudeAdapter implements ProviderAdapter {
   constructor(options: ClaudeAdapterOptions) {
     this.workspace = options.workspace;
     this.onEvent = options.onEvent;
+    this.onNativeTerminalReceipt = options.onNativeTerminalReceipt;
     this.maxBudgetUsd = options.maxBudgetUsd ?? 5;
     this.questionRuntimeVersion = process.env.FLYX_CLAUDE_EXECUTABLE ? "unverified" : BUNDLED_CLAUDE_VERSION;
     this.questionBridge = new ClaudeQuestionBridge<ActiveQuery>({provider:"claude",adapterVersion:SDK_VERSION,runtimeVersion:()=>this.questionRuntimeVersion,
@@ -668,7 +690,27 @@ export class ClaudeAdapter implements ProviderAdapter {
       });
       return undefined;
     }
-    if (message.type === "result") { active.nativeTerminal = typeof message.uuid === "string" && message.uuid ? { kind: "native-terminal", sourceId: message.uuid } : undefined; return message; }
+    if (message.type === "result") {
+      active.nativeTerminal = typeof message.uuid === "string" && message.uuid ? { kind: "native-terminal", sourceId: message.uuid } : undefined;
+      // Durable anchor at the earliest observable point: the actual SDK result
+      // event. A crash before the terminal commit still leaves the trusted
+      // receipt recovery needs; it never fabricates a terminal by itself.
+      if (active.nativeTerminal && message.session_id) {
+        try {
+          this.onNativeTerminalReceipt?.(Object.freeze({
+            turnId: active.turnId,
+            attemptId: active.context.attemptId,
+            sessionId: active.context.sessionId,
+            nativeSessionId: message.session_id,
+            contextDigest: digest(active.context),
+            resultUuid: message.uuid,
+            resultDigest: digest(message),
+            ...(active.interruptAcknowledged ? { interruptAcknowledged: true as const } : {}),
+          }));
+        } catch { /* A refused receipt write only leaves the anchor absent; recovery stays fail-closed. */ }
+      }
+      return message;
+    }
     return undefined;
   }
 

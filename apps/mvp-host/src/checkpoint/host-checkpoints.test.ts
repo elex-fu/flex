@@ -176,10 +176,10 @@ describe("owned checkpoint production factory and RPC", { timeout: 20_000 }, () 
     const bad = await createHostCheckpoints({ ...f.options, runGit, driverFactory: (workspace) => new CheckpointGitDriver(workspace.worktreeRoot) }); cleanups.push(() => bad.seal());
     await expect(bad.capabilitiesForSession(f.session.sessionId, "device-1")).rejects.toMatchObject({ code: "CHECKPOINT_MANAGED_GIT_REQUIRED" });
   });
-  it("uses the owned schema-11 migration path and validates readiness without schema writes", async () => {
+  it("uses the owned schema migration path and validates readiness without schema writes", async () => {
     const f = await fixture(); const before = f.store.db.prepare("SELECT sql FROM sqlite_master ORDER BY name").all();
-    expect(SUPPORTED_SCHEMA_VERSION).toBe(11); expect(inspectSchema(f.store.db).version).toBe(SUPPORTED_SCHEMA_VERSION);
-    expect(f.store.db.prepare("SELECT version FROM schema_migrations ORDER BY version").all()).toEqual(Array.from({ length: 11 }, (_, index) => ({ version: index + 1 })));
+    expect(SUPPORTED_SCHEMA_VERSION).toBe(12); expect(inspectSchema(f.store.db).version).toBe(SUPPORTED_SCHEMA_VERSION);
+    expect(f.store.db.prepare("SELECT version FROM schema_migrations ORDER BY version").all()).toEqual(Array.from({ length: SUPPORTED_SCHEMA_VERSION }, (_, index) => ({ version: index + 1 })));
     const validationOnly = await createHostCheckpoints(f.options); cleanups.push(() => validationOnly.seal());
     const support = await f.host.capabilitiesForSession(f.session.sessionId, "device-1");
     expect(support).toEqual({ capabilities: [CHECKPOINT_DIFF_CAPABILITY], diff: true, preview: true, workspaceRestore: false, nativeRewind: false, unsupportedReason: "REVERT_UNAVAILABLE" }); expect(f.runtimeFactory).not.toHaveBeenCalled();

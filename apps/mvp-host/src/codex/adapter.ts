@@ -377,6 +377,24 @@ export class CodexAdapter implements ProviderAdapter {
   }
   sealCallbacks(): void { this.callbacksSealed = true; }
   sealProcessJournal(): void { this.runtimes.sealJournals(); }
+  /** Read-only recovery reader over the live connection only (design §8.2); it never reconnects or resumes. */
+  codexRecoveryReader(_context: DispatchContext): { client: Pick<AppServerClient, "request">; runtimeVersion: string } | undefined {
+    if (this.closing || this.callbacksSealed) return undefined;
+    const client = this.client;
+    const runtimeVersion = this.runtimeVersion;
+    if (!client || !runtimeVersion || runtimeVersion === "unknown" || runtimeVersion === "unverified") return undefined;
+    const live = this.client === client;
+    if (!live) return undefined;
+    // The wrapper fails closed once the captured connection retires, so a
+    // recovery read can never race a close into a resurrected transport.
+    const guarded: Pick<AppServerClient, "request"> = {
+      request: <T,>(method: string, params?: JsonObject, timeoutMs?: number) => {
+        if (this.closing || this.client !== client) return Promise.reject<T>(new Error("CODEX_RECOVERY_CONNECTION_RETIRED"));
+        return client.request<T>(method, params, timeoutMs);
+      },
+    };
+    return { client: guarded, runtimeVersion };
+  }
   private retireClient(client: AppServerClient, deadlineMs = 5_000, hadActive = false): Promise<ProcessStopResult> {
     const prior = this.clientStops.get(client); if (prior) return prior;
     const runtime = this.clientRuntimes.get(client);

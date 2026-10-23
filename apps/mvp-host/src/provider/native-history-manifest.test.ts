@@ -74,6 +74,28 @@ describe("native history manifest source", () => {
     });
     expect(f.source().verifiedManifestForHandle(f.handle)?.evidenceId).toMatch(/^[a-f0-9]{64}$/);
   });
+  it("exposes the same trusted manifest at instance level without a transcript contract", async () => {
+    const f = await fixture("claude");
+    await f.recordTurn(f.recorderFor("run-1"));
+    await f.recordRecovery(f.recorderFor("run-1"));
+    const instance = f.source().verifiedManifestForInstance("claude", "pi-1");
+    expect(instance).toMatchObject({
+      source: "real-provider", state: "verified", provider: "claude", providerInstanceId: "pi-1",
+      configurationFingerprint: f.configurationFingerprint, verifiedVersions: ["1.0.0"],
+    });
+    expect("historyContract" in (instance ?? {})).toBe(false);
+    // Handle- and instance-level views agree on the trusted evidence.
+    expect(instance?.evidenceId).toBe(f.source().verifiedManifestForHandle(f.handle)?.evidenceId);
+  });
+  it("keeps the instance-level manifest unavailable on drift and mismatch", async () => {
+    const f = await fixture("codex");
+    await f.recordTurn(f.recorderFor("run-1"));
+    await f.recordRecovery(f.recorderFor("run-1"));
+    expect(f.source().verifiedManifestForInstance("claude", "pi-1")).toBeUndefined();
+    expect(f.source({ resolveProvider: () => undefined }).verifiedManifestForInstance("codex", "pi-1")).toBeUndefined();
+    await writeFile(f.executable, "drifted-content", { mode: 0o755 });
+    expect(f.source().verifiedManifestForInstance("codex", "pi-1")).toBeUndefined();
+  });
   it("maps a codex provider to the thread-read contract", async () => {
     const f = await fixture("codex");
     await f.recordTurn(f.recorderFor("run-1"));

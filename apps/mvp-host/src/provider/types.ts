@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { Bootstrap, QuestionAnswers } from "@flyx/mvp-protocol";
 
+import type { AppServerClient } from "../codex/app-server-client.js";
 import type { NativeQuestionDelivery, NativeQuestionRequest, NativeInteractionEvidence, NativeInteractionMethod } from "../interaction/types.js";
 
 export type ProviderId = Bootstrap["provider"];
@@ -180,4 +181,6 @@ export interface ProviderAdapter {
   /** Called only after durable unknown settlement and all bounded drains. */
   sealCallbacks?(): void;
   sealProcessJournal?(): void;
+  /** Read-only recovery reader over an existing native connection (Codex). Absence is unknown; it never reconnects, resumes or starts. */
+  codexRecoveryReader?(context: DispatchContext): { client: Pick<AppServerClient, "request">; runtimeVersion: string } | undefined;
 }

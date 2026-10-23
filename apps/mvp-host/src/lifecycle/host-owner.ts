@@ -168,8 +168,9 @@ function readRecord(path: string): { record: OwnerRecord; stat: Stats } {
     if (value.v !== 1 || typeof value.ownerId !== "string" || !Number.isSafeInteger(value.ownerGeneration) ||
         typeof value.resourceKey !== "string" || !value.process || !Number.isSafeInteger(value.process.pid) ||
         typeof value.process.platform !== "string" || value.process.pid <= 0 ||
-        (value.process.birth && (value.process.platform !== "linux" || value.process.birth.kind !== "linux" ||
-          !/^[a-f0-9-]{36}$/i.test(value.process.birth.bootId) || !/^\d+$/.test(value.process.birth.startTicks)))) throw new Error("invalid_lock");
+        (value.process.birth && (!/^[a-f0-9-]{36}$/i.test(value.process.birth.bootId)
+          || !(value.process.platform === "linux" && value.process.birth.kind === "linux" && /^\d+$/.test(value.process.birth.startTicks)
+            || value.process.platform === "darwin" && value.process.birth.kind === "macos" && /^[A-Z][a-z]{2} [A-Z][a-z]{2} \d{1,2} \d{2}:\d{2}:\d{2} \d{4}$/.test(value.process.birth.startTime))))) throw new Error("invalid_lock");
     return { record: value as OwnerRecord, stat };
   } finally { closeSync(fd); }
 }

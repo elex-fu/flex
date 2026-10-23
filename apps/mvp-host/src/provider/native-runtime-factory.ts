@@ -7,6 +7,8 @@ import { ManagedProcessRegistry, SqliteProcessJournal, type ManagedProcessRecord
 import { SystemProcessInspector } from "../lifecycle/process-inspector.js";
 import { prepareNativeExecutionBoundary, type NativeBoundaryAssessment } from "../lifecycle/native-execution-boundary.js";
 import { inspectNativeBoundaryStop } from "../lifecycle/native-boundary-proof.js";
+import { hasManagedStopContract } from "../lifecycle/managed-stop-contract.js";
+import { validateTreeStopEvidence } from "../lifecycle/managed-process-evidence.js";
 import { dispatchContextForTurn, type DispatchContext, type ProviderId } from "./types.js";
 import type { ManagedRuntimeOptions } from "./managed-runtime.js";
 
@@ -27,12 +29,13 @@ export class HostManagedRuntime {
         const id = `probe-${randomUUID()}`;
         return dispatchContextForTurn(id, { hostOwnerId: host.owner.ownerId, hostOwnerGeneration: host.owner.generation, sessionId: host.sessionId, flyxTurnId: id, runtimeId: `${host.runtimeId}:probe`, runtimeGeneration: 1, attemptId: randomUUID() });
       },
-      processRegistryFactory: (context) => {
+      processRegistryFactory: (context, proof) => {
         if (this.closing) throw new Error("RUNTIME_CLOSING");
         host.owner.assertActive();
         const fixed = dispatchContextForTurn(context.flyxTurnId, context);
         if (fixed.hostOwnerId !== host.owner.ownerId || fixed.hostOwnerGeneration !== host.owner.generation || fixed.sessionId !== host.sessionId) throw new Error("NATIVE_LAUNCH_CONTEXT_MISMATCH");
-        const registry = new ManagedProcessRegistry({ journal: new SqliteProcessJournal(host.store.db), context: () => fixed, verifyDescendantStop: (record) => this.verifyStop(record) });
+        const registry = new ManagedProcessRegistry({ journal: new SqliteProcessJournal(host.store.db), context: () => fixed,
+          ...(proof && hasManagedStopContract(proof) ? { stopMode: "managed_process_group" as const } : {}), verifyDescendantStop: (record) => this.verifyStop(record) });
         this.registries.add(registry);
         const registered = this.turnRegistries.get(key(fixed)) ?? new Set<ManagedProcessRegistry>();
         registered.add(registry); this.turnRegistries.set(key(fixed), registered); return registry;
@@ -52,7 +55,11 @@ export class HostManagedRuntime {
     // owns an empty Provider set. Additional Git/helper proofs are checked by Host composition.
     if (!this.turnRegistries.has(key(context))) return true;
     const proof = this.stops.get(key(context));
-    return !!proof?.stopped && proof.treeStopped && [...this.turnRegistries.get(key(context))!].every((registry)=>registry.records().every((record) => record.state === "not_spawned" || record.state === "stopped" && record.stopProof?.kind === "verified-tree-stop"));
+    return !!proof?.stopped && [...this.turnRegistries.get(key(context))!].every((registry)=>registry.records().every((record) => {
+      if (record.state === "not_spawned") return true;
+      if (record.state !== "stopped" || !record.stopProof) return false;
+      try { validateTreeStopEvidence(record.stopProof, record.processIdentity, record.boundaryEvidence, record.processGroup); return true; } catch { return false; }
+    }));
   }
   async closeTurnAndWait(context: DispatchContext, deadlineMs = 5_000): Promise<ProcessStopResult> {
     const results = await Promise.all([...(this.turnRegistries.get(key(context)) ?? [])].map((registry) => registry.closeAndWait(deadlineMs)));

@@ -70,9 +70,20 @@ describe("native private-data execution boundary", () => {
     process.env.SHOULD_NOT_INHERIT = "host-secret";
     try {
       const request = { command: process.execPath, args: ["-e", code, ...values], cwd: f.workspace, env, signal: controller.signal, stdio: ["pipe", "pipe", "pipe"] as SpawnOptions["stdio"] };
-      const plan = boundary.plan(request); expect(plan.options.signal).toBe(controller.signal); expect(plan.options.cwd).toBe(request.cwd); expect(plan.options.env).toEqual(env); expect(plan.options.stdio).toBe(request.stdio);
+      const plan = boundary.plan(request); expect(plan.options.signal).toBe(controller.signal); expect(plan.options.cwd).toBe(request.cwd);
+      expect(plan.options.env).toEqual({ ...env, ...(process.platform === "darwin" ? { TMPDIR: expect.stringMatching(/\/flyx-native-boundary-[^/]+\/tmp$/), CLAUDE_CODE_TMPDIR: plan.options.env?.TMPDIR } : {}) });
+      expect(plan.options.stdio).toBe(request.stdio);
       const result = await output(boundary.spawn(managed.wrapped, request)); expect(result.code).toBe(0); expect(JSON.parse(result.stdout)).toEqual({ argv: values, cwd: await realpath(f.workspace), env: env.ONLY_FOR_NATIVE });
     } finally { delete process.env.SHOULD_NOT_INHERIT; }
+  });
+
+  it.runIf(process.platform === "darwin")("confines tool writes to workspace/state/temp without a second Seatbelt layer", async () => {
+    const f = await fixture(), boundary = await prepared(f.options), managed = registry();
+    const outside = join(f.root, "outside");
+    const result = await output(boundary.spawn(managed.wrapped, { command: "/bin/sh", args: ["-c", 'printf inside > inside; printf denied > "$1"', "sh", outside], cwd: f.workspace, env: {} }));
+    expect(result.code).not.toBe(0); expect(await readFile(join(f.workspace, "inside"), "utf8")).toBe("inside");
+    await expect(readFile(outside)).rejects.toMatchObject({ code: "ENOENT" });
+    expect(boundary.proof.verifiedWorkspaceWriteBoundary).toBe(true); expect(boundary.proof.verifiedDescendantStop).toBe(false);
   });
 
   it.runIf(supported)("binds owner-only generated policy and public evidence without leaking paths or env secrets", async () => {

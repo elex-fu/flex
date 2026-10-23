@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { isAbsolute, relative, sep } from "node:path";
 import { type ManagedChildHandle } from "./managed-child-handle.js";
 import { CONTROLLED_RESTORE_HELPER } from "../checkpoint/controlled-restore-helper.js";
+import { MACOS_MANAGED_STOP_CONTRACT } from "./managed-stop-contract.js";
 import type { CheckpointGitOperation, CheckpointGitRunRequest, CheckpointGitRunner, CheckpointGitRunResult } from "../checkpoint/git-driver.js";
 import type { GitServiceRunner } from "../git/git-service.js";
 import {
@@ -60,17 +61,12 @@ export class ManagedGitError extends Error {
   }
 }
 
-/**
- * Trusted stop verifier for this Host. `supervisor` is the C0 contract and only
- * exists where the platform can prove descendant stop (Linux PID-namespace
- * boundary today); macOS has no supervisor, so a production constructor must
- * refuse instead of weakening the proof. `fixture` is a deterministic test
- * backend and requires an explicit opt-in.
- */
+/** Trusted local stop contract. Ordinary macOS group cleanup and complete
+ * namespace isolation are distinct branches; fixtures always require opt-in. */
 export type ManagedGitStopBackend = Readonly<{
-  kind: "supervisor" | "fixture";
+  kind: "supervisor" | "fixture" | "managed_process_group";
   contractId: string;
-  verifiedDescendantStop: true;
+  verifiedDescendantStop: boolean;
   verify(record: ManagedProcessRecord): ProcessTreeStopEvidence | undefined | Promise<ProcessTreeStopEvidence | undefined>;
   /** Required for production: original launch is controlled by the same proven backend. */
   platform?: NodeJS.Platform;
@@ -274,7 +270,7 @@ function buildPolicies(options: { git: ManagedGitExecutableIdentity; python: Man
  * Order per dispatch: input validation -> actual path/binary/policy validation ->
  * durable `launching` -> controlled spawn and raw identity commit -> bounded
  * output -> original stop evidence -> result. A run is only a success when the
- * injected stop backend proved the descendant tree stopped; otherwise the
+ * original launch satisfied its selected stop contract; otherwise the
  * journal keeps `unknown` and a typed error carries that state.
  */
 export class ManagedGitRunner {
@@ -290,11 +286,14 @@ export class ManagedGitRunner {
   constructor(private readonly options: ManagedGitRunnerOptions) {
     const backend = options.stopBackend;
     if (!backend || typeof backend !== "object") throw new ManagedGitError("MANAGED_GIT_STOP_BACKEND_REQUIRED", "not_spawned");
-    if (backend.verifiedDescendantStop !== true || typeof backend.contractId !== "string" || backend.contractId.length < 1 || backend.contractId.length > 512 || typeof backend.verify !== "function") {
+    const ordinary = backend.kind === "managed_process_group" && backend.platform === "darwin" && process.platform === "darwin"
+      && backend.contractId === MACOS_MANAGED_STOP_CONTRACT && backend.verifiedDescendantStop === false;
+    if ((!ordinary && backend.verifiedDescendantStop !== true) || !["supervisor", "fixture", "managed_process_group"].includes(backend.kind)
+      || backend.kind === "managed_process_group" && !ordinary || typeof backend.contractId !== "string" || backend.contractId.length < 1 || backend.contractId.length > 512 || typeof backend.verify !== "function") {
       throw new ManagedGitError("MANAGED_GIT_STOP_BACKEND_UNVERIFIED", "not_spawned");
     }
     if (backend.kind === "fixture" && options.allowFixtureStopBackend !== true) throw new ManagedGitError("MANAGED_GIT_FIXTURE_BACKEND_FORBIDDEN", "not_spawned");
-    // The supervisor contract is a per-kernel proof; there is no macOS supervisor.
+    // The complete-tree supervisor branch remains a per-kernel isolation proof.
     if (backend.kind === "supervisor" && (process.platform !== "linux" || backend.platform !== process.platform || typeof backend.spawn !== "function")) throw new ManagedGitError("MANAGED_GIT_SUPERVISOR_UNAVAILABLE", "not_spawned");
     this.stopBackend = backend;
     const git = trustedExecutable(options.gitExecutable ?? GIT_EXECUTABLE);
@@ -467,6 +466,7 @@ export class ManagedGitRunner {
       const env = { ...policy.env };
       const evidence = Object.freeze({
         proof: Object.freeze({ kind: "managed-helper-launch-plan", purpose: policy.purpose, policyId: policy.policyId,
+          ...(this.stopBackend.kind === "managed_process_group" ? { stopContractId: this.stopBackend.contractId } : {}),
           executableDigest: policy.executable.digest, operationId: request.operationId ?? null, stepId: request.stepId ?? null }),
         launchDigest: digest(stableJson({ purpose: policy.purpose, policyId: policy.policyId, executable: policy.executable, argv: request.args, cwd, env })),
       });
@@ -488,7 +488,7 @@ export class ManagedGitRunner {
       const deadlineAt = Date.now() + deadlineMs;
       // 1. Stop every active producer before draining any completion.
       const stops = [...this.stops.values()];
-      const observations = Promise.all(stops.map((stop) => stop(Math.max(0, deadlineAt - Date.now())).then((result) => result.stopped && result.treeStopped, () => false)));
+      const observations = Promise.all(stops.map((stop) => stop(Math.max(0, deadlineAt - Date.now())).then((result) => result.stopped, () => false)));
       const stopped = await waitForSettled([observations], Math.max(0, deadlineAt - Date.now())) && (await observations).every(Boolean);
       // 2. Drain the actual run promises, bounded by the same deadline.
       const runs = [...this.runs];
@@ -504,6 +504,7 @@ export class ManagedGitRunner {
       context: () => launchContext(this.options.context(input)),
       ...(this.options.groupExists ? { groupExists: this.options.groupExists } : {}),
       ...(this.options.identify ? { identify: this.options.identify } : {}),
+      ...(this.stopBackend.kind === "managed_process_group" ? { stopMode: "managed_process_group" as const } : {}),
       verifyDescendantStop: async (record) => {
         const proof = await this.stopBackend.verify(record);
         return proof && proof.contractId === this.stopBackend.contractId && proof.kind === "verified-tree-stop" ? proof : undefined;
@@ -549,6 +550,7 @@ export class ManagedGitRunner {
     const boundaryEvidence = Object.freeze({
       proof: Object.freeze({
         kind: "managed-git-launch-plan", purpose: policy.purpose, policyId: policy.policyId, executableDigest: policy.executable.digest,
+        ...(this.stopBackend.kind === "managed_process_group" ? { stopContractId: this.stopBackend.contractId } : {}),
         operationId: input.operationId ?? null, stepId: input.stepId ?? null, bindingDigest: input.bindingDigest ?? null,
       }),
       launchDigest,
@@ -568,7 +570,7 @@ export class ManagedGitRunner {
       const record = registry.records()[0];
       if (!record) throw new ManagedGitError("MANAGED_GIT_SPAWN_FAILED", "unknown");
       if (record.state === "not_spawned") throw new ManagedGitError("MANAGED_GIT_SPAWN_FAILED", "not_spawned");
-      if (!stopped.treeStopped || record.state !== "stopped" || !record.stopProof) {
+      if (!stopped.stopped || record.state !== "stopped" || !record.stopProof) {
         throw new ManagedGitError("MANAGED_GIT_TREE_STOP_UNPROVEN", "unknown");
       }
       if (collected.kind === "spawn") throw new ManagedGitError("MANAGED_GIT_SPAWN_FAILED", "stopped");

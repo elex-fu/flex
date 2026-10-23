@@ -4,13 +4,14 @@ import { ManagedProcessRegistry, type ProcessStopResult } from "../lifecycle/man
 import type { ManagedChildExit, ManagedChildHandle } from "../lifecycle/managed-child-handle.js";
 import type { DispatchContext } from "./types.js";
 import { dispatchContextForTurn } from "./types.js";
+import { supportsNativeStop } from "../lifecycle/managed-stop-contract.js";
 
 export type NativeSpawnRequest = Omit<SpawnOptions, "cwd" | "env"> & { command: string; args: readonly string[]; cwd: string; env: NodeJS.ProcessEnv };
 export interface ProviderExecutionBoundary {
   spawn(registry: ManagedProcessRegistry, request: NativeSpawnRequest): ManagedChildHandle;
 }
 export type BoundaryReadiness =
-  | { ready: true; boundary: ProviderExecutionBoundary; proof: { verifiedPrivateReadBoundary: true; verifiedDescendantStop: boolean } }
+  | { ready: true; boundary: ProviderExecutionBoundary; proof: { verifiedPrivateReadBoundary: true; verifiedDescendantStop: boolean; platform?: NodeJS.Platform; managedStopContractId?: string; verifiedWorkspaceWriteBoundary?: true } }
   | { ready: false; code: string; summary: unknown };
 export type ManagedRuntimeOptions = {
   /** Production supplies a per-attempt registry using the shared Store journal. */
@@ -24,6 +25,7 @@ export type ManagedRuntimeOptions = {
 export type PreparedNativeRuntime = {
   context: DispatchContext;
   registry: ManagedProcessRegistry;
+  workspaceWriteBoundary?: true;
   spawn(request: NativeSpawnRequest): ManagedChildHandle;
   closeAndWait(deadlineMs?: number): Promise<ProcessStopResult>;
 };
@@ -46,11 +48,12 @@ export class ManagedRuntimeController {
     if (this.closing) throw new Error("RUNTIME_CLOSING");
     if (readiness && !readiness.ready) throw new Error(readiness.code);
     if (fixed.hostOwnerId !== "standalone" && (!this.options.processRegistryFactory || !readiness?.ready)) throw new Error("NATIVE_EXECUTION_BOUNDARY_REQUIRED");
-    if (fixed.hostOwnerId !== "standalone" && readiness?.ready && readiness.proof.verifiedDescendantStop !== true) throw new Error("NATIVE_DESCENDANT_STOP_UNVERIFIED");
+    if (fixed.hostOwnerId !== "standalone" && readiness?.ready && !supportsNativeStop(readiness.proof)) throw new Error("NATIVE_DESCENDANT_STOP_UNVERIFIED");
     const registry = this.options.processRegistryFactory?.(fixed, readiness?.ready ? readiness.proof : undefined) ?? new ManagedProcessRegistry({ journal: { save() {} }, context: () => fixed });
     let closed: Promise<ProcessStopResult> | undefined;
     const runtime: PreparedNativeRuntime = {
       context: fixed, registry,
+      ...(readiness?.ready && readiness.proof.verifiedWorkspaceWriteBoundary === true ? { workspaceWriteBoundary: true as const } : {}),
       spawn: ({ command, args, ...spawnOptions }) => {
         if (this.closing) throw new Error("RUNTIME_CLOSING");
         this.options.assertDispatch?.(fixed);

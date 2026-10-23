@@ -7,6 +7,7 @@ import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { measurePlannedNativeArtifact, type PlannedNativeArtifact } from "../diagnostics/planned-native-artifact.js";
 import { SystemProcessInspector, type ProcessIdentity } from "./process-inspector.js";
 import type { ManagedChildHandle } from "./managed-child-handle.js";
+import { MACOS_MANAGED_STOP_CONTRACT } from "./managed-stop-contract.js";
 import { NativeBoundaryError, type NativeBoundaryBackend, type NativeBoundaryPlatform, type NativeBoundaryProof, type NativeBoundaryPublicSummary, type NativeBoundaryReadinessCode } from "./native-boundary-proof.js";
 export { NativeBoundaryError, inspectNativeBoundaryStop, isNativeBoundaryProof, nativeIdentityDigest } from "./native-boundary-proof.js";
 export type { NativeBoundaryProof, NativeBoundaryPublicSummary, NativeBoundaryReadinessCode } from "./native-boundary-proof.js";
@@ -53,7 +54,7 @@ type Probe = {
   directRead: boolean; directWrite: boolean; aliasRead: boolean; aliasWrite: boolean;
   childRead: boolean; childWrite: boolean; childAliasRead: boolean; childAliasWrite: boolean;
   privateRoots: boolean; workspaceWritable: boolean; nativeStateWritable: boolean;
-  namespace?: string; capsDropped?: boolean; userNamespacesDisabled?: boolean;
+  namespace?: string; capsDropped?: boolean; userNamespacesDisabled?: boolean; outsideWriteDenied?: boolean;
 };
 const VERSION = 1;
 const SELF_TEST_TIMEOUT_MS = 8_000;
@@ -90,6 +91,13 @@ function resolveExecutable(command: string, cwd: string, env: NodeJS.ProcessEnv)
 export function macosPrivateBoundaryProfile(privateRoots: readonly string[]): string {
   if (!privateRoots.length || privateRoots.some((path) => !isAbsolute(path) || /[\x00-\x1f\x7f]/.test(path))) throw new NativeBoundaryError("NATIVE_BOUNDARY_POLICY_INVALID");
   return ["(version 1)", "(allow default)", ...privateRoots.map((path) => "(deny file-read* file-write* (subpath " + JSON.stringify(path) + "))"), ""].join("\n");
+}
+/** One Seatbelt layer for the Provider and its tools: workspace/state/temp writes, private-root denial. */
+export function macosManagedBoundaryProfile(privateRoots: readonly string[], writableRoots: readonly string[]): string {
+  const base = macosPrivateBoundaryProfile(privateRoots);
+  if (!writableRoots.length || writableRoots.some((path) => !isAbsolute(path) || /[\x00-\x1f\x7f]/.test(path))) throw new NativeBoundaryError("NATIVE_BOUNDARY_POLICY_INVALID");
+  return base + "(deny file-write* (require-all (subpath \"/\") (require-not (literal \"/dev/null\")) "
+    + writableRoots.map((path) => "(require-not (subpath " + JSON.stringify(path) + "))").join(" ") + "))\n";
 }
 /** Minimum bubblewrap 0.12: includes the absolute-symlink setup fix. Runtime probes still decide support.
  * https://github.com/containers/bubblewrap/blob/main/NEWS.md */
@@ -132,6 +140,11 @@ export class NativeExecutionBoundary {
     try { cwd = realpathSync(resolve(request.cwd)); if (!statSync(cwd).isDirectory()) throw new Error(); }
     catch { throw new NativeBoundaryError("NATIVE_BOUNDARY_SPAWN_INVALID"); }
     const env = safeEnvironment(request.env);
+    if (this.platform === "darwin") {
+      env.TMPDIR = join(this.generated.path, "tmp");
+      // Claude uses /tmp instead of TMPDIR on macOS unless its own variable is set.
+      env.CLAUDE_CODE_TMPDIR = env.TMPDIR;
+    }
     if (!inside(this.workspace.path, cwd)) throw new NativeBoundaryError("NATIVE_BOUNDARY_SPAWN_INVALID");
     const originalExecutable = resolveExecutable(request.command, cwd, env);
     if (this.privateRoots.some((root) => inside(root.path, originalExecutable))) throw new NativeBoundaryError("NATIVE_BOUNDARY_SPAWN_INVALID");
@@ -171,15 +184,16 @@ export class NativeExecutionBoundary {
       const path = await mkdtemp(join(temporary.path, "flyx-native-boundary-")); await chmod(path, 0o700); generated = directory(path);
       if ([workspace, ...states, ...privateRoots].some((root) => overlap(root.path, path))) throw new NativeBoundaryError("NATIVE_BOUNDARY_POLICY_INVALID");
       const profiles = join(path, "profiles"), probePrivate = join(path, "probe-private"), probeWorkspace = join(path, "probe-workspace"), probeState = join(path, "probe-state");
-      for (const directory of [profiles, probePrivate, probeWorkspace, probeState]) await mkdir(directory, { mode: 0o700 });
+      for (const directory of [profiles, probePrivate, probeWorkspace, probeState, join(path, "tmp")]) await mkdir(directory, { mode: 0o700 });
       const sentinel = join(probePrivate, "sentinel"), alias = join(probeWorkspace, "private-alias"), nonce = randomUUID();
       await writeFile(sentinel, nonce, { flag: "wx", mode: 0o600 }); await symlink(sentinel, alias);
       const deniedPaths = [...privateRoots.map((root) => root.path), profiles, probePrivate];
-      const policy = platform === "darwin" ? macosPrivateBoundaryProfile(deniedPaths) : JSON.stringify({ version: VERSION, privateRoots: deniedPaths, workspaceRoot: workspace.path, nativeStateRoots: states.map((root) => root.path), flags: linuxPrivateBoundaryArguments({ workspaceRoot: workspace.path, nativeStateRoots: states.map((root) => root.path), privateRoots: deniedPaths }, "COMMAND", [], "CWD") });
+      const policy = platform === "darwin" ? macosManagedBoundaryProfile(deniedPaths, [workspace.path, ...states.map((root) => root.path), probeWorkspace, probeState, join(path, "tmp")]) : JSON.stringify({ version: VERSION, privateRoots: deniedPaths, workspaceRoot: workspace.path, nativeStateRoots: states.map((root) => root.path), flags: linuxPrivateBoundaryArguments({ workspaceRoot: workspace.path, nativeStateRoots: states.map((root) => root.path), privateRoots: deniedPaths }, "COMMAND", [], "CWD") });
       const profilePath = join(profiles, "policy" + (platform === "darwin" ? ".sb" : ".json"));
       await writeFile(profilePath, policy, { flag: "wx", mode: 0o600 });
       const wrap = (command: string, args: readonly string[], cwd: string) => ({ command: backend.path, args: platform === "darwin" ? ["-f", profilePath, "--", command, ...args] : linuxPrivateBoundaryArguments({ workspaceRoot: workspace.path, nativeStateRoots: [...states.map((root) => root.path), probeWorkspace, probeState], privateRoots: deniedPaths }, command, args, cwd) });
-      const result = await runPrivateProbe(wrap, { sentinel, alias, workspace: probeWorkspace, state: probeState, roots: privateRoots.map((root) => root.path), nonce }, platform).catch(() => { throw new NativeBoundaryError("NATIVE_BOUNDARY_SELF_TEST_FAILED"); });
+      const result = await runPrivateProbe(wrap, { sentinel, alias, workspace: probeWorkspace, state: probeState, roots: privateRoots.map((root) => root.path), nonce, outside: join(path, "outside-write-probe") }, platform).catch(() => { throw new NativeBoundaryError("NATIVE_BOUNDARY_SELF_TEST_FAILED"); });
+      if (platform === "darwin" && result.probe.outsideWriteDenied !== true) throw new NativeBoundaryError("NATIVE_BOUNDARY_SELF_TEST_FAILED");
       if (!REQUIRED_PROBES.every((key) => result.probe[key] === true) || await readFile(sentinel, "utf8") !== nonce) throw new NativeBoundaryError("NATIVE_BOUNDARY_SELF_TEST_FAILED");
       let treeVerified = false;
       if (platform === "linux") {
@@ -188,7 +202,7 @@ export class NativeExecutionBoundary {
       }
       assertRoot(backend);
       if (hash(readFileSync(backend.path)) !== backend.digest) throw new NativeBoundaryError("NATIVE_BOUNDARY_CHANGED");
-      const proof: NativeBoundaryProof = Object.freeze({ version: VERSION, boundaryId: randomUUID(), platform, kernelRelease: release(), backend: backend.kind, backendVersion: backend.version, backendDigest: backend.digest, policyDigest: hash(policy), evidenceDigest: hash(JSON.stringify({ version: VERSION, kernelRelease: release(), backendDigest: backend.digest, policyDigest: hash(policy), probeProgramDigest: hash(PROBE_PROGRAM), probe: result.probe, treeVerified, nonce })), verifiedPrivateReadBoundary: true, verifiedPrivateWriteBoundary: true, verifiedChildInheritance: true, treeIsolation: treeVerified ? "linux_pid_namespace" : "unverified", verifiedDescendantStop: treeVerified });
+      const proof: NativeBoundaryProof = Object.freeze({ version: VERSION, boundaryId: randomUUID(), platform, kernelRelease: release(), backend: backend.kind, backendVersion: backend.version, backendDigest: backend.digest, policyDigest: hash(policy), evidenceDigest: hash(JSON.stringify({ version: VERSION, kernelRelease: release(), backendDigest: backend.digest, policyDigest: hash(policy), probeProgramDigest: hash(PROBE_PROGRAM), probe: result.probe, treeVerified, nonce })), verifiedPrivateReadBoundary: true, verifiedPrivateWriteBoundary: true, verifiedChildInheritance: true, treeIsolation: treeVerified ? "linux_pid_namespace" : "unverified", verifiedDescendantStop: treeVerified, ...(platform === "darwin" ? { managedStopContractId: MACOS_MANAGED_STOP_CONTRACT, verifiedWorkspaceWriteBoundary: true as const } : {}) });
       // Keep the exact tested profile; obsolete probe names remain denied after cleanup.
       for (const directory of [probeWorkspace, probeState, probePrivate]) await rm(directory, { recursive: true, force: false });
       const boundary = new NativeExecutionBoundary(platform, workspace, states, privateRoots, generated, { path: profilePath, digest: hash(policy), identity: identity(profilePath) }, backend, proof);
@@ -229,6 +243,7 @@ const childCode = 'const fs=require("node:fs");const p=JSON.parse(process.argv[1
 const child = cp.spawnSync(process.execPath,['-e',childCode,JSON.stringify(p)],{encoding:'utf8',timeout:2000});
 let inherited={};try{inherited=JSON.parse(child.stdout)}catch{}
 const result = {nonce:p.nonce,directRead:deniedRead(p.sentinel),directWrite:deniedWrite(p.sentinel),aliasRead:deniedRead(p.alias),aliasWrite:deniedWrite(p.alias),childRead:inherited.read===true,childWrite:inherited.write===true,childAliasRead:inherited.aliasRead===true,childAliasWrite:inherited.aliasWrite===true,privateRoots:p.roots.every(root=>{try{fs.readdirSync(root);return false}catch(e){return ['EPERM','EACCES','ENOENT'].includes(e.code)}}),workspaceWritable:writable(p.workspace),nativeStateWritable:writable(p.state)};
+if(p.outside) result.outsideWriteDenied=deniedWrite(p.outside);
 if(process.platform==='linux') {
   result.namespace=fs.readlinkSync('/proc/self/ns/pid');
   result.capsDropped=/^CapEff:\s*0+$/m.test(fs.readFileSync('/proc/self/status','utf8'));
@@ -239,7 +254,7 @@ if(process.platform==='linux') {
 `;
 async function runPrivateProbe(
   wrap: (command: string, args: readonly string[], cwd: string) => { command: string; args: string[] },
-  input: { sentinel: string; alias: string; workspace: string; state: string; roots: string[]; nonce: string },
+  input: { sentinel: string; alias: string; workspace: string; state: string; roots: string[]; nonce: string; outside?: string },
   platform: NativeBoundaryPlatform,
 ): Promise<{ probe: Probe; treeVerified: boolean }> {
   const plan = wrap(process.execPath, ["-e", PROBE_PROGRAM, JSON.stringify(input)], input.workspace);

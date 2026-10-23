@@ -2,11 +2,12 @@ import { spawn, type ChildProcess, type SpawnOptions } from "node:child_process"
 import { randomUUID } from "node:crypto";
 import type Database from "better-sqlite3";
 import { SystemProcessInspector, type ProcessIdentity } from "./process-inspector.js";
-import { validateTreeStopEvidence, type ProcessBoundaryEvidence, type ProcessTreeStopEvidence } from "./managed-process-evidence.js";
+import { processIdentityDigest, validateTreeStopEvidence, type ProcessBoundaryEvidence, type ProcessTreeStopEvidence } from "./managed-process-evidence.js";
 import { adoptNodeChildProcess, type ManagedChildHandle } from "./managed-child-handle.js";
 import { savePlannedCompatibilityLaunch } from "../diagnostics/managed-native-provenance.js";
 import type { PlannedNativeArtifact } from "../diagnostics/planned-native-artifact.js";
 import { MANAGED_PROCESS_EVIDENCE_SCHEMA } from "../storage/migrations/005-process-evidence.js";
+import { MACOS_MANAGED_STOP_CONTRACT } from "./managed-stop-contract.js";
 export { MANAGED_PROCESS_SCHEMA } from "../storage/migrations/004-managed-process-schema.js";
 export { processIdentityDigest, type ProcessBoundaryEvidence, type ProcessTreeStopEvidence } from "./managed-process-evidence.js";
 export type { ManagedChildExit, ManagedChildHandle, ManagedChildRawEvidence } from "./managed-child-handle.js";
@@ -32,6 +33,7 @@ export type ManagedProcessRecord = ProcessLaunchContext & {
   boundaryEvidence?: ProcessBoundaryEvidence;
   stopProof?: ProcessTreeStopEvidence;
 };
+/** stopped follows each launch's explicit contract; treeStopped only claims complete descendant isolation. */
 export type ProcessStopResult = { stopped: boolean; treeStopped: boolean; records: ManagedProcessRecord[] };
 export interface ProcessJournal { save(record: ManagedProcessRecord): void; savePlannedLaunch?(record: ManagedProcessRecord, planned: PlannedNativeArtifact): void; }
 
@@ -80,7 +82,7 @@ export class SqliteProcessJournal implements ProcessJournal {
       if (saved.proof_json !== encoded || saved.launch_digest !== launchDigest) throw new Error("PROCESS_BOUNDARY_CONFLICT");
     }
     if (record.stopProof) {
-      validateTreeStopEvidence(record.stopProof, record.processIdentity);
+      validateTreeStopEvidence(record.stopProof, record.processIdentity, record.boundaryEvidence, record.processGroup);
       const encoded = JSON.stringify(record.stopProof);
       this.db.prepare("INSERT OR IGNORE INTO managed_process_stop_proofs(process_id,proof_json) VALUES(?,?)").run(record.id, encoded);
       const saved = this.db.prepare("SELECT proof_json FROM managed_process_stop_proofs WHERE process_id = ?").get(record.id) as { proof_json: string };
@@ -102,6 +104,8 @@ export class ManagedProcessRegistry {
     spawn?: typeof spawn;
     groupExists?: (pid: number) => "present" | "absent" | "unknown";
     gracefulExitMs?: number;
+    stopMode?: "managed_process_group";
+    signalGroup?: (pid: number, signal: NodeJS.Signals) => void;
     identify?: (pid: number) => ProcessIdentity;
     /** Trusted local verifier bound to this process's persisted boundary and birth identity. */
     verifyDescendantStop?: (record: ManagedProcessRecord) => ProcessTreeStopEvidence | undefined | Promise<ProcessTreeStopEvidence | undefined>;
@@ -126,6 +130,7 @@ export class ManagedProcessRegistry {
       throw error;
     }
     const handle = adoptNodeChildProcess({ id: record.id, child, grouped });
+    handle.stdin?.on("error", () => { /* A closed input is not an exit observation. */ });
     const entry: Entry = { handle, record, exited: false };
     this.entries.set(record.id, entry);
     void handle.exited.then(() => {
@@ -134,7 +139,7 @@ export class ManagedProcessRegistry {
       // A handle without a PID never observed an OS process: its terminal
       // observation settles as "never spawned", never as a normal root exit.
       if (handle.pid === undefined) { record.state = "not_spawned"; record.errorCode = "SPAWN_FAILED"; }
-      else record.state = "root_exited";
+      else if (record.state !== "stopped") record.state = "root_exited";
       this.persist(record);
     });
     handle.on("error", () => {
@@ -145,7 +150,7 @@ export class ManagedProcessRegistry {
     });
     if (handle.pid !== undefined) {
       record.pid = handle.pid;
-      record.processIdentity = (this.options.identify ?? ((pid) => new SystemProcessInspector({ pid }).currentIdentity()))(handle.pid);
+      record.processIdentity = (this.options.identify ?? ((pid) => new SystemProcessInspector({ pid, observeMacosBirth: this.options.stopMode === "managed_process_group" }).currentIdentity()))(handle.pid);
       if (grouped) record.processGroup = handle.pid;
       record.state = "running";
       // If this commit fails after spawn, the durable launching row remains a recovery gate.
@@ -172,7 +177,8 @@ export class ManagedProcessRegistry {
     const entries = [...this.entries.values()];
     const results = await Promise.all(entries.map((entry) => this.stopEntry(entry, deadlineMs)));
     const stopped = results.every(Boolean);
-    return { stopped, treeStopped: stopped, records: this.records() };
+    const records = this.records();
+    return { stopped, treeStopped: stopped && records.every((record) => record.state === "not_spawned" || record.stopProof?.kind === "verified-tree-stop"), records };
   }
   private async stopEntry(entry: Entry, deadlineMs: number): Promise<boolean> {
     const deadline = Date.now() + Math.max(0, deadlineMs);
@@ -191,17 +197,42 @@ export class ManagedProcessRegistry {
     }
     if (entry.record.state === "not_spawned") return true;
     const group = entry.record.processGroup;
-    const proof = group === undefined ? "unknown" : (this.options.groupExists ?? groupExists)(group);
-    if (entry.exited && proof === "absent" && this.options.verifyDescendantStop) {
+    let proof = group === undefined ? "unknown" : (this.options.groupExists ?? groupExists)(group);
+    if (this.options.stopMode === "managed_process_group" && group !== undefined && proof === "present") {
+      // A root may exit while its tools still hold the group and stdio. Clean
+      // that original group too; ChildProcess.kill deliberately refuses an exited root.
+      for (const signal of ["SIGTERM", "SIGKILL"] as const) {
+        try { (this.options.signalGroup ?? ((pid, value) => process.kill(-pid, value)))(group, signal); }
+        catch (error) { if ((error as NodeJS.ErrnoException).code !== "ESRCH") break; }
+        const until = signal === "SIGTERM" ? Date.now() + Math.max(0, (deadline - Date.now()) / 2) : deadline;
+        do {
+          proof = (this.options.groupExists ?? groupExists)(group);
+          if (proof !== "present" || Date.now() >= until) break;
+          await new Promise((resolve) => setTimeout(resolve, Math.min(20, Math.max(0, until - Date.now()))));
+        } while (true);
+        if (proof !== "present") break;
+      }
+    }
+    if (this.options.stopMode !== "managed_process_group" && entry.exited && proof === "absent" && this.options.verifyDescendantStop) {
       try {
         const stopProof = await this.options.verifyDescendantStop({ ...entry.record });
         if (stopProof) {
-          validateTreeStopEvidence(stopProof, entry.record.processIdentity);
+          validateTreeStopEvidence(stopProof, entry.record.processIdentity, entry.record.boundaryEvidence, group);
           entry.record.stopProof = stopProof;
           entry.record.state = "stopped";
           return this.persist(entry.record);
         }
       } catch { /* Unavailable or invalid proof retains the recovery gate. */ }
+    }
+    if (this.options.stopMode === "managed_process_group" && entry.exited && proof === "absent" && group !== undefined && entry.record.processIdentity && entry.record.boundaryEvidence) {
+      const stopProof: ProcessTreeStopEvidence = { kind: "managed-group-stop", version: 1, contractId: MACOS_MANAGED_STOP_CONTRACT,
+        sourceId: `${entry.record.id}:managed-group-stop/v1`, identityDigest: processIdentityDigest(entry.record.processIdentity),
+        launchDigest: entry.record.boundaryEvidence.launchDigest, processGroup: group, rootExitObserved: true, groupAbsent: true, observedAt: new Date().toISOString() };
+      try {
+        validateTreeStopEvidence(stopProof, entry.record.processIdentity, entry.record.boundaryEvidence, group);
+        entry.record.stopProof = stopProof; entry.record.state = "stopped";
+        return this.persist(entry.record);
+      } catch { /* Original contract/binding missing: preserve unknown. */ }
     }
     // Never infer descendant exit from root exit or the boolean returned by kill().
     entry.record.state = "unknown"; entry.record.errorCode = "PROCESS_TREE_STOP_UNPROVEN";

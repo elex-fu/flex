@@ -1,5 +1,6 @@
 import { processIdentityDigest } from "./managed-process-evidence.js";
 import type { ProcessIdentity, ProcessInspector } from "./process-inspector.js";
+import { hasManagedStopContract, MACOS_MANAGED_STOP_CONTRACT } from "./managed-stop-contract.js";
 
 export type NativeBoundaryPlatform = "darwin" | "linux";
 export type NativeBoundaryBackend = "macos_seatbelt" | "linux_bubblewrap";
@@ -18,6 +19,9 @@ export type NativeBoundaryProof = Readonly<{
   verifiedChildInheritance: true;
   treeIsolation: "unverified" | "linux_pid_namespace";
   verifiedDescendantStop: boolean;
+  /** Explicit ordinary mode; never upgrades the descendant-stop boolean. */
+  managedStopContractId?: typeof MACOS_MANAGED_STOP_CONTRACT;
+  verifiedWorkspaceWriteBoundary?: true;
 }>;
 export type NativeBoundaryReadinessCode = "NATIVE_BOUNDARY_READY" | "NATIVE_BOUNDARY_PLATFORM_UNSUPPORTED" | "NATIVE_BOUNDARY_BACKEND_UNAVAILABLE" | "NATIVE_BOUNDARY_BACKEND_UNTRUSTED" | "NATIVE_BOUNDARY_POLICY_INVALID" | "NATIVE_BOUNDARY_SELF_TEST_FAILED" | "NATIVE_BOUNDARY_CHANGED" | "NATIVE_BOUNDARY_CLOSED" | "NATIVE_BOUNDARY_SPAWN_INVALID";
 export type NativeBoundaryPublicSummary = Readonly<{
@@ -42,7 +46,9 @@ export function isNativeBoundaryProof(value: unknown): value is NativeBoundaryPr
     && [p.backendDigest, p.policyDigest, p.evidenceDigest].every((digest) => typeof digest === "string" && /^[a-f0-9]{64}$/.test(digest))
     && typeof p.kernelRelease === "string" && typeof p.backendVersion === "string"
     && p.verifiedPrivateReadBoundary === true && p.verifiedPrivateWriteBoundary === true && p.verifiedChildInheritance === true
-    && (p.treeIsolation === "unverified" && p.verifiedDescendantStop === false || p.platform === "linux" && p.treeIsolation === "linux_pid_namespace" && p.verifiedDescendantStop === true);
+    && (p.treeIsolation === "unverified" && p.verifiedDescendantStop === false || p.platform === "linux" && p.treeIsolation === "linux_pid_namespace" && p.verifiedDescendantStop === true)
+    && (p.managedStopContractId === undefined || hasManagedStopContract(p))
+    && (p.verifiedWorkspaceWriteBoundary === undefined || p.verifiedWorkspaceWriteBoundary === true && hasManagedStopContract(p));
 }
 
 export const NATIVE_RAW_PROCESS_EVIDENCE_VERSION = 1;

@@ -7,6 +7,7 @@ import { SqliteStore } from "../storage/db.js";
 import { dispatchContextForTurn } from "./types.js";
 import { ManagedRuntimeController } from "./managed-runtime.js";
 import { HostManagedRuntime } from "./native-runtime-factory.js";
+import { hasManagedStopContract } from "../lifecycle/managed-stop-contract.js";
 
 function readyOutput(stream: import("node:stream").Readable | null) {
   return new Promise<string>((resolve, reject) => {
@@ -16,7 +17,7 @@ function readyOutput(stream: import("node:stream").Readable | null) {
 }
 
 describe("production Host process factory", () => {
-  it("journals a real private-boundary child with original context/birth before output and never releases from root-only stop", async () => {
+  it("journals a real private-boundary child and releases only after its selected stop contract", async () => {
     const root = await mkdtemp(join(tmpdir(), "flyx-native-factory-")); const workspace = join(root, "checkout"); const nativeState = join(root, "native-state"); const privateRoot = join(root, "host-private");
     await Promise.all([workspace, nativeState, privateRoot].map((path) => mkdir(path))); const privateFile = join(privateRoot, "state.txt"); await writeFile(privateFile, "fixture private state");
     const owner = createTestHostOwner(); const store = new SqliteStore(); const session = store.createSession(workspace, "claude");
@@ -26,7 +27,7 @@ describe("production Host process factory", () => {
       if (process.platform === "darwin") expect(readiness.ready).toBe(true);
       const context = dispatchContextForTurn("fixture-turn", { hostOwnerId: owner.ownerId, hostOwnerGeneration: owner.generation, sessionId: session.id, flyxTurnId: "fixture-turn", runtimeId: "native-fixture", runtimeGeneration: 4, attemptId: "fixture-attempt" });
       if (!readiness.ready) { await expect(controller.prepare(context)).rejects.toThrow(readiness.code); expect(store.db.prepare("SELECT count(*) AS n FROM managed_processes").get()).toEqual({ n: 0 }); return; }
-      if (!readiness.proof.verifiedDescendantStop) {
+      if (!readiness.proof.verifiedDescendantStop && !hasManagedStopContract(readiness.proof)) {
         // Production gate: a boundary whose proof variant does not verify
         // descendant stop never prepares a Native runtime at all; nothing is
         // journalled and no child exists to release (plan R1, pre-R0 fail-closed).
@@ -42,7 +43,7 @@ describe("production Host process factory", () => {
       expect(record).toMatchObject({ owner_id: owner.ownerId, owner_generation: owner.generation, runtime_id: context.runtimeId, runtime_generation: context.runtimeGeneration, attempt_id: context.attemptId, session_id: session.id, turn_id: context.flyxTurnId, pid: child.pid, state: "running" });
       expect(store.db.prepare("SELECT identity_json FROM managed_process_identities WHERE process_id=?").get(record.id)).toBeDefined(); expect(store.db.prepare("SELECT proof_json,launch_digest FROM managed_process_boundaries WHERE process_id=?").get(record.id)).toMatchObject({ proof_json: JSON.stringify(readiness.proof), launch_digest: expect.stringMatching(/^[a-f0-9]{64}$/) });
       const stopped = await runtime.closeAndWait(1000);
-      if (!readiness.proof.verifiedDescendantStop) { expect(stopped.treeStopped).toBe(false); expect(host.canReleaseWorkspace(context)).toBe(false); expect(store.db.prepare("SELECT state FROM managed_processes WHERE id=?").get(record.id)).toEqual({ state: "unknown" }); }
+      if (hasManagedStopContract(readiness.proof)) { expect(stopped.stopped).toBe(true); expect(stopped.treeStopped).toBe(false); expect(host.canReleaseWorkspace(context)).toBe(true); expect(store.db.prepare("SELECT state FROM managed_processes WHERE id=?").get(record.id)).toEqual({ state: "stopped" }); }
       else { expect(stopped.treeStopped).toBe(true); expect(host.canReleaseWorkspace(context)).toBe(true); }
     } finally { await controller.closeAndWait(1000); await host.closeAndWait(1000); await host.disposeBoundary(); controller.sealJournals(); host.sealJournals(); store.close(); owner.release(); await rm(root, { recursive: true, force: true }); }
   }, 20_000);

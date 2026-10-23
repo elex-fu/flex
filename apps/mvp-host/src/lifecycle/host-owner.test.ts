@@ -151,11 +151,21 @@ describe("process inspection", () => {
   it("treats EPERM and unsupported macOS birth identity as unknown", () => {
     const denied = new SystemProcessInspector({ platform: "darwin", signal: () => { throw Object.assign(new Error("denied"), { code: "EPERM" }); } });
     expect(denied.inspect({ pid: 10, platform: "darwin" })).toEqual({ state: "unknown", reason: "permission_denied" });
-    const mac = new SystemProcessInspector({ platform: "darwin", signal: () => {} });
+    const mac = new SystemProcessInspector({ platform: "darwin", signal: () => {}, exec: () => { throw new Error("unavailable"); } });
     expect(mac.currentIdentity().birth).toBeUndefined();
     expect(mac.inspect({ pid: 10, platform: "darwin" }).state).toBe("unknown");
     const exited = new SystemProcessInspector({ platform: "darwin", signal: () => { throw Object.assign(new Error("gone"), { code: "ESRCH" }); } });
     expect(exited.inspect({ pid: 10, platform: "darwin" }).state).toBe("exited");
+  });
+
+  it("observes ordinary macOS birth and distinguishes reuse without treating a bare legacy PID as identity", () => {
+    let start = "Sat Oct 24 00:00:00 2026";
+    const mac = new SystemProcessInspector({ platform: "darwin", pid: 10, signal: () => {}, observeMacosBirth: true, exec: (command) => command.endsWith("sysctl") ? "12345678-1234-1234-1234-123456789abc" : start });
+    const original = mac.currentIdentity();
+    expect(mac.inspect(original)).toEqual({ state: "alive", reason: "managed_macos_identity_observed" });
+    start = "Sat Oct 24 00:00:01 2026";
+    expect(mac.inspect(original).state).toBe("exited");
+    expect(mac.inspect({ pid: 10, platform: "darwin" }).state).toBe("unknown");
   });
 
   it("distinguishes a verified live Linux birth from PID reuse or failed identity inspection", () => {

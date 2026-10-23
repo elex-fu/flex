@@ -31,6 +31,9 @@ import { CatalogStore } from "./storage/catalog-store.js";
 import { SqliteStore } from "./storage/db.js";
 import { HostOwnerLock, canonicalPath, type HostOwnerHandle } from "./lifecycle/host-owner.js";
 import { SqliteProcessJournal } from "./lifecycle/managed-process-registry.js";
+import { createMacosManagedExecution, macosManagedGitOptions, macosManagedExecutionFacts } from "./lifecycle/macos-managed-execution.js";
+import { ManagedGitRunner } from "./lifecycle/managed-git-runner.js";
+import { homedir } from "node:os";
 import { openForMaintenance, openForManagement, openOwned, openReadOnly } from "./storage/open-store.js";
 
 await main().catch((error: unknown) => {
@@ -202,8 +205,11 @@ async function main(): Promise<void> {
     store.setHostIdentityMirror(getHostIdentityMirror(identity));
     const connectivity = await resolveConnectivityConfig(parseConnectivityConfig());
     const bootstrap = readHostCatalogBootstrap({ store, workspace, provider, environment: process.env });
+    const execution = await createMacosManagedExecution({ identity, compatibilityEvidencePath: compatibilityEvidencePathFor(owner.databasePath),
+      compatibilityEndorsementPath: compatibilityEndorsementPathFor(owner.databasePath),
+      worktreesRoot: resolve(process.env.FLYX_WORKTREES_ROOT ?? join(homedir(), ".flyx-worktrees")) });
     pairingConfirmation = createPairingConfirmation();
-    application = await createHostApplication({ store, owner, identity, ...bootstrap, snapshotLane,
+    application = await createHostApplication({ store, owner, identity, ...bootstrap, snapshotLane, ...(execution ? { execution } : {}),
       compatibilityEvidencePath: compatibilityEvidencePathFor(owner.databasePath),
       compatibilityEndorsementPath: compatibilityEndorsementPathFor(owner.databasePath),
       server: { pairingConfirmation, connectivity, ...(process.env.FLYX_WEB_ROOT ? { webRoot: process.env.FLYX_WEB_ROOT } : {}) },
@@ -317,8 +323,8 @@ function compatibilityEndorsementPathFor(databasePath: string): string {
 /**
  * Offline execution activation (design §6.3). The maintenance owner is the only
  * live writer while the Host is stopped; the managed query executor is composed
- * exactly like the Host read path, so a platform without a proven process-birth
- * contract refuses instead of launching raw Git. Installed supervisor/adapter
+ * exactly like the Host read path, using the ordinary macOS contract or refusing
+ * when no trusted backend is available. Installed supervisor/adapter
  * facts arrive with their own contracts and stay absent until then, which keeps
  * verify fail-closed instead of inferring readiness.
  */
@@ -328,7 +334,9 @@ async function runActivationCommand(store: SqliteStore, owner: HostOwnerHandle, 
   const mirror = store.getHostIdentityMirror();
   if (!mirror) throw new OperationsError("BACKUP_IDENTITY_MISMATCH");
   const identity = await loadOrCreateHostIdentity({ directory: owner.identityDirectory!, expectedMirror: mirror });
-  const observation = localActivationFacts({ compatibilityEvidencePath: compatibilityEvidencePathFor(owner.databasePath), privateRoots,
+  const ordinaryFacts = process.platform === "darwin" ? macosManagedExecutionFacts({ compatibilityEvidencePath: compatibilityEvidencePathFor(owner.databasePath),
+    trust: { destination: publicHostIdentity(identity), endorsementPath: compatibilityEndorsementPathFor(owner.databasePath) } }) : {};
+  const observation = localActivationFacts({ compatibilityEvidencePath: compatibilityEvidencePathFor(owner.databasePath), privateRoots, ...ordinaryFacts,
     compatibilityTrust: { destination: publicHostIdentity(identity), endorsementPath: compatibilityEndorsementPathFor(owner.databasePath) } });
   const catalog = new CatalogStore(store);
   try {
@@ -338,11 +346,16 @@ async function runActivationCommand(store: SqliteStore, owner: HostOwnerHandle, 
     );
     const load = new HostActivationLoad(operations, observation);
     const executorFactory: ManagedQueryExecutorFactory = async () => {
+      const runner = process.platform === "darwin" ? new ManagedGitRunner({ ...macosManagedGitOptions(), journal: new SqliteProcessJournal(store.db),
+        roots: () => catalog.workspaces().flatMap((workspace) => [workspace.canonicalRoot, workspace.worktreeRoot]), privateRoots,
+        context: ({ operationId }) => ({ hostOwnerId: owner.ownerId, hostOwnerGeneration: owner.generation,
+          runtimeId: "activation-query", runtimeGeneration: 1, attemptId: operationId ?? randomUUID() }) }) : undefined;
       const managed = createManagedWorkspaceQuery({
         journal: new SqliteProcessJournal(store.db), privateRoots,
         assertActive: () => { owner.assertActive(); store.assertWriterOwner(); },
         context: ({ operationId }) => ({ hostOwnerId: owner.ownerId, hostOwnerGeneration: owner.generation,
           runtimeId: "activation-query", runtimeGeneration: 1, attemptId: operationId ?? randomUUID() }),
+        ...(runner ? { executor: runner.workspaceQueryPort() } : {}),
       });
       return { readOnlyGit: managed.readOnlyGit, prepare: () => managed.prepare(),
         closeAndWait: async (deadlineMs) => { const report = await managed.drain(deadlineMs); return { producerStopped: report.producerStopped, clean: report.clean }; } };

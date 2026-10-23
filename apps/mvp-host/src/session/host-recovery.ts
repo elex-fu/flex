@@ -1,3 +1,4 @@
+import { hasValidProcessStop } from "../lifecycle/managed-process-evidence.js";
 import type { RecoveryEvidence, RecoveryInspectPayload, RecoveryOperation, SessionEvent } from "@flyx/mvp-protocol";
 import { inspectCodexNativeTurn } from "../codex/recovery-reader.js";
 import type { AppServerClient } from "../codex/app-server-client.js";
@@ -193,7 +194,7 @@ export class HostRecovery {
       const journal = this.recovery.operation(operation.operationId);
       const stopped = evidence?.execution.evidence;
       if (operation.gate === "released" && journal?.phase === "completed" && journal.action === "acknowledge"
-        && evidence?.execution.state === "stopped" && evidence.execution.workspaceState === "clear" && stopped?.kind === "process-tree-stopped") {
+        && evidence?.execution.state === "stopped" && evidence.execution.workspaceState === "clear" && stopped && ["process-tree-stopped", "managed-processes-stopped"].includes(stopped.kind)) {
         this.options.reconcileStoppedRuntime?.(target.context, Object.freeze({ kind: "execution-stopped", sourceId: stopped.sourceId,
           evidenceId, operationId: operation.operationId }));
       }
@@ -268,9 +269,15 @@ export class HostRecovery {
     if (!target.context || !target.turn.attemptId || !target.processes.length) return { state: "unknown", workspaceState: "unknown", reason: "original_process_identity_missing" };
     const inspector = this.options.processInspector ?? new SystemProcessInspector();
     const proofs: Array<{ id: string; sourceId: string; contractId: string; identityDigest?: string }> = [];
+    let ordinary = false;
     for (const record of target.ownerProcesses) {
       if (record.state === "not_spawned" && record.pid === undefined && record.processGroup === undefined && !record.processIdentity && !record.stopProof) { proofs.push({ id: record.id, sourceId: digest(record), contractId: "spawn-not-created" }); continue; }
       const identity = record.processIdentity;
+      if (record.stopProof?.kind === "managed-group-stop" && hasValidProcessStop({ ...record, boundaryEvidence: record.boundary })) {
+        ordinary = true;
+        proofs.push({ id: record.id, sourceId: record.stopProof.sourceId, contractId: record.stopProof.contractId, identityDigest: record.stopProof.identityDigest });
+        continue;
+      }
       if (!identity || !identity.birth || identity.birth.kind !== "linux" || identity.platform !== "linux" || identity.pid !== record.pid
         || !/^[a-f0-9-]{36}$/i.test(identity.birth.bootId) || !/^\d+$/.test(identity.birth.startTicks)) return { state: "unknown", workspaceState: "unknown", reason: "original_process_birth_unverified" };
       const root = inspector.inspect(identity);
@@ -293,7 +300,7 @@ export class HostRecovery {
     }
     const workspaceState = await this.options.inspectWorkspace?.(target) ?? "unknown";
     this.assertOpen();
-    return { state: "stopped", workspaceState, evidence: { kind: "process-tree-stopped", sourceId: digest(proofs), ownerId: target.context.hostOwnerId,
+    return { state: "stopped", workspaceState, evidence: { kind: ordinary ? "managed-processes-stopped" : "process-tree-stopped", sourceId: digest(proofs), ownerId: target.context.hostOwnerId,
       ownerGeneration: target.context.hostOwnerGeneration, resourceKeys: [...this.options.owner.resourceKeys, `workspace:${this.options.checkoutRoot ?? this.options.workspace}`],
       processRecordIds: proofs.map((proof) => proof.id) } };
   }

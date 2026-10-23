@@ -142,7 +142,8 @@ export async function createHostApplication(options: HostApplicationOptions) {
   } });
   const runner = options.execution?.git ? new ManagedGitRunner({ ...options.execution.git, journal, privateRoots: privateDirectories,
     repositoryMetadata: repositoryMetadata.run,
-    roots: () => [...(catalog?.catalog.workspaces().map((workspace) => workspace.worktreeRoot) ?? options.configuration.workspaces?.map((workspace) => workspace.root) ?? []),
+    roots: () => [...(catalog?.catalog.workspaces().flatMap((workspace) => [workspace.canonicalRoot, workspace.worktreeRoot]) ?? []),
+      ...(options.configuration.workspaces?.map((workspace) => workspace.root) ?? []),
       ...(options.execution?.worktreesRoot ? [options.execution.worktreesRoot] : [])],
     context: ({ operationId }) => {
       const worktree = worktreeBindings?.worktrees.currentExecution()?.dispatchContext;
@@ -244,17 +245,17 @@ export async function createHostApplication(options: HostApplicationOptions) {
           ...(compatibilityRecorder ? { compatibilityRecorder } : {}),
           canReleaseAdditionalProducers: (dispatch) => {
             owner.assertActive();
-            const records = store.db.prepare(`SELECT p.state,p.pid,i.identity_json,b.launch_digest,s.proof_json FROM managed_processes p
+            const records = store.db.prepare(`SELECT p.state,p.pid,p.process_group,i.identity_json,b.proof_json AS boundary_json,b.launch_digest,s.proof_json FROM managed_processes p
               LEFT JOIN managed_process_identities i ON i.process_id=p.id
               LEFT JOIN managed_process_boundaries b ON b.process_id=p.id
               LEFT JOIN managed_process_stop_proofs s ON s.process_id=p.id
               WHERE p.owner_id=? AND p.owner_generation=? AND p.runtime_id=? AND p.session_id=? AND
                 (p.turn_id IS NULL OR (p.runtime_generation=? AND p.turn_id=? AND p.attempt_id=?))`)
-              .all(owner.ownerId, owner.generation, dispatch.runtimeId, dispatch.sessionId, dispatch.runtimeGeneration, dispatch.flyxTurnId, dispatch.attemptId) as Array<{ state: string; pid: number | null; identity_json: string | null; launch_digest: string | null; proof_json: string | null }>;
+              .all(owner.ownerId, owner.generation, dispatch.runtimeId, dispatch.sessionId, dispatch.runtimeGeneration, dispatch.flyxTurnId, dispatch.attemptId) as Array<{ state: string; pid: number | null; process_group: number | null; identity_json: string | null; boundary_json: string | null; launch_digest: string | null; proof_json: string | null }>;
             return records.every((record) => {
               if (record.state === "not_spawned" && record.pid === null) return true;
               if (record.state !== "stopped" || !record.identity_json || !record.proof_json || !record.launch_digest) return false;
-              try { validateTreeStopEvidence(JSON.parse(record.proof_json), JSON.parse(record.identity_json)); return true; } catch { return false; }
+              try { validateTreeStopEvidence(JSON.parse(record.proof_json), JSON.parse(record.identity_json), record.boundary_json ? { proof: JSON.parse(record.boundary_json), launchDigest: record.launch_digest } : undefined, record.process_group ?? undefined); return true; } catch { return false; }
             }) && (extra?.canReleaseAdditionalProducers?.(dispatch) ?? true);
           },
           gitRunner: async (request) => {
@@ -434,7 +435,7 @@ export async function createHostApplication(options: HostApplicationOptions) {
       compatibilityArtifact: () => options.execution?.compatibilityArtifact?.(),
       prepareCompatibilityScene: async (input: Pick<CompatibilityScenePolicyOptions, "authorization" | "expectedDestination" | "entry" | "measureArtifact">) => {
         if (nativeScenePolicy || runningCatalog.catalog.allSessions().some((session) => runningCatalog.registry.loaded(session.sessionId))) throw new CatalogError("COMPATIBILITY_SCENE_ALREADY_STARTED");
-        if (!runner || options.execution?.git?.stopBackend.kind !== "supervisor" || options.execution.facts?.supervision?.()?.contractId !== options.execution.git.stopBackend.contractId) throw new CatalogError("SUPERVISION_CONTRACT_UNAVAILABLE");
+        if (!runner || !["supervisor", "managed_process_group"].includes(options.execution?.git?.stopBackend.kind ?? "") || options.execution?.facts?.supervision?.()?.contractId !== options.execution?.git?.stopBackend.contractId) throw new CatalogError("SUPERVISION_CONTRACT_UNAVAILABLE");
         nativeScenePolicy = await createCompatibilityScenePolicy({ ...input, store, owner,
           currentBinding: () => sceneBinding(runningCatalog.registry.resolve(runningCatalog.legacySessionId)),
           assertBaseline: (actorId, sessionId) => {

@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { AppServerClient } from "../codex/app-server-client.js";
 import { createTestHostOwner } from "../lifecycle/host-owner.js";
 import { processIdentityDigest } from "../lifecycle/managed-process-evidence.js";
+import { MACOS_MANAGED_STOP_CONTRACT } from "../lifecycle/managed-stop-contract.js";
 import { MANAGED_PROCESS_IDENTITY_SCHEMA } from "../lifecycle/managed-process-registry.js";
 import type { ProcessIdentity, ProcessInspector } from "../lifecycle/process-inspector.js";
 import { fenceAdapterEvent, type DispatchContext, type ProviderId } from "../provider/types.js";
@@ -47,6 +48,22 @@ function fixture(provider: ProviderId = "codex", extra: Partial<HostRecoveryOpti
 }
 
 describe("production Host recovery factory", () => {
+  it("releases a bound ordinary macOS stop without upgrading its guarantee, and rejects a changed launch", async () => {
+    const f = fixture("codex", { inspectWorkspace: async () => "clear" }); f.process("stopped"); f.unknown();
+    const original = { pid: 123, platform: "darwin" as const };
+    f.store.db.prepare("UPDATE managed_process_identities SET identity_json=?").run(JSON.stringify(original));
+    f.store.db.prepare("INSERT INTO managed_process_boundaries(process_id,proof_json,launch_digest) VALUES('original-process',?,?)")
+      .run(JSON.stringify({ platform: "darwin", managedStopContractId: MACOS_MANAGED_STOP_CONTRACT }), "a".repeat(64));
+    const stop = { kind: "managed-group-stop", version: 1, contractId: MACOS_MANAGED_STOP_CONTRACT, sourceId: "original-process:managed-group-stop/v1",
+      identityDigest: processIdentityDigest(original), launchDigest: "a".repeat(64), processGroup: 123, rootExitObserved: true, groupAbsent: true, observedAt: new Date().toISOString() };
+    f.store.db.prepare("INSERT INTO managed_process_stop_proofs(process_id,proof_json) VALUES('original-process',?)").run(JSON.stringify(stop));
+    const view = await f.recovery.inspect({ sessionId: f.session.id, turnId: "original-turn" });
+    expect(view).toMatchObject({ processState: "stopped", processStopScope: "managed_process_group", workspaceState: "clear", nativeState: "terminal" });
+    const result = await f.recovery.reconcile(await f.input());
+    expect(result.gate).toBe("released"); expect(result.turnStatus).toBe("completed");
+    f.store.db.prepare("UPDATE managed_process_boundaries SET launch_digest=?").run("b".repeat(64));
+    expect((await f.recovery.inspect({ sessionId: f.session.id, turnId: "original-turn" })).processState).toBe("unknown");
+  });
   it("persists exact fenced native handles and rejects a late original binding after activity changed", () => {
     const f = fixture();
     expect(f.recovery.recovery.nativeHandle("original-turn", "original-attempt")).toMatchObject({ nativeSessionId: "native-session", nativeTurnId: "native-turn", context: f.context, verifiedVersion: "verified-v1", configurationFingerprint: "configured-policy" });

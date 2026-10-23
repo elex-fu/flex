@@ -25,6 +25,7 @@ export const RecoveryEvidenceSchema = z.object({
   observedAt: z.string(),
   expiresAt: z.string(),
   processState: z.enum(["stopped", "running", "unknown"]),
+  processStopScope: z.enum(["managed_process_group", "isolated_descendants"]).optional(),
   workspaceState: z.enum(["clear", "held", "unknown"]),
   nativeState: z.enum(["terminal", "running", "unknown"]),
   nativeOutcome: z.enum(["completed", "failed", "cancelled"]).optional(),

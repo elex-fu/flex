@@ -1,3 +1,4 @@
+import { hasValidProcessStop } from "../lifecycle/managed-process-evidence.js";
 import type Database from "better-sqlite3";
 import type { RecoveryOperation } from "@flyx/mvp-protocol";
 import type { HostCatalog } from "../catalog/host-catalog.js";
@@ -84,9 +85,10 @@ export function inspectCatalogStartupReadiness(host: CatalogFacts, options: Cata
     }
     const covered = new Set([...releases.values()].flatMap((items) => items.flatMap((release) => [...release.records])));
     for (const record of records) {
-      const local = !options.includeCurrentOwner && record.ownerId === host.owner.ownerId && record.ownerGeneration === host.owner.generation;
-      if (validNotSpawned(record) || journalStopped(record) || covered.has(record.id)) continue;
-      if (local && record.state !== "unknown" && record.ownerId && record.runtimeId && record.attemptId
+      const sameOwner = record.ownerId === host.owner.ownerId && record.ownerGeneration === host.owner.generation;
+      const local = !options.includeCurrentOwner && sameOwner;
+      if (validNotSpawned(record) || journalStopped(record, sameOwner) || covered.has(record.id)) continue;
+      if (local && ["launching", "running", "root_exited"].includes(record.state) && record.ownerId && record.runtimeId && record.attemptId
         && Number.isSafeInteger(record.runtimeGeneration) && record.runtimeGeneration > 0) continue;
       block("ORIGINAL_PROCESS_STOP_UNVERIFIED");
     }
@@ -163,10 +165,11 @@ function releasedFacts(host: CatalogFacts, target: RecoveryTarget, records: read
         || evidence.view.turnId !== target.turn.id || evidence.view.attemptId !== target.turn.attemptId || stored.facts_fingerprint !== evidence.factsFingerprint
         || stored.recovery_revision !== evidence.view.recoveryRevision || result.recoveryRevision !== evidence.view.recoveryRevision + 1 || target.session.recoveryRevision < result.recoveryRevision
         || evidence.execution.state !== "stopped" || evidence.execution.workspaceState !== "clear" || evidence.view.processState !== "stopped" || evidence.view.workspaceState !== "clear"
-        || !stop || stop.kind !== "process-tree-stopped" || stop.ownerId !== fence.hostOwnerId || stop.ownerGeneration !== fence.hostOwnerGeneration
+        || !stop || !["process-tree-stopped", "managed-processes-stopped"].includes(stop.kind) || stop.ownerId !== fence.hostOwnerId || stop.ownerGeneration !== fence.hostOwnerGeneration
         || !Array.isArray(stop.processRecordIds) || !stop.processRecordIds.length || !Array.isArray(stop.resourceKeys)
         || ![...host.owner.resourceKeys, `workspace:${workspace.worktreeRoot}`].every((key) => stop.resourceKeys.includes(key))) continue;
       const selected = records.filter((record) => stop.processRecordIds!.includes(record.id));
+      if (stop.kind === "process-tree-stopped" && selected.some((record) => record.stopProof?.kind === "managed-group-stop")) continue;
       if (selected.length !== new Set(stop.processRecordIds).size || selected.some((record) => record.ownerId !== stop.ownerId || record.ownerGeneration !== stop.ownerGeneration)
         || digest(selected) !== evidence.ownerJournalFingerprint || !selected.some((record) => record.sessionId === fence.sessionId && record.turnId === fence.flyxTurnId
           && record.attemptId === fence.attemptId && record.runtimeId === fence.runtimeId && record.runtimeGeneration === fence.runtimeGeneration)) continue;
@@ -211,6 +214,9 @@ function validNotSpawned(record: RecoveryProcessRecord): boolean {
     && Number.isSafeInteger(record.runtimeGeneration) && record.runtimeGeneration > 0 && record.state === "not_spawned" && record.pid === undefined && record.processGroup === undefined && !record.processIdentity && !record.boundary && !record.stopProof;
 }
 function boundaryStopped(record: RecoveryProcessRecord): { id: string; sourceId: string; contractId: string; identityDigest: string } | undefined {
+  if (record.stopProof?.kind === "managed-group-stop" && hasValidProcessStop({ ...record, boundaryEvidence: record.boundary })) {
+    return { id: record.id, sourceId: record.stopProof.sourceId, contractId: record.stopProof.contractId, identityDigest: record.stopProof.identityDigest };
+  }
   const identity = record.processIdentity; const boundary = record.boundary;
   if (!identity || identity.platform !== "linux" || !identity.birth || identity.birth.kind !== "linux" || identity.pid !== record.pid || !Number.isSafeInteger(identity.pid) || identity.pid < 1
     || !/^[a-f0-9-]{36}$/i.test(identity.birth.bootId) || !/^\d+$/.test(identity.birth.startTicks)
@@ -220,10 +226,15 @@ function boundaryStopped(record: RecoveryProcessRecord): { id: string; sourceId:
   return { id: record.id, sourceId: boundary.proof.boundaryId + ":" + identityDigest,
     contractId: "native-boundary/v1/" + boundary.proof.backend + "/" + boundary.proof.evidenceDigest, identityDigest };
 }
-function journalStopped(record: RecoveryProcessRecord): boolean {
+function journalStopped(record: RecoveryProcessRecord, currentOwner = false): boolean {
   if (record.state !== "stopped" || !record.stopProof) return false;
+  // This invocation's journal already ran its selected trusted backend's
+  // verifier. Recheck its immutable launch binding too, including ordinary
+  // Git/helper plans; historical owners still require the original boundary.
+  if (currentOwner && record.boundary && /^[a-f0-9]{64}$/.test(record.boundary.launchDigest)
+    && hasValidProcessStop({ ...record, boundaryEvidence: record.boundary })) return true;
   const proof = boundaryStopped(record); if (!proof) return false;
-  try { validateTreeStopEvidence(record.stopProof, record.processIdentity); }
+  try { validateTreeStopEvidence(record.stopProof, record.processIdentity, record.boundary, record.processGroup); }
   catch { return false; }
   return record.stopProof.sourceId === proof.sourceId && record.stopProof.contractId === proof.contractId;
 }

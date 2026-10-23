@@ -1,3 +1,4 @@
+import { nativeStopContractId, supportsNativeStop } from "../lifecycle/managed-stop-contract.js";
 import type Database from "better-sqlite3";
 import { createRequire } from "node:module";
 import { dirname, join, resolve } from "node:path";
@@ -9,6 +10,7 @@ import { validateTreeStopEvidence, type ProcessTreeStopEvidence } from "../lifec
 import type { ProcessIdentity } from "../lifecycle/process-inspector.js";
 import { OperationsError } from "../operations/operation-files.js";
 import { providerConfigurationFingerprint } from "../lifecycle/host-activation-load.js";
+import type { ProviderRuntimeFacts } from "../lifecycle/host-activation-load.js";
 import type { ProviderInstanceRecord } from "../storage/catalog-store.js";
 import type { DispatchContext } from "../provider/types.js";
 import { inspectNativeVersion, type ManagedVersionObservation, type PreparedNativeRuntime } from "../provider/managed-runtime.js";
@@ -44,15 +46,16 @@ function originalVersionSource(db: Database.Database, context: DispatchContext, 
   const stop = JSON.parse(String(row.stop_json)) as ProcessTreeStopEvidence;
   const identity = JSON.parse(String(row.identity_json)) as ProcessIdentity;
   if (snapshot.v !== 1 || snapshot.processId !== processId || snapshot.launchDigest !== row.launch_digest || snapshot.planned.operation !== "version-query"
-    || compatibilityDigest(planned) !== snapshotDigest || !isNativeBoundaryProof(boundary) || !boundary.verifiedDescendantStop
-    || stop.contractId !== "native-boundary/v1/" + boundary.backend + "/" + boundary.evidenceDigest) fail("COMPATIBILITY_VERSION_SOURCE_MISMATCH");
-  validateTreeStopEvidence(stop, identity);
+    || compatibilityDigest(planned) !== snapshotDigest || !isNativeBoundaryProof(boundary) || !supportsNativeStop(boundary)
+    || stop.contractId !== nativeStopContractId(boundary)) fail("COMPATIBILITY_VERSION_SOURCE_MISMATCH");
+  validateTreeStopEvidence(stop, identity, { proof: boundary as NativeBoundaryProof, launchDigest: String(row.launch_digest) }, Number(row.process_group));
   return { planned: snapshot.planned, boundary: boundary as NativeBoundaryProof, stop };
 }
 export function recordManagedVersionObservation(db: Database.Database, provider: ProviderInstanceRecord,
   observation: ManagedVersionObservation, assertOwner: () => void): void {
   assertOwner();
-  if (!observation.stop.stopped || !observation.stop.treeStopped || !observation.stop.records.some((record) => record.id === observation.processId && record.state === "stopped" && record.stopProof)) fail("COMPATIBILITY_C0_STOP_UNVERIFIED");
+  if (!observation.stop.stopped || !observation.stop.treeStopped && !observation.stop.records.some((record) => record.stopProof?.kind === "managed-group-stop")
+    || !observation.stop.records.some((record) => record.id === observation.processId && record.state === "stopped" && record.stopProof)) fail("COMPATIBILITY_C0_STOP_UNVERIFIED");
   const source = originalVersionSource(db, observation.context, observation.processId);
   const executable = measureRuntimeFile(provider.executable);
   if (realpathSync(observation.executable) !== executable.path || source.planned.executable.path !== executable.path || source.planned.executable.digest !== executable.digest) fail("COMPATIBILITY_VERSION_EXECUTABLE_CHANGED");
@@ -90,19 +93,25 @@ function installedSdk(): { version: string; entry: string } {
   } catch { /* inspect the owning installed package only */ } directory = dirname(directory); }
   return fail("COMPATIBILITY_INSTALLED_METADATA_UNAVAILABLE");
 }
+/** Installed adapter/SDK bytes; providerVersion must come from a measured, trusted artifact. */
+export function installedProviderRuntimeFacts(provider: "claude" | "codex", providerVersion: string): ProviderRuntimeFacts {
+  const adapter = measureRuntimeFile(join(root, provider, "adapter" + (root.endsWith("/dist") ? ".js" : ".ts")));
+  return { providerVersion, ...(provider === "claude" ? { sdkVersion: installedSdk().version } : {}),
+    adapterId: provider === "claude" ? "claude-agent-sdk" : "codex-app-server", adapterVersion: "sha256-" + adapter.digest };
+}
 export function createCompatibilityRuntimeFacts(options: CompatibilityRuntimeFactsOptions) {
   const measure = (): NativeCompatibilityArtifact => {
     options.assertOwner(); const provider = options.provider();
     const proof = options.supervision();
-    if (!proof || !isNativeBoundaryProof(proof) || !proof.verifiedDescendantStop) return fail("COMPATIBILITY_C0_UNAVAILABLE");
+    if (!proof || !isNativeBoundaryProof(proof) || !supportsNativeStop(proof)) return fail("COMPATIBILITY_C0_UNAVAILABLE");
     const executable = measureRuntimeFile(provider.executable), configFingerprint = providerConfigurationFingerprint(provider);
-    const stored = options.db.prepare("SELECT value_json FROM host_state WHERE key=?").get(versionKey(provider.provider, executable, configFingerprint, "native-boundary/v1/" + proof.backend + "/" + proof.evidenceDigest)) as { value_json: string } | undefined;
+    const stored = options.db.prepare("SELECT value_json FROM host_state WHERE key=?").get(versionKey(provider.provider, executable, configFingerprint, nativeStopContractId(proof))) as { value_json: string } | undefined;
     if (!stored) return fail("COMPATIBILITY_VERSION_OBSERVATION_UNAVAILABLE");
     const fact = JSON.parse(stored.value_json) as QueryFact;
     const source = originalVersionSource(options.db, fact.context, fact.processId);
     if (fact.v !== 1 || fact.provider !== provider.provider || fact.executablePath !== executable.path || fact.executableDigest !== executable.digest
       || fact.configFingerprint !== configFingerprint || fact.plannedDigest !== source.planned.snapshotDigest || source.planned.executable.digest !== executable.digest
-      || source.boundary.evidenceDigest !== proof.evidenceDigest || source.planned.nodeExecutable.digest !== measureRuntimeFile(process.execPath).digest
+      || nativeStopContractId(source.boundary) !== nativeStopContractId(proof) || source.planned.nodeExecutable.digest !== measureRuntimeFile(process.execPath).digest
       || !/^[a-f0-9]{64}$/.test(fact.outputDigest)) return fail("COMPATIBILITY_VERSION_SOURCE_MISMATCH");
     const adapter = measureRuntimeFile(join(root, provider.provider, "adapter" + (root.endsWith("/dist") ? ".js" : ".ts")));
     const host = packageMetadata(resolve(root, "../package.json"));
@@ -110,7 +119,7 @@ export function createCompatibilityRuntimeFacts(options: CompatibilityRuntimeFac
     return Object.freeze({ providerVersion: fact.version, executablePath: executable.path, executableDigest: executable.digest, configFingerprint,
       ...(sdk ? { sdkVersion: sdk.version } : {}), adapterId: provider.provider === "claude" ? "claude-agent-sdk" : "codex-app-server", adapterVersion: "sha256-" + adapter.digest,
       runtimeVersion: host.version, runtimeDigest: measuredHostBuildDigest(), nodeVersion: process.versions.node, os: source.planned.os,
-      supervisionContractId: "native-boundary/v1/" + proof.backend + "/" + proof.evidenceDigest });
+      supervisionContractId: nativeStopContractId(proof) });
   };
   return Object.freeze({ measure,
     /** Runs only the managed exact --version query, never preflight/model execution. */

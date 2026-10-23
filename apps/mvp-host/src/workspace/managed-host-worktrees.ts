@@ -11,7 +11,7 @@ import { WorktreeGitDriver } from "./worktree-git.js";
 import type { RepositoryMetadataLocks } from "./repository-metadata-lock.js";
 import type { OwnershipRecoveryAuthorization } from "../lifecycle/host-owner.js";
 
-type StopRow = { id: string; state: string; identity_json: string | null; proof_json: string | null; boundary_json: string | null; launch_digest: string | null };
+type StopRow = { id: string; state: string; process_group: number | null; identity_json: string | null; proof_json: string | null; boundary_json: string | null; launch_digest: string | null };
 type ManagedOptions = Omit<HostWorktreesOptions, "git" | "producerStopProof" | "closeGit" | "sealGitJournal"> & {
   runner: ManagedGitRunner;
   /** Exact verified backend contract selected by application construction. */
@@ -34,7 +34,7 @@ export function createManagedScheduledHostWorktrees(options: ManagedOptions) {
     const all: StopRow[] = [];
     try {
       for (const dispatch of contexts) {
-        const rows = options.catalog.db.prepare(`SELECT p.id,p.state,i.identity_json,s.proof_json,b.proof_json AS boundary_json,b.launch_digest
+        const rows = options.catalog.db.prepare(`SELECT p.id,p.state,p.process_group,i.identity_json,s.proof_json,b.proof_json AS boundary_json,b.launch_digest
           FROM managed_processes p LEFT JOIN managed_process_identities i ON i.process_id=p.id
           LEFT JOIN managed_process_stop_proofs s ON s.process_id=p.id LEFT JOIN managed_process_boundaries b ON b.process_id=p.id
           WHERE p.owner_id=? AND p.owner_generation=? AND p.runtime_id=? AND p.runtime_generation=? AND p.attempt_id=? AND p.session_id=? AND p.turn_id=? ORDER BY p.id`)
@@ -48,7 +48,7 @@ export function createManagedScheduledHostWorktrees(options: ManagedOptions) {
           if (row.state === "not_spawned") continue;
           if (row.state !== "stopped" || !row.identity_json || !row.proof_json) return undefined;
           const proof = JSON.parse(row.proof_json) as ProcessTreeStopEvidence;
-          validateTreeStopEvidence(proof, JSON.parse(row.identity_json) as ProcessIdentity);
+          validateTreeStopEvidence(proof, JSON.parse(row.identity_json) as ProcessIdentity, { proof: boundary, launchDigest: row.launch_digest }, row.process_group ?? undefined);
           if (proof.contractId !== options.stopContractId) return undefined;
         }
         all.push(...rows);

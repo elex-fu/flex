@@ -1,4 +1,5 @@
 import { constants } from "node:fs";
+import { MACOS_MANAGED_STOP_CONTRACT } from "../lifecycle/managed-stop-contract.js";
 import { open } from "node:fs/promises";
 import type { AppServerClient } from "../codex/app-server-client.js";
 import { inspectCodexNativeTurn } from "../codex/recovery-reader.js";
@@ -29,7 +30,7 @@ export type NativeHistoryInspectionHelper = Readonly<{
   launchId: string; launchDigest: string;
   originalContextDigest: string; successorProcessRecordIds: readonly string[];
   stop(deadlineAt: number): Promise<Readonly<{
-    kind: "process-tree-stopped"; launchId: string; launchDigest: string; sourceId: string; contractId: string;
+    kind: "process-tree-stopped" | "managed-processes-stopped"; launchId: string; launchDigest: string; sourceId: string; contractId: string;
   }> | undefined>;
 }>;
 export type ClaudeTranscriptSource = Readonly<{
@@ -127,7 +128,8 @@ export class NativeHistoryReaderFactory {
         try {
           const stopDeadline = Date.now() + budget;
           const proof = await bounded(helper.stop(stopDeadline), stopDeadline);
-          if (!hash.test(helper.launchDigest) || !helper.launchId || proof?.kind !== "process-tree-stopped"
+          if (!hash.test(helper.launchDigest) || !helper.launchId || !proof || !["process-tree-stopped", "managed-processes-stopped"].includes(proof.kind)
+            || (proof.kind === "managed-processes-stopped") !== (proof.contractId === MACOS_MANAGED_STOP_CONTRACT)
             || proof.launchId !== helper.launchId || proof.launchDigest !== helper.launchDigest || !proof.sourceId || !proof.contractId
             || helper.originalContextDigest !== digest(handle.context) || !helper.successorProcessRecordIds.length
             || !this.options.verifyInspectionHelper?.(handle, helper)) {

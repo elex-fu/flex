@@ -4,6 +4,7 @@ import type { NativeHandle, NativeTurnObservation, NativeInspectionExecutionEvid
 import type { PlannedEvent } from "../orchestration/command-contract.js";
 import type { SqliteStore } from "../storage/db.js";
 import { RecoveryError, RecoveryStore, digest } from "../storage/recovery-store.js";
+import { hasValidProcessStop } from "../lifecycle/managed-process-evidence.js";
 import type { ExecutionRecoveryObservation, RecoveryCommandInput, RecoveryTarget, StoredRecoveryEvidence, NotDispatchedRecoveryOutcome } from "../storage/recovery-store.js";
 
 export type RecoveryServiceOptions = {
@@ -65,6 +66,7 @@ export class RecoveryService {
       ...(target.turn.attemptId ? { attemptId: target.turn.attemptId } : {}), recoveryRevision: target.session.recoveryRevision,
       observedAt, expiresAt: new Date(Date.parse(observedAt) + this.evidenceTtlMs).toISOString(),
       processState: observed.execution.state, workspaceState: observed.execution.workspaceState, nativeState: observed.native.state,
+      ...(observed.execution.evidence?.kind === "managed-processes-stopped" ? { processStopScope: "managed_process_group" as const } : {}),
       ...(observed.native.state === "terminal" ? { nativeOutcome: observed.native.status } : {}),
       ...(observed.committedOutcome ? { committedOutcome: { status: observed.committedOutcome.status, source: "not-dispatched" as const } } : {}),
       nextSteps: ["inspect", ...(observed.native.state === "terminal" || observed.committedOutcome && this.canRelease(observed.execution) ? ["reconcile" as const] : []),
@@ -247,7 +249,7 @@ export class RecoveryService {
     const proof = observation.evidence;
     const owners = new Set(target.processes.map((record) => JSON.stringify([record.ownerId, record.ownerGeneration])));
     const owner = target.context ? JSON.stringify([target.context.hostOwnerId, target.context.hostOwnerGeneration]) : owners.size === 1 ? [...owners][0] : undefined;
-    if (!target.turn.attemptId || !proof || proof.kind !== "process-tree-stopped" || !proof.sourceId
+    if (!target.turn.attemptId || !proof || !["process-tree-stopped", "managed-processes-stopped"].includes(proof.kind) || !proof.sourceId
       || owner !== JSON.stringify([proof.ownerId, proof.ownerGeneration]) || !Number.isSafeInteger(proof.ownerGeneration) || proof.ownerGeneration < 1
       || observation.workspaceState === "clear" && proof.resourceKeys.length === 0 || proof.resourceKeys.length > 16 || proof.resourceKeys.some((key) => typeof key !== "string" || !key || key.length > 4096)) {
       return { state: "unknown", workspaceState: "unknown", reason: "process_stop_proof_binding_missing" };
@@ -257,6 +259,10 @@ export class RecoveryService {
       || processRecordIds.some((id) => !target.ownerProcesses.some((record) => record.id === id))) {
       return { state: "unknown", workspaceState: "unknown", reason: "process_stop_scope_mismatch" };
     }
+    const selected = target.ownerProcesses.filter((record) => processRecordIds.includes(record.id));
+    const managed = selected.some((record) => record.stopProof?.kind === "managed-group-stop");
+    if (proof.kind === "managed-processes-stopped" && (!managed || selected.some((record) => !hasValidProcessStop({ ...record, boundaryEvidence: record.boundary })))
+      || proof.kind === "process-tree-stopped" && managed) return { state: "unknown", workspaceState: "unknown", reason: "process_stop_contract_mismatch" };
     return { state: "stopped", workspaceState: observation.workspaceState === "clear" ? "clear" : observation.workspaceState === "held" ? "held" : "unknown",
       evidence: { ...proof, resourceKeys: [...new Set(proof.resourceKeys)].sort(), processRecordIds }, ...(observation.reason ? { reason: observation.reason } : {}) };
   }
@@ -280,7 +286,7 @@ export class RecoveryService {
     return observation;
   }
   private canRelease(execution: ExecutionRecoveryObservation): boolean {
-    return execution.state === "stopped" && execution.workspaceState === "clear" && execution.evidence?.kind === "process-tree-stopped";
+    return execution.state === "stopped" && execution.workspaceState === "clear" && !!execution.evidence && ["process-tree-stopped", "managed-processes-stopped"].includes(execution.evidence.kind);
   }
 }
 

@@ -1,3 +1,4 @@
+import { nativeStopContractId, supportsNativeStop } from "../lifecycle/managed-stop-contract.js";
 import type Database from "better-sqlite3";
 import { validateTreeStopEvidence, type ProcessTreeStopEvidence } from "../lifecycle/managed-process-evidence.js";
 import { isNativeBoundaryProof } from "../lifecycle/native-boundary-proof.js";
@@ -83,10 +84,10 @@ export function resolveManagedNativeProvenance(db: Database.Database, context: D
     const identity = JSON.parse(String(launch.identity_json)) as ProcessIdentity;
     const boundary = JSON.parse(String(launch.boundary_json)) as unknown;
     const stop = launch.stop_json ? JSON.parse(String(launch.stop_json)) as ProcessTreeStopEvidence : undefined;
-    if (!isNativeBoundaryProof(boundary) || !boundary.verifiedDescendantStop || !stop || launch.state !== "stopped"
-      || artifact.supervisionContractId !== stop.contractId || stop.contractId !== "native-boundary/v1/" + boundary.backend + "/" + boundary.evidenceDigest
+    if (!isNativeBoundaryProof(boundary) || !supportsNativeStop(boundary) || !stop || launch.state !== "stopped"
+      || artifact.supervisionContractId !== stop.contractId || stop.contractId !== nativeStopContractId(boundary)
       || evidence.stopRef && evidence.stopRef !== evidence.launchRef) refuse("COMPATIBILITY_STOP_PROOF_MISSING");
-    validateTreeStopEvidence(stop!, identity);
+    validateTreeStopEvidence(stop!, identity, { proof: boundary as object, launchDigest: String(launch.launch_digest) }, Number(launch.process_group));
     return { provider: evidence.provider, attemptIdHash: compatibilityEvidenceHash(context.attemptId),
       launchRecordDigest: compatibilityDigest({ processId: evidence.launchRef, owner: [context.hostOwnerId, context.hostOwnerGeneration], runtime: [context.runtimeId, context.runtimeGeneration],
         attemptId: context.attemptId, sessionId: context.sessionId, turnId: context.flyxTurnId, identity, boundary, launchDigest: launch.launch_digest, snapshot: snapshot ?? null, plannedSnapshot: plannedSnapshot ?? null }),

@@ -14,7 +14,7 @@ type GitDiff = Awaited<ReturnType<SessionOrchestrator["gitDiff"]>>;
 
 const PATH_KEYS = new Set(["cwd", "path", "filePath", "file_path", "targetPath", "target_path", "workspacePath", "workspace_path", "workspace", "directory"]);
 const PRIVATE_RUNTIME_KEYS = new Set(["dispatchContext", "providerSessionId", "nativeSessionId", "nativeTurnId", "nativeItemId", "terminalEvidence", "boundaryEvidence", "stopProof"]);
-const PRIVATE_EVIDENCE_KINDS = new Set(["native-terminal", "native-ack", "local-delivery", "not-dispatched", "unknown", "verified-tree-stop"]);
+const PRIVATE_EVIDENCE_KINDS = new Set(["native-terminal", "native-ack", "local-delivery", "not-dispatched", "unknown", "verified-tree-stop", "managed-group-stop"]);
 function privateEvidence(key: string, value: unknown): boolean {
   return key === "evidence" && !!value && typeof value === "object" && "kind" in value &&
     typeof value.kind === "string" && PRIVATE_EVIDENCE_KINDS.has(value.kind);

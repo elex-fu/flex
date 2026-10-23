@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -57,13 +57,13 @@ describe("Host management command isolation", () => {
     }
   }, 15_000);
 
-  it("refuses offline activation without a proven query executor and records the rejection", async () => {
+  it("keeps offline activation rejected without verified Provider facts and never launches the Provider", async () => {
     const temporary = await mkdtemp(join(tmpdir(), "flyx-activation-cli-"));
     const databasePath = join(temporary, "data", "host.sqlite"), identityDirectory = join(temporary, "identity"), workspace = join(temporary, "workspace");
     try {
       await mkdir(join(temporary, "data"), { mode: 0o700 }); await mkdir(workspace, { mode: 0o700 });
       await runFile("git", ["init", "--quiet", workspace]);
-      const executable = join(temporary, "codex-bin"); await writeFile(executable, "#!/bin/sh\nexit 1\n", { mode: 0o755 });
+      const executable = join(temporary, "codex-bin"); await writeFile(executable, '#!/bin/sh\nprintf touched > "$0.invoked"\nexit 1\n', { mode: 0o755 });
       const owner = HostOwnerLock.acquire({ databasePath, identityDirectory });
       try {
         const store = openOwned({ databasePath, owner });
@@ -94,7 +94,8 @@ describe("Host management command isolation", () => {
         const row = db.prepare("SELECT id,state,result_json FROM host_execution_operations WHERE kind='activation' ORDER BY created_at DESC,id DESC LIMIT 1")
           .get() as { id: string; state: string; result_json: string };
         expect(row.state).toBe("rejected");
-        expect(JSON.parse(row.result_json)).toMatchObject({ reasonCodes: expect.arrayContaining(["WORKSPACE_QUERY_UNVERIFIED"]) });
+        expect(JSON.parse(row.result_json)).toMatchObject({ reasonCodes: expect.arrayContaining([process.platform === "darwin" ? "PROVIDER_RUNTIME_UNAVAILABLE" : "WORKSPACE_QUERY_UNVERIFIED"]) });
+        await expect(stat(executable + ".invoked")).rejects.toMatchObject({ code: "ENOENT" });
         const inspected = await run(["activation", "inspect", row.id]);
         expect(JSON.parse(inspected.stdout)).toMatchObject({ command: "inspect", operation: { id: row.id, state: "rejected" } });
       } finally { db.close(); }

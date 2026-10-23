@@ -1,3 +1,4 @@
+import { hasValidProcessStop } from "../lifecycle/managed-process-evidence.js";
 import type Database from "better-sqlite3";
 import { fileURLToPath } from "node:url";
 import { StdioAppServerClient, type AppServerClient, type AppServerClientHandlers, type JsonObject } from "../codex/app-server-client.js";
@@ -33,7 +34,7 @@ export type ManagedNativeRevertPortOptions = {
 function object(value: unknown): value is Record<string, unknown> { return value !== null && typeof value === "object" && !Array.isArray(value); }
 function text(value: unknown): value is string { return typeof value === "string" && value.length > 0; }
 function bounded(value: unknown): void { if (Buffer.byteLength(JSON.stringify(value)) > MAX_HISTORY_BYTES) throw new Error("NATIVE_HISTORY_BUDGET"); }
-function stopped(result: ProcessStopResult): boolean { return result.stopped && result.treeStopped && result.records.length > 0 && result.records.every((record) => record.state === "not_spawned" || record.state === "stopped" && record.stopProof?.kind === "verified-tree-stop"); }
+function stopped(result: ProcessStopResult): boolean { return result.stopped && result.records.length > 0 && result.records.every(hasValidProcessStop); }
 
 export function parseCodexRevertHistory(raw: unknown, handle: NativeRevertHandle): NativeRevertHistory["entries"] {
   bounded(raw);
@@ -165,10 +166,17 @@ export class HostManagedNativeRevertPort implements ManagedNativeRevertPort {
 
 /** Read only actual original process rows; root exit alone cannot satisfy this. */
 export function inspectManagedNativeRevertExecution(db: Database.Database, context: DispatchContext): NativeRevertExecutionObservation {
-  const rows = db.prepare(`SELECT p.id,p.state,b.launch_digest,s.proof_json FROM managed_processes p
+  const rows = db.prepare(`SELECT p.id,p.state,p.pid,p.process_group,i.identity_json,b.proof_json AS boundary_json,b.launch_digest,s.proof_json FROM managed_processes p
+    LEFT JOIN managed_process_identities i ON i.process_id=p.id
     LEFT JOIN managed_process_boundaries b ON b.process_id=p.id LEFT JOIN managed_process_stop_proofs s ON s.process_id=p.id
     WHERE p.owner_id=? AND p.owner_generation=? AND p.session_id=? AND p.turn_id=? AND p.runtime_id=? AND p.runtime_generation=? AND p.attempt_id=? ORDER BY p.id`)
-    .all(context.hostOwnerId, context.hostOwnerGeneration, context.sessionId, context.flyxTurnId, context.runtimeId, context.runtimeGeneration, context.attemptId) as { id: string; state: string; launch_digest: string | null; proof_json: string | null }[];
-  const proven = rows.length > 0 && rows.every((row) => row.state === "not_spawned" || row.state === "stopped" && row.launch_digest && row.proof_json && (() => { try { return JSON.parse(row.proof_json).kind === "verified-tree-stop"; } catch { return false; } })());
+    .all(context.hostOwnerId, context.hostOwnerGeneration, context.sessionId, context.flyxTurnId, context.runtimeId, context.runtimeGeneration, context.attemptId) as { id: string; state: string; pid: number | null; process_group: number | null; identity_json: string | null; boundary_json: string | null; launch_digest: string | null; proof_json: string | null }[];
+  const proven = rows.length > 0 && rows.every((row) => {
+    if (row.state === "not_spawned") return row.pid === null;
+    try { return !!row.identity_json && !!row.boundary_json && !!row.launch_digest && !!row.proof_json && hasValidProcessStop({
+      state: row.state, ...(row.pid !== null ? { pid: row.pid } : {}), ...(row.process_group !== null ? { processGroup: row.process_group } : {}),
+      processIdentity: JSON.parse(row.identity_json), boundaryEvidence: { proof: JSON.parse(row.boundary_json), launchDigest: row.launch_digest }, stopProof: JSON.parse(row.proof_json) });
+    } catch { return false; }
+  });
   return { sourceId: bindingDigest({ context, rows }), quiescent: Boolean(proven), pendingRequest: !proven };
 }

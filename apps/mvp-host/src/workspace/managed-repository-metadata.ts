@@ -26,7 +26,7 @@ export function createManagedRepositoryMetadata(options: { owner: HostOwnerHandl
       try {
         const result = await action();
         const stopped = result as ManagedGitRunResult;
-        producerStopped = stopped?.state === "stopped" && stopped.stopped === true && stopped.stopProof?.kind === "verified-tree-stop";
+        producerStopped = stopped?.state === "stopped" && stopped.stopped === true && ["verified-tree-stop", "managed-group-stop"].includes(stopped.stopProof?.kind);
         return result;
       } catch (error) {
         producerStopped = error instanceof ManagedGitError && (error.state === "stopped" || error.state === "not_spawned");

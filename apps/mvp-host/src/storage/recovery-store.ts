@@ -22,7 +22,7 @@ export type ExecutionRecoveryObservation = {
   state: "stopped" | "running" | "unknown";
   workspaceState: "clear" | "held" | "unknown";
   reason?: string;
-  evidence?: { kind: "process-tree-stopped"; sourceId: string; ownerId: string; ownerGeneration: number; resourceKeys: readonly string[]; processRecordIds?: readonly string[] };
+  evidence?: { kind: "process-tree-stopped" | "managed-processes-stopped"; sourceId: string; ownerId: string; ownerGeneration: number; resourceKeys: readonly string[]; processRecordIds?: readonly string[] };
 };
 export type NotDispatchedRecoveryOutcome = Readonly<{ status: "failed" | "cancelled"; sourceId: string; context: DispatchContext }>;
 export type RecoveryTarget = {

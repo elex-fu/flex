@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { ManagedProcessRegistry } from "../lifecycle/managed-process-registry.js";
+import { ManagedProcessRegistry, processIdentityDigest } from "../lifecycle/managed-process-registry.js";
 import type { ManagedProcessRecord, ProcessStopResult } from "../lifecycle/managed-process-registry.js";
 import type { AppServerClient, AppServerClientHandlers, JsonObject } from "../codex/app-server-client.js";
 import type { DispatchContext } from "../provider/types.js";
@@ -13,7 +13,8 @@ const context:DispatchContext={hostOwnerId:"owner",hostOwnerGeneration:1,session
 const mutation:NativeRevertMutation={operationId:"operation",requestId:"request",requestDigest:"request-digest",originalHandle:handle,command:{method:"thread/rollback",threadId:"thread",numTurns:1}};
 function fixture(options:{unknownStop?:boolean;deniedAtRpc?:boolean;nativeRunning?:boolean}={}) {
   const calls:{method:string;params:JsonObject}[]=[],rejects:unknown[]=[];let preparations=0,assertions=0,closes=0;
-  const record:ManagedProcessRecord={...context,id:"original-process",state:options.unknownStop?"root_exited":"stopped",treeControl:"process_group",boundaryEvidence:{launchDigest:"a".repeat(64),proof:{contract:"test"}},...(!options.unknownStop?{stopProof:{kind:"verified-tree-stop" as const,sourceId:"stop-source",identityDigest:"b".repeat(64),contractId:"test-contract"}}:{})};
+  const processIdentity={pid:123,platform:"linux" as const};
+  const record:ManagedProcessRecord={...context,id:"original-process",pid:123,processIdentity,state:options.unknownStop?"root_exited":"stopped",treeControl:"process_group",boundaryEvidence:{launchDigest:"a".repeat(64),proof:{contract:"test"}},...(!options.unknownStop?{stopProof:{kind:"verified-tree-stop" as const,sourceId:"stop-source",identityDigest:processIdentityDigest(processIdentity),contractId:"test-contract"}}:{})};
   const stop:ProcessStopResult={stopped:!options.unknownStop,treeStopped:!options.unknownStop,records:[record]};
   const runtime:PreparedNativeRuntime={context,registry:new ManagedProcessRegistry({journal:{save(){}},context:()=>context}),spawn(){throw new Error("fixture client must not spawn");},async closeAndWait(){closes++;return stop;}};
   let receipt:NativeRevertMutationReceipt|undefined;

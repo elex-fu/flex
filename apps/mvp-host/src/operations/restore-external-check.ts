@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { MACOS_MANAGED_STOP_CONTRACT } from "../lifecycle/managed-stop-contract.js";
 import type Database from "better-sqlite3";
 import { assertHostOwner, type HostOwnerHandle } from "../lifecycle/host-owner.js";
 import { loadOrCreateHostIdentity } from "../identity/host-identity.js";
@@ -17,7 +18,7 @@ export type RestoreExternalObservation = Readonly<{
   supervisor: Readonly<{
     sourceId: string; since: string; coverage: "complete" | "unknown";
     launches: readonly Readonly<{ launchId: string; launchDigest: string; state: "stopped" | "running" | "unknown";
-      stop?: Readonly<{ kind: "process-tree-stopped"; sourceId: string; contractId: string; launchDigest: string }> }>[];
+      stop?: Readonly<{ kind: "process-tree-stopped" | "managed-processes-stopped"; sourceId: string; contractId: string; launchDigest: string }> }>[];
     /** Unknown post-backup commands must remain blocked even if no restored receipt exists. */
     unresolvedCommandIds: readonly string[];
   }>;
@@ -87,7 +88,9 @@ export class RestoreExternalCheckService {
     const supervisor = observation.supervisor;
     if (!supervisor?.sourceId || supervisor.coverage !== "complete" || supervisor.since !== binding.backupCreatedAt) reasons.push("RESTORE_SUPERVISOR_COVERAGE_UNVERIFIED");
     if (!supervisor || supervisor.unresolvedCommandIds.length || supervisor.launches.some((launch) => launch.state !== "stopped" || !launch.launchId || !hash.test(launch.launchDigest)
-      || launch.stop?.kind !== "process-tree-stopped" || !launch.stop.sourceId || !launch.stop.contractId || launch.stop.launchDigest !== launch.launchDigest)) reasons.push("RESTORE_ORIGINAL_OPERATIONS_UNRESOLVED");
+      || !launch.stop || !["process-tree-stopped", "managed-processes-stopped"].includes(launch.stop.kind)
+      || (launch.stop.kind === "managed-processes-stopped") !== (launch.stop.contractId === MACOS_MANAGED_STOP_CONTRACT)
+      || !launch.stop.sourceId || !launch.stop.contractId || launch.stop.launchDigest !== launch.launchDigest)) reasons.push("RESTORE_ORIGINAL_OPERATIONS_UNRESOLVED");
     for (const workspace of binding.workspaces) {
       const matches = observation.checkouts.filter((check) => check.workspaceId === workspace.id);
       const check = matches[0];

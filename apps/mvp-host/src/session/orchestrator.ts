@@ -1,3 +1,4 @@
+import { supportsNativeStop } from "../lifecycle/managed-stop-contract.js";
 import type { CompatibilityScenePolicy, CompatibilityScenePermit } from "../diagnostics/compatibility-scene-policy.js";
 import type { HostExecutionPermits, HostExecutionPermit } from "../workspace/host-execution-permits.js";
 import { randomUUID } from "node:crypto";
@@ -519,7 +520,7 @@ export class SessionOrchestrator {
     if (this.callbacksSealed && !this.closePromise) return this.closePromise = Promise.resolve({
       closed: true, producerStopped: false, clean: false, stopped: false, recoveryRequired: true, state: "recovery_required",
     });
-    this.closePromise ??= this.lifecycle.shutdown(deadlineMs).then((result) => ({ ...result, closed: true, producerStopped: !!this.producerStop?.treeStopped, clean: result.stopped && !result.recoveryRequired && (!this.ownsStore || !this.owner.retainedReason),
+    this.closePromise ??= this.lifecycle.shutdown(deadlineMs).then((result) => ({ ...result, closed: true, producerStopped: !!this.producerStop?.stopped, clean: result.stopped && !result.recoveryRequired && (!this.ownsStore || !this.owner.retainedReason),
       state: result.stopped && !result.recoveryRequired && (!this.ownsStore || !this.owner.retainedReason) ? "stopped" as const : "recovery_required" as const }));
     return this.closePromise;
   }
@@ -535,7 +536,7 @@ export class SessionOrchestrator {
     if (!this.nativeRuntime) return undefined;
     const assessment = await this.nativeRuntime.prepare();
     if (this.callbacksSealed) throw new OrchestratorError("HOST_DRAINING", "Host callbacks are sealed");
-    this.lifecycle.markReady(assessment.ready && assessment.proof.verifiedDescendantStop === true);
+    this.lifecycle.markReady(assessment.ready && supportsNativeStop(assessment.proof));
     return assessment;
   }
   private async stopProducers(deadlineMs: number): Promise<{ stopped: boolean }> {
@@ -548,7 +549,7 @@ export class SessionOrchestrator {
     const managedStopping = this.nativeRuntime?.closeAndWait(deadlineMs);
     const [adapter, managed] = await Promise.all([adapterStopping, managedStopping]);
     this.producerStop = { stopped: adapter.stopped && (managed?.stopped ?? true), treeStopped: adapter.treeStopped && (managed?.treeStopped ?? true), records: managed?.records ?? adapter.records };
-    return { stopped: this.producerStop.stopped && this.producerStop.treeStopped };
+    return { stopped: this.producerStop.stopped };
   }
   private recordShutdownUnknown(reason: string): void {
     if (!this.store.db.open) return;
@@ -832,7 +833,7 @@ export class SessionOrchestrator {
         [adapterStop, managedStop] = stopped;
       } catch { if (!this.worker.isSealed) this.retainExecution(intent, "producer_stop_unverified"); return; }
       if (this.worker.isSealed) return;
-      if (adapterStop && (!adapterStop.stopped || !adapterStop.treeStopped) || managedStop && (!managedStop.stopped || !managedStop.treeStopped)) {
+      if (adapterStop && !adapterStop.stopped || managedStop && !managedStop.stopped) {
         this.retainExecution(intent, "producer_stop_unverified"); return;
       }
       if (!lease) {

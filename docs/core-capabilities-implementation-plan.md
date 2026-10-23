@@ -1,9 +1,9 @@
 # Flyx 核心能力实施计划
 
-> 更新：2026-10-24（Asia/Shanghai）。**开发已按用户要求暂停**；已停止本轮最终回归，仅更新进度与剩余任务。当前采用普通 macOS 受管执行，契约以 [技术方案 §4](./core-capabilities-technical-design.md#4-macos-平台契约普通受管执行) 与 [普通执行专题](./macos-managed-execution.md) 为准。
+> 更新：2026-10-24（Asia/Shanghai）。**开发已恢复**（用户指令按 G0 → M4 → R4 → R6 → R9 顺序继续）；G0 固定源码完整回归已通过。当前采用普通 macOS 受管执行，契约以 [技术方案 §4](./core-capabilities-technical-design.md#4-macos-平台契约普通受管执行) 与 [普通执行专题](./macos-managed-execution.md) 为准。
 > 下方 2026-10-23 及以前内容保留为历史记录；其中 ES/签名前置和强停止闭包门槛已被本次决策替代，不再代表当前依赖。
 
-## 当前实施与验收（暂停检查点）
+## 当前实施与验收（恢复检查点）
 
 | 任务 | 当前状态 | 实现方式与退出条件 |
 | --- | --- | --- |
@@ -12,15 +12,16 @@
 | M2 恢复与放行 | 契约/组合回归通过；真实恢复另验 | after checkpoint、metadata/checkout lease、startup readiness、inspect/reconcile/acknowledge 消费原契约绑定的停止记录；缺观察/超时/旧记录保持 unknown。 |
 | M3 真实 Provider | Claude/Codex 2/2 通过 | 独立临时 checkout/Store/identity；分别记录 CLI/SDK/Node/OS；真实任务与文件结果、中断、受管清理、跨进程续接；失败不登记通过。 |
 | M4 兼容证据 / 准入 | 普通合同消费已接；首份产物闭环待做 | 实际原始 launch/native terminal/stop 连接签名产物；版本查询与激活消费相同合同；未验证能力不发布；常规启动不调用模型。 |
-| G0 固定源码全量回归 | **用户暂停中断，未完成** | 最终冻结重跑在 50.33 秒后被 SIGINT 中断；前后 361 个源文件指纹一致，但未得到完整测试汇总。恢复后重新完整运行，不能以定向通过替代。 |
+| G0 固定源码全量回归 | **通过（2026-10-24 恢复后重跑）** | 冻结源码 `5943418`、指纹 `d54ab46c`（360 文件，运行前后一致）；串行 `--maxWorkers=1` 完整运行：142 文件 / 1317 passed / 7 skipped / 0 failed，exit 0，828.78 秒；日志 `/tmp/flyx-g0-20261024.log`、指纹 JSON 同名 `.json`。暂停中断不再作为未完成状态保留。 |
 | 后续 R4/R6/R9 | 仍待验收 | 真实恢复检查器、双 Provider Native 回退锚点/完整回退、备份后外部状态、完整主入口与物理手机。普通模式不自动使这些事项完成。 |
 
-恢复开发后的顺序：G0 固定源码完整回归 → M4 首份生产兼容产物闭环 → R4 真实恢复与备份外部复核 → R6 Native 回退 → R9 组合终验。M0–M3 的平台/适配器证据不替代这些事项。ES 强监督移为可选增强；Developer ID 留在桌面分发阶段，不作为 M0–M4 前置。
+恢复开发后的顺序：~~G0 固定源码完整回归~~（已通过）→ **M4 首份生产兼容产物闭环（当前项）** → R4 真实恢复与备份外部复核 → R6 Native 回退 → R9 组合终验。M0–M3 的平台/适配器证据不替代这些事项。ES 强监督移为可选增强；Developer ID 留在桌面分发阶段，不作为 M0–M4 前置。
 
 暂停时源码基线为 `003faa3254a3fc76a2d624ed4a1c2d5fdf2c36c8`；本轮源码、测试和文档已于 2026-10-24 提交入库并推送（`4af1af5` 普通进程组执行 → `b60852c` 接线与恢复 → `0bbc950` 双 Provider 实机验收测试 → `0345f83` 状态文档，`main` 与 `codex/flyx-optimization` 同点，工作区干净）。真实 Provider 调用已结束；本轮最终回归已停止，没有继续开发或测试。下述待办保留实现步骤，等待恢复开发后执行。
 
 ### 本轮证据
 
+- 2026-10-24（恢复后）：G0 固定源码完整回归通过——冻结 `5943418`，串行全量 142 文件 / 1317 passed / 7 skipped / 0 failed，exit 0，828.78 秒；运行前后 360 个 Host/protocol 源文件指纹一致（`d54ab46c`）。日志 `/tmp/flyx-g0-20261024.log`。
 - 2026-10-24：普通合同、单层私有/工作区写边界、生产 main/维护 Git、恢复范围与停止门禁已实现。真实 Claude/Codex 2/2 通过（实际工具、跨进程续接、长命令开始后中断、清理）；生产 main 启动/关闭通过，未激活时零 Native 启动。详见 [阶段验收](./analysis/2026-10-24-macos-managed-execution-acceptance.md) 与 [版本/摘要 JSON](./analysis/2026-10-24-macos-managed-provider-results.json)。
 - 构建、全工作区 typecheck、Host 测试类型检查通过；protocol 56、client-core 163、mobile 90、Web Node 63 通过。Host 首轮全量 1303 passed / 13 failed / 7 skipped；相关修复已通过 37、2、40 项定向复测。第二轮为 1316 passed / 1 failed / 7 skipped，运行跨越源码修改；新合同隔离断言独立复测 5/5、最终相关定向 35/35 通过。各批次有重叠，不合计为唯一测试数，也未登记 Host 全量通过。
 - 暂停中断记录：`/private/tmp/flyx-macos-host-frozen-20261024.log` 与同名 `.json`；运行 50.33 秒，Vitest 退出码 130（SIGINT，包装进程记录 `-2`），`sameSource=true`。此结果只证明运行期间所检查源码未变，不能证明完整回归通过；本轮未重跑完整仓库/浏览器 E2E 或物理手机验收。

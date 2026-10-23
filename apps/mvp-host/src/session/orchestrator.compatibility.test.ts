@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { resolve } from "node:path";
-import { SessionOrchestrator, type CommittedNativeStopRecorder } from "./orchestrator.js";
+import { SessionOrchestrator, bindRecoveryInspectionRecorder, type CommittedNativeStopRecorder } from "./orchestrator.js";
+import type { NativeHandle, NativeTurnObservation } from "../provider/native-history.js";
 import type { AdapterStatus, DispatchContext, ProviderAdapter, ProviderOutcome } from "../provider/types.js";
 
 function barrier<T = void>() { let release!: (value: T) => void; const promise = new Promise<T>((yes) => { release = yes; }); return { promise, release }; }
@@ -97,5 +98,40 @@ describe("compatibility recorder event source on the Turn terminal path", () => 
     expect(f.host.snapshot().session).toMatchObject({ activeTurnId: accepted.turnId, recoveryState: "blocked", activityState: "outcome_unknown" });
     // The degraded flag from the unverified fact chain gates any new Turn first.
     await expect(f.host.startTurn("device", "second", "another prompt")).rejects.toMatchObject({ code: "HOST_DEGRADED" });
+  });
+});
+
+const recoveryHandle: NativeHandle = {
+  id: "binding-1", sessionId: "session-1", turnId: "turn-1", attemptId: "attempt-1", provider: "claude",
+  providerInstanceId: "pi-1", nativeSessionId: "native-1", workspacePath: "/workspace", configurationFingerprint: "fingerprint",
+  verifiedVersion: "1.0.0", revision: 1, updatedAt: "2026-01-01T00:00:00.000Z",
+  context: { hostOwnerId: "owner", hostOwnerGeneration: 1, sessionId: "session-1", flyxTurnId: "turn-1", runtimeId: "runtime-1", runtimeGeneration: 1, attemptId: "attempt-1" },
+};
+const terminal: NativeTurnObservation & { state: "terminal" } = {
+  state: "terminal", nativeSessionId: "native-1", nativeTurnId: "turn-1", status: "completed",
+  evidence: { kind: "native-terminal", sourceId: "read-source", verifiedVersion: "1.0.0" },
+};
+const running: NativeTurnObservation = { state: "running", nativeSessionId: "native-1", nativeTurnId: "turn-1" };
+const unknown: NativeTurnObservation = { state: "unknown", reason: "reader unavailable" };
+
+describe("recovery inspection recorder binding", () => {
+  it("records the verified terminal observation and returns the reader's result unchanged", async () => {
+    const afterVerifiedRecoveryInspection = vi.fn(async () => {});
+    const reader = vi.fn(async () => terminal);
+    const observed = await bindRecoveryInspectionRecorder(reader, { afterCommittedNativeStop: async () => {}, afterVerifiedRecoveryInspection })(recoveryHandle);
+    expect(observed).toBe(terminal);
+    expect(afterVerifiedRecoveryInspection).toHaveBeenCalledExactlyOnceWith(recoveryHandle.context, terminal);
+  });
+  it("leaves the reader unbound for non-terminal observations", async () => {
+    const afterVerifiedRecoveryInspection = vi.fn(async () => {});
+    const bound = bindRecoveryInspectionRecorder(async () => running, { afterCommittedNativeStop: async () => {}, afterVerifiedRecoveryInspection });
+    expect(await bound(recoveryHandle)).toBe(running);
+    expect(await bindRecoveryInspectionRecorder(async () => unknown, { afterCommittedNativeStop: async () => {}, afterVerifiedRecoveryInspection })(recoveryHandle)).toBe(unknown);
+    expect(afterVerifiedRecoveryInspection).not.toHaveBeenCalled();
+  });
+  it("propagates recorder failure so the recovery observation fails closed", async () => {
+    const bound = bindRecoveryInspectionRecorder(async () => terminal,
+      { afterCommittedNativeStop: async () => {}, afterVerifiedRecoveryInspection: async () => { throw new Error("COMPATIBILITY_RECOVERY_OBSERVATION_MISMATCH"); } });
+    await expect(bound(recoveryHandle)).rejects.toThrow("COMPATIBILITY_RECOVERY_OBSERVATION_MISMATCH");
   });
 });

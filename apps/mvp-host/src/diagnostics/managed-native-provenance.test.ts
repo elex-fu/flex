@@ -87,4 +87,20 @@ describe("original journal provenance using explicit structural fixtures", () =>
     const f = fixture(); f.db.exec("DELETE FROM host_state");
     expect(() => resolveManagedNativeProvenance(f.db, f.context, f.evidence, f.artifact)).toThrow("COMPATIBILITY_LAUNCH_ARTIFACT_UNAVAILABLE");
   });
+  it("accepts recovery reads whose sourceId is the read path, not the original terminal source", () => {
+    const f = fixture();
+    // The recorder verified the status/session match before record(); provenance
+    // pins the original terminal event by turn+attempt+dispatch context and its
+    // digest, never by the read-path sourceId or the event type.
+    const recovery = { ...f.evidence, kind: "recovery" as const, nativeEvent: "inspect", evidenceCode: "NATIVE_HISTORY_INSPECT_VERIFIED", nativeSourceId: "sha256:thread-read-digest" };
+    expect(() => resolveManagedNativeProvenance(f.db, f.context, recovery, f.artifact)).not.toThrow();
+    f.db.prepare("UPDATE session_events SET type=?").run("turn.failed");
+    expect(() => resolveManagedNativeProvenance(f.db, f.context, recovery, f.artifact)).not.toThrow();
+    // The binding's nativeTurnId still pins the original turn identity.
+    const withoutTurn = { ...recovery }; delete (withoutTurn as { nativeTurnId?: string }).nativeTurnId;
+    expect(() => resolveManagedNativeProvenance(f.db, f.context, withoutTurn, f.artifact)).toThrow("COMPATIBILITY_NATIVE_BINDING_MISMATCH");
+    // Two native-terminal observations of the same original turn stay ambiguous.
+    f.db.prepare("INSERT INTO session_events VALUES(?,?,?,?,?)").run("committed-event-2", "session", 2, "turn.cancelled", JSON.stringify({ dispatchContext: f.context, terminalEvidence: { kind: "native-terminal", sourceId: "native-source-2" } }));
+    expect(() => resolveManagedNativeProvenance(f.db, f.context, recovery, f.artifact)).toThrow("COMPATIBILITY_ORIGINAL_NATIVE_EVENT_MISSING");
+  });
 });

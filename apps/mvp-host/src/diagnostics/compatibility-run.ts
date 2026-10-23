@@ -17,6 +17,7 @@ import type { ProviderInstanceRecord, ProviderConfiguration } from "../storage/c
 import type { SqliteStore } from "../storage/db.js";
 import type { HostIdentityFileV1 } from "../identity/host-identity.js";
 import type { CommittedNativeStopRecorder } from "../session/orchestrator.js";
+import type { NativeHistorySceneBootstrap } from "../provider/native-history-manifest.js";
 import type { CompatibilityHostIdentity } from "./compatibility-integrity.js";
 import type { CompatibilityRunAuthorization } from "./compatibility-import.js";
 import type { CompatibilityReadinessOptions } from "./compatibility-readiness.js";
@@ -122,6 +123,8 @@ export interface IsolatedCompatibilityRun {
   compatibilityArtifact(): NativeCompatibilityArtifact | undefined;
   /** The committed-stop recorder once a scene policy has been attached. */
   compatibilityRecorder(): CommittedNativeStopRecorder | undefined;
+  /** The scene's own manifest-bootstrap authorization once a scene policy has been attached. */
+  compatibilityScene(): NativeHistorySceneBootstrap | undefined;
   /** Binds the scene policy to the run, constructing the committed-stop recorder from the validated ticket. */
   attachScene(policy: CompatibilityScenePolicy): void;
   authMode(): "unknown" | "signed_in" | "api_key";
@@ -136,6 +139,7 @@ export function createIsolatedCompatibilityRun(options: IsolatedCompatibilityRun
   let probeAuthority: CompatibilityVersionProbeAuthority | undefined;
   let measured: NativeCompatibilityArtifact | undefined;
   let recorder: CommittedNativeStopRecorder | undefined;
+  let scene: NativeHistorySceneBootstrap | undefined;
   let facts: ReturnType<typeof createCompatibilityRuntimeFacts> | undefined;
   let supervisionProof: NativeBoundaryProof | undefined;
   let started = false;
@@ -196,7 +200,12 @@ export function createIsolatedCompatibilityRun(options: IsolatedCompatibilityRun
       recorder = createCompatibilityCommittedRecorder({ db: options.store.db, identity: options.identity, path: options.compatibilityEvidencePath,
         runId: ticket.runId, entryDigest: ticket.entryDigest, facts,
         assertSceneObservation: (context: DispatchContext) => policy.assertObservation(context) });
+      // The scene's own authorization for manifest bootstrap (design §8.2):
+      // run/entry bound to the validated ticket, artifact re-measured live so
+      // any drift after the scene attached is a refusal.
+      scene = Object.freeze({ runId: ticket.runId, entryDigest: ticket.entryDigest, artifact: () => facts!.measure() });
     },
+    compatibilityScene: () => scene,
     authMode: () => observeCompatibilityAuthMode(options.provider),
   });
 }

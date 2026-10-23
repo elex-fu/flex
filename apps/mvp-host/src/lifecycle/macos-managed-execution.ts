@@ -43,7 +43,8 @@ export async function createMacosManagedExecution(options: { identity: HostIdent
   await mkdir(options.worktreesRoot, { recursive: true, mode: 0o700 });
   return { git: macosManagedGitOptions(), worktreesRoot: realpathSync(options.worktreesRoot),
     ...(options.compatibility ? { compatibilityArtifact: () => options.compatibility!.compatibilityArtifact(),
-      compatibilityRecorder: () => options.compatibility!.compatibilityRecorder() } : {}),
+      compatibilityRecorder: () => options.compatibility!.compatibilityRecorder(),
+      compatibilityScene: () => options.compatibility!.compatibilityScene() } : {}),
     facts: macosManagedExecutionFacts({ compatibilityEvidencePath: options.compatibilityEvidencePath,
       trust: { destination: publicHostIdentity(options.identity), endorsementPath: options.compatibilityEndorsementPath } }) };
 }

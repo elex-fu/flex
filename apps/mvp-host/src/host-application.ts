@@ -39,12 +39,13 @@ import { WORKTREE_COMMAND_METHODS, WORKTREE_RPC_SCOPES, type WorktreeCommandMeth
 import { createManagedScheduledHostWorktrees } from "./workspace/managed-host-worktrees.js";
 import { createManagedRepositoryMetadata } from "./workspace/managed-repository-metadata.js";
 import { NativeHistoryReaderFactory } from "./provider/native-history-reader.js";
-import { createNativeHistoryManifestSource } from "./provider/native-history-manifest.js";
+import { createNativeHistoryManifestSource, type NativeHistorySceneBootstrap } from "./provider/native-history-manifest.js";
 import type { DispatchContext } from "./provider/types.js";
 import { GitService } from "./git/git-service.js";
 import { NativeTerminalReceiptStore } from "./storage/native-receipt-store.js";
 import type { RecoveryTarget } from "./storage/recovery-store.js";
 import type { CatalogRecoveryIdentity, ExistingCatalogRecoveryReader } from "./session/catalog-recovery.js";
+import { catalogRecoveryConfigurationFingerprint } from "./session/catalog-recovery.js";
 import { homedir } from "node:os";
 
 export type HostApplicationOptions = Pick<HostCatalogOptions, "configuration" | "initialLegacySession"> & {
@@ -67,6 +68,9 @@ export type HostApplicationOptions = Pick<HostCatalogOptions, "configuration" | 
     /** Design §6.3: compatibility fact recorder for the isolated compatibility
      *  scenario only. The online Host never constructs or injects one. */
     compatibilityRecorder?: () => CommittedNativeStopRecorder | undefined;
+    /** Design §8.2: the isolated compatibility scene's own manifest-bootstrap
+     *  authorization; undefined for the ordinary online Host. */
+    compatibilityScene?: () => NativeHistorySceneBootstrap | undefined;
     worktreesRoot?: string;
     recovery?: Pick<Parameters<typeof createCatalogRecoveryBindings>[0], "nativeHistoryReaderFactory" | "processInspector" | "inspectBoundary" | "inspectWorkspace" | "verifiedManifestForInstance" | "existingCodexReader">;
   };
@@ -307,11 +311,24 @@ export async function createHostApplication(options: HostApplicationOptions) {
     const runningInteractions = interactions;
     // Design §8.2 trusted manifest source: shared by the Native read factory
     // (handle-level, with transcript contract) and recovery admission
-    // (instance-level, no contract implied).
+    // (instance-level, no contract implied). The live resource port keeps the
+    // manifest's configurationFingerprint in the recovery domain the reader
+    // gate and recovery admission actually compare, derived from the live
+    // catalog rows — never echoed from the handle asking for it. The scene
+    // bootstrap authorizes the isolated run's own reads before import.
     const manifestSource = createNativeHistoryManifestSource({
       compatibilityEvidencePath, compatibilityTrust: activationTrust,
       ...(options.execution?.facts?.supervision ? { supervision: options.execution.facts.supervision } : {}),
       ...(options.execution?.facts?.runtime ? { runtime: options.execution.facts.runtime } : {}),
+      ...(options.execution?.compatibilityScene ? { sceneBootstrap: options.execution.compatibilityScene } : {}),
+      resourceFingerprint: (sessionId) => {
+        try {
+          owner.assertActive();
+          const target = runningCatalog.registry.resolve(sessionId);
+          return Object.freeze({ provider: target.providerInstance.provider, providerInstanceId: target.providerInstance.providerInstanceId,
+            configurationFingerprint: catalogRecoveryConfigurationFingerprint(target) });
+        } catch { return undefined; }
+      },
       resolveProvider: (providerInstanceId) => runningCatalog.catalog.provider(providerInstanceId),
     });
     const nativeReceipts = new NativeTerminalReceiptStore(store.db);
@@ -349,7 +366,7 @@ export async function createHostApplication(options: HostApplicationOptions) {
     });
     recovery = createCatalogRecoveryBindings({ catalog: runningCatalog,
       ...options.execution?.recovery,
-      ...(options.execution?.recovery?.verifiedManifestForInstance ? {} : { verifiedManifestForInstance: (identity: CatalogRecoveryIdentity) => manifestSource.verifiedManifestForInstance(identity.provider, identity.providerInstanceId) }),
+      ...(options.execution?.recovery?.verifiedManifestForInstance ? {} : { verifiedManifestForInstance: (identity: CatalogRecoveryIdentity) => manifestSource.verifiedManifestForInstance(identity.provider, identity.providerInstanceId, identity.sessionId) }),
       // The production existing-connection reader selects the loaded Session's
       // live Codex connection only; absence stays unknown and it never
       // reconnects, resumes or starts a provider (design §8.2).

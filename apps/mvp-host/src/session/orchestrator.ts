@@ -28,6 +28,7 @@ import { decideAcceptTurn, decideApprovalReservation, decideInterrupt } from "..
 import { ExecutionWorker, type ExecutionWorkerOptions, type OperationIntentHandler } from "../orchestration/execution-worker.js";
 import { ProviderIngestion } from "../orchestration/provider-ingestion.js";
 import { createHostRecovery, type HostRecovery, type HostRecoveryOptions } from "./host-recovery.js";
+import type { NativeHandle, NativeTurnObservation } from "../provider/native-history.js";
 import { RuntimeRegistry } from "../provider/runtime-registry.js";
 import type { CommandRequest, ExecutionIntentRow } from "../orchestration/command-contract.js";
 import type { HostInteractionHooks, InteractionRpcPort } from "../interaction/host-interactions.js";
@@ -96,7 +97,7 @@ export type OrchestratorOptions = {
    */
   compatibilityRecorder?: CommittedNativeStopRecorder;
   executionPermits?: HostExecutionPermits;
-  recovery?: Pick<HostRecoveryOptions, "resolveResource" | "checkoutRoot" | "assertCommandAuthorized" | "processInspector" | "inspectBoundary" | "inspectWorkspace" | "codexReader" | "supersedeInteractions" | "companionEvents">;
+  recovery?: Pick<HostRecoveryOptions, "resolveResource" | "checkoutRoot" | "assertCommandAuthorized" | "processInspector" | "inspectBoundary" | "inspectWorkspace" | "codexReader" | "nativeHistoryReader" | "supersedeInteractions" | "companionEvents">;
   runtimeId?: string;
   owner?: HostOwnerHandle;
   store?: SqliteStore;
@@ -128,7 +129,26 @@ export type ShutdownService = { drain(deadlineMs: number): Promise<void | boolea
 export type CommittedNativeStopRecorder = {
   /** Records one verified native stop behind a committed Turn terminal state. */
   afterCommittedNativeStop(context: DispatchContext): Promise<void>;
+  /** Records one verified read-only native-history inspection (design §8.2 R4). */
+  afterVerifiedRecoveryInspection(context: DispatchContext, observation: NativeTurnObservation & { state: "terminal" }): Promise<void>;
 };
+
+/**
+ * Binds recovery-inspection evidence recording to the trusted recovery read
+ * port (design §8.2 R4): every terminal observation the reader returns is fed
+ * to the recorder before recovery sees it. A recorder refusal propagates so
+ * recovery degrades to unknown — the read contract stays fail-closed.
+ */
+export function bindRecoveryInspectionRecorder(
+  reader: (handle: NativeHandle) => Promise<NativeTurnObservation>,
+  recorder: CommittedNativeStopRecorder,
+): (handle: NativeHandle) => Promise<NativeTurnObservation> {
+  return async (handle) => {
+    const observed = await reader(handle);
+    if (observed.state === "terminal") await recorder.afterVerifiedRecoveryInspection(handle.context, observed);
+    return observed;
+  };
+}
 
 const MAX_PROMPT_BYTES = 16 * 1024;
 
@@ -298,8 +318,16 @@ export class SessionOrchestrator {
     }
     this.runtimes = new RuntimeRegistry({ drainIngestion: () => this.ingestion.drain() });
     this.runtimes.register(this.runtimeId, this.adapter);
+    // Design §8.2 R4: in the isolated compatibility scene the recovery read
+    // port also feeds the committed recorder, so a verified read-only
+    // inspection becomes signed recovery evidence. Online runtimes have no
+    // recorder and keep the read port exactly as wired.
+    const recoveryOptions = { ...options.recovery };
+    if (recoveryOptions.nativeHistoryReader && this.compatibilityRecorder) {
+      recoveryOptions.nativeHistoryReader = bindRecoveryInspectionRecorder(recoveryOptions.nativeHistoryReader, this.compatibilityRecorder);
+    }
     this.recovery = createHostRecovery({ store: this.store, owner: this.owner, sessionId: this.session.id, workspace: this.workspace,
-      provider: this.session.provider, ...options.recovery, checkoutRoot: this.checkoutRoot, canReleaseWorkspace: this.canReleaseWorkspace,
+      provider: this.session.provider, ...recoveryOptions, checkoutRoot: this.checkoutRoot, canReleaseWorkspace: this.canReleaseWorkspace,
       onCommit: (events) => events.forEach((event) => this.notify(event)),
       onBlocked: (context) => { this.runtimes.retainBinding(context); this.activeWorkspaceLease?.retain("producer_stop_unverified"); this.owner.retain("producer_stop_unverified"); },
       reconcileRuntime: (context, native) => {

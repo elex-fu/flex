@@ -48,7 +48,14 @@ export function savePlannedCompatibilityLaunch(db: Database.Database, processId:
 export function resolveManagedNativeProvenance(db: Database.Database, context: DispatchContext,
   evidence: NativeCompatibilityEvidence, artifact: NativeCompatibilityArtifact): CompatibilityNativeProvenance {
   assertCompleteCompatibilityArtifact(artifact);
-  if (!["turn", "interrupt", "stop"].includes(evidence.kind) || !evidence.launchRef || !evidence.nativeSourceId || evidence.provider === "claude" && evidence.nativeResultId !== undefined && evidence.nativeResultId !== evidence.nativeSourceId || evidence.attemptId !== context.attemptId) refuse("COMPATIBILITY_NATIVE_SOURCE_UNSUPPORTED");
+  // "recovery" records a verified read-only native-history inspection: its
+  // nativeSourceId names the READ-path observation (Claude
+  // resultUuid:resultDigest / Codex thread-read digest), never the original
+  // terminal event, and its status match is proven by the recorder before
+  // record(); provenance still pins the original event and binding below.
+  if (!["turn", "interrupt", "stop", "recovery"].includes(evidence.kind) || !evidence.launchRef || !evidence.nativeSourceId
+    || evidence.provider === "claude" && evidence.nativeResultId !== undefined && evidence.nativeResultId !== evidence.nativeSourceId
+    || evidence.attemptId !== context.attemptId) refuse("COMPATIBILITY_NATIVE_SOURCE_UNSUPPORTED");
   return db.transaction(() => {
     const launch = db.prepare(`SELECT p.*,i.identity_json,b.proof_json AS boundary_json,b.launch_digest,s.proof_json AS stop_json
       FROM managed_processes p JOIN managed_process_identities i ON i.process_id=p.id
@@ -107,8 +114,15 @@ export function resolveManagedNativeProvenance(db: Database.Database, context: D
       AND json_extract(payload_json,'$.dispatchContext.attemptId')=?`).all(context.sessionId, context.flyxTurnId, context.attemptId) as Array<{ id: string; sequence: number; type: string; payload_json: string }>;
     const native = rows.filter((row) => {
       const payload = JSON.parse(row.payload_json) as { terminalEvidence?: { kind?: string; sourceId?: string }; dispatchContext?: unknown };
-      return payload.terminalEvidence?.kind === "native-terminal" && payload.terminalEvidence.sourceId === evidence.nativeSourceId
-        && compatibilityCanonicalJson(payload.dispatchContext) === compatibilityCanonicalJson(context)
+      if (payload.terminalEvidence?.kind !== "native-terminal" || compatibilityCanonicalJson(payload.dispatchContext) !== compatibilityCanonicalJson(context)) return false;
+      if (evidence.kind === "recovery") {
+        // The recovery read records the verified status/native-session match
+        // itself before record(); here the original terminal event is pinned
+        // by identity (turn + attempt + native-terminal dispatch context) and
+        // by its digest below, not by the read-path sourceId.
+        return true;
+      }
+      return payload.terminalEvidence.sourceId === evidence.nativeSourceId
         && (evidence.result !== "passed" || row.type === (evidence.kind === "turn" ? "turn.completed" : "turn.cancelled"));
     });
     if (native.length !== 1) refuse("COMPATIBILITY_ORIGINAL_NATIVE_EVENT_MISSING");

@@ -1,17 +1,17 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { generateHostIdentity } from "../identity/host-identity.js";
-import { CompatibilityEvidenceRecorder } from "../diagnostics/compatibility-evidence.js";
+import { CompatibilityEvidenceRecorder, readCompatibilityEvidence } from "../diagnostics/compatibility-evidence.js";
 import { providerConfigurationFingerprint } from "../lifecycle/host-activation-load.js";
 import type { ProviderInstanceRecord } from "../storage/catalog-store.js";
 import type { NativeHandle } from "./native-history.js";
 import { createNativeHistoryManifestSource } from "./native-history-manifest.js";
 
 const roots: string[] = [];
-afterEach(async () => { for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true }); });
+afterEach(async () => { vi.unstubAllEnvs(); for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true }); });
 const hex = (value: string) => value.repeat(64);
 const sha256 = (value: string | Uint8Array) => createHash("sha256").update(value).digest("hex");
 
@@ -59,7 +59,17 @@ async function fixture(provider: "claude" | "codex") {
       supervision: () => ({ contractId: "contract-1" }), runtime,
       resolveProvider: () => record, ...overrides,
     });
-  return { root, executable, record, handle, recorderFor, recordTurn, recordRecovery, source, configurationFingerprint };
+  // The scene's own recorder: signature-verified isolated-real evidence whose
+  // provenance is structurally valid without a live journal behind it.
+  const sceneRecorderFor = (runId: string, entryDigest = hex("d")) => {
+    for (const [key, value] of Object.entries({ FLYX_COMPATIBILITY_MODE: "isolated", FLYX_COMPATIBILITY_REAL_ENABLED: "1", RUN_REAL_CLAUDE: "1", RUN_REAL_CODEX: "1" })) vi.stubEnv(key, value);
+    return new CompatibilityEvidenceRecorder(evidencePath, true, runId, { domain: "isolated-real", identity: generateHostIdentity(), artifact,
+      sceneVersion: "flyx-c3-basic-v1", entryDigest,
+      assertNativeProvenance: (evidence) => ({ provider: evidence.provider, attemptIdHash: sha256(evidence.attemptId),
+        launchRecordDigest: hex("a"), nativeObservationDigest: hex("b"), executableDigest: sha256("binary-content"),
+        runtimeDigest: hex("c"), configFingerprint: configurationFingerprint, supervisionContractId: "contract-1" }) });
+  };
+  return { root, executable, record, handle, artifact, evidencePath, recorderFor, sceneRecorderFor, recordTurn, recordRecovery, source, configurationFingerprint };
 }
 
 describe("native history manifest source", () => {
@@ -125,5 +135,83 @@ describe("native history manifest source", () => {
     await f.recordTurn(f.recorderFor("run-1"));
     await f.recordRecovery(f.recorderFor("run-1"));
     expect(f.source({ resolveProvider: () => undefined }).verifiedManifestForHandle(f.handle)).toBeUndefined();
+  });
+});
+
+describe("scene bootstrap manifest", () => {
+  it("derives the scene's own manifest from its signature-verified turn baseline", async () => {
+    const f = await fixture("claude");
+    await f.recordTurn(f.sceneRecorderFor("run-1"));
+    const resource = { provider: "claude" as const, providerInstanceId: "pi-1", configurationFingerprint: f.configurationFingerprint };
+    const scene = { runId: "run-1", entryDigest: hex("d"), artifact: () => ({ ...f.artifact }) };
+    const manifest = f.source({ sceneBootstrap: () => scene, resourceFingerprint: () => resource }).verifiedManifestForHandle(f.handle);
+    expect(manifest).toMatchObject({
+      source: "real-provider", state: "verified", provider: "claude", providerInstanceId: "pi-1",
+      configurationFingerprint: f.configurationFingerprint, verifiedVersions: ["1.0.0"], historyContract: "claude-sdk-result-v1",
+    });
+    // The scene manifest cites the turn baseline, the only evidence that exists before import.
+    const baseline = readCompatibilityEvidence(f.evidencePath).entries.find((entry) => entry.kind === "turn");
+    expect(manifest?.evidenceId).toBe(baseline?.digest);
+    expect(manifest?.evidenceId).toMatch(/^[a-f0-9]{64}$/);
+  });
+  it("requires the scene's exact run, controlled entry and live artifact", async () => {
+    const f = await fixture("claude");
+    await f.recordTurn(f.sceneRecorderFor("run-1"));
+    const resource = { provider: "claude" as const, providerInstanceId: "pi-1", configurationFingerprint: f.configurationFingerprint };
+    const artifact = () => ({ ...f.artifact });
+    // A different run or controlled entry does not authorize this scene.
+    expect(f.source({ sceneBootstrap: () => ({ runId: "run-2", entryDigest: hex("d"), artifact }), resourceFingerprint: () => resource }).verifiedManifestForHandle(f.handle)).toBeUndefined();
+    expect(f.source({ sceneBootstrap: () => ({ runId: "run-1", entryDigest: hex("x"), artifact }), resourceFingerprint: () => resource }).verifiedManifestForHandle(f.handle)).toBeUndefined();
+    // The scene only fills the gap while the live resource proof holds.
+    expect(f.source({ sceneBootstrap: () => ({ runId: "run-1", entryDigest: hex("d"), artifact }) }).verifiedManifestForHandle(f.handle)).toBeUndefined();
+    // Any drift in the re-measured artifact, or in the executable it attests, is a refusal.
+    expect(f.source({ sceneBootstrap: () => ({ runId: "run-1", entryDigest: hex("d"), artifact: () => { throw new Error("measured drift"); } }), resourceFingerprint: () => resource }).verifiedManifestForHandle(f.handle)).toBeUndefined();
+    await writeFile(f.executable, "drifted-content", { mode: 0o755 });
+    expect(f.source({ sceneBootstrap: () => ({ runId: "run-1", entryDigest: hex("d"), artifact }), resourceFingerprint: () => resource }).verifiedManifestForHandle(f.handle)).toBeUndefined();
+  });
+  it("stays unavailable without a scene turn baseline on the same artifact", async () => {
+    const f = await fixture("claude");
+    const resource = { provider: "claude" as const, providerInstanceId: "pi-1", configurationFingerprint: f.configurationFingerprint };
+    const scene = { runId: "run-1", entryDigest: hex("d"), artifact: () => ({ ...f.artifact }) };
+    // No evidence at all: the log itself is unavailable.
+    expect(f.source({ sceneBootstrap: () => scene, resourceFingerprint: () => resource }).verifiedManifestForHandle(f.handle)).toBeUndefined();
+    // A turn recorded under another run is not this scene's baseline.
+    await f.recordTurn(f.sceneRecorderFor("run-2"));
+    expect(f.source({ sceneBootstrap: () => scene, resourceFingerprint: () => resource }).verifiedManifestForHandle(f.handle)).toBeUndefined();
+  });
+  it("prefers the endorsed production manifest over the scene bootstrap", async () => {
+    const f = await fixture("claude");
+    await f.recordTurn(f.recorderFor("run-1"));
+    await f.recordRecovery(f.recorderFor("run-1"));
+    const resource = { provider: "claude" as const, providerInstanceId: "pi-1", configurationFingerprint: f.configurationFingerprint };
+    const scene = { runId: "run-scene", entryDigest: hex("d"), artifact: () => ({ ...f.artifact }) };
+    const manifest = f.source({ sceneBootstrap: () => scene, resourceFingerprint: () => resource }).verifiedManifestForHandle(f.handle);
+    const recovery = readCompatibilityEvidence(f.evidencePath).entries.find((entry) => entry.kind === "recovery");
+    expect(manifest?.evidenceId).toBe(recovery?.digest);
+  });
+});
+
+describe("live session resource fingerprint", () => {
+  it("binds the instance manifest to the recovery-domain fingerprint of the live session resource", async () => {
+    const f = await fixture("claude");
+    await f.recordTurn(f.recorderFor("run-1"));
+    await f.recordRecovery(f.recorderFor("run-1"));
+    const recoveryFingerprint = hex("e");
+    const resource = { provider: "claude" as const, providerInstanceId: "pi-1", configurationFingerprint: recoveryFingerprint };
+    const source = f.source({ resourceFingerprint: (sessionId) => sessionId === f.handle.sessionId ? resource : undefined });
+    // With the live session identified, the manifest carries the recovery-domain fingerprint.
+    expect(source.verifiedManifestForInstance("claude", "pi-1", f.handle.sessionId)?.configurationFingerprint).toBe(recoveryFingerprint);
+    // Without a session the compatibility-domain fingerprint of the activation remains.
+    expect(source.verifiedManifestForInstance("claude", "pi-1")?.configurationFingerprint).toBe(f.configurationFingerprint);
+  });
+  it("keeps the read contract unavailable for a handle that no longer matches the live resource", async () => {
+    const f = await fixture("claude");
+    await f.recordTurn(f.recorderFor("run-1"));
+    await f.recordRecovery(f.recorderFor("run-1"));
+    const stale = { provider: "claude" as const, providerInstanceId: "pi-1", configurationFingerprint: hex("z") };
+    expect(f.source({ resourceFingerprint: () => stale }).verifiedManifestForHandle(f.handle)).toBeUndefined();
+    expect(f.source({ resourceFingerprint: () => undefined }).verifiedManifestForHandle(f.handle)).toBeUndefined();
+    const live = { provider: "claude" as const, providerInstanceId: "pi-1", configurationFingerprint: f.configurationFingerprint };
+    expect(f.source({ resourceFingerprint: () => live }).verifiedManifestForHandle(f.handle)?.configurationFingerprint).toBe(f.configurationFingerprint);
   });
 });

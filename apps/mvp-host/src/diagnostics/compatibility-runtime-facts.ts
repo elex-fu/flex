@@ -14,6 +14,7 @@ import type { ProviderRuntimeFacts } from "../lifecycle/host-activation-load.js"
 import type { ProviderInstanceRecord } from "../storage/catalog-store.js";
 import type { DispatchContext } from "../provider/types.js";
 import { inspectNativeVersion, type ManagedVersionObservation, type PreparedNativeRuntime } from "../provider/managed-runtime.js";
+import type { NativeTurnObservation } from "../provider/native-history.js";
 import { CompatibilityEvidenceRecorder, compatibilityEvidenceHash, type NativeCompatibilityArtifact, type NativeCompatibilityEvidence } from "./compatibility-evidence.js";
 import { compatibilityCanonicalJson, compatibilityDigest } from "./compatibility-integrity.js";
 import { COMPATIBILITY_SCENE_VERSION } from "./compatibility-readiness.js";
@@ -149,30 +150,63 @@ export function createCompatibilityCommittedRecorder(options: {
     assertNativeProvenance: (evidence, artifact) => { const context = contexts.get(evidence.attemptId); if (!context) return fail("COMPATIBILITY_ORIGINAL_NATIVE_EVENT_MISSING"); return resolveManagedNativeProvenance(options.db, context, evidence, artifact); } });
   return Object.freeze({ drain: () => recorder.drain(),
     afterCommittedNativeStop: async (context: DispatchContext) => {
-      options.assertSceneObservation(context);
-      const binding = options.db.prepare("SELECT * FROM native_turn_bindings WHERE turn_id=? AND attempt_id=?").get(context.flyxTurnId, context.attemptId) as Record<string, unknown> | undefined;
-      if (!binding) return fail("COMPATIBILITY_NATIVE_BINDING_MISMATCH");
-      const events = options.db.prepare(`SELECT type,payload_json FROM session_events WHERE session_id=? AND type IN ('turn.completed','turn.failed','turn.cancelled')
-        AND json_extract(payload_json,'$.dispatchContext.flyxTurnId')=? AND json_extract(payload_json,'$.dispatchContext.attemptId')=?`).all(context.sessionId, context.flyxTurnId, context.attemptId) as Array<{ type: string; payload_json: string }>;
-      const originals = events.map((event) => ({ ...event, payload: JSON.parse(event.payload_json) as { terminalEvidence?: { kind?: string; sourceId?: string }; dispatchContext?: unknown } }))
-        .filter((event) => event.payload.terminalEvidence?.kind === "native-terminal" && event.payload.terminalEvidence.sourceId && compatibilityCanonicalJson(event.payload.dispatchContext) === compatibilityCanonicalJson(context));
-      if (originals.length !== 1) return fail("COMPATIBILITY_ORIGINAL_NATIVE_EVENT_MISSING");
-      const artifact = options.facts.measure();
-      const processes = options.db.prepare("SELECT id,state FROM managed_processes WHERE owner_id=? AND owner_generation=? AND runtime_id=? AND runtime_generation=? AND attempt_id=? AND session_id=? AND turn_id=?")
-        .all(context.hostOwnerId,context.hostOwnerGeneration,context.runtimeId,context.runtimeGeneration,context.attemptId,context.sessionId,context.flyxTurnId) as Array<{ id: string; state: string }>;
-      if (!processes.length || processes.some((process) => process.state !== "stopped")) return fail("COMPATIBILITY_STOP_PROOF_MISSING");
-      const matches = processes.filter((process) => { const row = options.db.prepare("SELECT value_json FROM host_state WHERE key=?").get("compatibility-planned-launch/v1/" + process.id) as { value_json: string } | undefined;
-        if (!row) return false; const { planned } = JSON.parse(row.value_json) as { planned: PlannedNativeArtifact };
-        return planned.operation === "provider-launch" && [planned.executable,...planned.scripts].some((file) => file.path === artifact.executablePath && file.digest === artifact.executableDigest); });
-      if (matches.length !== 1) return fail("COMPATIBILITY_LAUNCH_ARTIFACT_UNAVAILABLE");
-      const source = originals[0]!; const nativeSourceId = source.payload.terminalEvidence!.sourceId!;
-      const provider = binding.provider; if (provider !== "claude" && provider !== "codex") return fail("COMPATIBILITY_NATIVE_BINDING_MISMATCH");
-      const evidence: NativeCompatibilityEvidence = { provider, kind: "turn", capability: "turn", result: source.type === "turn.completed" ? "passed" : "failed",
-        nativeEvent: provider === "claude" ? "result" : "turn/completed", nativeSourceId, ...(provider === "claude" ? { nativeResultId: nativeSourceId } : { nativeTurnId: String(binding.native_turn_id) }),
-        nativeSessionId: String(binding.native_session_id), attemptId: context.attemptId, launchRef: matches[0]!.id, stopRef: matches[0]!.id,
-        evidenceCode: source.type === "turn.completed" ? "NATIVE_TERMINAL_COMPLETED" : "NATIVE_TERMINAL_FAILED" };
+      const facts = await collectStopFacts(context);
+      const evidence: NativeCompatibilityEvidence = { provider: facts.provider, kind: "turn", capability: "turn", result: facts.source.type === "turn.completed" ? "passed" : "failed",
+        nativeEvent: facts.provider === "claude" ? "result" : "turn/completed", nativeSourceId: facts.nativeSourceId,
+        ...(facts.provider === "claude" ? { nativeResultId: facts.nativeSourceId } : { nativeTurnId: String(facts.binding.native_turn_id) }),
+        nativeSessionId: String(facts.binding.native_session_id), attemptId: context.attemptId, launchRef: facts.matches[0]!.id, stopRef: facts.matches[0]!.id,
+        evidenceCode: facts.source.type === "turn.completed" ? "NATIVE_TERMINAL_COMPLETED" : "NATIVE_TERMINAL_FAILED" };
+      contexts.set(context.attemptId, context);
+      try { await recorder.record(evidence); } finally { contexts.delete(context.attemptId); }
+    },
+    /**
+     * Records one verified read-only native-history inspection (design §8.2
+     * R4): only after the reader returned a terminal observation whose native
+     * session, verified version and terminal status match the original turn
+     * binding still proven by the shared fact chain. Recording is observation
+     * only; the inspection itself never dispatched or spawned anything.
+     */
+    afterVerifiedRecoveryInspection: async (context: DispatchContext, observation: NativeTurnObservation & { state: "terminal" }) => {
+      if (observation.state !== "terminal" || !observation.evidence?.sourceId || !observation.evidence?.verifiedVersion) return fail("COMPATIBILITY_RECOVERY_OBSERVATION_INVALID");
+      const facts = await collectStopFacts(context);
+      const nativeSessionId = String(facts.binding.native_session_id);
+      if (observation.nativeSessionId !== nativeSessionId || observation.evidence.verifiedVersion !== facts.artifact.providerVersion) return fail("COMPATIBILITY_RECOVERY_OBSERVATION_MISMATCH");
+      const status = observation.status === "completed" && facts.source.type === "turn.completed" || observation.status === "failed" && facts.source.type === "turn.failed"
+        || observation.status === "cancelled" && facts.source.type === "turn.cancelled" ? observation.status : undefined;
+      if (!status) return fail("COMPATIBILITY_RECOVERY_OBSERVATION_MISMATCH");
+      if (observation.nativeTurnId !== undefined && String(facts.binding.native_turn_id ?? "") !== observation.nativeTurnId) return fail("COMPATIBILITY_RECOVERY_OBSERVATION_MISMATCH");
+      const evidence: NativeCompatibilityEvidence = { provider: facts.provider, kind: "recovery", capability: "recovery", result: "passed",
+        nativeEvent: "inspect", evidenceCode: "NATIVE_HISTORY_INSPECT_VERIFIED", nativeSourceId: observation.evidence.sourceId,
+        ...(facts.binding.native_turn_id !== null && facts.binding.native_turn_id !== undefined ? { nativeTurnId: String(facts.binding.native_turn_id) } : {}),
+        nativeSessionId, attemptId: context.attemptId, launchRef: facts.matches[0]!.id };
       contexts.set(context.attemptId, context);
       try { await recorder.record(evidence); } finally { contexts.delete(context.attemptId); }
     },
   });
+
+  /** The shared fact chain behind both committed-stop and recovery-inspection evidence. */
+  async function collectStopFacts(context: DispatchContext): Promise<{
+    binding: Record<string, unknown>; source: { type: string; payload: { terminalEvidence?: { kind?: string; sourceId?: string }; dispatchContext?: unknown } };
+    artifact: NativeCompatibilityArtifact; matches: Array<{ id: string }>; nativeSourceId: string; provider: "claude" | "codex";
+  }> {
+    options.assertSceneObservation(context);
+    const binding = options.db.prepare("SELECT * FROM native_turn_bindings WHERE turn_id=? AND attempt_id=?").get(context.flyxTurnId, context.attemptId) as Record<string, unknown> | undefined;
+    if (!binding) return fail("COMPATIBILITY_NATIVE_BINDING_MISMATCH");
+    const events = options.db.prepare(`SELECT type,payload_json FROM session_events WHERE session_id=? AND type IN ('turn.completed','turn.failed','turn.cancelled')
+      AND json_extract(payload_json,'$.dispatchContext.flyxTurnId')=? AND json_extract(payload_json,'$.dispatchContext.attemptId')=?`).all(context.sessionId, context.flyxTurnId, context.attemptId) as Array<{ type: string; payload_json: string }>;
+    const originals = events.map((event) => ({ ...event, payload: JSON.parse(event.payload_json) as { terminalEvidence?: { kind?: string; sourceId?: string }; dispatchContext?: unknown } }))
+      .filter((event) => event.payload.terminalEvidence?.kind === "native-terminal" && event.payload.terminalEvidence.sourceId && compatibilityCanonicalJson(event.payload.dispatchContext) === compatibilityCanonicalJson(context));
+    if (originals.length !== 1) return fail("COMPATIBILITY_ORIGINAL_NATIVE_EVENT_MISSING");
+    const artifact = options.facts.measure();
+    const processes = options.db.prepare("SELECT id,state FROM managed_processes WHERE owner_id=? AND owner_generation=? AND runtime_id=? AND runtime_generation=? AND attempt_id=? AND session_id=? AND turn_id=?")
+      .all(context.hostOwnerId,context.hostOwnerGeneration,context.runtimeId,context.runtimeGeneration,context.attemptId,context.sessionId,context.flyxTurnId) as Array<{ id: string; state: string }>;
+    if (!processes.length || processes.some((process) => process.state !== "stopped")) return fail("COMPATIBILITY_STOP_PROOF_MISSING");
+    const matches = processes.filter((process) => { const row = options.db.prepare("SELECT value_json FROM host_state WHERE key=?").get("compatibility-planned-launch/v1/" + process.id) as { value_json: string } | undefined;
+      if (!row) return false; const { planned } = JSON.parse(row.value_json) as { planned: PlannedNativeArtifact };
+      return planned.operation === "provider-launch" && [planned.executable,...planned.scripts].some((file) => file.path === artifact.executablePath && file.digest === artifact.executableDigest); });
+    if (matches.length !== 1) return fail("COMPATIBILITY_LAUNCH_ARTIFACT_UNAVAILABLE");
+    const source = originals[0]!;
+    const provider = binding.provider; if (provider !== "claude" && provider !== "codex") return fail("COMPATIBILITY_NATIVE_BINDING_MISMATCH");
+    return { binding, source, artifact, matches, nativeSourceId: source.payload.terminalEvidence!.sourceId!, provider };
+  }
 }

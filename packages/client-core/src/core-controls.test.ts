@@ -189,4 +189,53 @@ describe("core product controls", () => {
     await controls.createWorktree("/arbitrary/path", "HEAD"); expect(controls.getState().error).toContain("registered repository");
     expect(await f.store.listCommands("host")).toEqual([]);
   });
+  const activeTurnSnapshot = (): SessionSnapshotV2 => ({ session: { ...summary(), activityState: "running" }, activeTurn: { id: "original-turn", sessionId: "session", commandId: "turn-command", status: "running", prompt: "Task" }, pendingApprovals: [] });
+  const interruptResponse = (id?: string) => ({ sessionId: "session", turnId: "original-turn", status: "accepted", receipt: { commandId: id, targetSessionId: "session", state: "completed" } });
+  it("interrupts the active Turn through the Outbox with the shown revision and refreshes authority", async () => {
+    const f = fixture(), controls = f.controller(); f.setSnapshot(activeTurnSnapshot()); await controls.refresh();
+    f.handlers.set("session.interrupt", (_payload: unknown, id?: string) => interruptResponse(id));
+    await controls.interrupt();
+    const write = f.request.mock.calls.find(([method]) => method === "session.interrupt");
+    expect(write?.[1]).toEqual({ sessionId: "session", expectedRevision: 3 });
+    expect(write?.[2]).toBe(original);
+    expect(f.port.retrySynchronization).toHaveBeenCalled();
+    expect(controls.getState().error).toBeUndefined();
+  });
+  it("refuses a second interrupt while the original command receipt is still pending", async () => {
+    const f = fixture(), controls = f.controller(); f.setSnapshot(activeTurnSnapshot()); await controls.refresh();
+    await f.store.putCommand({ commandId: "original-interrupt", hostId: "host", method: "session.interrupt", payloadHash: "hash", payload: { sessionId: "session" }, createdAt: new Date(now).toISOString(), state: "sent" });
+    await controls.interrupt();
+    expect(controls.getState().error).toContain("original command receipt");
+    expect(f.request.mock.calls.some(([method]) => method === "session.interrupt")).toBe(false);
+    expect((await f.store.listCommands("host"))).toHaveLength(1);
+  });
+  it("requires an interruptible active Turn before any write", async () => {
+    const f = fixture(), controls = f.controller(); await controls.refresh();
+    await controls.interrupt();
+    expect(controls.getState().error).toContain("active Turn");
+    f.setSnapshot({ ...activeTurnSnapshot(), session: { ...summary(), activityState: "outcome_unknown" } }); await controls.refresh();
+    await controls.interrupt();
+    expect(controls.getState().error).toContain("active Turn");
+    expect(await f.store.listCommands("host")).toEqual([]);
+  });
+  it("keeps interrupt on the negotiated Session catalog only, so pre-catalog Hosts need the legacy command", async () => {
+    const f = fixture(), controls = f.controller(); f.setSnapshot(activeTurnSnapshot()); await controls.refresh();
+    f.capabilities.delete(SESSION_CATALOG_CAPABILITY);
+    await controls.interrupt();
+    expect(controls.getState().error).toContain("Session catalog");
+    expect(f.request.mock.calls.some(([method]) => method === "session.interrupt")).toBe(false);
+    expect(await f.store.listCommands("host")).toEqual([]);
+  });
+  it("isolates a late interrupt response after the selection changed", async () => {
+    const f = fixture(), controls = f.controller(); f.setSnapshot(activeTurnSnapshot()); await controls.refresh();
+    let finish!: (value: unknown) => void;
+    f.handlers.set("session.interrupt", () => new Promise((done) => { finish = done; }));
+    const pending = controls.interrupt();
+    await vi.waitFor(() => { if (typeof finish !== "function") throw new Error("interrupt was not dispatched"); });
+    controls.select({ ...selection, replicaGeneration: 2 });
+    finish(interruptResponse()); await pending;
+    expect(controls.getState().error).toBeUndefined();
+    expect(controls.getState().snapshot).toBeUndefined();
+    expect(f.request.mock.calls.filter(([method]) => method === "session.interrupt")).toHaveLength(1);
+  });
 });

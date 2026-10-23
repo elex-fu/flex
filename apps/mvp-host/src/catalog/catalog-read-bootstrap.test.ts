@@ -197,6 +197,40 @@ describe("owner-only SQL catalog bootstrap", () => {
         noProcesses();
     });
 
+    it("composes the isolated real-entry step: revalidate resolves the seeded symlink executable to its realpath before execution admission", async () => {
+        const f = fixture();
+        // The isolated compatibility entry (main.ts) boots through the
+        // owner-only SQL bootstrap — which persists the configured executable
+        // verbatim and leaves the instance "unconfigured" — and then performs
+        // the explicit local configuration step the scene policy and execution
+        // admission require. A symlinked executable exercises exactly the
+        // production path: the raw alias must never survive revalidation.
+        const target = join(f.root, "real-executable");
+        writeFileSync(target, "#!/bin/sh\nexit 0\n");
+        chmodSync(target, 0o700);
+        const alias = join(f.root, "alias-executable");
+        symlinkSync(target, alias);
+        const configuration = { ...f.configuration, providerInstances: f.configuration.providerInstances.map((input) => ({ ...input, executable: alias })) };
+        const host = await open(f, { configuration });
+        const id = host.legacySessionId;
+        // SQL bootstrap: raw alias, unconfigured — execution admission would
+        // refuse (PROVIDER_INSTANCE_UNAVAILABLE) and the strict scene-policy
+        // executable comparison against the measured realpath would fail.
+        expect(host.catalog.provider("instance-claude")).toMatchObject({ executable: alias, state: "unconfigured" });
+        expect(() => host.providers.require("instance-claude")).toThrow("PROVIDER_INSTANCE_UNAVAILABLE");
+        mkdirSync(f.missingRoot);
+        // The isolated entry's explicit step (never the SQL bootstrap) resolves
+        // the executable and configures the instance.
+        await host.revalidateConfiguration(configuration, { readOnlyGit: vi.fn(async () => ({ stdout: f.missingRoot })) });
+        const record = host.providers.require("instance-claude");
+        expect(record.executable).toBe(target);
+        expect(record.state).toBe("configured");
+        expect(realpathSync(record.executable)).toBe(record.executable);
+        // The same identity the scene policy binds against stays stable.
+        expect(host.registry.resolve(id).providerInstance.providerInstanceId).toBe("instance-claude");
+        noProcesses();
+    });
+
     it("requires separate configuration and contract evidence, then denies stale executable writes before loading a runtime", async () => {
         const f = fixture();
         const host = await open(f);

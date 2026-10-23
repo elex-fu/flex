@@ -52,7 +52,11 @@ export async function runCompatibilityCommand(command: CompatibilityCommand, con
     try { await writePrivateFile(staged, JSON.stringify(ticket) + "\n"); context.owner.assertActive(); await rename(staged, destinationPath); await syncDirectory(directory); }
     finally { await unlink(staged).catch((error: NodeJS.ErrnoException) => { if (error.code !== "ENOENT") throw error; }); }
   } else {
-    await importCompatibilityRun({ destination: context.identity, authorization: await readJson(command.authorizationPath), readinessPath: command.readinessPath, evidencePath: command.evidencePath, endorsementPath: command.outputPath, beforePublish: () => context.owner.assertActive() });
+    // Same derivation as the activation CLI and the Host startup read: the
+    // verified evidence log lives beside the destination database unless the
+    // environment pins an explicit private path.
+    const evidenceLogPath = resolve(process.env.FLYX_COMPATIBILITY_EVIDENCE_PATH ?? join(dirname(resolve(context.owner.databasePath)), "compatibility-evidence.jsonl"));
+    await importCompatibilityRun({ destination: context.identity, authorization: await readJson(command.authorizationPath), readinessPath: command.readinessPath, evidencePath: command.evidencePath, endorsementPath: command.outputPath, evidenceLogPath, beforePublish: () => context.owner.assertActive() });
   }
   return { status: "completed", outputPath: resolve(command.outputPath) };
 }

@@ -1,6 +1,6 @@
 # Flyx 核心能力实施计划
 
-> 更新：2026-10-24（Asia/Shanghai）。**开发已恢复**（用户指令按 G0 → M4 → R4 → R6 → R9 顺序继续）；G0 固定源码完整回归已通过。当前采用普通 macOS 受管执行，契约以 [技术方案 §4](./core-capabilities-technical-design.md#4-macos-平台契约普通受管执行) 与 [普通执行专题](./macos-managed-execution.md) 为准。
+> 更新：2026-10-24（Asia/Shanghai）。**开发已恢复**（用户指令按 G0 → M4 → R4 → R6 → R9 顺序继续）；G0 固定源码完整回归已通过；M4 首份生产兼容产物与显式激活闭环已通过。当前采用普通 macOS 受管执行，契约以 [技术方案 §4](./core-capabilities-technical-design.md#4-macos-平台契约普通受管执行) 与 [普通执行专题](./macos-managed-execution.md) 为准。
 > 下方 2026-10-23 及以前内容保留为历史记录；其中 ES/签名前置和强停止闭包门槛已被本次决策替代，不再代表当前依赖。
 
 ## 当前实施与验收（恢复检查点）
@@ -11,16 +11,18 @@
 | M1 生产执行 | 后端接线与启动/关闭通过 | Node 受管进程组 + 原私有目录边界，按用途 Git/helper runner；生产 main、在线查询与维护查询统一构造可信端口。无后端/无激活继续拒绝 Native 派发。 |
 | M2 恢复与放行 | 契约/组合回归通过；真实恢复另验 | after checkpoint、metadata/checkout lease、startup readiness、inspect/reconcile/acknowledge 消费原契约绑定的停止记录；缺观察/超时/旧记录保持 unknown。 |
 | M3 真实 Provider | Claude/Codex 2/2 通过 | 独立临时 checkout/Store/identity；分别记录 CLI/SDK/Node/OS；真实任务与文件结果、中断、受管清理、跨进程续接；失败不登记通过。 |
-| M4 兼容证据 / 准入 | 普通合同消费已接；首份产物闭环待做 | 实际原始 launch/native terminal/stop 连接签名产物；版本查询与激活消费相同合同；未验证能力不发布；常规启动不调用模型。 |
+| M4 兼容证据 / 准入 | **通过（2026-10-24，run-id m4-final2）** | 完整闭环实机通过：prepare（source identity/摘要）→ destination `compatibility authorize`（60 分钟 ticket）→ 真实 10-turn 场景（det=passed real=passed，fully-verified）→ destination `compatibility import`（安装 destination 签名 endorsement + 源签名 evidence log，均 0600）→ `activation verify` → `activation activate`（workspace+provider 双资源，revision 2）→ 普通重启后激活绑定保持。产物摘要：entry `2c6fee52…` / runtime `2a749f23…` / artifact `1e590ebc…`。destination 按 flyx-c3-basic-v1 只请求已验证的 turn 能力（policyCapabilities=`["streamingText"]`），未运行场景不给背书。 |
 | G0 固定源码全量回归 | **通过（2026-10-24 恢复后重跑）** | 冻结源码 `5943418`、指纹 `d54ab46c`（360 文件，运行前后一致）；串行 `--maxWorkers=1` 完整运行：142 文件 / 1317 passed / 7 skipped / 0 failed，exit 0，828.78 秒；日志 `/tmp/flyx-g0-20261024.log`、指纹 JSON 同名 `.json`。暂停中断不再作为未完成状态保留。 |
 | 后续 R4/R6/R9 | 仍待验收 | 真实恢复检查器、双 Provider Native 回退锚点/完整回退、备份后外部状态、完整主入口与物理手机。普通模式不自动使这些事项完成。 |
 
-恢复开发后的顺序：~~G0 固定源码完整回归~~（已通过）→ **M4 首份生产兼容产物闭环（当前项）** → R4 真实恢复与备份外部复核 → R6 Native 回退 → R9 组合终验。M0–M3 的平台/适配器证据不替代这些事项。ES 强监督移为可选增强；Developer ID 留在桌面分发阶段，不作为 M0–M4 前置。
+恢复开发后的顺序：~~G0 固定源码完整回归~~（已通过）→ ~~M4 首份生产兼容产物闭环~~（已通过，2026-10-24）→ **R4 真实恢复与备份外部复核（当前项）** → R6 Native 回退 → R9 组合终验。M0–M3 的平台/适配器证据不替代这些事项。ES 强监督移为可选增强；Developer ID 留在桌面分发阶段，不作为 M0–M4 前置。
 
 暂停时源码基线为 `003faa3254a3fc76a2d624ed4a1c2d5fdf2c36c8`；本轮源码、测试和文档已于 2026-10-24 提交入库并推送（`4af1af5` 普通进程组执行 → `b60852c` 接线与恢复 → `0bbc950` 双 Provider 实机验收测试 → `0345f83` 状态文档，`main` 与 `codex/flyx-optimization` 同点，工作区干净）。真实 Provider 调用已结束；本轮最终回归已停止，没有继续开发或测试。下述待办保留实现步骤，等待恢复开发后执行。
 
 ### 本轮证据
 
+- 2026-10-24（M4）：首份生产兼容产物与显式激活闭环通过——run-id `m4-final2`（组合 cli-2.1.216_node-24.18.0，普通合同 managed-process-group/v1/darwin）：`run-matrix --prepare` 生成 source identity 与构建摘要 → destination `compatibility authorize` 签发 60 分钟 ticket → `RUN_REAL_CLAUDE=1 run-matrix --real` 真实 10-turn 场景（det=passed real=passed，fully-verified）→ destination `compatibility import` 原子安装 0600 的 destination 签名 endorsement 与源签名 evidence log（`compatibility-evidence.jsonl`）→ `activation verify`（操作 `de5101c9-76ef-4b7c-a20b-032e400a8b4d`）→ `activation activate --evidence … --command-id m4-explicit-activate-1`（workspace+provider 双资源 revision 2；provider verified，capabilities=`["streamingText"]`；SQL bootstrap 的空 worktreeRoot 由 verify 快照经受管 toplevel 查询决定并持久化）→ activate 后普通重启一次：workspace active/worktreeRoot 保持、readiness_revision 未变、Host 正常监听。产物位于 `.flyx-evidence/cli-2.1.216_node-24.18.0/m4-final2/`（readiness/native/turns/summary），矩阵状态 `fully-verified`。destination bootstrap（`scripts/compatibility/destination-bootstrap.mjs`）现经 `FLYX_CATALOG_CONFIG` 只请求已验证的 turn 能力：首个基本场景只发布实际完成的 `turn`（方案 §6.3），interrupt/approval/reconnect 待各自场景。
+- 2026-10-24（M4 运行观察，fail-closed 行为记录）：(1) import 要求 readiness.createdAt ≥ ticket.issuedAt——真实运行完成后再补签发 ticket 无法导入（时间序是授权语义的一部分，非缺陷）；(2) destination 普通启动留下的 owner 记录在该次 SIGTERM 退出后残留，pid 已死时阻塞离线维护 CLI，需按 destination-bootstrap 同款“验证进程已退出后清除”流程处理；(3) isolated 真实运行 Host 崩溃后二次启动会以 `COMPATIBILITY_SCENE_BINDING_CHANGED` 拒绝重入场景（`readHostCatalogBootstrap` 在已有 sessions 时返回空配置，SQL bootstrap 的 worktreeRoot='' 不再被 registerLocal 补全；fail-closed 但错误码有误导性）——source run 单次启动不受影响，后续需要 scope 决策再处理。
 - 2026-10-24（恢复后）：G0 固定源码完整回归通过——冻结 `5943418`，串行全量 142 文件 / 1317 passed / 7 skipped / 0 failed，exit 0，828.78 秒；运行前后 360 个 Host/protocol 源文件指纹一致（`d54ab46c`）。日志 `/tmp/flyx-g0-20261024.log`。
 - 2026-10-24：普通合同、单层私有/工作区写边界、生产 main/维护 Git、恢复范围与停止门禁已实现。真实 Claude/Codex 2/2 通过（实际工具、跨进程续接、长命令开始后中断、清理）；生产 main 启动/关闭通过，未激活时零 Native 启动。详见 [阶段验收](./analysis/2026-10-24-macos-managed-execution-acceptance.md) 与 [版本/摘要 JSON](./analysis/2026-10-24-macos-managed-provider-results.json)。
 - 构建、全工作区 typecheck、Host 测试类型检查通过；protocol 56、client-core 163、mobile 90、Web Node 63 通过。Host 首轮全量 1303 passed / 13 failed / 7 skipped；相关修复已通过 37、2、40 项定向复测。第二轮为 1316 passed / 1 failed / 7 skipped，运行跨越源码修改；新合同隔离断言独立复测 5/5、最终相关定向 35/35 通过。各批次有重叠，不合计为唯一测试数，也未登记 Host 全量通过。
@@ -35,7 +37,9 @@
 - 真实 Claude/Codex 2/2 已有独立阶段证据。后续执行路径、合同或 adapter 若变化，再按影响范围安排真实复测；不将暂停中断算作 Provider 失败或重写已有结果。
 - 出口：当前固定版本取得完整结果，失败项有明确处置；随后进入 M4。即使 G0 全绿，也不能替代生产激活、真实恢复/回退与终验。
 
-### M4：首份生产兼容产物与显式激活（下一优先项）
+### M4：首份生产兼容产物与显式激活（已通过，2026-10-24）
+
+> **完成记录（run-id `m4-final2`）**：普通 macOS 受管合同（managed-process-group/v1/darwin）下完整闭环一次通过——`run-matrix --prepare` → destination `compatibility authorize` → `RUN_REAL_CLAUDE=1 run-matrix --real`（真实 10-turn 场景，det=passed real=passed，状态 fully-verified）→ destination `compatibility import`（安装 destination 签名 endorsement + 源签名 evidence log，均 0600 原子落盘）→ `activation verify` → `activation activate`（显式 `--command-id m4-explicit-activate-1`）→ activate 后普通重启一次无回撤。destination 按 `flyx-c3-basic-v1` 只激活已验证的 `streamingText` 能力（§6.3）。interrupt/approval/reconnect 固定场景留待后续扩展。
 
 - 入口：`main.ts` isolated 分支、`diagnostics/compatibility-runtime-facts.ts`、`compatibility-scene-policy.ts`、`scripts/compatibility/run-matrix.mjs`。已有 `createVersionProbeAuthority` 尚须在真实入口组合；不能把本轮 adapter 报告直接塞进激活表。
 - 准备阶段固定 source/destination identity、runId、entry/runtime/executable/config 摘要和候选版本；候选不算已观察版本。校验私有授权文件后，仅允许受管 `--version`，用原始 query/stop 记录生成实际 runtime facts；候选不匹配即拒绝。

@@ -2,6 +2,7 @@ import { dirname } from "node:path";
 import type Database from "better-sqlite3";
 import { canonicalPath, type HostOwnerHandle } from "./host-owner.js";
 import type { ProviderInstanceRecord, ProviderVerification, WorkspaceRecord } from "../storage/catalog-store.js";
+import { checkoutKey } from "../storage/migrations/007-catalog.js";
 import type { WorkspaceGitQuery } from "../workspace/workspace-registry.js";
 import {
   activationConsumeRequestHash, activationRequestHash, newActivationOperationId, ActivationError,
@@ -75,6 +76,14 @@ export type HostActivationFacts = {
     workspaces(): readonly WorkspaceRecord[];
     provider(id: string): ProviderInstanceRecord | undefined;
     providers(): readonly ProviderInstanceRecord[];
+    /**
+     * Persist a verification-decided checkout identity for a SQL-bootstrapped
+     * local row (mirrors `WorkspaceRegistry.registerLocal`). Wired by the
+     * maintenance CLI, where the owner is the live writer; an embedder that
+     * leaves it unwired stays fail-closed — the row keeps its unknown identity
+     * and every later reconcile refuses it.
+     */
+    putWorkspace?(input: Omit<WorkspaceRecord, "createdAt" | "updatedAt">): WorkspaceRecord;
   };
   /** Current original-producer inventory (reuses `inspectCatalogStartupReadiness`); absent stays blocking. */
   readiness?: () => Readonly<{ ready: boolean }>;
@@ -249,6 +258,19 @@ export class HostActivationService {
     if (!reasonCodes.length && executor) {
       const observed = await this.bindingSource.snapshot({ workspace, provider, executor, operationId: operation.id });
       if (observed.ready) {
+        // A SQL-bootstrapped local row keeps its checkout identity unknown; the
+        // snapshot just decided it through the managed toplevel query. Persist
+        // that verified identity (mirroring registerLocal) so the activate
+        // preflight and the post-activation startup load reconcile the same
+        // row this evidence binds. Unwired embedders stay fail-closed.
+        if (workspace.kind === "local" && !workspace.worktreeRoot && observed.value.workspace.worktreeRoot !== workspace.worktreeRoot) {
+          facts.catalog.putWorkspace?.({
+            workspaceId: workspace.workspaceId, canonicalRoot: workspace.canonicalRoot,
+            worktreeRoot: observed.value.workspace.worktreeRoot, checkoutKey: observed.value.workspace.checkoutKey,
+            kind: workspace.kind, state: workspace.state, repositoryId: workspace.repositoryId, capabilities: [...workspace.capabilities],
+            ...(workspace.registrationOperationId ? { registrationOperationId: workspace.registrationOperationId } : {}),
+          });
+        }
         const revisions = Object.freeze({
           workspace: operations.recordReadiness("workspace", input.workspaceId),
           provider: operations.recordReadiness("provider", input.providerInstanceId),
@@ -476,24 +498,37 @@ export class DefaultActivationBindingSource implements ActivationBindingSource {
   }
 
   async snapshot(input: { workspace: WorkspaceRecord; provider: ProviderInstanceRecord; executor: ManagedQueryPort; operationId: string }): Promise<ActivationBindingSnapshotResult> {
-    const observed = this.workspaceFacts(input.workspace);
-    if (!observed.ready) return observed;
+    if (input.workspace.state === "disabled") return refused("WORKSPACE_NOT_VERIFIED");
+    if (privateDirectoryOverlap(input.workspace.canonicalRoot, this.privateRoots)) return refused("WORKSPACE_PRIVATE_DIRECTORY_OVERLAP");
     let toplevel: string;
+    try {
+      const top = await input.executor.readOnlyGit({ argv: workspaceArgv(input.workspace.canonicalRoot, "toplevel"), cwd: input.workspace.canonicalRoot, maxBufferBytes: QUERY_MAX_BUFFER_BYTES, timeoutMs: QUERY_TIMEOUT_MS, operationId: input.operationId });
+      toplevel = top.stdout.trim();
+    } catch { return refused("WORKSPACE_QUERY_UNVERIFIED"); }
+    let resolvedRoot: string;
+    try { resolvedRoot = canonicalPath(toplevel); } catch { return refused("WORKSPACE_CHECKOUT_UNAVAILABLE"); }
+    // A recorded checkout identity must still match the observed toplevel. An
+    // unknown identity — SQL-bootstrapped local rows keep worktreeRoot "" —
+    // is decided by this managed query alone: never by canonicalizing the
+    // empty root to the host process cwd, and never by guessing from the
+    // canonical root, which may be a repository subdirectory.
+    if (input.workspace.worktreeRoot && toplevel !== input.workspace.worktreeRoot) return refused("WORKSPACE_IDENTITY_CHANGED");
+    if (privateDirectoryOverlap(resolvedRoot, this.privateRoots)) return refused("WORKSPACE_PRIVATE_DIRECTORY_OVERLAP");
+    const record: WorkspaceRecord = input.workspace.worktreeRoot
+      ? input.workspace
+      : { ...input.workspace, worktreeRoot: resolvedRoot, checkoutKey: checkoutKey(resolvedRoot) };
     let commonDir: string;
     try {
-      const [top, common] = await Promise.all([
-        input.executor.readOnlyGit({ argv: workspaceArgv(input.workspace.canonicalRoot, "toplevel"), cwd: input.workspace.canonicalRoot, maxBufferBytes: QUERY_MAX_BUFFER_BYTES, timeoutMs: QUERY_TIMEOUT_MS, operationId: input.operationId }),
-        input.executor.readOnlyGit({ argv: workspaceArgv(input.workspace.worktreeRoot, "common_dir"), cwd: input.workspace.worktreeRoot, maxBufferBytes: QUERY_MAX_BUFFER_BYTES, timeoutMs: QUERY_TIMEOUT_MS, operationId: input.operationId }),
-      ]);
-      toplevel = top.stdout.trim();
+      const common = await input.executor.readOnlyGit({ argv: workspaceArgv(record.worktreeRoot, "common_dir"), cwd: record.worktreeRoot, maxBufferBytes: QUERY_MAX_BUFFER_BYTES, timeoutMs: QUERY_TIMEOUT_MS, operationId: input.operationId });
       commonDir = common.stdout.trim();
     } catch { return refused("WORKSPACE_QUERY_UNVERIFIED"); }
-    if (toplevel !== input.workspace.worktreeRoot) return refused("WORKSPACE_IDENTITY_CHANGED");
     let common: string;
     try { common = canonicalPath(commonDir); } catch { return refused("WORKSPACE_CHECKOUT_UNAVAILABLE"); }
     if (privateDirectoryOverlap(common, this.privateRoots)) return refused("WORKSPACE_PRIVATE_DIRECTORY_OVERLAP");
     const commonDirIdentity = directoryIdentity(common);
     if (!commonDirIdentity) return refused("WORKSPACE_CHECKOUT_UNAVAILABLE");
+    const observed = this.workspaceFacts(record);
+    if (!observed.ready) return observed;
     const provider = this.observation.provider(input.provider);
     if (!provider.ready) return refused(...provider.reasonCodes);
     return Object.freeze({ ready: true as const, value: Object.freeze({

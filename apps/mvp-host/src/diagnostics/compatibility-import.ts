@@ -34,6 +34,15 @@ export interface ImportCompatibilityRunOptions {
   readinessPath: string;
   evidencePath: string;
   endorsementPath: string;
+  /**
+   * Destination install path for the verified source-signed evidence records.
+   * The destination trust chain needs both files: the destination-signed
+   * endorsement alone cannot carry the per-capability records, and the
+   * self-signed records alone cannot establish destination acceptance. The
+   * log is published before the endorsement, so a crash between the two
+   * leaves records that no endorsement will trust.
+   */
+  evidenceLogPath?: string;
   now?: number;
   beforePublish?: () => void;
 }
@@ -63,13 +72,20 @@ export async function importCompatibilityRun(options: ImportCompatibilityRunOpti
   if (artifactDigest !== ticket.artifactDigest) throw new OperationsError("COMPATIBILITY_SOURCE_MISMATCH");
   const read = readCompatibilityEvidence(options.evidencePath);
   await assertPrivateDirectory(dirname(resolve(options.evidencePath)));
-  const sourceLineCount = (await readPrivateFile(options.evidencePath, 1024 * 1024)).toString("utf8").split("\n").filter((line) => line.trim()).length;
-  if (!read.available || !read.entries.length || read.entries.length !== sourceLineCount) throw new OperationsError("COMPATIBILITY_SOURCE_MISSING");
-  const entries = read.entries.filter((entry) => entry.trusted && entry.domain === "isolated-real" && entry.runId === ticket.runId
-    && entry.entryDigest === ticket.entryDigest && entry.sceneVersion === ticket.sceneVersion && entry.host?.fingerprint === ticket.sourceHost.fingerprint
-    && entry.host?.hostId === ticket.sourceHost.hostId && entry.provider === handshake.provider && entry.artifact
-    && compatibilityEvidenceArtifactDigest(entry.artifact) === artifactDigest && Date.parse(entry.at) >= Date.parse(String(handshake.createdAt)) - 1_000
-    && Date.parse(entry.at) <= now + 5_000);
+  const sourceLines = (await readPrivateFile(options.evidencePath, 1024 * 1024)).toString("utf8").split("\n").filter((line) => line.trim());
+  if (!read.available || !read.entries.length || read.entries.length !== sourceLines.length) throw new OperationsError("COMPATIBILITY_SOURCE_MISSING");
+  const verifiedLines: string[] = [];
+  const entries = read.entries.filter((entry, index) => {
+    const accepted = entry.trusted && entry.domain === "isolated-real" && entry.runId === ticket.runId
+      && entry.entryDigest === ticket.entryDigest && entry.sceneVersion === ticket.sceneVersion && entry.host?.fingerprint === ticket.sourceHost.fingerprint
+      && entry.host?.hostId === ticket.sourceHost.hostId && entry.provider === handshake.provider && entry.artifact
+      && compatibilityEvidenceArtifactDigest(entry.artifact) === artifactDigest && Date.parse(entry.at) >= Date.parse(String(handshake.createdAt)) - 1_000
+      && Date.parse(entry.at) <= now + 5_000;
+    // Preserve the exact source-signed line: bytes, order and signatures are
+    // never re-serialized; only the verified subset is installed.
+    if (accepted) verifiedLines.push(sourceLines[index]!);
+    return accepted;
+  });
   if (entries.length !== read.entries.length || entries.some((entry) => entry.result === "failed")) throw new OperationsError("COMPATIBILITY_SOURCE_MISMATCH");
   const turns = new Set(entries.filter((entry) => entry.kind === "turn" && entry.capability === "turn" && entry.result === "passed").map((entry) => entry.nativeSessionIdHash + ":" + (entry.provider === "claude" ? entry.nativeResultIdHash : entry.nativeTurnIdHash)));
   if (turns.size < 10) throw new OperationsError("COMPATIBILITY_SCENE_INCOMPLETE");
@@ -79,6 +95,13 @@ export async function importCompatibilityRun(options: ImportCompatibilityRunOpti
     evidenceSetDigest: compatibilityDigest(entries.map((entry) => entry.digest).sort()), capabilities: ["turn"], recordDigests: entries.filter((entry) => entry.kind === "turn" && entry.capability === "turn" && entry.result === "passed").map((entry) => entry.digest).sort(),
     issuedAt: new Date(now).toISOString(), expiresAt: new Date(Math.min(now + 86_400_000, Date.parse(handshake.createdAt) + 86_400_000, Date.parse(ticket.expiresAt))).toISOString(),
   }, options.destination);
+  if (options.evidenceLogPath) {
+    const logPath = resolve(options.evidenceLogPath);
+    const logDirectory = await assertPrivateDirectory(dirname(logPath));
+    const stagedLog = join(logDirectory, ".compatibility-evidence-" + randomBytes(16).toString("hex") + ".tmp");
+    try { await writePrivateFile(stagedLog, verifiedLines.join("\n") + "\n"); options.beforePublish?.(); await rename(stagedLog, logPath); await syncDirectory(logDirectory); }
+    finally { await unlink(stagedLog).catch((error: NodeJS.ErrnoException) => { if (error.code !== "ENOENT") throw error; }); }
+  }
   const destinationPath = resolve(options.endorsementPath);
   const directory = await assertPrivateDirectory(dirname(destinationPath));
   const staged = join(directory, ".compatibility-import-" + randomBytes(16).toString("hex") + ".tmp");

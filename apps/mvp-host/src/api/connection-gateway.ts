@@ -425,6 +425,7 @@ export class ConnectionGateway {
         replied = true;
         for (const opened of gates) await opened.activate();
       } catch (error) {
+        if (process.env.FLYX_DEBUG_DISPATCH) console.error("[dispatch]", frame.method, error);
         if (replied) for (const opened of gates) opened.cancel();
         else await send({ type: "response", id: frame.id, ok: false, error: publicError(error, (error) => withGeneration({ type: "response", id: frame.id, ok: false, error })) });
       } finally {

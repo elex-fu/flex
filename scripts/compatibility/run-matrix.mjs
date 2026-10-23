@@ -5,6 +5,7 @@ import { createRequire } from "node:module";
 import { createHash, randomUUID } from "node:crypto";
 import { chmod, cp, mkdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { arch, release } from "node:os";
+import { createServer } from "node:net";
 import { dirname, join, resolve } from "node:path";
 import { promisify } from "node:util";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -45,6 +46,25 @@ async function stopHost(child) {
   clearTimeout(timer);
   return { status: forced ? "forced" : "graceful", code: child.exitCode };
 }
+/** Candidate artifact via the exact Host composition module; providerVersion is the signed candidate, never an observation. */
+async function composeCandidateArtifact({ provider, executable, providerVersion }) {
+  const run = await import(pathToFileURL(join(ROOT, "apps/mvp-host/dist/diagnostics/compatibility-run.js")).href);
+  const { MACOS_MANAGED_STOP_CONTRACT } = await import(pathToFileURL(join(ROOT, "apps/mvp-host/dist/lifecycle/managed-stop-contract.js")).href);
+  if (process.platform !== "darwin") throw coded("MATRIX_CANDIDATE_PLATFORM_REQUIRED");
+  return run.composeCompatibilityCandidateArtifact({ provider, executable, providerVersion,
+    config: { environment: {}, sandboxRequired: true }, policyVersion: 1, supervisionContractId: MACOS_MANAGED_STOP_CONTRACT });
+}
+/** parseConnectivityConfig requires a concrete PORT; reserve one loopback port per Host start. */
+function reservePort() {
+  return new Promise((done, reject) => {
+    const server = createServer();
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", () => {
+      const { port } = server.address();
+      server.close(() => done(port));
+    });
+  });
+}
 async function startHost({ layer, combo, scratch, nativePath, runId }) {
   const controlled = join(scratch, layer);
   await mkdir(controlled, { recursive: true, mode: 0o700 });
@@ -59,6 +79,8 @@ async function startHost({ layer, combo, scratch, nativePath, runId }) {
   await git("git", ["-C", workspace, "-c", "user.name=Flyx compatibility", "-c", "user.email=compatibility@localhost", "commit", "--quiet", "-m", "isolated compatibility fixture"]);
   const real = layer === "real";
   if (real && (!combo.authorizationPath || !combo.destinationHostPath)) throw coded("MATRIX_PREAUTHORIZED_RUN_REQUIRED");
+  const candidateVersion = real ? (combo.provider === "codex" ? combo.codexCliVersion : combo.claudeCliVersion) : undefined;
+  if (real && (typeof candidateVersion !== "string" || !/^[a-zA-Z0-9][a-zA-Z0-9._+-]{0,127}$/.test(candidateVersion))) throw coded("MATRIX_CANDIDATE_VERSION_REQUIRED");
   const entryPath = real ? await realpath(join(ROOT, "apps/mvp-host/dist/main.js")) : undefined;
   const entryDigest = real ? hash(await readFile(entryPath)) : undefined;
   const expectedHost = real ? JSON.parse(await readPrivateArtifact(join(dirname(nativePath), "source-host.json"))) : undefined;
@@ -67,8 +89,14 @@ async function startHost({ layer, combo, scratch, nativePath, runId }) {
   const child = spawn(process.execPath, real ? [join(ROOT, "apps/mvp-host/dist/main.js")] : ["--import", "tsx", "src/test-support/e2e-main.ts"], {
     cwd: join(ROOT, "apps/mvp-host"),
     env: {
-      ...process.env, PORT: "0", FLYX_PROVIDER: provider, FLYX_WORKSPACE: workspace,
-      FLYX_DB: join(controlled, "host.sqlite"), FLYX_IDENTITY_DIR: join(controlled, "identity"),
+      ...process.env, PORT: String(await reservePort()), FLYX_PROVIDER: provider, FLYX_WORKSPACE: workspace,
+      // The DB must live in a sibling directory of the workspace, never in an
+      // ancestor: dirname(FLYX_DB) is a Host private root, and both the managed
+      // Git query and the workspace privacy contract reject a workspace that
+      // overlaps a private root. Keeping DB/identity/workspace as siblings
+      // under the controlled root also satisfies the scene policy's isolation
+      // requirement (all three inside FLYX_COMPATIBILITY_ROOT).
+      FLYX_DB: join(controlled, "state", "host.sqlite"), FLYX_IDENTITY_DIR: join(controlled, "identity"),
       FLYX_E2E_ROOT: join(controlled, "e2e"), FLYX_WEB_ROOT: join(controlled, "web"),
       FLYX_ALLOW_INSECURE_HTTP: "1", FLYX_REQUIRE_PAIRING_CONFIRM: "0",
       FLYX_CONNECTIVITY_MODE: "local", FLYX_RELAY_ENABLED: "0", FLYX_PUBLIC_BASE_URL: "", FLYX_SKIP_PREFLIGHT: "0",
@@ -77,8 +105,9 @@ async function startHost({ layer, combo, scratch, nativePath, runId }) {
       FLYX_COMPATIBILITY_MODE: "isolated", FLYX_COMPATIBILITY_ROOT: controlled,
       FLYX_COMPATIBILITY_AUTHORIZATION_PATH: combo.authorizationPath ?? "", FLYX_COMPATIBILITY_DESTINATION_HOST_PATH: combo.destinationHostPath ?? "",
       FLYX_COMPATIBILITY_REAL_ENABLED: real ? "1" : "0", FLYX_COMPATIBILITY_ENTRY_DIGEST: entryDigest ?? "",
+      ...(real ? { FLYX_COMPATIBILITY_CANDIDATE_VERSION: candidateVersion } : {}),
       ...(provider === "claude" ? { FLYX_CLAUDE_EXECUTABLE: combo.executableSource === "sdk-bundled" ? "" : combo.executablePath ?? "claude" } : { FLYX_CODEX_EXECUTABLE: combo.executablePath ?? "codex" }),
-    }, stdio: ["ignore", "ignore", "ignore"],
+    }, stdio: ["ignore", "ignore", process.env.MATRIX_DEBUG_STDERR === "1" ? "inherit" : "ignore"],
   });
   let spawnError;
   child.once("error", () => { spawnError = coded("HOST_SPAWN_FAILED"); });
@@ -145,12 +174,27 @@ export async function openClient(info) {
   if (!subscribed.ok) { client.close(); throw coded("SUBSCRIBE_FAILED"); }
   return client;
 }
+// The host commits turn.completed and notifies subscribers before the
+// after-terminal finalize chain (verified stop, compatibility recorder,
+// workspace-lease release) completes, so an immediately following startTurn can
+// observe a still-held lease. WORKSPACE_BUSY/TURN_BUSY are documented
+// retryable admission codes: wait for the previous finalization, bounded.
+const RETRYABLE_ADMISSION = new Set(["WORKSPACE_BUSY", "TURN_BUSY"]);
+const ADMISSION_RETRY_DELAY_MS = 1_000;
+const ADMISSION_RETRY_LIMIT = 90;
 async function runTurn(client, { layer, index, prompt, scenario = "turn", commandId }) {
   const start = Date.now();
-  const record = { layer, scenario, index, promptHash: hash(prompt), startedAt: new Date(start).toISOString(), turnIdHash: null, terminalType: null, result: "failed", errorCode: null };
+  const record = { layer, scenario, index, promptHash: hash(prompt), startedAt: new Date(start).toISOString(), turnIdHash: null, terminalType: null, result: "failed", errorCode: null, admissionRetries: 0 };
   let turnId;
   try {
-    const response = await client.call("session.startTurn", { prompt }, commandId ?? randomUUID());
+    const admissionId = commandId ?? randomUUID();
+    let response;
+    for (let attempt = 0; ; attempt += 1) {
+      response = await client.call("session.startTurn", { prompt }, admissionId, 120_000);
+      if (response.ok || !RETRYABLE_ADMISSION.has(response.error?.code) || attempt >= ADMISSION_RETRY_LIMIT) break;
+      record.admissionRetries += 1;
+      await new Promise((done) => setTimeout(done, ADMISSION_RETRY_DELAY_MS));
+    }
     if (!response.ok || typeof response.payload?.turnId !== "string") throw coded(response.error?.code ?? "TURN_ADMISSION_FAILED");
     turnId = response.payload.turnId; record.turnIdHash = hash(turnId);
     if (scenario === "approval") {
@@ -248,9 +292,19 @@ export async function main(argv = process.argv.slice(2)) {
       const entryPath = await realpath(join(ROOT, "apps/mvp-host/dist/main.js"));
       const entryDigest = hash(await readFile(entryPath));
       await writeJson(join(directory, "source-host.json"), sourceHost);
-      await writeJson(join(directory, "preparation.json"), { v: 1, runId, comboId: combo.id, provider: combo.provider, sourceHost, entryPath, entryDigest,
-        sourceHostPath: join(directory, "source-host.json"), commandIds: compatibilitySceneCommandIds(runId), note: "Authorize this source before --real --run-id; measure exact runtime/artifact digests for destination authorization. No model was called." });
-      log(combo.id + ": prepared run=" + runId); continue;
+      // Candidate artifact facts use the exact host composition (dist import):
+      // the destination ticket binds this candidate, never an observed version.
+      const candidateVersion = combo.provider === "codex" ? combo.codexCliVersion : combo.claudeCliVersion;
+      const candidate = typeof combo.executablePath === "string" && combo.executablePath.startsWith("/") && typeof candidateVersion === "string"
+        ? await composeCandidateArtifact({ provider: combo.provider, executable: combo.executablePath, providerVersion: candidateVersion }) : undefined;
+      const artifactDigest = candidate ? (await import(pathToFileURL(join(ROOT, "apps/mvp-host/dist/diagnostics/compatibility-evidence.js")).href)).compatibilityEvidenceArtifactDigest({ ...candidate, provider: combo.provider }) : undefined;
+      await writeJson(join(directory, "preparation.json"), { v: 2, runId, comboId: combo.id, provider: combo.provider, sourceHost, entryPath, entryDigest,
+        ...(candidate ? { candidate: { ...candidate, candidateVersion }, artifactDigest, runtimeDigest: candidate.runtimeDigest,
+          supervisionContractId: candidate.supervisionContractId, config: { environment: {}, sandboxRequired: true }, policyVersion: 1 } : {}),
+        sourceHostPath: join(directory, "source-host.json"), commandIds: compatibilitySceneCommandIds(runId), note: candidate
+          ? "Authorize this source before --real --run-id; the destination ticket must bind exactly this candidate artifactDigest/runtimeDigest/entryDigest. No model was called and no version was observed."
+          : "No absolute executablePath: this combination cannot be authorized for a real run until one is measured. No model was called." });
+      log(combo.id + ": prepared run=" + runId + (candidate ? " artifact=" + artifactDigest : " (no candidate)")); continue;
     }
     const context = { scratch, nativePath, runId, turns, prompt: config.matrixPrompt.text, scenarios: config.realScenarios };
     let deterministic, real;

@@ -4,7 +4,10 @@ import { validateTreeStopEvidence, type ProcessTreeStopEvidence } from "../lifec
 import { isNativeBoundaryProof } from "../lifecycle/native-boundary-proof.js";
 import type { ProcessIdentity } from "../lifecycle/process-inspector.js";
 import { OperationsError } from "../operations/operation-files.js";
-import type { DispatchContext } from "../provider/types.js";
+import { providerConfigurationFingerprint } from "../lifecycle/host-activation-load.js";
+import { catalogRecoveryConfigurationFingerprint } from "../session/recovery-fingerprint.js";
+import type { ProviderConfiguration } from "../storage/catalog-store.js";
+import type { DispatchContext, ProviderId } from "../provider/types.js";
 import { assertCompleteCompatibilityArtifact, compatibilityEvidenceHash, type CompatibilityNativeProvenance, type NativeCompatibilityArtifact, type NativeCompatibilityEvidence } from "./compatibility-evidence.js";
 import type { PlannedNativeArtifact } from "./planned-native-artifact.js";
 import { compatibilityCanonicalJson, compatibilityDigest } from "./compatibility-integrity.js";
@@ -68,9 +71,37 @@ export function resolveManagedNativeProvenance(db: Database.Database, context: D
         || measured.nodeVersion !== artifact.nodeVersion || measured.os !== artifact.os || measured.hostBuildDigest !== artifact.runtimeDigest) refuse("COMPATIBILITY_LAUNCH_ARTIFACT_MISMATCH");
     }
     const binding = db.prepare("SELECT * FROM native_turn_bindings WHERE turn_id=? AND attempt_id=?").get(context.flyxTurnId, context.attemptId) as Record<string, unknown> | undefined;
-    if (!binding || binding.provider !== evidence.provider || binding.session_id !== context.sessionId || binding.native_session_id !== evidence.nativeSessionId
-      || (binding.native_turn_id ?? undefined) !== evidence.nativeTurnId || binding.configuration_fingerprint !== artifact.configFingerprint || (/\b(\d+\.\d+\.\d+(?:-[a-zA-Z0-9.-]+)?)\b/.exec(String(binding.verified_version))?.[1] ?? binding.verified_version) !== artifact.providerVersion
-      || compatibilityCanonicalJson(JSON.parse(String(binding.context_json))) !== compatibilityCanonicalJson(context)) refuse("COMPATIBILITY_NATIVE_BINDING_MISMATCH");
+    // The binding's configuration fingerprint is written by host-recovery in the
+    // recovery domain (catalogRecoveryConfigurationFingerprint over the live
+    // session/workspace/provider rows), while the artifact's configFingerprint
+    // is the compatibility domain (providerConfigurationFingerprint over the
+    // provider activation configuration). The two never compare equal; instead
+    // re-derive both from the persisted catalog rows inside this transaction
+    // and prove each side independently: the binding belongs to exactly this
+    // live resource, and the artifact attests exactly this resource's provider
+    // configuration. verified_version stays "unknown" until a verified
+    // recovery manifest is wired (R4); the provider version itself is already
+    // proven by the version-probe fact and the planned-launch executable
+    // digest, so only a known-but-conflicting version is refused here.
+    const resource = db.prepare(`SELECT s.workspace_id AS workspace_id, w.canonical_root, w.worktree_root, w.checkout_key, w.kind, w.repository_id,
+      p.id AS provider_instance_id, p.provider AS provider, p.executable, p.config_json, p.policy_version, p.policy_capabilities_json
+      FROM sessions s JOIN session_catalog c ON c.session_id=s.id JOIN workspaces w ON w.id=s.workspace_id
+      JOIN provider_instances p ON p.id=c.provider_instance_id WHERE s.id=?`).get(context.sessionId) as {
+      workspace_id: string; canonical_root: string; worktree_root: string; checkout_key: string; kind: string; repository_id: string;
+      provider_instance_id: string; provider: string; executable: string; config_json: string; policy_version: number; policy_capabilities_json: string;
+    } | undefined;
+    const providerConfig = resource ? JSON.parse(resource.config_json) as ProviderConfiguration : undefined;
+    if (!binding || !resource || !providerConfig || binding.provider !== evidence.provider || binding.session_id !== context.sessionId || binding.native_session_id !== evidence.nativeSessionId
+      || (binding.native_turn_id ?? undefined) !== evidence.nativeTurnId
+      || compatibilityCanonicalJson(JSON.parse(String(binding.context_json))) !== compatibilityCanonicalJson(context)
+      || binding.provider_instance_id !== resource.provider_instance_id
+      || binding.configuration_fingerprint !== catalogRecoveryConfigurationFingerprint({ session: { workspaceId: resource.workspace_id },
+        providerInstance: { providerInstanceId: resource.provider_instance_id, provider: resource.provider as ProviderId, executable: resource.executable,
+          config: providerConfig, policyVersion: resource.policy_version, policyCapabilities: JSON.parse(resource.policy_capabilities_json) as string[] },
+        workspace: { canonicalRoot: resource.canonical_root, worktreeRoot: resource.worktree_root, checkoutKey: resource.checkout_key,
+          repositoryId: resource.repository_id, kind: resource.kind as "local" | "worktree" } })
+      || artifact.configFingerprint !== providerConfigurationFingerprint({ config: providerConfig, policyVersion: resource.policy_version })
+      || (binding.verified_version !== "unknown" && /\b(\d+\.\d+\.\d+(?:-[a-zA-Z0-9.-]+)?)\b/.exec(String(binding.verified_version))?.[1] !== artifact.providerVersion)) refuse("COMPATIBILITY_NATIVE_BINDING_MISMATCH");
     const rows = db.prepare(`SELECT id,sequence,type,payload_json FROM session_events WHERE session_id=?
       AND type IN ('turn.completed','turn.failed','turn.cancelled') AND json_extract(payload_json,'$.dispatchContext.flyxTurnId')=?
       AND json_extract(payload_json,'$.dispatchContext.attemptId')=?`).all(context.sessionId, context.flyxTurnId, context.attemptId) as Array<{ id: string; sequence: number; type: string; payload_json: string }>;

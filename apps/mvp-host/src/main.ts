@@ -24,6 +24,8 @@ import { OperationsError, operationOwnerFromHost, readPrivateFile, assertPrivate
 import { RestoreExternalCheckService, runRestoreExternalCheckCli } from "./operations/restore-external-check.js";
 import { SUPPORTED_SCHEMA_VERSION } from "./storage/migrations/schema-version.js";
 import { writeCompatibilityReadiness } from "./diagnostics/compatibility-readiness.js";
+import { createIsolatedCompatibilityRun } from "./diagnostics/compatibility-run.js";
+import type { CompatibilityHostIdentity } from "./diagnostics/compatibility-integrity.js";
 import { parseCompatibilityCommand, runCompatibilityCommand } from "./diagnostics/compatibility-cli.js";
 import { inspectCatalogStartupReadiness } from "./session/catalog-startup-readiness.js";
 import { createActivationOperationStore } from "./storage/activation-store.js";
@@ -205,9 +207,17 @@ async function main(): Promise<void> {
     store.setHostIdentityMirror(getHostIdentityMirror(identity));
     const connectivity = await resolveConnectivityConfig(parseConnectivityConfig());
     const bootstrap = readHostCatalogBootstrap({ store, workspace, provider, environment: process.env });
+    const isolatedCompatibility = process.env.FLYX_COMPATIBILITY_MODE === "isolated"
+      ? createIsolatedCompatibilityRun({ owner, store, identity, workspace, provider,
+        entryPath: fileURLToPath(import.meta.url), compatibilityEvidencePath: compatibilityEvidencePathFor(owner.databasePath),
+        authorization: await readControlledCompatibilityJson(process.env.FLYX_COMPATIBILITY_AUTHORIZATION_PATH),
+        expectedDestination: parseCompatibilityHostIdentity(await readControlledCompatibilityJson(process.env.FLYX_COMPATIBILITY_DESTINATION_HOST_PATH)),
+        candidateVersion: requireCandidateVersion() })
+      : undefined;
     const execution = await createMacosManagedExecution({ identity, compatibilityEvidencePath: compatibilityEvidencePathFor(owner.databasePath),
       compatibilityEndorsementPath: compatibilityEndorsementPathFor(owner.databasePath),
-      worktreesRoot: resolve(process.env.FLYX_WORKTREES_ROOT ?? join(homedir(), ".flyx-worktrees")) });
+      worktreesRoot: resolve(process.env.FLYX_WORKTREES_ROOT ?? join(homedir(), ".flyx-worktrees")),
+      ...(isolatedCompatibility ? { compatibility: isolatedCompatibility } : {}) });
     pairingConfirmation = createPairingConfirmation();
     application = await createHostApplication({ store, owner, identity, ...bootstrap, snapshotLane, ...(execution ? { execution } : {}),
       compatibilityEvidencePath: compatibilityEvidencePathFor(owner.databasePath),
@@ -216,24 +226,35 @@ async function main(): Promise<void> {
     });
     server = application.server;
     const address = await application.start();
-    if (process.env.FLYX_COMPATIBILITY_MODE === "isolated") {
-      const artifact = application.compatibilityArtifact();
-      if (!artifact) throw new OperationsError("COMPATIBILITY_RUNTIME_FACTS_UNAVAILABLE");
+    if (isolatedCompatibility) {
+      // Real-entry composition (design §6.3 / plan M4): the managed --version
+      // probe runs first under explicit probe authority; only its measured
+      // artifact may enter the readiness handshake and the scene policy, and
+      // only an attached scene constructs the committed-stop recorder.
+      // The explicit local configuration step belongs to this entry, never to
+      // the SQL/history bootstrap: it resolves the configured executable to
+      // its realpath and moves the provider instance to "configured", which
+      // both the scene policy's executable binding and the execution
+      // admission (PROVIDER_INSTANCE_UNAVAILABLE otherwise) require. Sessions
+      // are idle and unloaded at this point, so revalidation is safe.
+      await application.catalog.revalidateConfiguration(bootstrap.configuration);
+      const artifact = await isolatedCompatibility.start(application, {
+        path: resolve(process.env.FLYX_COMPATIBILITY_READINESS_PATH ?? ""), baseUrl: address,
+        pairingToken: server.auth.pairingUrlToken, provider, identity, runId: process.env.FLYX_COMPATIBILITY_RUN_ID ?? "",
+        entryPath: fileURLToPath(import.meta.url), databasePath: owner.databasePath, identityDirectory: owner.identityDirectory!,
+        workspace, authMode: isolatedCompatibility.authMode() });
       const entry = { path: resolve(process.env.FLYX_COMPATIBILITY_READINESS_PATH ?? ""), baseUrl: address,
         pairingToken: server.auth.pairingUrlToken, provider, identity, runId: process.env.FLYX_COMPATIBILITY_RUN_ID ?? "",
         entryPath: fileURLToPath(import.meta.url), databasePath: owner.databasePath, identityDirectory: owner.identityDirectory!,
-        workspace, artifact, authMode: "unknown" as const };
-      const readControlledJson = async (path: string | undefined) => {
-        if (!path) throw new OperationsError("COMPATIBILITY_AUTHORIZATION_REQUIRED");
-        await assertPrivateDirectory(dirname(resolve(path)));
-        return JSON.parse((await readPrivateFile(resolve(path), 64 * 1024)).toString("utf8"));
-      };
-      await application.prepareCompatibilityScene({ authorization: await readControlledJson(process.env.FLYX_COMPATIBILITY_AUTHORIZATION_PATH),
-        expectedDestination: await readControlledJson(process.env.FLYX_COMPATIBILITY_DESTINATION_HOST_PATH), entry,
+        workspace, artifact, authMode: isolatedCompatibility.authMode() };
+      const scenePolicy = await application.prepareCompatibilityScene({
+        authorization: await readControlledCompatibilityJson(process.env.FLYX_COMPATIBILITY_AUTHORIZATION_PATH),
+        expectedDestination: parseCompatibilityHostIdentity(await readControlledCompatibilityJson(process.env.FLYX_COMPATIBILITY_DESTINATION_HOST_PATH)), entry,
         measureArtifact: () => {
           const current = application!.compatibilityArtifact();
           if (!current) throw new OperationsError("COMPATIBILITY_RUNTIME_FACTS_UNAVAILABLE"); return current;
         } });
+      isolatedCompatibility.attachScene(scenePolicy);
       await writeCompatibilityReadiness(entry);
     }
     const legacy = application.catalog.registry.resolve(application.catalog.legacySessionId);
@@ -318,6 +339,26 @@ function compatibilityEvidencePathFor(databasePath: string): string {
 }
 function compatibilityEndorsementPathFor(databasePath: string): string {
   return resolve(process.env.FLYX_COMPATIBILITY_ENDORSEMENT_PATH ?? join(dirname(databasePath), "compatibility-endorsement.json"));
+}
+/** Private controlled JSON (destination authorization / destination host), never an environment-supplied value. */
+async function readControlledCompatibilityJson(path: string | undefined): Promise<unknown> {
+  if (!path) throw new OperationsError("COMPATIBILITY_AUTHORIZATION_REQUIRED");
+  await assertPrivateDirectory(dirname(resolve(path)));
+  return JSON.parse((await readPrivateFile(resolve(path), 64 * 1024)).toString("utf8"));
+}
+/** Independently pinned local destination identity; never taken from the ticket itself. */
+function parseCompatibilityHostIdentity(value: unknown): CompatibilityHostIdentity {
+  if (typeof value !== "object" || value === null) throw new OperationsError("COMPATIBILITY_DESTINATION_INVALID");
+  const record = value as Record<string, unknown>;
+  for (const key of ["hostId", "hostPublicKey", "signingPublicKey", "fingerprint"] as const) {
+    if (typeof record[key] !== "string" || (record[key] as string).length === 0) throw new OperationsError("COMPATIBILITY_DESTINATION_INVALID");
+  }
+  return { hostId: record.hostId as string, hostPublicKey: record.hostPublicKey as string, signingPublicKey: record.signingPublicKey as string, fingerprint: record.fingerprint as string };
+}
+function requireCandidateVersion(): string {
+  const value = process.env.FLYX_COMPATIBILITY_CANDIDATE_VERSION ?? "";
+  if (!/^[a-zA-Z0-9][a-zA-Z0-9._+-]{0,127}$/.test(value)) throw new OperationsError("COMPATIBILITY_CANDIDATE_VERSION_REQUIRED");
+  return value;
 }
 
 /**

@@ -433,7 +433,8 @@ export async function createHostApplication(options: HostApplicationOptions) {
       queryReadiness: () => query.prepare(),
       startupReadiness,
       compatibilityArtifact: () => options.execution?.compatibilityArtifact?.(),
-      prepareCompatibilityScene: async (input: Pick<CompatibilityScenePolicyOptions, "authorization" | "expectedDestination" | "entry" | "measureArtifact">) => {
+      /** Returns the created policy so the real entry can bind its recorder (M4 design §6.3). */
+      prepareCompatibilityScene: async (input: Pick<CompatibilityScenePolicyOptions, "authorization" | "expectedDestination" | "entry" | "measureArtifact">): Promise<CompatibilityScenePolicy> => {
         if (nativeScenePolicy || runningCatalog.catalog.allSessions().some((session) => runningCatalog.registry.loaded(session.sessionId))) throw new CatalogError("COMPATIBILITY_SCENE_ALREADY_STARTED");
         if (!runner || !["supervisor", "managed_process_group"].includes(options.execution?.git?.stopBackend.kind ?? "") || options.execution?.facts?.supervision?.()?.contractId !== options.execution?.git?.stopBackend.contractId) throw new CatalogError("SUPERVISION_CONTRACT_UNAVAILABLE");
         nativeScenePolicy = await createCompatibilityScenePolicy({ ...input, store, owner,
@@ -445,6 +446,7 @@ export async function createHostApplication(options: HostApplicationOptions) {
             if (target.providerInstance.state === "disabled" || !target.providerInstance.policyCapabilities.includes("workspaceWrite") || !target.workspace.capabilities.includes("workspaceWrite")) throw new CatalogError("PROVIDER_CAPABILITY_UNVERIFIED");
           },
         });
+        return nativeScenePolicy;
       },
     };
   } catch (error) {

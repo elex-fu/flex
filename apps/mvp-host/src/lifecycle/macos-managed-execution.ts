@@ -2,6 +2,7 @@ import { mkdir } from "node:fs/promises";
 import { realpathSync } from "node:fs";
 import { arch, release } from "node:os";
 import type { HostApplicationOptions } from "../host-application.js";
+import type { IsolatedCompatibilityRun } from "../diagnostics/compatibility-run.js";
 import { installedProviderRuntimeFacts } from "../diagnostics/compatibility-runtime-facts.js";
 import { measuredHostBuildDigest } from "../diagnostics/planned-native-artifact.js";
 import { publicHostIdentity, type HostIdentityFileV1 } from "../identity/host-identity.js";
@@ -35,10 +36,14 @@ export function macosManagedExecutionFacts(options: { compatibilityEvidencePath:
 }
 
 export async function createMacosManagedExecution(options: { identity: HostIdentityFileV1; compatibilityEvidencePath: string;
-  compatibilityEndorsementPath: string; worktreesRoot: string }): Promise<HostApplicationOptions["execution"]> {
+  compatibilityEndorsementPath: string; worktreesRoot: string;
+  /** Isolated compatibility run (M4); undefined for the ordinary online Host. */
+  compatibility?: IsolatedCompatibilityRun }): Promise<HostApplicationOptions["execution"]> {
   if (process.platform !== "darwin") return undefined;
   await mkdir(options.worktreesRoot, { recursive: true, mode: 0o700 });
   return { git: macosManagedGitOptions(), worktreesRoot: realpathSync(options.worktreesRoot),
+    ...(options.compatibility ? { compatibilityArtifact: () => options.compatibility!.compatibilityArtifact(),
+      compatibilityRecorder: () => options.compatibility!.compatibilityRecorder() } : {}),
     facts: macosManagedExecutionFacts({ compatibilityEvidencePath: options.compatibilityEvidencePath,
       trust: { destination: publicHostIdentity(options.identity), endorsementPath: options.compatibilityEndorsementPath } }) };
 }

@@ -895,6 +895,7 @@ export class SessionOrchestrator {
       await this.compatibilityRecorder!.afterCommittedNativeStop(context);
       return true;
     } catch (error) {
+      if (process.env.FLYX_DEBUG_DISPATCH) console.error("[compat-stop]", error);
       if (this.worker.isSealed || this.closed || !this.store.db.open) return true;
       this.degraded = true;
       this.retainExecution(intent, "compatibility_fact_unverified");

@@ -55,6 +55,92 @@
       "sceneVersion": "flyx-c3-basic-v1"
     },
     {
+      "id": "cli-2.1.216_node-24.18.0",
+      "sdkVersion": "0.3.220",
+      "claudeCliVersion": "2.1.216",
+      "nodeVersion": "24.18.0",
+      "os": "macOS 25.5.0 arm64",
+      "executableSource": "absolute-path",
+      "executablePath": "/Users/lex/.local/bin/claude",
+      "decision": "locked-candidate",
+      "hostVersion": "unknown",
+      "status": "fully-verified",
+      "evidence": {
+        "readiness": "/Users/lex/play/flyx/.flyx-evidence/cli-2.1.216_node-24.18.0/m4-final2/readiness.json",
+        "summary": "/Users/lex/play/flyx/.flyx-evidence/cli-2.1.216_node-24.18.0/m4-final2/summary.json",
+        "turns": "/Users/lex/play/flyx/.flyx-evidence/cli-2.1.216_node-24.18.0/m4-final2/turns.jsonl",
+        "native": "/Users/lex/play/flyx/.flyx-evidence/cli-2.1.216_node-24.18.0/m4-final2/native.jsonl"
+      },
+      "notes": [
+        "M4 目标组合：系统安装的 claude 2.1.216（/Users/lex/.local/bin/claude，symlink 由 Host 解析为真实文件并测量 digest）。candidate claudeCliVersion=2.1.216 由 run-matrix --prepare 计入候选 artifact，真实场景内由受管 --version 探针独立观测；二者不一致一律拒绝。"
+      ],
+      "provider": "claude",
+      "capabilities": [
+        "turn"
+      ],
+      "sceneVersion": "flyx-c3-basic-v1",
+      "lastRun": {
+        "runId": "m4-final2",
+        "at": "2026-10-23T21:48:46.435Z",
+        "deterministic": {
+          "status": "passed",
+          "completed": 10,
+          "scenarioResults": {
+            "approval": {
+              "status": "skipped",
+              "reasonCode": "SCENARIO_NOT_CONFIGURED"
+            },
+            "interrupt": {
+              "status": "skipped",
+              "reasonCode": "SCENARIO_NOT_CONFIGURED"
+            },
+            "recovery": {
+              "status": "skipped",
+              "reasonCode": "SCENARIO_NOT_CONFIGURED"
+            }
+          },
+          "shutdown": "graceful"
+        },
+        "real": {
+          "status": "passed",
+          "completed": 10,
+          "scenarioResults": {
+            "approval": {
+              "status": "skipped",
+              "reasonCode": "SCENARIO_NOT_CONFIGURED"
+            },
+            "interrupt": {
+              "status": "skipped",
+              "reasonCode": "SCENARIO_NOT_CONFIGURED"
+            },
+            "recovery": {
+              "status": "skipped",
+              "reasonCode": "SCENARIO_NOT_CONFIGURED"
+            }
+          },
+          "shutdown": "graceful"
+        },
+        "result": "fully-verified",
+        "nativeEvidence": {
+          "counts": {
+            "turn": 10,
+            "approval": 0,
+            "question": 0,
+            "interrupt": 0,
+            "stop": 0,
+            "reconnect": 0,
+            "recovery": 0,
+            "rewind": 0
+          },
+          "invalid": 0,
+          "complete": true,
+          "capabilities": {
+            "turn": true
+          }
+        }
+      }
+    },
+    {
       "id": "codex-measured-runtime-pending",
       "provider": "codex",
       "decision": "pending-measurement",

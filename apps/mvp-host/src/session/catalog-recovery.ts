@@ -12,6 +12,9 @@ import { RecoveryError, digest } from "../storage/recovery-store.js";
 import type { RecoveryCommandInput } from "../storage/recovery-store.js";
 import { createHostRecovery, HostRecovery } from "./host-recovery.js";
 import type { HostRecoveryOptions, RecoveryResource } from "./host-recovery.js";
+import { catalogRecoveryConfigurationFingerprint } from "./recovery-fingerprint.js";
+
+export { catalogRecoveryConfigurationFingerprint } from "./recovery-fingerprint.js";
 
 export type CatalogRecoveryIdentity = Readonly<{
   sessionId: string;
@@ -63,16 +66,6 @@ export type CatalogRecoveryOptions = {
   afterRecovery?: (operation: Parameters<NonNullable<HostRecoveryOptions["afterRecovery"]>>[0], evidenceId: string, recovery: HostRecovery) => void;
   onCommit?: (events: readonly SessionEvent[]) => void;
 };
-
-/** Shared by live capture and recovery. Mutable verification, version probes and residency are excluded. */
-export function catalogRecoveryConfigurationFingerprint(target: ResolvedSession): string {
-  const { session, providerInstance: provider, workspace } = target;
-  return digest({ version: 1, providerInstanceId: provider.providerInstanceId, provider: provider.provider,
-    executable: provider.executable, configuration: provider.config, policyVersion: provider.policyVersion,
-    policyCapabilities: [...provider.policyCapabilities].sort(), workspaceId: session.workspaceId,
-    canonicalRoot: workspace.canonicalRoot, checkoutRoot: workspace.worktreeRoot, checkoutKey: workspace.checkoutKey,
-    repositoryId: workspace.repositoryId, kind: workspace.kind });
-}
 
 /** Recovery is available for persisted Sessions independently of runtime residency. */
 export class CatalogRecoveryBindings {

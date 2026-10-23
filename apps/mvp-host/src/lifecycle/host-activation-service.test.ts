@@ -169,6 +169,47 @@ describe("HostActivationService explicit activation", () => {
     noProcesses();
   }, 20000);
 
+  it("decides an unknown local checkout identity through the managed toplevel query and persists it (SQL-bootstrap rows)", async () => {
+    const f = fixture();
+    f.writePassedEvidence();
+    // The SQL read-bootstrap writes an unknown checkout identity (worktreeRoot ""
+    // and checkoutKey ""). The empty root must never canonicalize to the host
+    // process cwd — an ancestor of the private state directories — and must not
+    // be guessed from the canonical root: the managed toplevel query decides it.
+    f.catalog.putWorkspace({
+      workspaceId: "workspace", canonicalRoot: f.canonicalRoot, worktreeRoot: "", checkoutKey: "", kind: "local",
+      state: "needs_verification", repositoryId: "repository-1", capabilities: ["streamingText", "workspaceWrite"],
+    });
+    const service = f.service();
+    const verified = await service.verify({ workspaceId: "workspace", providerInstanceId: "provider", commandId: "verify-unknown-root" });
+    expect(f.queries.map((query) => query.argv)).toEqual([
+      [...workspaceArgv(f.canonicalRoot, "toplevel")],
+      [...workspaceArgv(f.canonicalRoot, "common_dir")],
+    ]);
+    // The verification-decided identity is persisted like registerLocal would,
+    // so the activate preflight and the startup load reconcile the same row.
+    const persisted = f.catalog.workspace("workspace");
+    expect(persisted).toMatchObject({ worktreeRoot: f.canonicalRoot, checkoutKey: createHash("sha256").update(f.canonicalRoot).digest("hex"), state: "needs_verification", kind: "local" });
+    const activated = service.activate({ evidenceId: verified.evidenceId, commandId: "activate-unknown-root" });
+    expect(activated.activations.map((target) => `${target.kind}:${target.id}`)).toEqual(["workspace:workspace", "provider:provider"]);
+    expect(f.catalog.workspace("workspace")).toMatchObject({ state: "active", worktreeRoot: f.canonicalRoot });
+    noProcesses();
+  }, 20000);
+
+  it("refuses a recorded worktree root that no longer matches the observed toplevel", async () => {
+    const f = fixture();
+    f.writePassedEvidence();
+    f.catalog.putWorkspace({
+      workspaceId: "workspace", canonicalRoot: f.canonicalRoot, worktreeRoot: f.root, checkoutKey: "checkout-key-1", kind: "local",
+      state: "needs_verification", repositoryId: "repository-1", capabilities: ["streamingText", "workspaceWrite"],
+    });
+    const service = f.service();
+    await expect(service.verify({ workspaceId: "workspace", providerInstanceId: "provider", commandId: "verify-moved" }))
+      .rejects.toMatchObject({ code: "WORKSPACE_IDENTITY_CHANGED", reasonCodes: ["WORKSPACE_IDENTITY_CHANGED"] });
+    expect(f.catalog.workspace("workspace")?.worktreeRoot).toBe(f.root);
+    noProcesses();
+  }, 20000);
+
   it("refuses verify without a managed executor and persists the concrete blocking reason", async () => {
     const f = fixture();
     f.writePassedEvidence();

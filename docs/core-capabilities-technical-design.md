@@ -2,11 +2,11 @@
 
 > 版本：v1.3.1（普通 macOS 受管执行）
 > 日期：2026-10-24（Asia/Shanghai）；初版：2026-10-18
-> 状态：**开发已恢复（2026-10-24 用户指令，按 G0 → M4 → R4 → R6 → R9 顺序继续）**。G0 固定源码完整回归已通过（串行全量 1317 passed / 0 failed，指纹一致）；当前项为 M4 首份生产兼容产物与显式激活；真实恢复/回退仍待验收，检查点和恢复顺序见实施计划顶部。
+> 状态：**开发已恢复（2026-10-24 用户指令，按 G0 → M4 → R4 → R6 → R9 顺序继续）**。G0 固定源码完整回归已通过（串行全量 1317 passed / 0 failed，指纹一致）；M4 首份生产兼容产物与显式激活闭环已通过（2026-10-24，run-id `m4-final2`：真实 10-turn 场景 → 签名产物 → destination 导入 → activation verify/activate，普通合同下 workspace/provider 双资源激活成功）；当前项为 R4 真实恢复与备份恢复外部复核；回退仍待验收，检查点和恢复顺序见实施计划顶部。
 > 本轮起点：Flyx `003faa3`；本轮改动已全部提交入库并推送（`4af1af5` → `b60852c` → `0bbc950` → `0345f83`，`main` 与 `codex/flyx-optimization` 同点，工作区干净）；历史实现基线：`1108bed`；原分析基线：`c11e08d`；参考快照：Paseo `710851ccb`、T3 Code `4ba4871af`
 > 用户已明确：首版必须支持 macOS 本机执行，不能以 Linux Host 替代交付。
 
-本文负责上一轮差距分析后的**剩余核心交付**，作为接下来实施和验收的依据。[原对照方案](./paseo-t3code-comparison-and-optimization-technical-design.md)保留架构背景，[原实施记录](./flyx-optimization-implementation-plan.md)保留 R01–R18 的历史结果。当前进度（M0–M3 已实机通过、G0 未完成）、剩余任务 G0/M4/R4/R6/R9 的文件范围、实现步骤和证据见[核心实施计划](./core-capabilities-implementation-plan.md)顶部暂停检查点。本文规定最终契约；仅进度表明确确认的范围属于已实施，候选平台机制与剩余接线不因写入方案而视为完成。
+本文负责上一轮差距分析后的**剩余核心交付**，作为接下来实施和验收的依据。[原对照方案](./paseo-t3code-comparison-and-optimization-technical-design.md)保留架构背景，[原实施记录](./flyx-optimization-implementation-plan.md)保留 R01–R18 的历史结果。当前进度（M0–M3 与 G0、M4 已实机通过）、剩余任务 R4/R6/R9 的文件范围、实现步骤和证据见[核心实施计划](./core-capabilities-implementation-plan.md)顶部暂停检查点。本文规定最终契约；仅进度表明确确认的范围属于已实施，候选平台机制与剩余接线不因写入方案而视为完成。
 
 ## 1. 交付目标与范围
 

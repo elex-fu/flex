@@ -1,5 +1,5 @@
 import type { CompatibilityScenePolicy, CompatibilityScenePermit } from "../diagnostics/compatibility-scene-policy.js";
-import { catalogRecoveryConfigurationFingerprint } from "./catalog-recovery.js";
+import { providerConfigurationFingerprint } from "../lifecycle/host-activation-load.js";
 import { randomUUID } from "node:crypto";
 import { CreateSessionV2Schema, RenameSessionV2Schema, ChangeSessionStatusV2Schema, ListSessionsV2Schema, type ListSessionsV2Response, type SessionEvent, type SessionSummaryV2 } from "@flyx/mvp-protocol";
 import type { HostOwnerHandle } from "../lifecycle/host-owner.js";
@@ -62,8 +62,15 @@ export class SessionRegistry<R extends SessionRuntime=SessionRuntime> {
     if(authorization) {
       const policy=this.options.nativeScenePolicy?.();if(!policy)throw new CatalogError("COMPATIBILITY_SCENE_PERMIT_INVALID");
       const ready={...resolved,workspace:this.workspaces.requireControl(resolved.workspace.workspaceId),providerInstance:this.providers.requireExecution(resolved.providerInstance.providerInstanceId,{policy,permit:authorization})};
+      // The scene binding's configurationFingerprint must be built exactly like
+      // host-application's sceneBinding()/compatibility-run's sceneBinding():
+      // providerConfigurationFingerprint is the digest embedded in the signed
+      // compatibility artifact (configFingerprint) and validated by the scene
+      // policy against the ticket. Any other fingerprint (e.g. the catalog
+      // recovery digest over workspace/checkout facts) never compares equal and
+      // turns fail admission with COMPATIBILITY_SCENE_BINDING_CHANGED.
       policy.assertResource(authorization,{sessionId:ready.session.sessionId,workspaceId:ready.workspace.workspaceId,canonicalRoot:ready.workspace.canonicalRoot,
-        checkoutRoot:ready.workspace.worktreeRoot,providerInstanceId:ready.providerInstance.providerInstanceId,provider:ready.providerInstance.provider,configurationFingerprint:catalogRecoveryConfigurationFingerprint(ready)});
+        checkoutRoot:ready.workspace.worktreeRoot,providerInstanceId:ready.providerInstance.providerInstanceId,provider:ready.providerInstance.provider,configurationFingerprint:providerConfigurationFingerprint(ready.providerInstance)});
       policy.assertProvider(authorization,ready.providerInstance);
       if(!ready.workspace.capabilities.includes("streamingText"))throw new CatalogError("PROVIDER_CAPABILITY_UNVERIFIED");
       return ready;

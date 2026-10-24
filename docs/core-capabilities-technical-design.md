@@ -2,7 +2,7 @@
 
 > 版本：v1.3.1（普通 macOS 受管执行）
 > 日期：2026-10-24（Asia/Shanghai）；初版：2026-10-18
-> 状态：**开发进行中（按 G0 → M4 → R4 → R6 → R9 顺序）**。G0 固定源码完整回归已通过（串行全量 1317 passed / 0 failed，指纹一致）；M4 首份生产兼容产物与显式激活闭环已通过（2026-10-24，run-id `m4-final2`：真实 10-turn 场景 → 签名产物 → destination 导入 → activation verify/activate，普通合同下 workspace/provider 双资源激活成功）；R4 真实恢复与备份恢复外部复核已通过（2026-10-24，L1–L4 四层：终态收据锚点 → 恢复检查证据链 → 备份恢复外部复核 → 生产路径端到端恢复链测试并修复 destination endorsement 缺 recovery 能力的生产缺陷）；当前项为 R6 双 Provider Native 回退锚点/完整回退；组合终验与物理手机（R9）待验收，检查点和恢复顺序见实施计划顶部。
+> 状态：**开发进行中（按 G0 → M4 → R4 → R6 → R9 顺序）**。G0 固定源码完整回归已通过（串行全量 1317 passed / 0 failed，指纹一致）；M4 首份生产兼容产物与显式激活闭环已通过（2026-10-24，run-id `m4-final2`：真实 10-turn 场景 → 签名产物 → destination 导入 → activation verify/activate，普通合同下 workspace/provider 双资源激活成功）；R4 真实恢复与备份恢复外部复核已通过（2026-10-24，L1–L4 四层：终态收据锚点 → 恢复检查证据链 → 备份恢复外部复核 → 生产路径端到端恢复链测试并修复 destination endorsement 缺 recovery 能力的生产缺陷）；R6 L1 生产接线已通过（2026-10-24：生产 revert 端口默认构造 + 持久锚点采集接线 + 可信 manifest 门控 capability + nativeFactory journal 绑定，`native-revert-production.ts` 组合测试 fail-closed）；当前项为 R6 剩余真实 Provider 完整回退（A9/A10）；组合终验与物理手机（R9）待验收，检查点和恢复顺序见实施计划顶部。
 > 本轮起点：Flyx `003faa3`；本轮改动已全部提交入库并推送（`4af1af5` → `b60852c` → `0bbc950` → `0345f83`，`main` 与 `codex/flyx-optimization` 同点，工作区干净）；历史实现基线：`1108bed`；原分析基线：`c11e08d`；参考快照：Paseo `710851ccb`、T3 Code `4ba4871af`
 > 用户已明确：首版必须支持 macOS 本机执行，不能以 Linux Host 替代交付。
 

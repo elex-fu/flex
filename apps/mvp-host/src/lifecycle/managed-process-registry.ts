@@ -41,7 +41,9 @@ export interface ProcessJournal { save(record: ManagedProcessRecord): void; save
 export const MANAGED_PROCESS_IDENTITY_SCHEMA = MANAGED_PROCESS_EVIDENCE_SCHEMA;
 
 export class SqliteProcessJournal implements ProcessJournal {
-  constructor(private readonly db: Database.Database) {}
+  /** The host-private launch/stop order ledger survives database restores. */
+  constructor(private readonly db: Database.Database,
+    private readonly orderLog?: { record(record: ManagedProcessRecord): void }) {}
   savePlannedLaunch(record: ManagedProcessRecord, planned: PlannedNativeArtifact): void {
     if (!record.boundaryEvidence) throw new Error("COMPATIBILITY_PLANNED_LAUNCH_INVALID");
     savePlannedCompatibilityLaunch(this.db, record.id, record.boundaryEvidence.launchDigest, planned);
@@ -89,6 +91,9 @@ export class SqliteProcessJournal implements ProcessJournal {
       if (saved.proof_json !== encoded) throw new Error("PROCESS_STOP_PROOF_CONFLICT");
     }
     })();
+    // Only a durable database commit reaches the ledger: a failed transaction
+    // never overstates the supervision window.
+    this.orderLog?.record(record);
   }
 }
 

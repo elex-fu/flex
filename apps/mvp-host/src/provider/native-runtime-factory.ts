@@ -4,6 +4,7 @@ import { dirname, join } from "node:path";
 import type { SqliteStore } from "../storage/db.js";
 import type { HostOwnerHandle } from "../lifecycle/host-owner.js";
 import { ManagedProcessRegistry, SqliteProcessJournal, type ManagedProcessRecord, type ProcessStopResult } from "../lifecycle/managed-process-registry.js";
+import { managedLaunchOrderLogFor } from "../lifecycle/managed-launch-order-log.js";
 import { SystemProcessInspector } from "../lifecycle/process-inspector.js";
 import { prepareNativeExecutionBoundary, type NativeBoundaryAssessment } from "../lifecycle/native-execution-boundary.js";
 import { inspectNativeBoundaryStop } from "../lifecycle/native-boundary-proof.js";
@@ -34,7 +35,7 @@ export class HostManagedRuntime {
         host.owner.assertActive();
         const fixed = dispatchContextForTurn(context.flyxTurnId, context);
         if (fixed.hostOwnerId !== host.owner.ownerId || fixed.hostOwnerGeneration !== host.owner.generation || fixed.sessionId !== host.sessionId) throw new Error("NATIVE_LAUNCH_CONTEXT_MISMATCH");
-        const registry = new ManagedProcessRegistry({ journal: new SqliteProcessJournal(host.store.db), context: () => fixed,
+        const registry = new ManagedProcessRegistry({ journal: new SqliteProcessJournal(host.store.db, managedLaunchOrderLogFor(host.owner.databasePath)), context: () => fixed,
           ...(proof && hasManagedStopContract(proof) ? { stopMode: "managed_process_group" as const } : {}), verifyDescendantStop: (record) => this.verifyStop(record) });
         this.registries.add(registry);
         const registered = this.turnRegistries.get(key(fixed)) ?? new Set<ManagedProcessRegistry>();

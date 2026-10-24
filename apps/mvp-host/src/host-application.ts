@@ -21,6 +21,7 @@ import { createHostActivationService, type HostActivationService } from "./lifec
 import { ManagedGitRunner, type ManagedGitRunnerOptions } from "./lifecycle/managed-git-runner.js";
 import { assertHostOwner, type HostOwnerHandle } from "./lifecycle/host-owner.js";
 import { SqliteProcessJournal, type ProcessLaunchContext } from "./lifecycle/managed-process-registry.js";
+import { managedLaunchOrderLogFor } from "./lifecycle/managed-launch-order-log.js";
 import { validateTreeStopEvidence } from "./lifecycle/managed-process-evidence.js";
 import { createManagedWorkspaceQuery } from "./lifecycle/managed-workspace-query.js";
 import { OperationRegistry } from "./lifecycle/operation-registry.js";
@@ -145,7 +146,10 @@ export async function createHostApplication(options: HostApplicationOptions) {
       || store.db.prepare("SELECT 1 FROM host_state WHERE key='restore_readiness'").get()) return;
     attention.start(); attentionStarted = true;
   };
-  const journal = new SqliteProcessJournal(store.db);
+  const orderLog = managedLaunchOrderLogFor(owner.databasePath);
+  // The ledger anchors its supervision window at Host start, before any producer runs.
+  orderLog?.ensureOpen();
+  const journal = new SqliteProcessJournal(store.db, orderLog);
   const gitContext = new AsyncLocalStorage<ProcessLaunchContext>();
   const repositoryMetadata = createManagedRepositoryMetadata({ owner, runner: () => {
     if (!runner) throw new CatalogError("MANAGED_GIT_BACKEND_UNAVAILABLE"); return runner;
@@ -174,7 +178,7 @@ export async function createHostApplication(options: HostApplicationOptions) {
   const activationTrust = { destination: publicHostIdentity(identity), endorsementPath: options.compatibilityEndorsementPath ?? join(dirname(owner.databasePath), "compatibility-endorsement.json") };
   const observation = options.execution?.observation ?? localActivationFacts({ compatibilityEvidencePath, privateRoots: privateDirectories, ...options.execution?.facts, compatibilityTrust: activationTrust });
   const query = createManagedWorkspaceQuery({
-    journal: new SqliteProcessJournal(store.db), privateRoots: privateDirectories,
+    journal: new SqliteProcessJournal(store.db, orderLog), privateRoots: privateDirectories,
     assertActive: () => { owner.assertActive(); store.assertWriterOwner(); },
     context: ({ operationId }) => ({ hostOwnerId: owner.ownerId, hostOwnerGeneration: owner.generation,
       runtimeId: "catalog-query", runtimeGeneration: 1, attemptId: operationId ?? randomUUID() }),

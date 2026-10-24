@@ -21,7 +21,8 @@ import { createHostActivationService, privateRootsFor, type ManagedQueryExecutor
 import { createManagedWorkspaceQuery } from "./lifecycle/managed-workspace-query.js";
 import { OperationSnapshotLane } from "./operations/host-operations.js";
 import { OperationsError, operationOwnerFromHost, readPrivateFile, assertPrivateDirectory } from "./operations/operation-files.js";
-import { RestoreExternalCheckService, runRestoreExternalCheckCli } from "./operations/restore-external-check.js";
+import { RestoreExternalCheckService, runRestoreExternalCheckCli, type RestoreExternalBinding, type RestoreExternalObservation } from "./operations/restore-external-check.js";
+import { createRestoreExternalInspector, type RestoreCheckoutReader } from "./operations/restore-external-inspector.js";
 import { SUPPORTED_SCHEMA_VERSION } from "./storage/migrations/schema-version.js";
 import { writeCompatibilityReadiness } from "./diagnostics/compatibility-readiness.js";
 import { createIsolatedCompatibilityRun } from "./diagnostics/compatibility-run.js";
@@ -32,7 +33,11 @@ import { createActivationOperationStore } from "./storage/activation-store.js";
 import { CatalogStore } from "./storage/catalog-store.js";
 import { SqliteStore } from "./storage/db.js";
 import { HostOwnerLock, canonicalPath, type HostOwnerHandle } from "./lifecycle/host-owner.js";
-import { SqliteProcessJournal } from "./lifecycle/managed-process-registry.js";
+import { SqliteProcessJournal, MANAGED_PROCESS_SCHEMA } from "./lifecycle/managed-process-registry.js";
+import { managedLaunchOrderLogFor } from "./lifecycle/managed-launch-order-log.js";
+import { MANAGED_PROCESS_EVIDENCE_SCHEMA } from "./storage/migrations/005-process-evidence.js";
+import { createNativeHistoryManifestSource } from "./provider/native-history-manifest.js";
+import Database from "better-sqlite3";
 import { createMacosManagedExecution, macosManagedGitOptions, macosManagedExecutionFacts } from "./lifecycle/macos-managed-execution.js";
 import { ManagedGitRunner } from "./lifecycle/managed-git-runner.js";
 import { homedir } from "node:os";
@@ -70,17 +75,17 @@ async function main(): Promise<void> {
     await stat(databasePath);
     const owner = HostOwnerLock.acquire({ databasePath, identityDirectory, mode: "maintenance" });
     let restoredStore: SqliteStore | undefined;
+    let inspection: Awaited<ReturnType<typeof openRestoreExternalInspection>> | undefined;
     try {
       restoredStore = openForMaintenance({ databasePath: owner.databasePath, owner });
+      inspection = await openRestoreExternalInspection(restoredStore, owner);
       const service = new RestoreExternalCheckService({ db: restoredStore.db, owner, backupDirectory: resolve(backupDirectory),
         identityDirectory: owner.identityDirectory!, supportedSchemaVersion: SUPPORTED_SCHEMA_VERSION,
         withSnapshot: new OperationSnapshotLane(() => owner.assertActive()).withSnapshot,
-        // An incomplete platform ledger cannot establish coverage since backup.
-        // Keep the exact restore gate until an installed inspector can prove it.
-        inspectExternal: async () => { throw new OperationsError("RESTORE_EXTERNAL_INSPECTOR_UNAVAILABLE"); },
+        inspectExternal: inspection.inspectExternal,
       });
       console.log(JSON.stringify(await runRestoreExternalCheckCli([args[1]!, ...args.slice(3)], service), null, 2));
-    } finally { restoredStore?.close(); owner.release(); }
+    } finally { inspection?.dispose(); restoredStore?.close(); owner.release(); }
     return;
   }
   const command = parseHostCommand(args);
@@ -380,6 +385,9 @@ async function runActivationCommand(store: SqliteStore, owner: HostOwnerHandle, 
   const observation = localActivationFacts({ compatibilityEvidencePath: compatibilityEvidencePathFor(owner.databasePath), privateRoots, ...ordinaryFacts,
     compatibilityTrust: { destination: publicHostIdentity(identity), endorsementPath: compatibilityEndorsementPathFor(owner.databasePath) } });
   const catalog = new CatalogStore(store);
+  // The order ledger is anchored before any activation producer can launch.
+  const orderLog = managedLaunchOrderLogFor(owner.databasePath);
+  orderLog?.ensureOpen();
   try {
     const operations = createActivationOperationStore(
       { db: store.db, workspace: (id) => catalog.workspace(id), provider: (id) => catalog.provider(id) },
@@ -387,12 +395,12 @@ async function runActivationCommand(store: SqliteStore, owner: HostOwnerHandle, 
     );
     const load = new HostActivationLoad(operations, observation);
     const executorFactory: ManagedQueryExecutorFactory = async () => {
-      const runner = process.platform === "darwin" ? new ManagedGitRunner({ ...macosManagedGitOptions(), journal: new SqliteProcessJournal(store.db),
+      const runner = process.platform === "darwin" ? new ManagedGitRunner({ ...macosManagedGitOptions(), journal: new SqliteProcessJournal(store.db, orderLog),
         roots: () => catalog.workspaces().flatMap((workspace) => [workspace.canonicalRoot, workspace.worktreeRoot]), privateRoots,
         context: ({ operationId }) => ({ hostOwnerId: owner.ownerId, hostOwnerGeneration: owner.generation,
           runtimeId: "activation-query", runtimeGeneration: 1, attemptId: operationId ?? randomUUID() }) }) : undefined;
       const managed = createManagedWorkspaceQuery({
-        journal: new SqliteProcessJournal(store.db), privateRoots,
+        journal: new SqliteProcessJournal(store.db, orderLog), privateRoots,
         assertActive: () => { owner.assertActive(); store.assertWriterOwner(); },
         context: ({ operationId }) => ({ hostOwnerId: owner.ownerId, hostOwnerGeneration: owner.generation,
           runtimeId: "activation-query", runtimeGeneration: 1, attemptId: operationId ?? randomUUID() }),
@@ -410,6 +418,64 @@ async function runActivationCommand(store: SqliteStore, owner: HostOwnerHandle, 
   } finally {
     catalog.dispose();
   }
+}
+
+/**
+ * Production restore-check inspection (design §8.3). Inspection git launches
+ * journal into a scratch in-memory database so the restored database's binding
+ * facts stay byte-stable; only the host-private order ledger, which the
+ * restore swap never touches, grows — under a dedicated inspection runtime
+ * identity the supervisor view filters out. Checkouts re-verify through the
+ * same managed macOS git contract as the Host; provider histories re-verify
+ * through the trusted compatibility manifest.
+ */
+async function openRestoreExternalInspection(store: SqliteStore, owner: HostOwnerHandle): Promise<{ inspectExternal(binding: RestoreExternalBinding): Promise<RestoreExternalObservation>; dispose(): void }> {
+  const mirror = store.getHostIdentityMirror();
+  if (!mirror) throw new OperationsError("COMPATIBILITY_MAINTENANCE_REQUIRED");
+  const identity = await loadOrCreateHostIdentity({ directory: owner.identityDirectory!, expectedMirror: mirror });
+  const orderLog = managedLaunchOrderLogFor(owner.databasePath);
+  if (!orderLog) throw new OperationsError("RESTORE_EXTERNAL_INSPECTOR_UNAVAILABLE");
+  const scratch = new Database(":memory:");
+  // The scratch journal carries the same facts-table shape so inspection launches
+  // commit the same way they do on the live database — never into the restored one.
+  scratch.exec(MANAGED_PROCESS_SCHEMA + MANAGED_PROCESS_EVIDENCE_SCHEMA);
+  const journal = new SqliteProcessJournal(scratch, orderLog);
+  const catalog = new CatalogStore(store);
+  const inspectionRuntimeId = "restore-check-git";
+  const trust = { destination: publicHostIdentity(identity), endorsementPath: compatibilityEndorsementPathFor(owner.databasePath) };
+  const privateRoots = privateRootsFor({ owner }, [dirname(owner.databasePath), owner.identityDirectory!, owner.coordinationDirectory!]);
+  const ordinaryFacts: Partial<ReturnType<typeof macosManagedExecutionFacts>> = process.platform === "darwin" ? macosManagedExecutionFacts({ compatibilityEvidencePath: compatibilityEvidencePathFor(owner.databasePath), trust }) : {};
+  const manifests = createNativeHistoryManifestSource({
+    compatibilityEvidencePath: compatibilityEvidencePathFor(owner.databasePath), compatibilityTrust: trust,
+    ...(ordinaryFacts.supervision ? { supervision: ordinaryFacts.supervision } : {}),
+    ...(ordinaryFacts.runtime ? { runtime: ordinaryFacts.runtime } : {}),
+    resolveProvider: (providerInstanceId) => catalog.provider(providerInstanceId),
+  });
+  try {
+    const inspectExternal = createRestoreExternalInspector({
+      orderLog, inspectionRuntimeId, closeDeadlineMs: 10_000,
+      openCheckoutReader: (roots) => process.platform === "darwin"
+        ? new ManagedGitRunner({ ...macosManagedGitOptions(), journal, roots: () => [...roots], privateRoots,
+          context: ({ operationId }) => ({ hostOwnerId: owner.ownerId, hostOwnerGeneration: owner.generation,
+            runtimeId: inspectionRuntimeId, runtimeGeneration: 1, attemptId: operationId ?? randomUUID() }) })
+        : unavailableCheckoutReader(),
+      manifestForInstance: (provider, providerInstanceId) => {
+        if (provider !== "claude" && provider !== "codex") return undefined;
+        return manifests.verifiedManifestForInstance(provider, providerInstanceId);
+      },
+    });
+    return { inspectExternal, dispose: () => { catalog.dispose(); scratch.close(); } };
+  } catch (error) {
+    catalog.dispose(); scratch.close(); throw error;
+  }
+}
+
+/** Non-darwin hosts cannot host the managed macOS checkout contract: every read fails closed. */
+function unavailableCheckoutReader(): RestoreCheckoutReader {
+  return {
+    run: async () => { throw new OperationsError("MANAGED_MACOS_PLATFORM_REQUIRED"); },
+    closeAndWait: async () => ({ closed: true as const, producerStopped: false, clean: false, runs: 0 }),
+  };
 }
 
 async function printPairingUrl(label: string, url: string): Promise<void> {

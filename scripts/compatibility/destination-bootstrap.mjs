@@ -90,13 +90,17 @@ await execFile("git", ["-C", workspace, "-c", "user.name=Flyx destination", "-c"
 
 // The M4 basic scene (flyx-c3-basic-v1) publishes only the capabilities its
 // source run actually exercised: the `turn` baseline. Per design §6.3 import
-// never endorses capabilities the scene did not run, so the destination
-// requests exactly the verified scope (streamingText) instead of the full
-// default policy; interrupt/approval/reconnect arrive with their own scenes.
+// never endorses capabilities the scene did not run; the destination requests
+// exactly the verified scope. `workspaceWrite` is the compose capability the
+// turn baseline itself gates (host-activation-load newestPassedArtifact binds
+// it to the same signed turn artifact — it is deliberately absent from the
+// per-scenario evidence map), so a destination that must accept real turns
+// from the web composer requests it alongside streamingText. Pure read-only
+// destinations drop it; interrupt/approval/reconnect arrive with their own scenes.
 const catalogConfigPath = join(destination, "catalog-config.json");
 await writeFile(catalogConfigPath, JSON.stringify({
-  workspaces: [{ workspaceId: "default-workspace", root: workspace, capabilities: ["streamingText"] }],
-  providerInstances: [{ providerInstanceId: `default-${provider}`, provider, executable, policyCapabilities: ["streamingText"] }],
+  workspaces: [{ workspaceId: "default-workspace", root: workspace, capabilities: ["streamingText", "workspaceWrite"] }],
+  providerInstances: [{ providerInstanceId: `default-${provider}`, provider, executable, policyCapabilities: ["streamingText", "workspaceWrite"] }],
 }) + "\n", { mode: 0o600 });
 await chmod(catalogConfigPath, 0o600);
 

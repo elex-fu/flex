@@ -1,6 +1,6 @@
 import {describe,expect,it} from "vitest";
 import {SessionSchema} from "./index.js";
-import {CreateSessionV2Schema,SessionSummaryV2Schema,SessionNativeHandleSchema,StartTurnV2Schema} from "./session-api.js";
+import {CreateSessionV2Schema,SessionSnapshotV2Schema,SessionSummaryV2Schema,SessionNativeHandleSchema,StartTurnV2Schema} from "./session-api.js";
 describe("explicit Session catalog protocol",()=>{
   it("keeps arbitrary client filesystem paths out of registration and writes",()=>{
     expect(CreateSessionV2Schema.safeParse({workspaceId:"registered",providerInstanceId:"configured",cwd:"/client/supplied"}).success).toBe(false);
@@ -14,5 +14,13 @@ describe("explicit Session catalog protocol",()=>{
   });
   it("retains typed private native ownership rather than accepting unscoped handles",()=>{
     expect(SessionNativeHandleSchema.safeParse({nativeSessionId:"thread"}).success).toBe(false);expect(SessionNativeHandleSchema.parse({v:1,provider:"claude",providerInstanceId:"instance",workspaceId:"workspace",nativeSessionId:"conversation",provenance:"legacy"}).provider).toBe("claude");
+  });
+  it("accepts the zeroed pendingInteractions marker that timeline-delivered canonical snapshots carry",()=>{
+    const session={sessionId:"session",workspaceId:"actual-workspace",providerInstanceId:"provider",provider:"codex",title:"Title",status:"active",activityState:"idle",headSequence:0,revision:0,residency:"unloaded",nativeSessionAvailable:false,createdAt:"created",updatedAt:"updated"};
+    const rpcSnapshot={session,pendingApprovals:[]};
+    const timelineSnapshot={session,pendingApprovals:[],pendingInteractions:[]};
+    expect(SessionSnapshotV2Schema.parse(rpcSnapshot).pendingInteractions).toBeUndefined();
+    expect(SessionSnapshotV2Schema.parse(timelineSnapshot).pendingInteractions).toEqual([]);
+    expect(SessionSnapshotV2Schema.safeParse({...timelineSnapshot,pendingInteractions:"not-array"}).success).toBe(false);
   });
 });

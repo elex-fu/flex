@@ -77,6 +77,13 @@ export async function runOfflineRecovery(command: RecoveryCliCommand, options: O
         // Check every held resource before changing any retained file.
         workspaceLock.validateRecovery(workspaceProof, verifyWorkspace);
         for (const resourceKey of owner.resourceKeys) if (!verify(hostProof, { resourceKey, ownerId: owner.ownerId, ownerGeneration: owner.generation, purpose: "host" })) throw new RecoveryError("RECOVERY_RELEASE_PROOF_INVALID");
+        // A live Host runs the same reconciliation from its afterRecovery hook
+        // (catalog-recovery): once the release is proven, the Session's
+        // persisted runtime residency returns to "unloaded" so the next Host
+        // start is writable instead of dead-ending in HOST_RECOVERY_REQUIRED
+        // (CATALOG_RESIDENCY_UNRESOLVED). The offline CLI must mirror that, or
+        // its successful release leaves the destination permanently gated.
+        reconcileResidencyAfterRelease(store, command.sessionId, operation);
         workspaceLock.clearRetention(workspaceProof, verifyWorkspace);
         owner.clearRetention(hostProof, verify);
         workspaceLock.release(); workspaceLock = undefined;
@@ -90,6 +97,22 @@ export async function runOfflineRecovery(command: RecoveryCliCommand, options: O
     store?.close();
     if (!ownershipReleased) owner.closeMaintenance();
   }
+}
+
+/** Mirrors catalog-recovery's afterRecovery residency reconciliation for offline releases. */
+function reconcileResidencyAfterRelease(store: SqliteStore, sessionId: string, operation: RecoveryOperation): void {
+  // Legacy (pre-007) databases have no session_catalog residency column; nothing to reconcile.
+  if (!store.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='session_catalog'").get()) return;
+  store.withRecoveryTransaction(() => store.db.transaction(() => {
+    const session = store.getSession(sessionId);
+    // Same freshness contract as the live-host hook: a stale session state keeps the residency untouched.
+    if (!session || session.activeTurnId || session.recoveryState !== "idle" || session.recoveryRevision !== operation.recoveryRevision) return;
+    const row = store.db.prepare("SELECT residency_state FROM session_catalog WHERE session_id=?").get(sessionId) as { residency_state: string } | undefined;
+    if (!row || row.residency_state === "unloaded") return;
+    store.db.prepare("UPDATE session_catalog SET residency_state='unloaded' WHERE session_id=?").run(sessionId);
+    store.commitEvent(sessionId, "session.recovery.residency.reconciled", { turnId: operation.turnId,
+      operationId: operation.operationId, recoveryRevision: operation.recoveryRevision, residency: "unloaded" });
+  })());
 }
 
 function heldOriginalWorkspace(owner: RecoveryMaintenanceOwnerHandle, lock: ExclusiveFileLock | undefined, turnId: string): boolean {

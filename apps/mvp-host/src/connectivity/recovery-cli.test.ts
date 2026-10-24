@@ -75,6 +75,26 @@ describe("offline recovery CLI under retained original guards", () => {
     const successor = HostOwnerLock.acquire(f.options); successor.release();
   });
 
+  it("unblocks persisted session residency after a proven offline release on catalog databases", async () => {
+    const f = fixture();
+    // A catalog-era (007+) database also carries session_catalog; a released
+    // offline recovery must reconcile its residency exactly like the live
+    // Host's afterRecovery hook, or the next start stays HOST_RECOVERY_REQUIRED.
+    const catalog = new Database(f.options.databasePath);
+    catalog.exec(`CREATE TABLE session_catalog (session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE, provider_instance_id TEXT NOT NULL, title TEXT, native_handle_json TEXT, residency_state TEXT NOT NULL, archived_at TEXT)`);
+    catalog.prepare("INSERT INTO session_catalog VALUES('original-session','instance','Original',NULL,'blocked',NULL)").run();
+    catalog.close();
+    const evidence = await runOfflineRecovery(f.inspect(true), f.options);
+    if (!("evidenceId" in evidence)) throw new Error("Inspection result required");
+    const result = await runOfflineRecovery({ ...f.inspect(false), action: "acknowledge", evidenceId: evidence.evidenceId, expectedRecoveryRevision: evidence.recoveryRevision, commandId: "residency-reconcile", acknowledgeUnknown: true }, f.options);
+    expect(result).toMatchObject({ state: "completed", gate: "released", ownershipReleased: true });
+    const store = openReadOnly(f.options.databasePath);
+    try {
+      expect(store.db.prepare("SELECT residency_state FROM session_catalog WHERE session_id='original-session'").get()).toEqual({ residency_state: "unloaded" });
+      expect(store.db.prepare("SELECT type FROM session_events WHERE session_id='original-session' ORDER BY id DESC LIMIT 1").get()).toEqual({ type: "session.recovery.residency.reconciled" });
+    } finally { store.close(); }
+  });
+
   it("holds unretained original crash files unchanged and still denies proof-free release or normal writers", async () => {
     const f = fixture("not_spawned", { unretained: true }); const before = f.retained();
     const scope = HostOwnerLock.acquireForRecoveryMaintenance(f.options);

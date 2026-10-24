@@ -32,7 +32,7 @@ export type TrustedNativeRevertCapability = {
 };
 export type NativeRevertMutation = {
   operationId: string; requestId: string; requestDigest: string; originalHandle: NativeRevertHandle;
-  command: { method: "thread/rollback"; threadId: string; numTurns: number }
+  command: { method: "thread/revert"; threadId: string; beforeTurnId: string }
     | { method: "forkSession"; sessionId: string; upToMessageId: string }
     | { method: "newConversation"; provider: NativeRevertProvider };
 };
@@ -259,9 +259,9 @@ abstract class ProviderDriver implements NativeRevertDriver {
       throw new CheckpointError("NATIVE_REQUEST_REBOUND", "Preparation is not bound to this exact native request and capability");
     }
     const command: NativeRevertMutation["command"] = request.mode === "workspaceRestore" ? { method: "newConversation", provider: this.provider } : this.provider === "codex"
-      ? { method: "thread/rollback", threadId: original.nativeSessionId, numTurns: boundary.originalEntries.length - boundary.targetEntries.length }
+      ? { method: "thread/revert", threadId: original.nativeSessionId, beforeTurnId: boundary.originalEntries[boundary.targetEntries.length]!.id }
       : { method: "forkSession", sessionId: original.nativeSessionId, upToMessageId: boundary.targetEntries.at(-1)!.id };
-    if (command.method === "thread/rollback" && command.numTurns < 1) throw new CheckpointError("NATIVE_BOUNDARY_UNAVAILABLE", "Rollback must remove actual native Turns");
+    if (command.method === "thread/revert" && boundary.targetEntries.length >= boundary.originalEntries.length) throw new CheckpointError("NATIVE_BOUNDARY_UNAVAILABLE", "Revert must drop an actual native Turn boundary");
     return { boundary, mutation: { operationId: request.operationId, requestId: request.requestId, requestDigest: bindingDigest(request), originalHandle: original, command } };
   }
   private checkReceipt(mutation: NativeRevertMutation, receipt: NativeRevertMutationReceipt): void {

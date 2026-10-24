@@ -52,7 +52,12 @@ export function parseClaudeRevertHistory(raw: unknown, handle: NativeRevertHandl
   return raw.messages.map((message: unknown) => {
     if (!object(message) || !text(message.uuid) || message.session_id !== handle.nativeSessionId || ids.has(message.uuid) || !["user", "assistant", "system"].includes(String(message.type)) || !("message" in message)) throw new Error("NATIVE_CLAUDE_MESSAGE_BOUNDARY_INVALID");
     ids.add(message.uuid);
-    const { uuid: _uuid, session_id: _sessionId, ...semantic } = message;
+    // The SDK projects each message to {type, uuid, session_id, message,
+    // parent_tool_use_id, parent_agent_id, timestamp}. uuid/session_id are
+    // remapped by design, and a real forkSession restamps the copied final
+    // message's timestamp (verified against claude-agent-sdk 0.3.220), so the
+    // content digest covers exactly the semantic fields the fork must preserve.
+    const semantic = { type: message.type, message: message.message, parent_tool_use_id: message.parent_tool_use_id, parent_agent_id: message.parent_agent_id };
     return { id: message.uuid, digest: bindingDigest(semantic) };
   });
 }
@@ -118,14 +123,17 @@ export class HostManagedNativeRevertPort implements ManagedNativeRevertPort {
     try {
       assert();
       if (handle.provider === "codex") {
-        const beforeRequest = (method: string) => { if (!["initialize", "thread/read", "thread/rollback", "thread/start"].includes(method) || action !== "mutate" && !["initialize", "thread/read"].includes(method)) throw new Error("NATIVE_REVERT_RPC_FORBIDDEN"); assert(); };
+        const beforeRequest = (method: string) => { if (!["initialize", "thread/read", "thread/resume", "thread/revert", "thread/start"].includes(method) || action !== "mutate" && !["initialize", "thread/read"].includes(method)) throw new Error("NATIVE_REVERT_RPC_FORBIDDEN"); assert(); };
         const handlers: AppServerClientHandlers = { onNotification() {}, onRequest(request) { client?.respondError(request.id, -32601, "Native history helper does not accept server requests"); }, onExit() {} };
         client = this.options.clientFactory?.(handlers, runtime, beforeRequest) ?? new StdioAppServerClient({ executable: this.options.codex.executable, cwd: handle.workspacePath,
           env: restrictedEnvironment(this.options.codex.environment), args: APP_SERVER_SECURITY_ARGS, handlers, processes: runtime.registry, beforeRequest,
           spawn: (command, args, options) => { assert(); return runtime.spawn({ command, args, ...options, cwd: handle.workspacePath, env: restrictedEnvironment(this.options.codex.environment) }); } });
         await client.start(); assert();
         if (!mutation) value = await client.request("thread/read", { threadId: handle.nativeSessionId, includeTurns: true }, this.options.timeoutMs ?? 30_000);
-        else if (mutation.command.method === "thread/rollback") value = await client.request("thread/rollback", { threadId: mutation.command.threadId, numTurns: mutation.command.numTurns }, this.options.timeoutMs ?? 30_000);
+        // A persisted thread must be loaded into this fresh helper process before
+        // it can be reverted (verified against codex CLI 0.164.0: thread/read works
+        // on disk-backed threads, thread/revert requires a thread/resume load first).
+        else if (mutation.command.method === "thread/revert") { await client.request("thread/resume", { threadId: mutation.command.threadId, cwd: handle.workspacePath, approvalPolicy: "never", sandbox: "read-only" }, this.options.timeoutMs ?? 30_000); value = await client.request("thread/revert", { threadId: mutation.command.threadId, beforeTurnId: mutation.command.beforeTurnId }, this.options.timeoutMs ?? 30_000); }
         else if (mutation.command.method === "newConversation") value = await client.request("thread/start", { cwd: handle.workspacePath, approvalPolicy: "never", sandbox: "read-only" }, this.options.timeoutMs ?? 30_000);
         else throw new Error("NATIVE_MUTATION_PROVIDER_MISMATCH");
       } else {

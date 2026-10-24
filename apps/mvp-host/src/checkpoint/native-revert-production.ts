@@ -154,7 +154,12 @@ export function createProductionNativeRevert(options: ProductionNativeRevertOpti
     if (handle.captureContext) return structuredClone(handle.captureContext);
     const sessionId = typeof handle.sessionId === "string" ? handle.sessionId : undefined;
     if (!sessionId) throw new Error("NATIVE_REVERT_CONTEXT_INVALID");
-    return { hostOwnerId: owner.ownerId, hostOwnerGeneration: owner.generation, runtimeId: "native-revert-read", runtimeGeneration: 1, sessionId, flyxTurnId: "native-revert-read", attemptId: randomUUID() };
+    // Reads are idempotent and journal-free, so the exact (owner, Session, native
+    // binding) tuple must reproduce an identical context: the port re-evaluates
+    // this callback inside its anti-rebound digest check, and a fresh random
+    // attemptId would fail every real read closed as NATIVE_REVERT_CONTEXT_REBOUND.
+    return { hostOwnerId: owner.ownerId, hostOwnerGeneration: owner.generation, runtimeId: "native-revert-read", runtimeGeneration: 1, sessionId, flyxTurnId: "native-revert-read",
+      attemptId: `native-revert-read:${bindingDigest({ sessionId, provider: handle.provider, providerInstanceId: handle.providerInstanceId, workspaceId: handle.workspaceId, nativeSessionId: handle.nativeSessionId })}` };
   };
 
   /** The mutation journal is owned by the RevertService; each instance binds a fresh port to it. */

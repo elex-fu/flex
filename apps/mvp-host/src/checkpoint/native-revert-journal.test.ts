@@ -22,7 +22,7 @@ async function fixture(crash?: "after_claim" | "after_external", beforeClaim?: (
       apply: async (request) => {
         const mutation: NativeRevertMutation = { operationId: request.operationId, requestId: request.requestId, requestDigest: bindingDigest(request),
           originalHandle: { provider: "codex", providerInstanceId: "fixture-instance", workspaceId: "default", nativeSessionId: "native-1", workspacePath: f.root, configurationFingerprint: "config-v1", verifiedVersion: "fixture-v1" },
-          command: { method: "thread/rollback", threadId: "native-1", numTurns: 1 } };
+          command: { method: "thread/revert", threadId: "native-1", beforeTurnId: "turn-2" } };
         lastMutation = mutation; lastRequest = request;
         await beforeClaim?.();
         if (await journal.claim(mutation) === "existing") return f.native.query(request);

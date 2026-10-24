@@ -10,7 +10,7 @@ import type { NativeRevertHandle, NativeRevertMutation, NativeRevertMutationJour
 
 const handle:NativeRevertHandle={provider:"codex",providerInstanceId:"instance",workspaceId:"workspace",nativeSessionId:"thread",workspacePath:"/workspace",configurationFingerprint:"configuration",verifiedVersion:"native-v1"};
 const context:DispatchContext={hostOwnerId:"owner",hostOwnerGeneration:1,sessionId:"session",flyxTurnId:"operation",runtimeId:"runtime",runtimeGeneration:1,attemptId:"request"};
-const mutation:NativeRevertMutation={operationId:"operation",requestId:"request",requestDigest:"request-digest",originalHandle:handle,command:{method:"thread/rollback",threadId:"thread",numTurns:1}};
+const mutation:NativeRevertMutation={operationId:"operation",requestId:"request",requestDigest:"request-digest",originalHandle:handle,command:{method:"thread/revert",threadId:"thread",beforeTurnId:"t2"}};
 function fixture(options:{unknownStop?:boolean;deniedAtRpc?:boolean;nativeRunning?:boolean}={}) {
   const calls:{method:string;params:JsonObject}[]=[],rejects:unknown[]=[];let preparations=0,assertions=0,closes=0;
   const processIdentity={pid:123,platform:"linux" as const};
@@ -35,9 +35,9 @@ describe("managed native local-history port",()=>{
     expect(history).toMatchObject({nativeSessionId:"thread",verifiedVersion:"native-v1",quiescent:true,pendingRequest:false,entries:[{id:"t1"}]});
     expect(f.closes).toBe(1);f.handlers.onRequest({id:"inbound",method:"turn/start",params:{}});expect(f.rejects).toMatchObject([{id:"inbound",code:-32601}]);
   });
-  it("sends the immutable actual rollback count without any turn/start or resume",async()=>{
+  it("loads the persisted thread and sends the immutable revert boundary turn id",async()=>{
     const f=fixture(),receipt=await f.port.execute(mutation);
-    expect(f.calls).toEqual([{method:"thread/rollback",params:{threadId:"thread",numTurns:1}}]);
+    expect(f.calls).toEqual([{method:"thread/resume",params:{threadId:"thread",cwd:"/workspace",approvalPolicy:"never",sandbox:"read-only"}},{method:"thread/revert",params:{threadId:"thread",beforeTurnId:"t2"}}]);
     expect(receipt).toMatchObject({state:"completed",requestId:"request",requestDigest:"request-digest",quiescent:true});
   });
   it("checks authorization at actual RPC write after asynchronous preparation",async()=>{
@@ -69,9 +69,11 @@ describe("managed native local-history port",()=>{
   it("parses only complete Codex Turn boundaries and preserves semantic Claude content across remapped UUIDs",()=>{
     expect(()=>parseCodexRevertHistory({thread:{id:"thread",turns:[{id:"t1",status:"inProgress",items:[]}]}},handle)).toThrow("BOUNDARY");
     expect(()=>parseCodexRevertHistory({thread:{id:"other",turns:[]}},handle)).toThrow("INVALID");
-    const row={type:"assistant",uuid:"old",session_id:"source",message:{content:[{type:"text",text:"actual"}]},parent_tool_use_id:null,parent_agent_id:null};
+    const row={type:"assistant",uuid:"old",session_id:"source",message:{content:[{type:"text",text:"actual"}]},parent_tool_use_id:null,parent_agent_id:null,timestamp:"2026-10-24T01:00:00.000Z"};
     const source=parseClaudeRevertHistory({schema:1,sessionId:"source",messages:[row]},{...handle,provider:"claude",nativeSessionId:"source"});
-    const fork=parseClaudeRevertHistory({schema:1,sessionId:"fork",messages:[{...row,uuid:"new",session_id:"fork"}]},{...handle,provider:"claude",nativeSessionId:"fork"});
+    // A real forkSession remaps uuid/session_id AND restamps the final copied
+    // message's timestamp; the digest must stay invariant under all three.
+    const fork=parseClaudeRevertHistory({schema:1,sessionId:"fork",messages:[{...row,uuid:"new",session_id:"fork",timestamp:"2026-10-24T02:00:00.000Z"}]},{...handle,provider:"claude",nativeSessionId:"fork"});
     expect(source[0]!.digest).toBe(fork[0]!.digest);expect(source[0]!.id).not.toBe(fork[0]!.id);
   });
 });

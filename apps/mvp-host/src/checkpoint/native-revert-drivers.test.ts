@@ -56,9 +56,9 @@ function fixture(provider: NativeRevertProvider = "codex") {
     async read(handle) { reads++; const result = histories.get(handle.nativeSessionId); if (!result) throw new Error("missing native history"); return structuredClone(result); },
     async execute(mutation) {
       calls.push(structuredClone(mutation));
-      if (mutation.command.method === "thread/rollback") {
+      if (mutation.command.method === "thread/revert") {
         const history = histories.get(original.nativeSessionId)!;
-        history.entries = history.entries.slice(0, history.entries.length - mutation.command.numTurns);
+        history.entries = history.entries.slice(0, history.entries.findIndex((entry) => entry.id === mutation.command.beforeTurnId));
         receipt = reply(mutation);
       } else {
         const next = { ...original, nativeSessionId: "native-new" };
@@ -88,12 +88,12 @@ function fixture(provider: NativeRevertProvider = "codex") {
 }
 
 describe("Provider native revert proof contract", () => {
-  it("derives Codex numTurns from exact native before/after boundaries", async () => {
+  it("derives the Codex revert boundary turn from exact native before/after boundaries", async () => {
     const before = fixture(), after = fixture();
     expect((await before.driver.apply(await before.request("revert", "before"))).state).toBe("applied");
-    expect(before.calls[0]!.command).toEqual({ method: "thread/rollback", threadId: "native-original", numTurns: 2 });
+    expect(before.calls[0]!.command).toEqual({ method: "thread/revert", threadId: "native-original", beforeTurnId: "t2" });
     expect((await after.driver.apply(await after.request())).state).toBe("applied");
-    expect(after.calls[0]!.command).toEqual({ method: "thread/rollback", threadId: "native-original", numTurns: 1 });
+    expect(after.calls[0]!.command).toEqual({ method: "thread/revert", threadId: "native-original", beforeTurnId: "t3" });
   });
   it("queries the original Codex step after response loss and never rolls back twice across driver recreation", async () => {
     const f = fixture(), request = await f.request(); f.loseResponse();
@@ -108,7 +108,7 @@ describe("Provider native revert proof contract", () => {
   });
   it("does not infer application from a stopped helper while original history remains unchanged", async () => {
     const f = fixture(), request = await f.request();
-    await f.journal.claim({ operationId: request.operationId, requestId: request.requestId, requestDigest: bindingDigest(request), originalHandle: f.original, command: { method: "thread/rollback", threadId: "native-original", numTurns: 1 } });
+    await f.journal.claim({ operationId: request.operationId, requestId: request.requestId, requestDigest: bindingDigest(request), originalHandle: f.original, command: { method: "thread/revert", threadId: "native-original", beforeTurnId: "t3" } });
     expect((await f.driver.query(request)).state).toBe("unknown");
     expect((await f.driver.apply(request)).state).toBe("unknown"); expect(f.calls).toHaveLength(0);
   });
@@ -166,7 +166,7 @@ describe("Provider native revert proof contract", () => {
   });
   it("a not_dispatched proof is read-only and never authorizes a second native mutation", async () => {
     const f = fixture(), request = await f.request();
-    await f.journal.claim({ operationId: request.operationId, requestId: request.requestId, requestDigest: bindingDigest(request), originalHandle: f.original, command: { method: "thread/rollback", threadId: "native-original", numTurns: 1 } });
+    await f.journal.claim({ operationId: request.operationId, requestId: request.requestId, requestDigest: bindingDigest(request), originalHandle: f.original, command: { method: "thread/revert", threadId: "native-original", beforeTurnId: "t3" } });
     f.queryWith((mutation) => f.reply(mutation, { state: "not_dispatched" }));
     expect((await f.driver.apply(request)).state).toBe("not_applied"); expect(f.calls).toHaveLength(0);
   });

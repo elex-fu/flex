@@ -3,8 +3,8 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { chmod, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { parseArgs, parseNativeEvidence, parseReadiness, readReadiness, evaluateVerification, nativeCounts, digest, canonicalJson, verifySignedPayload, compatibilitySceneCommandIds } from "./evidence.mjs";
+import { dirname, join, resolve } from "node:path";
+import { parseArgs, parseNativeEvidence, parseReadiness, readReadiness, evaluateVerification, nativeCounts, digest, canonicalJson, verifySignedPayload, compatibilitySceneCommandIds, sceneSegments, sceneCommandCount, SCENE_REGISTRY, SCENE_NAMES } from "./evidence.mjs";
 import { openClient, RpcClient } from "./run-matrix.mjs";
 
 const h = (character) => character.repeat(64);
@@ -26,10 +26,13 @@ function record(kind, overrides = {}) {
   return signed({ v: 2, domain: "fixture", capability: kind, sceneVersion: "flyx-c3-basic-v1", entryDigest: h("a"), artifact: observed, launchRef: "launch-1", stopRef: "stop-1", nativeResultIdHash: h("d"), runId: "run-1", source: "native", provider: "claude", kind, result: "passed", nativeEvent: "result", evidenceCode: "NATIVE_VERIFIED", attemptIdHash: h("a"), nativeSessionIdHash: h("b"), ...(kind === "approval" ? { nativeRequestIdHash: h("c") } : {}), at: new Date().toISOString(), ...overrides });
 }
 test("argument parser rejects traversal, missing values and contradictory execution gates", () => {
-  assert.deepEqual(parseArgs(["--deterministic-only", "--turns", "10", "--combo", "valid-id"]), { deterministicOnly: true, real: false, turns: 10, combo: "valid-id" });
-  assert.equal(compatibilitySceneCommandIds("run-1").length, 10);
-  assert.deepEqual(compatibilitySceneCommandIds("run-1"), compatibilitySceneCommandIds("run-1"));
-  assert.notDeepEqual(compatibilitySceneCommandIds("run-1"), compatibilitySceneCommandIds("run-2"));
+  assert.deepEqual(parseArgs(["--deterministic-only", "--turns", "10", "--combo", "valid-id"]), { deterministicOnly: true, real: false, scene: "basic", turns: 10, combo: "valid-id" });
+  assert.equal(parseArgs(["--scene", "interactive"]).scene, "interactive");
+  assert.throws(() => parseArgs(["--scene", "unknown"]), /MATRIX_SCENE_UNSUPPORTED/);
+  assert.throws(() => parseArgs(["--scene", "--real"]), /MATRIX_ARGUMENT_INVALID/);
+  assert.equal(compatibilitySceneCommandIds("flyx-c3-basic-v1", "run-1").length, 10);
+  assert.deepEqual(compatibilitySceneCommandIds("flyx-c3-basic-v1", "run-1"), compatibilitySceneCommandIds("flyx-c3-basic-v1", "run-1"));
+  assert.notDeepEqual(compatibilitySceneCommandIds("flyx-c3-basic-v1", "run-1"), compatibilitySceneCommandIds("flyx-c3-basic-v1", "run-2"));
   assert.equal(parseArgs(["--prepare", "--run-id", "run-1"]).prepare, true);
   for (const args of [["--prepare", "--real"], ["--run-id", "../escape"], ["--combo", "../identity"], ["--turns", "0"], ["--turns", "2.5"], ["--config", "--real"], ["--real", "--deterministic-only"], ["--unknown"]]) assert.throws(() => parseArgs(args));
 });
@@ -165,4 +168,70 @@ test("canonical signatures reject tampering and old unsigned evidence; basic sco
   assert.equal(parseNativeEvidence(JSON.stringify(forged), expected).invalid, 1);
   assert.equal(parseNativeEvidence(JSON.stringify(record("turn", { v: 1 })), expected).invalid, 1);
   assert.equal(evaluateVerification({ combo: { ...combo, status: "fully-verified" }, deterministic: { status: "blocked", completed: 0 }, real: passed, observed, native, requirements }).status, "pending");
+});
+
+test("scene registry mirror: registered scenes, segment order, and per-scene command families", () => {
+  assert.deepEqual([...SCENE_NAMES.keys()].sort(), ["approval", "basic", "interactive", "interrupt", "reconnect"]);
+  assert.equal(SCENE_REGISTRY.size, 5);
+  assert.equal(sceneSegments("flyx-c99-unknown-v1"), undefined);
+  assert.deepEqual(sceneSegments("flyx-c4-approval-v1").map((segment) => segment.id), ["basic", "approval"]);
+  assert.deepEqual(sceneSegments("flyx-c7-interactive-v1").map((segment) => segment.id), ["basic", "approval", "interrupt", "reconnect"]);
+  assert.equal(sceneCommandCount("flyx-c3-basic-v1"), 10);
+  assert.equal(sceneCommandCount("flyx-c7-interactive-v1"), 14);
+  assert.equal(sceneCommandCount("flyx-c99-unknown-v1"), 0);
+  // The legacy c3 family keeps its pre-registry shape byte-for-byte.
+  const legacy = compatibilitySceneCommandIds("flyx-c3-basic-v1", "run-1");
+  assert.ok(legacy.every((id) => /^compat-[a-f0-9]{32}-\d+$/.test(id)));
+  // New families are segmented and keep the same digest prefix per scene run.
+  const interactive = compatibilitySceneCommandIds("flyx-c7-interactive-v1", "run-1");
+  assert.ok(interactive.every((id) => /^compat-[a-f0-9]{32}-(basic|approval|interrupt|reconnect)-\d+$/.test(id)));
+  assert.equal(interactive.filter((id) => id.includes("-basic-")).length, 10);
+  assert.equal(interactive.filter((id) => id.includes("-approval-")).length, 2);
+  assert.equal(interactive.filter((id) => id.includes("-interrupt-")).length, 1);
+  assert.equal(interactive.filter((id) => id.includes("-reconnect-")).length, 1);
+  assert.throws(() => compatibilitySceneCommandIds("flyx-c99-unknown-v1", "run-1"), /MATRIX_SCENE_UNSUPPORTED/);
+});
+
+test("scene-aware verification: reconnect scenes demand reconnect evidence, interactive demands all kinds", () => {
+  const layers10 = { status: "passed", completed: 10 };
+  const sceneRequirements = { deterministic: { turns: 1 }, real: { turns: 10 } };
+  const turn = (index, sceneVersion) => record("turn", { attemptIdHash: h(String(index)), nativeTurnIdHash: h(String(index)), nativeResultIdHash: h(String(index)), sceneVersion });
+  const scene = (records, sceneVersion) => parseNativeEvidence(records.map((value) => JSON.stringify(value)).join("\n"), { ...expected, sceneVersion });
+  // A reconnect-scene run needs one passed reconnect record on top of ten turns.
+  const reconnectRecords = [Array.from({ length: 10 }, (_, index) => turn(index, "flyx-c6-reconnect-v1")),
+    record("reconnect", { sceneVersion: "flyx-c6-reconnect-v1", nativeEvent: "resume", evidenceCode: "NATIVE_SESSION_RESUMED" })].flat();
+  const input = { combo: { ...combo, capabilities: ["turn", "reconnect"] }, deterministic: layers10, real: layers10, observed, native: scene(reconnectRecords, "flyx-c6-reconnect-v1"), requirements: sceneRequirements, sceneVersion: "flyx-c6-reconnect-v1" };
+  assert.equal(evaluateVerification(input).currentVerification, "fully-verified");
+  // Without the reconnect record the same scene stays short.
+  const without = scene(reconnectRecords.filter((value) => value.kind !== "reconnect"), "flyx-c6-reconnect-v1");
+  assert.equal(evaluateVerification({ ...input, native: without }).currentVerification, "deterministic-verified");
+  // Interactive needs two approvals (scene repetitions), one interrupt, one reconnect.
+  const interactiveRecords = [Array.from({ length: 10 }, (_, index) => turn(index, "flyx-c7-interactive-v1")),
+    record("approval", { sceneVersion: "flyx-c7-interactive-v1", nativeRequestIdHash: h("1"), nativeResultIdHash: undefined, nativeTurnIdHash: h("a") }),
+    record("approval", { sceneVersion: "flyx-c7-interactive-v1", nativeRequestIdHash: h("2"), nativeResultIdHash: undefined, nativeTurnIdHash: h("b") }),
+    record("interrupt", { sceneVersion: "flyx-c7-interactive-v1", nativeTurnIdHash: h("c") }),
+    record("reconnect", { sceneVersion: "flyx-c7-interactive-v1", nativeEvent: "resume", evidenceCode: "NATIVE_SESSION_RESUMED" })].flat();
+  const interactiveInput = { combo: { ...combo, capabilities: ["turn", "approval", "interrupt", "reconnect"] }, deterministic: layers10, real: layers10, observed, native: scene(interactiveRecords, "flyx-c7-interactive-v1"), requirements: sceneRequirements, sceneVersion: "flyx-c7-interactive-v1" };
+  assert.equal(evaluateVerification(interactiveInput).currentVerification, "fully-verified");
+  // A single approval observation is not enough: the scene demands two.
+  const oneApproval = scene(interactiveRecords.filter((value) => !(value.kind === "approval" && value.nativeRequestIdHash === h("2"))), "flyx-c7-interactive-v1");
+  assert.equal(evaluateVerification({ ...interactiveInput, native: oneApproval }).currentVerification, "deterministic-verified");
+});
+
+// The script-side registry must never drift from the built host registry
+// (design §7). The dist file appears only after a rebuild; before that, the
+// tooling suite (which runs before build) verifies the mirror on its own.
+test("script scene registry matches the built dist registry when present", async () => {
+  const { fileURLToPath } = await import("node:url");
+  const distPath = resolve(dirname(fileURLToPath(import.meta.url)), "../../apps/mvp-host/dist/diagnostics/compatibility-scenes.js");
+  let module;
+  try { module = await import("file://" + distPath); } catch { module = undefined; }
+  if (!module) return; // dist registry not built yet (task #27 rebuilds it)
+  assert.deepEqual([...module.SCENE_REGISTRY.keys()].sort(), [...SCENE_REGISTRY.keys()].sort());
+  for (const [sceneVersion, segments] of SCENE_REGISTRY) {
+    const distSegments = module.SCENE_REGISTRY.get(sceneVersion);
+    assert.deepEqual(distSegments.map((segment) => segment.id), segments.map((segment) => segment.id));
+    assert.deepEqual(distSegments.map((segment) => segment.repetitions), segments.map((segment) => segment.repetitions));
+    assert.deepEqual(distSegments.map((segment) => segment.prompt), segments.map((segment) => segment.prompt));
+  }
 });

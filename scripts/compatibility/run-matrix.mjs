@@ -9,13 +9,11 @@ import { createServer } from "node:net";
 import { dirname, join, resolve } from "node:path";
 import { promisify } from "node:util";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { compatibilitySceneCommandIds, environmentMatches, evaluateVerification, parseArgs, parseNativeEvidence, readPrivateArtifact, readReadiness } from "./evidence.mjs";
+import { compatibilitySceneCommandIds, environmentMatches, evaluateVerification, parseArgs, parseNativeEvidence, readPrivateArtifact, readReadiness, sceneSegments, SCENE_NAMES, SCENE_BASIC_PROMPT } from "./evidence.mjs";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
-const SCENE_VERSION = "flyx-c3-basic-v1";
-const BASIC_PROMPT = "回复 OK 两个字母，不要做任何其他事";
 const TERMINALS = new Set(["turn.completed", "turn.failed", "turn.cancelled"]);
-const USAGE = "node scripts/compatibility/run-matrix.mjs [--prepare | --deterministic-only | --real] [--run-id id] [--combo id] [--turns 1-100] [--config path] [--evidence-root path]\nReal calls also require RUN_REAL_CLAUDE=1 or RUN_REAL_CODEX=1. Existing authentication and built artifacts are required.\n";
+const USAGE = "node scripts/compatibility/run-matrix.mjs [--prepare | --deterministic-only | --real] [--scene basic|approval|interrupt|reconnect|interactive] [--run-id id] [--combo id] [--turns 1-100] [--config path] [--evidence-root path]\nReal calls also require RUN_REAL_CLAUDE=1 or RUN_REAL_CODEX=1. Existing authentication and built artifacts are required.\n";
 const hash = (value) => createHash("sha256").update(value).digest("hex");
 const code = (error) => typeof error?.code === "string" && /^[A-Z][A-Z0-9_]{0,95}$/.test(error.code) ? error.code : "MATRIX_OPERATION_FAILED";
 const coded = (value) => Object.assign(new Error(value), { code: value });
@@ -65,12 +63,15 @@ function reservePort() {
     });
   });
 }
-async function startHost({ layer, combo, scratch, nativePath, runId }) {
+async function startHost({ layer, combo, scratch, nativePath, runId, sceneVersion }) {
   const controlled = join(scratch, layer);
   await mkdir(controlled, { recursive: true, mode: 0o700 });
   await chmod(controlled, 0o700);
   await mkdir(join(controlled, "web"), { mode: 0o700 });
   const readinessPath = join(controlled, "ready.json");
+  // A restart re-awaits readiness with the new pid: the previous process's
+  // readiness file must be removed first or the pid comparison refuses it.
+  await rm(readinessPath, { force: true });
   const workspace = join(controlled, "workspace");
   await cp(join(ROOT, "packages/claude-fixtures"), workspace, { recursive: true, filter: (path) => !path.split(/[\\/]/).includes(".git") });
   const git = promisify(execFile);
@@ -112,7 +113,7 @@ async function startHost({ layer, combo, scratch, nativePath, runId }) {
   let spawnError;
   child.once("error", () => { spawnError = coded("HOST_SPAWN_FAILED"); });
   try {
-    const info = await waitForReady(child, readinessPath, { expectedProvider: real ? provider : "deterministic", expectedRunId: runId, expectedEntryDigest: entryDigest, expectedEntryPath: entryPath, expectedHost, startedAt }, real ? 180_000 : 60_000);
+    const info = await waitForReady(child, readinessPath, { expectedProvider: real ? provider : "deterministic", expectedRunId: runId, expectedEntryDigest: entryDigest, expectedEntryPath: entryPath, expectedHost, expectedSceneVersion: sceneVersion, startedAt }, real ? 180_000 : 60_000);
     if (spawnError) throw spawnError;
     if (info.pid !== child.pid) throw coded("READINESS_PID_MISMATCH");
     return { child, info };
@@ -182,7 +183,7 @@ export async function openClient(info) {
 const RETRYABLE_ADMISSION = new Set(["WORKSPACE_BUSY", "TURN_BUSY"]);
 const ADMISSION_RETRY_DELAY_MS = 1_000;
 const ADMISSION_RETRY_LIMIT = 90;
-async function runTurn(client, { layer, index, prompt, scenario = "turn", commandId }) {
+async function runTurn(client, { layer, index, prompt, scenario = "turn", commandId, approvalAction = "deny" }) {
   const start = Date.now();
   const record = { layer, scenario, index, promptHash: hash(prompt), startedAt: new Date(start).toISOString(), turnIdHash: null, terminalType: null, result: "failed", errorCode: null, admissionRetries: 0 };
   let turnId;
@@ -199,7 +200,7 @@ async function runTurn(client, { layer, index, prompt, scenario = "turn", comman
     turnId = response.payload.turnId; record.turnIdHash = hash(turnId);
     if (scenario === "approval") {
       const request = await client.waitEvent((event) => event?.type === "approval.requested" && event?.payload?.turnId === turnId, 60_000);
-      const answer = await client.call("approval.respond", { approvalId: request.payload.approvalId, expectedVersion: request.payload.version ?? 0, action: "deny" }, randomUUID());
+      const answer = await client.call("approval.respond", { approvalId: request.payload.approvalId, expectedVersion: request.payload.version ?? 0, action: approvalAction }, randomUUID());
       if (!answer.ok) throw coded("APPROVAL_RESPONSE_FAILED");
     } else if (scenario === "interrupt") {
       await client.waitEvent((event) => event?.type === "turn.started" && event?.payload?.turnId === turnId, 60_000);
@@ -218,10 +219,27 @@ async function runTurn(client, { layer, index, prompt, scenario = "turn", comman
   record.durationMs = Date.now() - start;
   return record;
 }
+/** One scene segment's driving, against the currently-open client (design §4). */
+async function runSegment(segment, slot, commandIds, client, { layer, promptOverrides }) {
+  const records = [];
+  for (let index = 1; index <= segment.repetitions; index += 1) {
+    const prompt = promptOverrides?.[segment.id] ?? segment.prompt;
+    if (segment.id === "approval") {
+      // First repetition allows the tool once (it executes), the second denies.
+      records.push(await runTurn(client, { layer, index, prompt, scenario: "approval", approvalAction: index === 1 ? "allow_once" : "deny", ...(commandIds ? { commandId: commandIds[slot + index - 1] } : {}) }));
+    } else if (segment.id === "interrupt") {
+      records.push(await runTurn(client, { layer, index, prompt, scenario: "interrupt", ...(commandIds ? { commandId: commandIds[slot + index - 1] } : {}) }));
+    } else {
+      records.push(await runTurn(client, { layer, index, prompt, ...(commandIds ? { commandId: commandIds[slot + index - 1] } : {}) }));
+    }
+  }
+  return records;
+}
 async function runLayer(layer, combo, context) {
   let host;
   let layerResult;
   const records = [];
+  let restartBlocked = null;
   try {
     host = await startHost({ layer, combo, ...context });
     const observed = { nodeVersion: process.versions.node, os: process.platform + " " + release() + " " + arch(), ...host.info.observed };
@@ -229,16 +247,32 @@ async function runLayer(layer, combo, context) {
       const match = environmentMatches(combo, observed);
       if (!match.matched) return layerResult = { outcome: { status: "skipped", completed: 0, reasonCode: "RUNTIME_COMBINATION_UNVERIFIED", reasons: match.reasonCodes }, observed, records, handshake: host.info };
     }
-    const client = await openClient(host.info);
+    let client = await openClient(host.info);
     try {
-      for (let index = 1; index <= context.turns; index += 1) records.push(await runTurn(client, { layer, index, prompt: context.prompt, ...(layer === "real" ? { commandId: compatibilitySceneCommandIds(context.runId)[index - 1] } : {}) }));
-      if (layer === "real") for (const scenario of ["approval", "interrupt"]) {
-        const spec = context.scenarios?.[scenario];
-        if (spec?.prompt) for (let index = 1; index <= (spec.repetitions ?? 1); index += 1) records.push(await runTurn(client, { layer, index, prompt: spec.prompt, scenario }));
+      // Deterministic layer always runs the basic segment only (the
+      // deterministic adapter never emits approval requests); the real layer
+      // runs the full registered scene set in consumption order.
+      const segments = layer === "real" ? sceneSegments(context.sceneVersion) : [sceneSegments("flyx-c3-basic-v1")[0]];
+      const commandIds = layer === "real" ? compatibilitySceneCommandIds(context.sceneVersion, context.runId) : null;
+      let slot = 0;
+      for (const segment of segments) {
+        if (segment.id === "reconnect") {
+          // The reconnect event IS the host restart: same env/DB/identity and
+          // the same runId, a new pid; the resumed turn's decider attaches
+          // resumeSessionId to the pre-restart native session (design §4).
+          client.close();
+          const stopped = await stopHost(host.child);
+          if (stopped.status === "forced" || stopped.code !== 0) restartBlocked = stopped.status === "forced" ? "HOST_STOP_FORCED" : "HOST_STOP_UNVERIFIED";
+          host = await startHost({ layer, combo, ...context });
+          client = await openClient(host.info);
+        }
+        records.push(...await runSegment(segment, slot, commandIds, client, { layer }));
+        slot += segment.commandCount;
       }
     } finally { client.close(); }
     const turns = records.filter((record) => record.scenario === "turn");
-    return layerResult = { records, observed, handshake: host.info, outcome: { status: records.some((record) => record.result !== "passed") ? "failed" : "passed", completed: turns.filter((record) => record.result === "passed").length, scenarioResults: Object.fromEntries(["approval", "interrupt", "recovery"].map((kind) => [kind, { status: records.some((record) => record.scenario === kind) ? records.filter((record) => record.scenario === kind).every((record) => record.result === "passed") ? "passed" : "failed" : "skipped", reasonCode: records.some((record) => record.scenario === kind) ? null : "SCENARIO_NOT_CONFIGURED" }])) } };
+    return layerResult = { records, observed, handshake: host.info, outcome: { status: restartBlocked || records.some((record) => record.result !== "passed") ? "failed" : "passed", completed: turns.filter((record) => record.result === "passed").length, ...(restartBlocked ? { reasonCode: restartBlocked } : {}),
+      scenarioResults: Object.fromEntries(["approval", "interrupt", "reconnect", "recovery"].map((kind) => [kind, { status: records.some((record) => record.scenario === kind) ? records.filter((record) => record.scenario === kind).every((record) => record.result === "passed") ? "passed" : "failed" : "skipped", reasonCode: records.some((record) => record.scenario === kind) ? null : "SCENARIO_NOT_CONFIGURED" }])) } };
   } catch (error) { return layerResult = { records, observed: host?.info.observed ?? {}, outcome: { status: "blocked", completed: 0, reasonCode: code(error) } }; }
   finally {
     if (host) {
@@ -267,15 +301,13 @@ export async function main(argv = process.argv.slice(2)) {
     await writeJson(join(evidenceRoot, "run-" + runId + ".json"), { v: 1, runId, status: "skipped", reasonCode: "NO_SELECTED_COMBINATIONS" });
     log("skipped: NO_SELECTED_COMBINATIONS"); return options.combo ? 2 : 0;
   }
-  if (config.sceneVersion !== SCENE_VERSION || config.matrixPrompt?.text !== BASIC_PROMPT) throw coded("MATRIX_FIXED_SCENE_REQUIRED");
-  if (config.realScenarios && Object.keys(config.realScenarios).length) throw coded("MATRIX_SCENE_UNSUPPORTED");
+  const sceneVersion = SCENE_NAMES.get(options.scene);
+  if (config.sceneVersion !== sceneVersion || config.matrixPrompt?.text !== SCENE_BASIC_PROMPT) throw coded("MATRIX_FIXED_SCENE_REQUIRED");
   const turns = options.turns ?? config.deterministicRequirements?.turns ?? 10;
   if (options.real && turns !== 10) throw coded("MATRIX_REAL_SCENE_REQUIRES_TEN_TURNS");
   if (!Number.isInteger(turns) || turns < 1 || turns > 100) throw coded("MATRIX_CONFIG_INVALID");
-  for (const kind of ["approval", "interrupt"]) {
-    const spec = config.realScenarios?.[kind];
-    if (spec && (typeof spec.prompt !== "string" || !spec.prompt || Buffer.byteLength(spec.prompt) > 65_536 || !Number.isInteger(spec.repetitions ?? 1) || (spec.repetitions ?? 1) < 1 || (spec.repetitions ?? 1) > 100)) throw coded("MATRIX_CONFIG_INVALID");
-  }
+  // Interactive repetition counts come from the registered scene itself
+  // (config realRequirements may raise, never lower, them).
   let exitCode = 0;
   for (const original of selected) {
     const combo = { ...original, authorizationPath: options.authorization ? resolve(options.authorization) : undefined, destinationHostPath: options.destinationHost ? resolve(options.destinationHost) : undefined, provider: original.provider ?? "claude" };
@@ -301,12 +333,12 @@ export async function main(argv = process.argv.slice(2)) {
       await writeJson(join(directory, "preparation.json"), { v: 2, runId, comboId: combo.id, provider: combo.provider, sourceHost, entryPath, entryDigest,
         ...(candidate ? { candidate: { ...candidate, candidateVersion }, artifactDigest, runtimeDigest: candidate.runtimeDigest,
           supervisionContractId: candidate.supervisionContractId, config: { environment: {}, sandboxRequired: true }, policyVersion: 1 } : {}),
-        sourceHostPath: join(directory, "source-host.json"), commandIds: compatibilitySceneCommandIds(runId), note: candidate
+        sourceHostPath: join(directory, "source-host.json"), sceneVersion, commandIds: compatibilitySceneCommandIds(sceneVersion, runId), note: candidate
           ? "Authorize this source before --real --run-id; the destination ticket must bind exactly this candidate artifactDigest/runtimeDigest/entryDigest. No model was called and no version was observed."
           : "No absolute executablePath: this combination cannot be authorized for a real run until one is measured. No model was called." });
       log(combo.id + ": prepared run=" + runId + (candidate ? " artifact=" + artifactDigest : " (no candidate)")); continue;
     }
-    const context = { scratch, nativePath, runId, turns, prompt: config.matrixPrompt.text, scenarios: config.realScenarios };
+    const context = { scratch, nativePath, runId, turns, sceneVersion };
     let deterministic, real;
     try {
       deterministic = await runLayer("deterministic", combo, context);
@@ -323,7 +355,7 @@ export async function main(argv = process.argv.slice(2)) {
       let native = { records: [], invalid: 0 };
       try { native = parseNativeEvidence(await readPrivateArtifact(nativePath, 8 * 1024 * 1024), { runId, provider: combo.provider, host: real.handshake?.host, entryDigest: real.handshake?.entryDigest, sceneVersion: real.handshake?.sceneVersion, artifact: real.observed }); }
       catch (error) { if (error?.code !== "ENOENT") native = { records: [], invalid: 1 }; }
-      const evaluation = evaluateVerification({ combo, deterministic: deterministic.outcome, real: real.outcome, native, observed: real.observed, requirements: { deterministic: config.deterministicRequirements, real: config.realRequirements } });
+      const evaluation = evaluateVerification({ combo, deterministic: deterministic.outcome, real: real.outcome, native, observed: real.observed, requirements: { deterministic: config.deterministicRequirements, real: config.realRequirements }, sceneVersion });
       const summary = { v: 2, runId, comboId: combo.id, provider: combo.provider, ranAt: new Date().toISOString(), expected: { nodeVersion: combo.nodeVersion, os: combo.os, sdkVersion: combo.sdkVersion, cliVersion: combo.claudeCliVersion ?? combo.codexCliVersion, executableSource: combo.executableSource, capabilities: combo.capabilities ?? [] }, observed: real.observed, deterministicObserved: deterministic.observed, layers: { deterministic: deterministic.outcome, real: real.outcome }, nativeEvidence: { counts: evaluation.counts, invalid: evaluation.invalidEvidence, complete: evaluation.nativeComplete, capabilities: evaluation.capabilities }, result: evaluation.currentVerification, persistedStatus: evaluation.status, environment: evaluation.environment };
       await writeJson(join(directory, "summary.json"), summary);
       original.status = evaluation.status;

@@ -7,20 +7,23 @@ export function extractSemver(text) { return /\b\d+\.\d+\.\d+\b/.exec(text ?? ""
 export function normalizedOs(value) { return String(value ?? "").replace(/^macOS\s+/i, "darwin ").replace(/^linux\s+/i, "linux ").trim().toLowerCase(); }
 function fail(code) { throw Object.assign(new Error(code), { code }); }
 export function parseArgs(argv, defaults = {}) {
-  const options = { deterministicOnly: false, real: false, ...defaults };
+  const options = { deterministicOnly: false, real: false, scene: "basic", ...defaults };
   for (let index = 0; index < argv.length; index += 1) {
     const argument = argv[index];
     if (argument === "--help" || argument === "-h") { options.help = true; continue; }
     if (argument === "--deterministic-only") { options.deterministicOnly = true; continue; }
     if (argument === "--prepare") { options.prepare = true; continue; }
     if (argument === "--real") { options.real = true; continue; }
-    const key = { "--authorization": "authorization", "--destination-host": "destinationHost", "--run-id": "runId", "--combo": "combo", "--turns": "turns", "--config": "config", "--evidence-root": "evidenceRoot" }[argument];
+    const key = { "--scene": "scene", "--authorization": "authorization", "--destination-host": "destinationHost", "--run-id": "runId", "--combo": "combo", "--turns": "turns", "--config": "config", "--evidence-root": "evidenceRoot" }[argument];
     if (!key || !argv[index + 1] || argv[index + 1].startsWith("--")) fail("MATRIX_ARGUMENT_INVALID");
     const value = argv[++index];
     if (key === "turns") {
       const turns = Number(value);
       if (!/^\d+$/.test(value) || !Number.isInteger(turns) || turns < 1 || turns > 100) fail("MATRIX_TURNS_INVALID");
       options.turns = turns;
+    } else if (key === "scene") {
+      if (!SCENE_NAMES.has(value)) fail("MATRIX_SCENE_UNSUPPORTED");
+      options.scene = value;
     } else options[key] = value;
   }
   if (options.combo && !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(options.combo)) fail("MATRIX_COMBO_INVALID");
@@ -38,7 +41,49 @@ export function canonicalJson(value) {
   return "{" + Object.keys(value).sort().map((key) => JSON.stringify(key) + ":" + canonicalJson(value[key])).join(",") + "}";
 }
 export const digest = (value) => createHash("sha256").update(canonicalJson(value)).digest("hex");
-export function compatibilitySceneCommandIds(runId) { const prefix = "compat-" + digest({ sceneVersion: "flyx-c3-basic-v1", runId }).slice(0,32); return Array.from({length:10},(_,index)=>prefix+"-"+(index+1)); }
+
+// Script-side mirror of apps/mvp-host/src/diagnostics/compatibility-scenes.ts
+// (design §4/§7). Pure data + derivations; evidence.test.mjs cross-checks the
+// mirror against the built dist registry whenever dist contains it, so drift
+// is caught by the tooling suite after a rebuild.
+export const SCENE_BASIC_PROMPT = "回复 OK 两个字母，不要做任何其他事";
+export const SCENE_APPROVAL_PROMPT = "在当前工作区创建文件 approval-scene.txt，内容为 OK，然后回复 DONE，不要做任何其他事";
+export const SCENE_INTERRUPT_PROMPT = "从 1 数到 50，每数一个数字就输出一次，不要做任何其他事";
+const BASIC_SEGMENT = Object.freeze({ id: "basic", prompt: SCENE_BASIC_PROMPT, repetitions: 10, commandCount: 10, capability: "turn" });
+const APPROVAL_SEGMENT = Object.freeze({ id: "approval", prompt: SCENE_APPROVAL_PROMPT, repetitions: 2, commandCount: 2, capability: "approval" });
+const INTERRUPT_SEGMENT = Object.freeze({ id: "interrupt", prompt: SCENE_INTERRUPT_PROMPT, repetitions: 1, commandCount: 1, capability: "interrupt" });
+const RECONNECT_SEGMENT = Object.freeze({ id: "reconnect", prompt: SCENE_BASIC_PROMPT, repetitions: 1, commandCount: 1, capability: "reconnect" });
+export const SCENE_REGISTRY = new Map([
+  ["flyx-c3-basic-v1", Object.freeze([BASIC_SEGMENT])],
+  ["flyx-c4-approval-v1", Object.freeze([BASIC_SEGMENT, APPROVAL_SEGMENT])],
+  ["flyx-c5-interrupt-v1", Object.freeze([BASIC_SEGMENT, INTERRUPT_SEGMENT])],
+  ["flyx-c6-reconnect-v1", Object.freeze([BASIC_SEGMENT, RECONNECT_SEGMENT])],
+  ["flyx-c7-interactive-v1", Object.freeze([BASIC_SEGMENT, APPROVAL_SEGMENT, INTERRUPT_SEGMENT, RECONNECT_SEGMENT])],
+]);
+/** --scene name -> the registered sceneVersion. */
+export const SCENE_NAMES = new Map([
+  ["basic", "flyx-c3-basic-v1"],
+  ["approval", "flyx-c4-approval-v1"],
+  ["interrupt", "flyx-c5-interrupt-v1"],
+  ["reconnect", "flyx-c6-reconnect-v1"],
+  ["interactive", "flyx-c7-interactive-v1"],
+]);
+export function sceneSegments(sceneVersion) { return SCENE_REGISTRY.get(sceneVersion); }
+export function sceneCommandCount(sceneVersion) { return sceneSegments(sceneVersion)?.reduce((total, segment) => total + segment.commandCount, 0) ?? 0; }
+/** Flat command-id family, in consumption order (basic slots first). */
+export function compatibilitySceneCommandIds(sceneVersion, runId) {
+  const segments = sceneSegments(sceneVersion);
+  if (!segments) fail("MATRIX_SCENE_UNSUPPORTED");
+  const prefix = "compat-" + digest({ sceneVersion, runId }).slice(0, 32);
+  const ids = [];
+  for (const segment of segments) {
+    for (let index = 1; index <= segment.commandCount; index += 1) {
+      // The legacy c3 family keeps its pre-registry shape byte-for-byte.
+      ids.push(sceneVersion === "flyx-c3-basic-v1" ? prefix + "-" + index : prefix + "-" + segment.id + "-" + index);
+    }
+  }
+  return ids;
+}
 export function verifySignedPayload(value, expectedHost) {
   try {
     const { digest: recorded, signature, host, ...payload } = value;
@@ -163,14 +208,24 @@ export function environmentMatches(combo, observed) {
   for (const key of ["executableDigest", "adapterId", "adapterVersion", "runtimeVersion", "runtimeDigest", "supervisionContractId"]) if (combo[key] && combo[key] !== observed?.[key]) reasons.push(key.toUpperCase() + "_MISMATCH");
   return { matched: reasons.length === 0, reasonCodes: reasons };
 }
-export function evaluateVerification({ combo, deterministic, real, native, observed, requirements }) {
+export function evaluateVerification({ combo, deterministic, real, native, observed, requirements, sceneVersion = "flyx-c3-basic-v1" }) {
   const counts = nativeCounts(native.records);
-  const required = { turns: 10, approvals: 0, interrupts: 0, recoveries: 0, ...requirements.real };
+  // Per-scene required native counts (design §7): the basic baseline stays 10
+  // turns; interactive segments add approvals/interrupts/reconnects as the
+  // scene (or its per-scene config realRequirements) requires.
+  const sceneCounts = sceneSegments(sceneVersion)?.reduce((required, segment) => {
+    if (segment.id === "approval") required.approvals = Math.max(required.approvals, segment.repetitions);
+    if (segment.id === "interrupt") required.interrupts = Math.max(required.interrupts, segment.repetitions);
+    if (segment.id === "reconnect") required.reconnects = Math.max(required.reconnects, segment.repetitions);
+    return required;
+  }, { approvals: 0, interrupts: 0, reconnects: 0, recoveries: 0 }) ?? { approvals: 0, interrupts: 0, reconnects: 0, recoveries: 0 };
+  const required = { turns: 10, ...sceneCounts, ...requirements.real };
+  const kindRequirements = { turn: required.turns, approval: required.approvals, interrupt: required.interrupts, reconnect: required.reconnects, recovery: required.recoveries };
   const declared = combo.capabilities ?? ["turn"];
   const capabilities = Object.fromEntries([...new Set(native.records.map((record) => record.capability))].filter(Boolean).map((capability) => [capability, native.records.some((record) => record.capability === capability && record.result === "passed")]));
   const environment = environmentMatches(combo, observed);
   const detQualifies = deterministic.status === "passed" && deterministic.completed >= (requirements.deterministic?.turns ?? 10);
-  const nativeComplete = native.invalid === 0 && declared.every((capability) => capabilities[capability]) && ["turn", "approval", "interrupt", "recovery"].every((kind) => counts[kind] >= required[{ turn: "turns", approval: "approvals", interrupt: "interrupts", recovery: "recoveries" }[kind]]);
+  const nativeComplete = native.invalid === 0 && declared.every((capability) => capabilities[capability]) && Object.entries(kindRequirements).every(([kind, count]) => counts[kind] >= count);
   const failures = deterministic.status === "failed" || real.status === "failed" || native.records.some((record) => record.result === "failed");
   const currentVerification = failures ? "broken" : detQualifies && real.status === "passed" && real.completed >= required.turns && environment.matched && nativeComplete ? "fully-verified" : detQualifies ? "deterministic-verified" : "pending";
   const status = currentVerification; // Persisted/manual status cannot preserve a verdict the current evidence does not prove.

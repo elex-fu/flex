@@ -251,7 +251,7 @@ async function main(): Promise<void> {
       const entry = { path: resolve(process.env.FLYX_COMPATIBILITY_READINESS_PATH ?? ""), baseUrl: address,
         pairingToken: server.auth.pairingUrlToken, provider, identity, runId: process.env.FLYX_COMPATIBILITY_RUN_ID ?? "",
         entryPath: fileURLToPath(import.meta.url), databasePath: owner.databasePath, identityDirectory: owner.identityDirectory!,
-        workspace, artifact, authMode: isolatedCompatibility.authMode() };
+        workspace, artifact, authMode: isolatedCompatibility.authMode(), sceneVersion: isolatedCompatibility.sceneVersion() };
       const scenePolicy = await application.prepareCompatibilityScene({
         authorization: await readControlledCompatibilityJson(process.env.FLYX_COMPATIBILITY_AUTHORIZATION_PATH),
         expectedDestination: parseCompatibilityHostIdentity(await readControlledCompatibilityJson(process.env.FLYX_COMPATIBILITY_DESTINATION_HOST_PATH)), entry,

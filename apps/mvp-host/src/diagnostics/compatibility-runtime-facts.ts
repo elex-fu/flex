@@ -18,6 +18,7 @@ import type { NativeTurnObservation } from "../provider/native-history.js";
 import { CompatibilityEvidenceRecorder, compatibilityEvidenceHash, type NativeCompatibilityArtifact, type NativeCompatibilityEvidence } from "./compatibility-evidence.js";
 import { compatibilityCanonicalJson, compatibilityDigest } from "./compatibility-integrity.js";
 import { COMPATIBILITY_SCENE_VERSION } from "./compatibility-readiness.js";
+import { sceneSegments } from "./compatibility-scenes.js";
 import { resolveManagedNativeProvenance } from "./managed-native-provenance.js";
 import { measureRuntimeFile, measuredHostBuildDigest, type PlannedNativeArtifact } from "./planned-native-artifact.js";
 
@@ -143,10 +144,14 @@ export function createCompatibilityCommittedRecorder(options: {
   db: Database.Database; identity: HostIdentityFileV1; path: string; runId: string; entryDigest: string;
   facts: ReturnType<typeof createCompatibilityRuntimeFacts>;
   assertSceneObservation(context: DispatchContext): void;
+  /** Registered scene the run executes; defaults to the c3 basic scene. */
+  sceneVersion?: string | undefined;
 }) {
+  const sceneVersion = options.sceneVersion ?? COMPATIBILITY_SCENE_VERSION;
+  if (sceneSegments(sceneVersion) === undefined) fail("COMPATIBILITY_SCENE_VERSION_UNSUPPORTED");
   const contexts = new Map<string, DispatchContext>();
   const recorder = new CompatibilityEvidenceRecorder(options.path, true, options.runId, { domain: "isolated-real", identity: options.identity,
-    artifact: () => options.facts.measure(), sceneVersion: COMPATIBILITY_SCENE_VERSION, entryDigest: options.entryDigest,
+    artifact: () => options.facts.measure(), sceneVersion, entryDigest: options.entryDigest,
     assertNativeProvenance: (evidence, artifact) => { const context = contexts.get(evidence.attemptId); if (!context) return fail("COMPATIBILITY_ORIGINAL_NATIVE_EVENT_MISSING"); return resolveManagedNativeProvenance(options.db, context, evidence, artifact); } });
   return Object.freeze({ drain: () => recorder.drain(),
     afterCommittedNativeStop: async (context: DispatchContext) => {

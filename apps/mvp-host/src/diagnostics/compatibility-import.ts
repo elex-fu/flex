@@ -7,6 +7,10 @@ import { assertPrivateDirectory, OperationsError, readPrivateFile, syncDirectory
 import { compatibilityEvidenceArtifactDigest, readCompatibilityEvidence, type CompatibilityEvidenceArtifact } from "./compatibility-evidence.js";
 import { compatibilityDigest, signCompatibilityPayload, verifyCompatibilityPayload, type CompatibilityHostIdentity } from "./compatibility-integrity.js";
 import { COMPATIBILITY_SCENE_VERSION } from "./compatibility-readiness.js";
+import { sceneSegments } from "./compatibility-scenes.js";
+
+/** Capabilities an imported endorsement can carry (registry scene segments). */
+export type CompatibilityImportCapability = "turn" | "recovery" | "approval" | "interrupt" | "reconnect";
 
 export type CompatibilityRunAuthorization = {
   v: 2; kind: "compatibility-run-authorization"; domain: "destination-authorization";
@@ -18,13 +22,17 @@ export type CompatibilityRunAuthorization = {
 export function authorizeCompatibilityRun(destination: HostIdentityFileV1, input: {
   provider: "claude" | "codex"; artifactDigest: string; runtimeDigest: string;
   runId: string; sourceHost: CompatibilityHostIdentity; entryDigest: string; now?: number;
+  /** Registered scene the run will execute; defaults to the c3 basic scene. */
+  sceneVersion?: string | undefined;
 }) {
+  const sceneVersion = input.sceneVersion ?? COMPATIBILITY_SCENE_VERSION;
+  if (sceneSegments(sceneVersion) === undefined) throw new OperationsError("COMPATIBILITY_SCENE_VERSION_UNSUPPORTED");
   if (input.sourceHost.hostId === destination.hostId || input.sourceHost.fingerprint === destination.fingerprint || !["claude", "codex"].includes(input.provider) || !/^[a-f0-9]{64}$/.test(input.artifactDigest) || !/^[a-f0-9]{64}$/.test(input.runtimeDigest)
     || input.sourceHost.fingerprint !== "sha256:" + compatibilityDigest({ v: 1, hostPublicKey: input.sourceHost.hostPublicKey, signingPublicKey: input.sourceHost.signingPublicKey }) || !/^[a-zA-Z0-9-]{1,128}$/.test(input.runId) || !/^[a-f0-9]{64}$/.test(input.entryDigest)) throw new OperationsError("COMPATIBILITY_AUTHORIZATION_INVALID");
   const now = input.now ?? Date.now();
   const payload: CompatibilityRunAuthorization = { v: 2, kind: "compatibility-run-authorization", domain: "destination-authorization",
     provider: input.provider, artifactDigest: input.artifactDigest, runtimeDigest: input.runtimeDigest, nonce: randomBytes(24).toString("base64url"),
-    runId: input.runId, sourceHost: input.sourceHost, entryDigest: input.entryDigest, sceneVersion: COMPATIBILITY_SCENE_VERSION,
+    runId: input.runId, sourceHost: input.sourceHost, entryDigest: input.entryDigest, sceneVersion,
     issuedAt: new Date(now).toISOString(), expiresAt: new Date(now + 60 * 60_000).toISOString() };
   return signCompatibilityPayload(payload, destination);
 }
@@ -56,7 +64,7 @@ export async function importCompatibilityRun(options: ImportCompatibilityRunOpti
   const ticket = options.authorization as unknown as CompatibilityRunAuthorization;
   if (!Number.isFinite(Date.parse(ticket.issuedAt)) || !Number.isFinite(Date.parse(ticket.expiresAt)) || ticket.v !== 2 || ticket.kind !== "compatibility-run-authorization" || ticket.domain !== "destination-authorization"
     || !ticket.sourceHost || ticket.sourceHost.hostId === destination.hostId || ticket.sourceHost.fingerprint === destination.fingerprint
-    || ticket.sceneVersion !== COMPATIBILITY_SCENE_VERSION || Date.parse(ticket.issuedAt) > now + 5_000 || Date.parse(ticket.expiresAt) <= now) throw new OperationsError("COMPATIBILITY_AUTHORIZATION_INVALID");
+    || ticket.sceneVersion === undefined || sceneSegments(ticket.sceneVersion) === undefined || Date.parse(ticket.issuedAt) > now + 5_000 || Date.parse(ticket.expiresAt) <= now) throw new OperationsError("COMPATIBILITY_AUTHORIZATION_INVALID");
   await assertPrivateDirectory(dirname(resolve(options.readinessPath)));
   const ready: unknown = JSON.parse((await readPrivateFile(options.readinessPath, 64 * 1024)).toString("utf8"));
   if (!verifyCompatibilityPayload(ready, ticket.sourceHost)) throw new OperationsError("COMPATIBILITY_SOURCE_UNTRUSTED");
@@ -94,7 +102,7 @@ export async function importCompatibilityRun(options: ImportCompatibilityRunOpti
   // its recovery records importable, or the production manifest (which
   // requires a trusted recovery entry) could never exist after import.
   const passedRecords = entries.filter((entry) => entry.result === "passed" && entry.capability === entry.kind);
-  const capabilities = [...new Set(passedRecords.map((entry) => entry.kind))].sort() as ("turn" | "recovery")[];
+  const capabilities = [...new Set(passedRecords.map((entry) => entry.kind))].sort() as CompatibilityImportCapability[];
   const payload = signCompatibilityPayload({ v: 2, kind: "compatibility-import", domain: "destination-endorsement",
     sourceHost: ticket.sourceHost, runId: ticket.runId, entryDigest: ticket.entryDigest, sceneVersion: ticket.sceneVersion,
     authorizationDigest: (options.authorization as { digest: string }).digest, readinessDigest: handshake.digest, artifactDigest,

@@ -13,7 +13,12 @@ import { OperationsError } from "../operations/operation-files.js";
 import { compatibilityEvidenceArtifactDigest, assertCompleteCompatibilityArtifact, type NativeCompatibilityArtifact, type CompatibilityEvidenceArtifact } from "./compatibility-evidence.js";
 import { compatibilityDigest, verifyCompatibilityPayload, type CompatibilityHostIdentity } from "./compatibility-integrity.js";
 import type { CompatibilityRunAuthorization } from "./compatibility-import.js";
-import { assertControlledCompatibilityEntry, COMPATIBILITY_BASIC_PROMPT, COMPATIBILITY_SCENE_VERSION, type CompatibilityReadinessOptions } from "./compatibility-readiness.js";
+import { assertControlledCompatibilityEntry, COMPATIBILITY_SCENE_VERSION, type CompatibilityReadinessOptions } from "./compatibility-readiness.js";
+import {
+  compatibilitySceneCommandIds as sceneRegistryCommandIds,
+  sceneSegments,
+  sceneSegmentCommandIds,
+} from "./compatibility-scenes.js";
 
 declare const scenePermit: unique symbol;
 declare const versionProbeAuthority: unique symbol;
@@ -57,10 +62,10 @@ export type CompatibilityVersionProbeOptions = Omit<CompatibilityScenePolicyOpti
 function fail(code: string): never { throw new OperationsError(code); }
 const same = (left: unknown, right: unknown) => compatibilityDigest(left) === compatibilityDigest(right);
 const bytesDigest = (value: string | Uint8Array) => createHash("sha256").update(value).digest("hex");
+/** Legacy c3 helper kept for back-compat with existing tickets and tests. */
 export function compatibilitySceneCommandIds(runId: string): readonly string[] {
   if (!/^[a-zA-Z0-9-]{1,128}$/.test(runId)) fail("COMPATIBILITY_RUN_MISMATCH");
-  const prefix = compatibilityDigest({ sceneVersion: COMPATIBILITY_SCENE_VERSION, runId }).slice(0, 32);
-  return Object.freeze(Array.from({ length: 10 }, (_, index) => `compat-${prefix}-${index + 1}`));
+  return sceneRegistryCommandIds(COMPATIBILITY_SCENE_VERSION, runId);
 }
 const within = (root: string, path: string) => { const value = relative(root, path); return !!value && value !== ".." && !value.startsWith("../") && !isAbsolute(value); };
 
@@ -68,6 +73,8 @@ const within = (root: string, path: string) => { const value = relative(root, pa
 export class CompatibilityScenePolicy {
   private readonly permits = new WeakMap<object, CompatibilitySceneStart>();
   readonly commandIds: readonly string[];
+  /** commandId -> the fixed segment prompt pinned for that slot. */
+  private readonly promptByCommandId: ReadonlyMap<string, string>;
   private readonly binding: CompatibilitySceneBinding;
   private readonly ticket: CompatibilityRunAuthorization;
   private readonly ticketDigest: string;
@@ -75,7 +82,13 @@ export class CompatibilityScenePolicy {
     this.ticket = options.authorization as CompatibilityRunAuthorization;
     this.ticketDigest = compatibilityDigest(options.authorization);
     this.binding = Object.freeze({ ...options.currentBinding() });
-    this.commandIds = compatibilitySceneCommandIds(this.ticket.runId);
+    if (!/^[a-zA-Z0-9-]{1,128}$/.test(this.ticket.runId)) fail("COMPATIBILITY_RUN_MISMATCH");
+    this.commandIds = sceneRegistryCommandIds(this.ticket.sceneVersion, this.ticket.runId);
+    const pairs = new Map<string, string>();
+    for (const segment of sceneSegments(this.ticket.sceneVersion)!) {
+      for (const commandId of sceneSegmentCommandIds(this.ticket.sceneVersion, this.ticket.runId, segment.id)) pairs.set(commandId, segment.prompt);
+    }
+    this.promptByCommandId = pairs;
   }
   static async create(options: CompatibilityScenePolicyOptions): Promise<CompatibilityScenePolicy> {
     const checked = await assertControlledCompatibilityEntry(options.entry);
@@ -107,7 +120,7 @@ export class CompatibilityScenePolicy {
     assertRestoreWriteReady(options.store.db);
     if (!verifyCompatibilityPayload(options.authorization, options.expectedDestination) || compatibilityDigest(options.authorization) !== this.ticketDigest
       || ticket.v !== 2 || ticket.kind !== "compatibility-run-authorization" || ticket.domain !== "destination-authorization"
-      || ticket.sceneVersion !== COMPATIBILITY_SCENE_VERSION || ticket.runId !== options.entry.runId
+      || sceneSegments(ticket.sceneVersion) === undefined || ticket.runId !== options.entry.runId
       || !Number.isFinite(Date.parse(ticket.issuedAt)) || !Number.isFinite(Date.parse(ticket.expiresAt))
       || Date.parse(ticket.issuedAt) > this.now() + 5_000 || Date.parse(ticket.expiresAt) <= this.now()
       || Date.parse(ticket.expiresAt) - Date.parse(ticket.issuedAt) > 60 * 60_000) fail("COMPATIBILITY_AUTHORIZATION_INVALID");
@@ -142,8 +155,9 @@ export class CompatibilityScenePolicy {
   }
   private assertStart(input: CompatibilitySceneStart): void {
     this.assertSource();
-    if (input.method !== "session.startTurn" || input.prompt !== COMPATIBILITY_BASIC_PROMPT || input.sessionId !== this.binding.sessionId
-      || !this.commandIds.includes(input.commandId) || !/^[a-f0-9]{64}$/.test(input.requestHash)) fail("COMPATIBILITY_SCENE_REQUEST_REJECTED");
+    if (input.method !== "session.startTurn" || input.sessionId !== this.binding.sessionId
+      || !this.commandIds.includes(input.commandId) || this.promptByCommandId.get(input.commandId) !== input.prompt
+      || !/^[a-f0-9]{64}$/.test(input.requestHash)) fail("COMPATIBILITY_SCENE_REQUEST_REJECTED");
     this.options.assertBaseline(input.actorId, input.sessionId);
     const actor = this.options.store.getDevice(input.actorId);
     if (!actor || actor.revokedAt || actor.expiresAt && Date.parse(actor.expiresAt) <= this.now() || !actor.scopes.includes("session:write")) fail("COMPATIBILITY_SCENE_DEVICE_REJECTED");
@@ -168,13 +182,15 @@ export class CompatibilityScenePolicy {
   assertAcceptInCommit<T>(permit: CompatibilityScenePermit, input: { request: CommandRequest; plan: CommandPlan<T> }): void {
     if (!this.options.store.db.inTransaction) fail("COMPATIBILITY_SCENE_TRANSACTION_REQUIRED");
     const original = this.original(permit), { request, plan } = input;
+    const segmentPrompt = this.promptByCommandId.get(original.commandId);
+    if (!segmentPrompt) fail("COMPATIBILITY_SCENE_REQUEST_REJECTED");
     if (request.authSubjectId !== original.actorId || request.commandId !== original.commandId || request.method !== original.method
       || request.targetSessionId !== original.sessionId || request.requestHash !== original.requestHash || request.actorKind === "host") fail("COMPATIBILITY_SCENE_REQUEST_REJECTED");
     const intent = plan.intents?.[0], turn = plan.turns?.[0], receipt = plan.receipts?.[0];
     if (plan.intents?.length !== 1 || plan.turns?.length !== 1 || plan.receipts?.length !== 1 || !intent || !turn || !receipt
       || intent.kind !== "start_turn" || intent.actorKind !== "device" || intent.commandId !== original.commandId || intent.authSubjectId !== original.actorId
-      || intent.sessionId !== original.sessionId || intent.requestHash !== original.requestHash || (intent.payload as { prompt?: unknown }).prompt !== COMPATIBILITY_BASIC_PROMPT
-      || turn.prompt !== COMPATIBILITY_BASIC_PROMPT || turn.turnId !== intent.turnId || turn.attemptId !== intent.attemptId
+      || intent.sessionId !== original.sessionId || intent.requestHash !== original.requestHash || (intent.payload as { prompt?: unknown }).prompt !== segmentPrompt
+      || turn.prompt !== segmentPrompt || turn.turnId !== intent.turnId || turn.attemptId !== intent.attemptId
       || receipt.commandId !== original.commandId || receipt.authSubjectId !== original.actorId || receipt.requestHash !== original.requestHash || receipt.state !== "accepted"
       || !intent.dispatchContext || intent.dispatchContext.hostOwnerId !== this.options.owner.ownerId || intent.dispatchContext.hostOwnerGeneration !== this.options.owner.generation) fail("COMPATIBILITY_SCENE_PLAN_REJECTED");
     const payload = intent.payload as Record<string, unknown>;
@@ -186,12 +202,16 @@ export class CompatibilityScenePolicy {
     // A rolled-back plan consumes no slot, while another actor cannot reuse a slot.
     const reservations = this.options.store.db.prepare("SELECT auth_subject_id,command_id FROM execution_intents WHERE command_id IN (" + this.commandIds.map(() => "?").join(",") + ")").all(...this.commandIds) as { auth_subject_id: string; command_id: string }[];
     const count = new Set(reservations.map((row) => row.command_id)).size;
-    if (reservations.some((row) => row.command_id === original.commandId) || count >= 10) fail("COMPATIBILITY_SCENE_COMMAND_CONSUMED");
+    // The full flat scene order (basic slots first, then each interactive
+    // segment in registry order) governs: a run must consume its scene in
+    // exactly the registered order.
+    if (reservations.some((row) => row.command_id === original.commandId) || count >= this.commandIds.length) fail("COMPATIBILITY_SCENE_COMMAND_CONSUMED");
     if (this.commandIds[count] !== original.commandId) fail("COMPATIBILITY_SCENE_COMMAND_ORDER_INVALID");
   }
   assertDispatch(input: { intent: ExecutionIntentRow; context: DispatchContext; phase?: "before_claim" | "before_marker" | "spawn" }): void {
     const intent = input.intent;
     const original: CompatibilitySceneStart = { actorId: intent.authSubjectId, commandId: intent.commandId, method: "session.startTurn", prompt: (intent.payload as { prompt?: string }).prompt ?? "", requestHash: intent.requestHash, sessionId: intent.sessionId };
+    const dispatchPrompt = this.promptByCommandId.get(original.commandId);
     this.assertStart(original);
     const saved = new ExecutionStore(this.options.store).get(intent.id), receipt = this.options.store.getCommandReceipt(intent.authSubjectId, intent.commandId);
     const turn = intent.turnId ? this.options.store.getTurn(intent.turnId) : undefined;
@@ -201,7 +221,7 @@ export class CompatibilityScenePolicy {
       || saved.state !== "pending" && (saved.claimOwnerId !== this.options.owner.ownerId || saved.claimOwnerGeneration !== this.options.owner.generation)
       || !saved.dispatchContext || !same(saved.dispatchContext, input.context) || input.context.hostOwnerId !== this.options.owner.ownerId || input.context.hostOwnerGeneration !== this.options.owner.generation
       || !turn || turn.id !== input.context.flyxTurnId || turn.attemptId !== input.context.attemptId || turn.generation !== input.context.runtimeGeneration
-      || turn.commandId !== original.commandId || turn.authSubjectId !== original.actorId || turn.prompt !== COMPATIBILITY_BASIC_PROMPT
+      || turn.commandId !== original.commandId || turn.authSubjectId !== original.actorId || turn.prompt !== dispatchPrompt
       || this.options.store.getActiveTurn(original.sessionId)?.id !== turn.id) fail("COMPATIBILITY_SCENE_DISPATCH_REJECTED");
     const duplicates = this.options.store.db.prepare("SELECT COUNT(*) AS n FROM execution_intents WHERE command_id=? AND kind='start_turn'").get(original.commandId) as { n: number };
     if (duplicates.n !== 1) fail("COMPATIBILITY_SCENE_COMMAND_CONSUMED");
@@ -218,7 +238,7 @@ export class CompatibilityScenePolicy {
     if (!intent.dispatchContext || !same(intent.dispatchContext, context) || context.hostOwnerId !== this.options.owner.ownerId || context.hostOwnerGeneration !== this.options.owner.generation
       || !["dispatching", "acknowledged", "settled"].includes(intent.state) || !receipt || receipt.method !== "session.startTurn" || receipt.requestHash !== intent.requestHash
       || !turn || turn.attemptId !== context.attemptId || turn.generation !== context.runtimeGeneration || turn.commandId !== intent.commandId
-      || turn.authSubjectId !== intent.authSubjectId || turn.prompt !== COMPATIBILITY_BASIC_PROMPT) fail("COMPATIBILITY_SCENE_OBSERVATION_REJECTED");
+      || turn.authSubjectId !== intent.authSubjectId || turn.prompt !== this.promptByCommandId.get(intent.commandId)) fail("COMPATIBILITY_SCENE_OBSERVATION_REJECTED");
   }
 }
 export const createCompatibilityScenePolicy = CompatibilityScenePolicy.create;

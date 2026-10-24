@@ -6,6 +6,7 @@ import type { HostIdentityFileV1 } from "../identity/host-identity.js";
 import { assertPrivateDirectory, OperationsError, syncDirectory, writePrivateFile } from "../operations/operation-files.js";
 import { assertCompleteCompatibilityArtifact, compatibilityEvidenceHash, type NativeCompatibilityArtifact } from "./compatibility-evidence.js";
 import { signCompatibilityPayload } from "./compatibility-integrity.js";
+import { sceneSegments } from "./compatibility-scenes.js";
 
 export const COMPATIBILITY_SCENE_VERSION = "flyx-c3-basic-v1";
 export const COMPATIBILITY_BASIC_PROMPT = "回复 OK 两个字母，不要做任何其他事";
@@ -24,6 +25,8 @@ export interface CompatibilityReadinessOptions {
   workspace: string;
   artifact: NativeCompatibilityArtifact;
   authMode: "unknown" | "signed_in" | "api_key";
+  /** Registered scene this run executes; defaults to the c3 basic scene. */
+  sceneVersion?: string | undefined;
 }
 const refuse = (code: string): never => { throw new OperationsError(code); };
 const inside = (root: string, path: string) => { const part = relative(root, path); return !!part && part !== ".." && !part.startsWith("../") && !isAbsolute(part); };
@@ -54,6 +57,8 @@ export async function assertControlledCompatibilityEntry(options: CompatibilityR
 }
 /** Private production handshake. Pairing material is never returned or logged. */
 export async function writeCompatibilityReadiness(options: CompatibilityReadinessOptions): Promise<void> {
+  const sceneVersion = options.sceneVersion ?? COMPATIBILITY_SCENE_VERSION;
+  if (sceneSegments(sceneVersion) === undefined) refuse("COMPATIBILITY_SCENE_VERSION_UNSUPPORTED");
   const checked = await assertControlledCompatibilityEntry(options);
   const base = new URL(options.baseUrl);
   if (base.protocol !== "http:" || !["127.0.0.1", "[::1]", "localhost"].includes(base.hostname)
@@ -70,7 +75,7 @@ export async function writeCompatibilityReadiness(options: CompatibilityReadines
     const payload = signCompatibilityPayload({
       v: 2, domain: "isolated-real", pid: process.pid, runId: options.runId, baseUrl: base.origin, provider: options.provider,
       credentialFile, credentialDigest: compatibilityEvidenceHash(options.pairingToken), entry: "production-main", entryPath: checked.entryPath,
-      entryDigest: checked.entryDigest, buildDigest: options.artifact.runtimeDigest, sceneVersion: COMPATIBILITY_SCENE_VERSION,
+      entryDigest: checked.entryDigest, buildDigest: options.artifact.runtimeDigest, sceneVersion,
       observed: { ...Object.fromEntries(Object.entries(options.artifact).filter(([, value]) => value !== undefined)), cliVersion: options.artifact.providerVersion, authMode: options.authMode }, createdAt: new Date().toISOString(),
     }, options.identity);
     await writePrivateFile(temporary, JSON.stringify(payload) + "\n");

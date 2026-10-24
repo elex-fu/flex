@@ -127,6 +127,8 @@ export interface IsolatedCompatibilityRun {
   compatibilityScene(): NativeHistorySceneBootstrap | undefined;
   /** Binds the scene policy to the run, constructing the committed-stop recorder from the validated ticket. */
   attachScene(policy: CompatibilityScenePolicy): void;
+  /** The ticket's sceneVersion; validated against the registry by the scene policy and readiness stamp. */
+  sceneVersion(): string | undefined;
   authMode(): "unknown" | "signed_in" | "api_key";
 }
 
@@ -199,6 +201,7 @@ export function createIsolatedCompatibilityRun(options: IsolatedCompatibilityRun
       // live process, so these bound values are the validated ones.
       recorder = createCompatibilityCommittedRecorder({ db: options.store.db, identity: options.identity, path: options.compatibilityEvidencePath,
         runId: ticket.runId, entryDigest: ticket.entryDigest, facts,
+        sceneVersion: ticket.sceneVersion,
         assertSceneObservation: (context: DispatchContext) => policy.assertObservation(context) });
       // The scene's own authorization for manifest bootstrap (design §8.2):
       // run/entry bound to the validated ticket, artifact re-measured live so
@@ -206,6 +209,7 @@ export function createIsolatedCompatibilityRun(options: IsolatedCompatibilityRun
       scene = Object.freeze({ runId: ticket.runId, entryDigest: ticket.entryDigest, artifact: () => facts!.measure() });
     },
     compatibilityScene: () => scene,
+    sceneVersion: () => typeof ticket.sceneVersion === "string" ? ticket.sceneVersion : undefined,
     authMode: () => observeCompatibilityAuthMode(options.provider),
   });
 }

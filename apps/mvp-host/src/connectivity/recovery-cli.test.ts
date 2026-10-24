@@ -91,7 +91,8 @@ describe("offline recovery CLI under retained original guards", () => {
     const store = openReadOnly(f.options.databasePath);
     try {
       expect(store.db.prepare("SELECT residency_state FROM session_catalog WHERE session_id='original-session'").get()).toEqual({ residency_state: "unloaded" });
-      expect(store.db.prepare("SELECT type FROM session_events WHERE session_id='original-session' ORDER BY id DESC LIMIT 1").get()).toEqual({ type: "session.recovery.residency.reconciled" });
+      // session_events.id is a random UUID; insertion order lives in sequence.
+      expect(store.db.prepare("SELECT type FROM session_events WHERE session_id='original-session' ORDER BY sequence DESC LIMIT 1").get()).toEqual({ type: "session.recovery.residency.reconciled" });
     } finally { store.close(); }
   });
 

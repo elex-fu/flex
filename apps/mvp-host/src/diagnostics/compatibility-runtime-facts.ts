@@ -19,7 +19,7 @@ import { CompatibilityEvidenceRecorder, compatibilityEvidenceHash, type NativeCo
 import { compatibilityCanonicalJson, compatibilityDigest } from "./compatibility-integrity.js";
 import { COMPATIBILITY_SCENE_VERSION } from "./compatibility-readiness.js";
 import { sceneSegments } from "./compatibility-scenes.js";
-import { resolveManagedNativeProvenance } from "./managed-native-provenance.js";
+import { resolveManagedNativeProvenance, compatibilityInteractionAnchor, confirmedCompatibilityApprovalInteractions, resolveCompatibilityReconnectPin } from "./managed-native-provenance.js";
 import { measureRuntimeFile, measuredHostBuildDigest, type PlannedNativeArtifact } from "./planned-native-artifact.js";
 
 const fail = (code: string): never => { throw new OperationsError(code); };
@@ -156,13 +156,40 @@ export function createCompatibilityCommittedRecorder(options: {
   return Object.freeze({ drain: () => recorder.drain(),
     afterCommittedNativeStop: async (context: DispatchContext) => {
       const facts = await collectStopFacts(context);
-      const evidence: NativeCompatibilityEvidence = { provider: facts.provider, kind: "turn", capability: "turn", result: facts.source.type === "turn.completed" ? "passed" : "failed",
-        nativeEvent: facts.provider === "claude" ? "result" : "turn/completed", nativeSourceId: facts.nativeSourceId,
-        ...(facts.provider === "claude" ? { nativeResultId: facts.nativeSourceId } : { nativeTurnId: String(facts.binding.native_turn_id) }),
-        nativeSessionId: String(facts.binding.native_session_id), attemptId: context.attemptId, launchRef: facts.matches[0]!.id, stopRef: facts.matches[0]!.id,
-        evidenceCode: facts.source.type === "turn.completed" ? "NATIVE_TERMINAL_COMPLETED" : "NATIVE_TERMINAL_FAILED" };
       contexts.set(context.attemptId, context);
-      try { await recorder.record(evidence); } finally { contexts.delete(context.attemptId); }
+      try {
+        const completed = facts.source.type === "turn.completed";
+        // A cancelled terminal bound by an accepted session.interrupt control
+        // records the interrupt capability (design §5): import refuses any
+        // failed entry, so the interrupted turn never becomes kind "turn" failed.
+        const interrupted = facts.source.type === "turn.cancelled" && hasInterruptControl(options.db, context);
+        await recorder.record(interrupted
+          ? { provider: facts.provider, kind: "interrupt", capability: "interrupt", result: "passed",
+              nativeEvent: facts.provider === "claude" ? "result" : "turn/cancelled", nativeSourceId: facts.nativeSourceId,
+              ...(facts.provider === "claude" ? { nativeResultId: facts.nativeSourceId } : { nativeTurnId: String(facts.binding.native_turn_id) }),
+              nativeSessionId: String(facts.binding.native_session_id), attemptId: context.attemptId, launchRef: facts.matches[0]!.id, stopRef: facts.matches[0]!.id,
+              evidenceCode: "NATIVE_INTERRUPT_CANCELLED" }
+          : { provider: facts.provider, kind: "turn", capability: "turn", result: completed ? "passed" : "failed",
+              nativeEvent: facts.provider === "claude" ? "result" : "turn/completed", nativeSourceId: facts.nativeSourceId,
+              ...(facts.provider === "claude" ? { nativeResultId: facts.nativeSourceId } : { nativeTurnId: String(facts.binding.native_turn_id) }),
+              nativeSessionId: String(facts.binding.native_session_id), attemptId: context.attemptId, launchRef: facts.matches[0]!.id, stopRef: facts.matches[0]!.id,
+              evidenceCode: completed ? "NATIVE_TERMINAL_COMPLETED" : "NATIVE_TERMINAL_FAILED" });
+        if (completed && resolveCompatibilityReconnectPin(options.db, context, String(facts.binding.native_session_id))) {
+          await recorder.record({ provider: facts.provider, kind: "reconnect", capability: "reconnect", result: "passed",
+            nativeEvent: facts.provider === "claude" ? "result" : "turn/completed", nativeSourceId: facts.nativeSourceId,
+            ...(facts.provider === "claude" ? { nativeResultId: facts.nativeSourceId } : { nativeTurnId: String(facts.binding.native_turn_id) }),
+            nativeSessionId: String(facts.binding.native_session_id), attemptId: context.attemptId, launchRef: facts.matches[0]!.id, stopRef: facts.matches[0]!.id,
+            evidenceCode: "NATIVE_RECONNECT_RESUMED" });
+        }
+        for (const row of confirmedCompatibilityApprovalInteractions(options.db, context)) {
+          if (!row.native_request_id || !row.native_method) continue;
+          await recorder.record({ provider: facts.provider, kind: "approval", capability: "approval", result: "passed",
+              nativeEvent: row.native_method, nativeSourceId: compatibilityInteractionAnchor(row), nativeRequestId: row.native_request_id,
+              ...(facts.provider === "claude" ? { nativeResultId: facts.nativeSourceId } : { nativeTurnId: String(facts.binding.native_turn_id) }),
+              nativeSessionId: String(facts.binding.native_session_id), attemptId: context.attemptId, launchRef: facts.matches[0]!.id, stopRef: facts.matches[0]!.id,
+              evidenceCode: "NATIVE_APPROVAL_CONFIRMED" });
+        }
+      } finally { contexts.delete(context.attemptId); }
     },
     /**
      * Records one verified read-only native-history inspection (design §8.2
@@ -188,6 +215,13 @@ export function createCompatibilityCommittedRecorder(options: {
       try { await recorder.record(evidence); } finally { contexts.delete(context.attemptId); }
     },
   });
+
+  /** A session.interrupt control receipt bound to this turn (accepted or settled) proves the cancellation was commanded. */
+  function hasInterruptControl(db: Database.Database, context: DispatchContext): boolean {
+    return !!db.prepare(`SELECT 1 FROM command_receipts WHERE method='session.interrupt' AND state IN ('accepted','cancelled','completed')
+      AND json_extract(response_json,'$.turnId')=? AND (target_session_id IS NULL OR target_session_id=?) LIMIT 1`)
+      .get(context.flyxTurnId, context.sessionId);
+  }
 
   /** The shared fact chain behind both committed-stop and recovery-inspection evidence. */
   async function collectStopFacts(context: DispatchContext): Promise<{

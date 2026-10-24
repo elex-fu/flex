@@ -6,7 +6,7 @@ import { MANAGED_PROCESS_SCHEMA } from "../storage/migrations/004-managed-proces
 import { MANAGED_PROCESS_EVIDENCE_SCHEMA } from "../storage/migrations/005-process-evidence.js";
 import { providerConfigurationFingerprint } from "../lifecycle/host-activation-load.js";
 import { catalogRecoveryConfigurationFingerprint } from "../session/recovery-fingerprint.js";
-import { resolveManagedNativeProvenance, saveCompatibilityLaunchArtifact } from "./managed-native-provenance.js";
+import { resolveManagedNativeProvenance, saveCompatibilityLaunchArtifact, compatibilityInteractionAnchor, type CompatibilityInteractionAnchorRow } from "./managed-native-provenance.js";
 import type { DispatchContext } from "../provider/types.js";
 const databases: Database.Database[] = [];
 afterEach(() => { for (const db of databases.splice(0)) db.close(); });
@@ -22,7 +22,10 @@ function fixture() {
     CREATE TABLE sessions(id TEXT PRIMARY KEY,workspace_id TEXT);
     CREATE TABLE session_catalog(session_id TEXT PRIMARY KEY,provider_instance_id TEXT);
     CREATE TABLE workspaces(id TEXT PRIMARY KEY,canonical_root TEXT,worktree_root TEXT,checkout_key TEXT,kind TEXT,repository_id TEXT);
-    CREATE TABLE provider_instances(id TEXT PRIMARY KEY,provider TEXT,executable TEXT,config_json TEXT,policy_version INTEGER,policy_capabilities_json TEXT);`);
+    CREATE TABLE provider_instances(id TEXT PRIMARY KEY,provider TEXT,executable TEXT,config_json TEXT,policy_version INTEGER,policy_capabilities_json TEXT);
+    CREATE TABLE interactions(interaction_id TEXT PRIMARY KEY,session_id TEXT,turn_id TEXT,kind TEXT,attempt_id TEXT,runtime_id TEXT,runtime_generation INTEGER,native_request_id TEXT,native_method TEXT,status TEXT,created_at TEXT);
+    CREATE TABLE interaction_delivery_evidence(id TEXT PRIMARY KEY,interaction_id TEXT,kind TEXT,source_id TEXT,created_at TEXT);
+    CREATE TABLE execution_intents(id TEXT PRIMARY KEY,session_id TEXT,turn_id TEXT,attempt_id TEXT,kind TEXT,payload_json TEXT);`);
   const context: DispatchContext = { hostOwnerId: "owner", hostOwnerGeneration: 1, runtimeId: "runtime", runtimeGeneration: 1, attemptId: "attempt", sessionId: "session", flyxTurnId: "turn" };
   const proof = { version: 1 as const, boundaryId: "11111111-1111-4111-8111-111111111111", platform: "linux" as const, backend: "linux_bubblewrap" as const, kernelRelease: "fixture", backendVersion: "fixture", backendDigest: hash("a"), policyDigest: hash("b"), evidenceDigest: hash("c"), verifiedPrivateReadBoundary: true as const, verifiedPrivateWriteBoundary: true as const, verifiedChildInheritance: true as const, treeIsolation: "linux_pid_namespace" as const, verifiedDescendantStop: true };
   const artifact = { providerVersion: "1", executablePath: "/fixture/provider", executableDigest: hash("a"), configFingerprint: providerConfigurationFingerprint({ config: providerConfig, policyVersion }), adapterId: "fixture", adapterVersion: "1", runtimeVersion: "1", runtimeDigest: hash("d"), nodeVersion: "24.0.0", os: "linux fixture", supervisionContractId: "native-boundary/v1/linux_bubblewrap/" + hash("c") };
@@ -102,5 +105,70 @@ describe("original journal provenance using explicit structural fixtures", () =>
     // Two native-terminal observations of the same original turn stay ambiguous.
     f.db.prepare("INSERT INTO session_events VALUES(?,?,?,?,?)").run("committed-event-2", "session", 2, "turn.cancelled", JSON.stringify({ dispatchContext: f.context, terminalEvidence: { kind: "native-terminal", sourceId: "native-source-2" } }));
     expect(() => resolveManagedNativeProvenance(f.db, f.context, recovery, f.artifact)).toThrow("COMPATIBILITY_ORIGINAL_NATIVE_EVENT_MISSING");
+  });
+});
+
+describe("interactive provenance (interrupt / approval / reconnect)", () => {
+  const interactionRow: CompatibilityInteractionAnchorRow = {
+    interaction_id: "interaction-1", session_id: "session", turn_id: "turn", attempt_id: "attempt",
+    runtime_id: "runtime", runtime_generation: 1, native_request_id: "toolu-1", native_method: "item/commandExecution/requestApproval",
+  };
+  function insertConfirmedInteraction(f: ReturnType<typeof fixture>) {
+    f.db.prepare(`INSERT INTO interactions(interaction_id,session_id,turn_id,kind,attempt_id,runtime_id,runtime_generation,native_request_id,native_method,status,created_at)
+      VALUES(?,?,?,?,?,?,?,?,?,?,?)`)
+      .run(interactionRow.interaction_id, interactionRow.session_id, interactionRow.turn_id, "approval", interactionRow.attempt_id,
+        interactionRow.runtime_id, interactionRow.runtime_generation, interactionRow.native_request_id, interactionRow.native_method,
+        "confirmed", "2026-01-01T00:00:00.000Z");
+    f.db.prepare("INSERT INTO interaction_delivery_evidence(id,interaction_id,kind,source_id,created_at) VALUES(?,?,?,?,?)")
+      .run("delivery-1", interactionRow.interaction_id, "native-ack", "native-ack-source", "2026-01-01T00:00:00.000Z");
+  }
+  it("pins a commanded interrupt to the original cancelled terminal", () => {
+    const f = fixture();
+    const interrupt = { ...f.evidence, kind: "interrupt" as const, nativeEvent: "turn/cancelled", stopRef: "process", evidenceCode: "NATIVE_INTERRUPT_CANCELLED" };
+    // A passed interrupt requires the turn.cancelled terminal, not turn.completed.
+    expect(() => resolveManagedNativeProvenance(f.db, f.context, interrupt, f.artifact)).toThrow("COMPATIBILITY_ORIGINAL_NATIVE_EVENT_MISSING");
+    f.db.prepare("UPDATE session_events SET type='turn.cancelled'").run();
+    const observed = resolveManagedNativeProvenance(f.db, f.context, interrupt, f.artifact);
+    expect(observed.stopRecordDigest).toMatch(/^[a-f0-9]{64}$/);
+    expect(observed.nativeObservationDigest).toMatch(/^[a-f0-9]{64}$/);
+  });
+  it("verifies a confirmed approval interaction anchor with native-ack delivery", () => {
+    const f = fixture(); insertConfirmedInteraction(f);
+    const approval = { ...f.evidence, kind: "approval" as const, nativeEvent: "item/commandExecution/requestApproval",
+      nativeSourceId: compatibilityInteractionAnchor(interactionRow), nativeRequestId: "toolu-1", evidenceCode: "NATIVE_APPROVAL_CONFIRMED" };
+    const observed = resolveManagedNativeProvenance(f.db, f.context, approval, f.artifact);
+    expect(observed.nativeObservationDigest).toMatch(/^[a-f0-9]{64}$/);
+    // Another native request id has no confirmed interaction row.
+    expect(() => resolveManagedNativeProvenance(f.db, f.context, { ...approval, nativeRequestId: "other-request" }, f.artifact)).toThrow("COMPATIBILITY_INTERACTION_ANCHOR_MISSING");
+    // Provider routing mismatch: a claude method on a codex record.
+    f.db.prepare("UPDATE interactions SET native_method='canUseTool/approval'").run();
+    expect(() => resolveManagedNativeProvenance(f.db, f.context, approval, f.artifact)).toThrow("COMPATIBILITY_INTERACTION_ANCHOR_MISMATCH");
+    f.db.prepare("UPDATE interactions SET native_method=?").run(interactionRow.native_method);
+    // A nativeSourceId that is not the interaction row digest anchor.
+    expect(() => resolveManagedNativeProvenance(f.db, f.context, { ...approval, nativeSourceId: "sha256:not-the-anchor" }, f.artifact)).toThrow("COMPATIBILITY_INTERACTION_ANCHOR_MISMATCH");
+    // Confirmed but never delivered to the provider.
+    f.db.exec("DELETE FROM interaction_delivery_evidence");
+    expect(() => resolveManagedNativeProvenance(f.db, f.context, approval, f.artifact)).toThrow("COMPATIBILITY_INTERACTION_DELIVERY_UNVERIFIED");
+  });
+  it("verifies a reconnect pin: one resume intent plus an earlier binding under another host generation", () => {
+    const f = fixture();
+    const earlier = { ...f.context, flyxTurnId: "turn-earlier", attemptId: "attempt-earlier", hostOwnerGeneration: 0 };
+    f.db.prepare("INSERT INTO native_turn_bindings(turn_id,attempt_id,provider,provider_instance_id,session_id,native_session_id,native_turn_id,workspace_path,configuration_fingerprint,verified_version,context_json) VALUES(?,?,?,?,?,?,?,?,?,?,?)")
+      .run(earlier.flyxTurnId, earlier.attemptId, "codex", "provider-instance", "session", "native-session", "native-turn-earlier", "/fixture/canonical", "irrelevant-fingerprint", "unknown", JSON.stringify(earlier));
+    const reconnect = { ...f.evidence, kind: "reconnect" as const, evidenceCode: "NATIVE_RECONNECT_RESUMED" };
+    // Without the start intent's resume pin there is no reconnect.
+    expect(() => resolveManagedNativeProvenance(f.db, f.context, reconnect, f.artifact)).toThrow("COMPATIBILITY_RECONNECT_PIN_MISSING");
+    f.db.prepare("INSERT INTO execution_intents(id,session_id,turn_id,attempt_id,kind,payload_json) VALUES(?,?,?,?,?,?)")
+      .run("intent-1", "session", "turn", "attempt", "start_turn", JSON.stringify({ turnId: "turn", prompt: "fixture", resumeSessionId: "native-session" }));
+    const observed = resolveManagedNativeProvenance(f.db, f.context, reconnect, f.artifact);
+    expect(observed.nativeObservationDigest).toMatch(/^[a-f0-9]{64}$/);
+    // The same native session under the same host generation is a plain
+    // continuation, not a host-restart reconnect.
+    f.db.prepare("UPDATE native_turn_bindings SET context_json=? WHERE turn_id=?").run(JSON.stringify({ ...earlier, hostOwnerGeneration: f.context.hostOwnerGeneration }), earlier.flyxTurnId);
+    expect(() => resolveManagedNativeProvenance(f.db, f.context, reconnect, f.artifact)).toThrow("COMPATIBILITY_RECONNECT_PIN_MISSING");
+    // Two matching resume intents are ambiguous.
+    f.db.prepare("UPDATE native_turn_bindings SET context_json=? WHERE turn_id=?").run(JSON.stringify(earlier), earlier.flyxTurnId);
+    f.db.prepare("INSERT INTO execution_intents VALUES(?,?,?,?,?,?)").run("intent-2", "session", "turn", "attempt", "start_turn", JSON.stringify({ turnId: "turn", prompt: "fixture", resumeSessionId: "native-session" }));
+    expect(() => resolveManagedNativeProvenance(f.db, f.context, reconnect, f.artifact)).toThrow("COMPATIBILITY_RECONNECT_PIN_MISSING");
   });
 });

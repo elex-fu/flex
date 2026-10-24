@@ -14,6 +14,45 @@ import { compatibilityCanonicalJson, compatibilityDigest } from "./compatibility
 
 const key = (id: string) => "compatibility-launch/v1/" + id;
 const refuse = (code: string): never => { throw new OperationsError(code); };
+/** Provider-routed native approval methods (mirror of interaction methodMatches for kind "approval"). */
+const APPROVAL_METHODS = new Set(["canUseTool/approval", "item/commandExecution/requestApproval", "item/fileChange/requestApproval"]);
+/** Stable projection of a confirmed interaction row; the recorder and provenance derive the same anchor from it. */
+export type CompatibilityInteractionAnchorRow = {
+  interaction_id: string; session_id: string; turn_id: string; attempt_id: string | null;
+  runtime_id: string | null; runtime_generation: number | null; native_request_id: string | null; native_method: string | null;
+};
+/** Deterministic digest anchor for one confirmed approval interaction (design §5). */
+export function compatibilityInteractionAnchor(row: CompatibilityInteractionAnchorRow): string {
+  return compatibilityDigest({ interactionId: row.interaction_id, sessionId: row.session_id, turnId: row.turn_id,
+    attemptId: row.attempt_id, nativeRequestId: row.native_request_id, nativeMethod: row.native_method, status: "confirmed" });
+}
+/** Confirmed native-ack approvals for exactly this dispatch context; the recorder records one evidence row per entry. */
+export function confirmedCompatibilityApprovalInteractions(db: Database.Database, context: DispatchContext): CompatibilityInteractionAnchorRow[] {
+  return db.prepare(`SELECT interaction_id,session_id,turn_id,attempt_id,runtime_id,runtime_generation,native_request_id,native_method
+    FROM interactions WHERE session_id=? AND turn_id=? AND attempt_id=? AND kind='approval' AND status='confirmed'
+    AND native_request_id IS NOT NULL AND runtime_id=? AND runtime_generation=? ORDER BY created_at,interaction_id`)
+    .all(context.sessionId, context.flyxTurnId, context.attemptId, context.runtimeId, context.runtimeGeneration) as CompatibilityInteractionAnchorRow[];
+}
+/**
+ * Reconnect pin (design §5): the turn's start intent resumed the session's
+ * pre-restart native session id, and the binding that established that native
+ * session id ran under a different host owner generation (a host restart).
+ */
+export function resolveCompatibilityReconnectPin(db: Database.Database, context: DispatchContext, nativeSessionId: string): { resumeSessionId: string; establishedGeneration: number } | undefined {
+  const intents = db.prepare(`SELECT payload_json FROM execution_intents WHERE session_id=? AND turn_id=? AND attempt_id=? AND kind='start_turn'`)
+    .all(context.sessionId, context.flyxTurnId, context.attemptId) as Array<{ payload_json: string }>;
+  const resumes = intents.map((row) => JSON.parse(row.payload_json) as { resumeSessionId?: unknown })
+    .filter((payload) => typeof payload.resumeSessionId === "string" && payload.resumeSessionId === nativeSessionId);
+  if (resumes.length !== 1) return undefined;
+  const established = db.prepare(`SELECT turn_id,attempt_id,context_json FROM native_turn_bindings WHERE session_id=? AND native_session_id=? ORDER BY rowid`)
+    .all(context.sessionId, nativeSessionId) as Array<{ turn_id: string; attempt_id: string; context_json: string }>;
+  const original = established.find((row) => row.turn_id !== context.flyxTurnId || row.attempt_id !== context.attemptId);
+  if (!original) return undefined;
+  const originalContext = JSON.parse(original.context_json) as DispatchContext;
+  if (typeof originalContext.hostOwnerId !== "string" || typeof originalContext.hostOwnerGeneration !== "number"
+    || originalContext.sessionId !== context.sessionId || originalContext.hostOwnerGeneration === context.hostOwnerGeneration) return undefined;
+  return { resumeSessionId: nativeSessionId, establishedGeneration: originalContext.hostOwnerGeneration };
+}
 /** Called by the actual spawn journal after durable launching/boundary commit and before OS spawn. */
 export function saveCompatibilityLaunchArtifact(db: Database.Database, input: {
   processId: string; launchDigest: string; artifact: NativeCompatibilityArtifact; assertOwner: () => void;
@@ -53,7 +92,7 @@ export function resolveManagedNativeProvenance(db: Database.Database, context: D
   // resultUuid:resultDigest / Codex thread-read digest), never the original
   // terminal event, and its status match is proven by the recorder before
   // record(); provenance still pins the original event and binding below.
-  if (!["turn", "interrupt", "stop", "recovery"].includes(evidence.kind) || !evidence.launchRef || !evidence.nativeSourceId
+  if (!["turn", "interrupt", "stop", "recovery", "approval", "reconnect"].includes(evidence.kind) || !evidence.launchRef || !evidence.nativeSourceId
     || evidence.provider === "claude" && evidence.nativeResultId !== undefined && evidence.nativeResultId !== evidence.nativeSourceId
     || evidence.attemptId !== context.attemptId) refuse("COMPATIBILITY_NATIVE_SOURCE_UNSUPPORTED");
   return db.transaction(() => {
@@ -122,10 +161,41 @@ export function resolveManagedNativeProvenance(db: Database.Database, context: D
         // by its digest below, not by the read-path sourceId.
         return true;
       }
+      if (evidence.kind === "approval") {
+        // An approval is not a terminal: the original terminal event is pinned
+        // by identity and digest, while the interaction row below carries the
+        // request anchor (nativeSourceId) and the native-ack delivery proof.
+        return true;
+      }
       return payload.terminalEvidence.sourceId === evidence.nativeSourceId
-        && (evidence.result !== "passed" || row.type === (evidence.kind === "turn" ? "turn.completed" : "turn.cancelled"));
+        && (evidence.result !== "passed" || row.type === (evidence.kind === "turn" || evidence.kind === "reconnect" ? "turn.completed" : "turn.cancelled"));
     });
     if (native.length !== 1) refuse("COMPATIBILITY_ORIGINAL_NATIVE_EVENT_MISSING");
+    let interaction: { row: CompatibilityInteractionAnchorRow; delivery: Array<{ kind: string; source_id: string | null }> } | undefined;
+    let reconnect: { resumeSessionId: string; establishedGeneration: number } | undefined;
+    if (evidence.kind === "approval") {
+      // Exactly one confirmed interaction row for this attempt/native request;
+      // native-ack delivery with a source id proves the answer reached the
+      // provider, and the method's provider routing must be consistent.
+      const rows = db.prepare(`SELECT interaction_id,session_id,turn_id,attempt_id,runtime_id,runtime_generation,native_request_id,native_method
+        FROM interactions WHERE session_id=? AND turn_id=? AND attempt_id=? AND kind='approval' AND status='confirmed' AND native_request_id=?`)
+        .all(context.sessionId, context.flyxTurnId, context.attemptId, evidence.nativeRequestId) as CompatibilityInteractionAnchorRow[];
+      if (rows.length !== 1) return refuse("COMPATIBILITY_INTERACTION_ANCHOR_MISSING");
+      const row = rows[0]!;
+      if (row.runtime_id !== context.runtimeId || row.runtime_generation !== context.runtimeGeneration || !row.native_method
+        || !APPROVAL_METHODS.has(row.native_method) || (evidence.provider === "codex") !== row.native_method.startsWith("item/")
+        || compatibilityInteractionAnchor(row) !== evidence.nativeSourceId) refuse("COMPATIBILITY_INTERACTION_ANCHOR_MISMATCH");
+      const delivery = db.prepare(`SELECT kind,source_id FROM interaction_delivery_evidence WHERE interaction_id=? ORDER BY created_at,id`)
+        .all(row.interaction_id) as Array<{ kind: string; source_id: string | null }>;
+      if (!delivery.some((record) => record.kind === "native-ack" && record.source_id)) refuse("COMPATIBILITY_INTERACTION_DELIVERY_UNVERIFIED");
+      interaction = { row, delivery };
+    }
+    if (evidence.kind === "reconnect") {
+      // The binding guard above already refused an absent row; the assertion
+      // only satisfies narrowing the guard's never-returning helper loses.
+      reconnect = resolveCompatibilityReconnectPin(db, context, String(binding!.native_session_id));
+      if (!reconnect) return refuse("COMPATIBILITY_RECONNECT_PIN_MISSING");
+    }
     const identity = JSON.parse(String(launch.identity_json)) as ProcessIdentity;
     const boundary = JSON.parse(String(launch.boundary_json)) as unknown;
     const stop = launch.stop_json ? JSON.parse(String(launch.stop_json)) as ProcessTreeStopEvidence : undefined;
@@ -136,7 +206,11 @@ export function resolveManagedNativeProvenance(db: Database.Database, context: D
     return { provider: evidence.provider, attemptIdHash: compatibilityEvidenceHash(context.attemptId),
       launchRecordDigest: compatibilityDigest({ processId: evidence.launchRef, owner: [context.hostOwnerId, context.hostOwnerGeneration], runtime: [context.runtimeId, context.runtimeGeneration],
         attemptId: context.attemptId, sessionId: context.sessionId, turnId: context.flyxTurnId, identity, boundary, launchDigest: launch.launch_digest, snapshot: snapshot ?? null, plannedSnapshot: plannedSnapshot ?? null }),
-      nativeObservationDigest: compatibilityDigest({ event: native[0], binding }), stopRecordDigest: compatibilityDigest({ processId: evidence.launchRef, stop }),
+      nativeObservationDigest: interaction
+        ? compatibilityDigest({ interaction: interaction.row, delivery: interaction.delivery, terminal: native[0], binding })
+        : reconnect
+          ? compatibilityDigest({ event: native[0], binding, reconnect })
+          : compatibilityDigest({ event: native[0], binding }), stopRecordDigest: compatibilityDigest({ processId: evidence.launchRef, stop }),
       executableDigest: artifact.executableDigest!, runtimeDigest: artifact.runtimeDigest!, configFingerprint: artifact.configFingerprint!, supervisionContractId: artifact.supervisionContractId! };
   })();
 }

@@ -89,12 +89,14 @@ describe("production native revert composition (R6 L1)", { timeout: 20_000 }, ()
     ]);
   });
 
-  it("proves quiescence fail-closed on blocked recovery, live producers and missing stop evidence", async () => {
+  it("proves quiescence on blocked recovery, fail-closed on live producers and missing stop evidence", async () => {
     const f = await fixture({ verified: true, manifest });
     const operation = { sessionId: f.session.sessionId, operationId: "op-1" } as RevertOperation;
     expect((await f.production!.ports.proveQuiescence(operation)).proven).toBe(true);
+    // A blocked Session is fenced from new Turns; recovery inspection and
+    // rollback evidence must stay available while blocked.
     f.store.db.prepare("UPDATE sessions SET recovery_state='blocked' WHERE id=?").run(f.session.sessionId);
-    expect((await f.production!.ports.proveQuiescence(operation)).proven).toBe(false);
+    expect((await f.production!.ports.proveQuiescence(operation)).proven).toBe(true);
     f.store.db.prepare("UPDATE sessions SET recovery_state='idle' WHERE id=?").run(f.session.sessionId);
     f.insertProcess("process-running", "running", 4321);
     expect((await f.production!.ports.proveQuiescence(operation)).proven).toBe(false);

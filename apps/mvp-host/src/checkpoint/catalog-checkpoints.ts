@@ -4,19 +4,21 @@ import type { HostCatalog } from "../catalog/host-catalog.js";
 import type { ManagedGitRunner } from "../lifecycle/managed-git-runner.js";
 import { SessionOrchestrator } from "../session/orchestrator.js";
 import type { HostViews } from "../timeline/host-views.js";
-import { CHECKPOINT_RPC_SCOPES, HostCheckpoints, type HostRevertPorts } from "./host-checkpoints.js";
+import { CHECKPOINT_RPC_SCOPES, createHostCheckpoints, type HostRevertPorts } from "./host-checkpoints.js";
 import type { CheckpointServiceOptions } from "./checkpoint-service.js";
 import type { NativeRevertHandle } from "./native-revert-drivers.js";
 import type { CheckpointPhase } from "./types.js";
 
-/** One checkpoint service, bound to the actual lazy Session runtimes. */
-export function createCatalogCheckpoints(catalog: HostCatalog, views: HostViews, runner: ManagedGitRunner | undefined, revert?: HostRevertPorts, captureNativeAnchor?: (context: Parameters<NonNullable<CheckpointServiceOptions["captureNativeAnchor"]>>[0], phase: CheckpointPhase) => Promise<NativeRevertHandle | undefined>) {
+/** One checkpoint service, bound to the actual lazy Session runtimes. The
+ * async factory runs the real helper probe (prepare) so revert admission
+ * reflects the actual restore-helper availability, not a constructor default. */
+export async function createCatalogCheckpoints(catalog: HostCatalog, views: HostViews, runner: ManagedGitRunner | undefined, revert?: HostRevertPorts, captureNativeAnchor?: (context: Parameters<NonNullable<CheckpointServiceOptions["captureNativeAnchor"]>>[0], phase: CheckpointPhase) => Promise<NativeRevertHandle | undefined>) {
   const runtime = (sessionId: string) => {
     const host = catalog.registry.loaded(sessionId);
     if (!(host instanceof SessionOrchestrator)) throw new Error("CHECKPOINT_RUNTIME_UNAVAILABLE");
     return host;
   };
-  const checkpoints = new HostCheckpoints({
+  const checkpoints = await createHostCheckpoints({
     store: catalog.store, owner: catalog.owner, registry: catalog.registry, workspaces: catalog.workspaces, views,
     authorizeSession: (sessionId, actorId, scope) => catalog.assertActorSession(actorId, sessionId, scope),
     runGit: runner?.checkpointGitRunner() ?? (async () => { throw new Error("MANAGED_GIT_BACKEND_UNAVAILABLE"); }),
@@ -41,7 +43,7 @@ export function createCatalogCheckpoints(catalog: HostCatalog, views: HostViews,
     previewCreated: (sessionId, actorId, expiresAt) => { const host = runtime(sessionId); const lease = host.workspaceLease; if (lease && host.finishCheckpointPreview(lease.operationId, actorId)) host.bindCheckpointPreviewExpiry(lease.operationId, expiresAt, actorId); },
     ...(revert ? { revert } : {}),
     ...(captureNativeAnchor ? { captureNativeAnchor } : {}),
-    ...(runner ? { restoreOptions: { spawnHelper: runner.helperLauncher() } } : {}),
+    ...(runner ? { restoreOptions: { spawnHelper: runner.helperLauncher(), runGit: runner.restoreGitRunner() } } : {}),
   });
   const port: RpcDomainPort = {
     methodScopes: CHECKPOINT_RPC_SCOPES, ready: () => catalog.store.db.open,

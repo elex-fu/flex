@@ -447,7 +447,12 @@ export class SessionOrchestrator {
       if ((!actor && this.owner.mode !== "test") || actor && (actor.revokedAt || actor.expiresAt && actor.expiresAt <= new Date().toISOString())) throw new OrchestratorError("DEVICE_REVOKED", "Current actor is unavailable");
       if (actor && !actor.scopes.includes("session:write")) throw new OrchestratorError("SCOPE_REQUIRED", "Preview requires checkout write permission");
       if (input.expectedSessionRevision !== undefined && current.revision !== input.expectedSessionRevision) throw new OrchestratorError("SESSION_REVISION_CONFLICT", "Session changed before checkout reservation");
-      if (current.status !== "active" || this.store.getActiveTurn(this.session.id) || current.activityState !== "idle" || this.preparingAttempts.size) throw new OrchestratorError("WORKSPACE_BUSY", "Preview requires an idle original Session");
+      // A preview reserves a genuinely idle checkout. The revert worker itself
+      // must still acquire the lease after acceptance: `checkpoint.revert.accepted`
+      // marks the session outcome_unknown (the workspace is about to change), so
+      // revert/recovery purposes accept that state while a preview never does.
+      const activityAdmitted = input.purpose === "preview" ? current.activityState === "idle" : current.activityState === "idle" || current.activityState === "outcome_unknown";
+      if (current.status !== "active" || this.store.getActiveTurn(this.session.id) || !activityAdmitted || this.preparingAttempts.size) throw new OrchestratorError("WORKSPACE_BUSY", "Preview requires an idle original Session");
       if (this.store.db.prepare("SELECT 1 FROM host_state WHERE key='restore_readiness'").get()) throw new OrchestratorError("RESTORE_EXTERNAL_STATE_UNVERIFIED", "Restore external state is unverified");
       if (input.purpose === "preview") this.recovery.assertAdmission();
       const reservation = this.checkpointReservation;

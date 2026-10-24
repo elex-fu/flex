@@ -172,13 +172,20 @@ const CHECKPOINT_COMMANDS: Readonly<Record<CheckpointGitOperation["kind"], reado
   fingerprint: Object.freeze(["rev-parse", "ls-files", "ls-tree", "read-tree", "symbolic-ref"]),
   // `verify` also serves the controlled-restore isolated-index queries
   // (`read-tree`/`write-tree` against a temp index owned by the caller).
-  verify: Object.freeze(["rev-parse", "read-tree", "write-tree"]), diff: Object.freeze(["diff-tree"]), resolve_commit: Object.freeze(["rev-parse"]),
-  list_tree: Object.freeze(["ls-tree"]), blob: Object.freeze(["cat-file"]), patch: Object.freeze(["diff"]),
+  verify: Object.freeze(["rev-parse", "read-tree", "write-tree"]),
+  // Read-side operations carry their plumbing commands too: every object query
+  // resolves the absolute git dir (`rev-parse --absolute-git-dir`) before its
+  // real command runs under the same sticky operation kind, and diff/blob/patch
+  // pages read content with cat-file/diff after resolving the trees.
+  diff: Object.freeze(["diff-tree", "rev-parse"]), resolve_commit: Object.freeze(["rev-parse"]),
+  list_tree: Object.freeze(["ls-tree", "rev-parse"]), blob: Object.freeze(["cat-file", "rev-parse"]), patch: Object.freeze(["diff", "rev-parse"]),
 });
 const WORKTREE_COMMANDS = Object.freeze(["worktree", "rev-parse", "ls-files", "update-ref", "write-tree", "read-tree"]);
 const RESTORE_COMMANDS = Object.freeze(["rev-parse", "read-tree", "write-tree"]);
 const SESSION_DIFF_COMMANDS = Object.freeze(["status", "rev-parse", "diff"]);
-const LIMITS = Object.freeze({ checkpoint: 32 * 1024 * 1024, sessionDiff: 2 * 1024 * 1024 + 64 * 1024, worktree: 32 * 1024 * 1024, restore: 1024 * 1024 });
+/** Per-command output ceiling the checkpoint driver must request at or below. */
+export const MANAGED_GIT_CHECKPOINT_OUTPUT_BYTES: number = 32 * 1024 * 1024;
+const LIMITS = Object.freeze({ checkpoint: MANAGED_GIT_CHECKPOINT_OUTPUT_BYTES, sessionDiff: 2 * 1024 * 1024 + 64 * 1024, worktree: 32 * 1024 * 1024, restore: 1024 * 1024 });
 
 function closed(): ManagedGitError { return new ManagedGitError("MANAGED_GIT_CLOSED", "not_spawned"); }
 function invalid(): never { throw new ManagedGitError("MANAGED_GIT_INPUT_INVALID", "not_spawned"); }
@@ -461,7 +468,13 @@ export class ManagedGitRunner {
       if (request.command !== policy.executable.path || !sameIdentity(policy.executable) ||
           request.args.length !== 3 || request.args[0] !== "-I" || request.args[1] !== "-c" || request.args[2] !== CONTROLLED_RESTORE_HELPER) invalid();
       const cwd = request.workspace !== undefined ? canonicalDirectory(request.workspace) : realpathSync(tmpdir());
-      if (request.workspace === undefined && !this.allowedCwd(cwd)) throw new ManagedGitError("MANAGED_GIT_CWD_INVALID", "not_spawned");
+      // Git commands keep the full cwd policy (their work tree is the cwd, so
+      // even an ancestor of private state must refuse). The restore helper
+      // never traverses its cwd; a workspace-less probe launches in the temp
+      // root and must only refuse when that cwd is itself inside private state
+      // — the default coordination directory lives under the temp root, so the
+      // ancestor direction would make every production probe fail closed.
+      if (request.workspace === undefined && this.privateCwd(cwd)) throw new ManagedGitError("MANAGED_GIT_CWD_INVALID", "not_spawned");
       const registry = this.runRegistry({ purpose: "restore_helper", ...(request.operationId !== undefined ? { operationId: request.operationId } : {}) , ...(request.stepId !== undefined ? { stepId: request.stepId } : {}) });
       const env = { ...policy.env };
       const evidence = Object.freeze({
@@ -663,6 +676,14 @@ export class ManagedGitRunner {
       if (within(canonical, cwd) || within(cwd, canonical)) return false;
     }
     return true;
+  }
+  private privateCwd(cwd: string): boolean {
+    for (const root of this.options.privateRoots) {
+      let canonical: string;
+      try { canonical = realpathSync(root); } catch { continue; }
+      if (within(canonical, cwd)) return true;
+    }
+    return false;
   }
 }
 

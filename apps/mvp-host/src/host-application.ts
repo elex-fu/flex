@@ -99,7 +99,7 @@ export async function createHostApplication(options: HostApplicationOptions) {
   let devices: DeviceRegistry | undefined;
   let activationLoad: HostActivationLoad | undefined;
   let activation: HostActivationService | undefined;
-  let checkpointBindings: ReturnType<typeof createCatalogCheckpoints> | undefined;
+  let checkpointBindings: Awaited<ReturnType<typeof createCatalogCheckpoints>> | undefined;
   let worktreeBindings: ReturnType<typeof createManagedScheduledHostWorktrees> | undefined;
   let nativeScenePolicy: CompatibilityScenePolicy | undefined;
   let started: Promise<string> | undefined;
@@ -340,7 +340,7 @@ export async function createHostApplication(options: HostApplicationOptions) {
     // requires the helper runner because HostCheckpoints only admits revert
     // when restoreOptions.spawnHelper exists (fail-closed without it).
     const productionRevert = runner && !options.execution?.revert ? createProductionNativeRevert({ store, owner, catalog: runningCatalog, views, manifestSource }) : undefined;
-    checkpointBindings = createCatalogCheckpoints(runningCatalog, views, runner, options.execution?.revert ?? productionRevert?.ports, productionRevert?.captureNativeAnchor);
+    checkpointBindings = await createCatalogCheckpoints(runningCatalog, views, runner, options.execution?.revert ?? productionRevert?.ports, productionRevert?.captureNativeAnchor);
     lifecycle.registerService({ drain: (deadline) => checkpointBindings!.checkpoints.drain(Math.max(0, deadline - Date.now())), seal: () => checkpointBindings!.checkpoints.seal() });
     interactions = createCatalogInteractionBindings({ catalog: runningCatalog, assertAdmission });
     const runningInteractions = interactions;

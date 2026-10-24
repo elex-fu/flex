@@ -117,7 +117,13 @@ export function createProductionNativeRevert(options: ProductionNativeRevertOpti
   const proveQuiescence = async (operation: RevertOperation): Promise<{ proven: boolean; proofId: string }> => {
     const rows = sessionRows(operation.sessionId);
     const session = db.prepare("SELECT recovery_state FROM sessions WHERE id=?").get(operation.sessionId) as { recovery_state: string } | undefined;
-    return { proven: Boolean(session && session.recovery_state === IDLE && rows.every(rowProven)), proofId: bindingDigest({ rows }) };
+    // A blocked Session is fenced from new Turns, and its original writers are
+    // exactly the journal rows rowProven proves stopped; recovery inspection and
+    // rollback evidence must therefore stay available while blocked. Requiring
+    // `idle` here would make recovery inspection permanently unavailable after
+    // precisely the blocked restore that needs it. Admission (nativeState) stays
+    // idle-only; this predicate only certifies the stop proof.
+    return { proven: Boolean(session && (session.recovery_state === IDLE || session.recovery_state === "blocked") && rows.every(rowProven)), proofId: bindingDigest({ rows }) };
   };
 
   /** Per-session managed runtime; the revert helper must never borrow another Session's boundary. */

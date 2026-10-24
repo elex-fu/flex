@@ -110,7 +110,14 @@ describe("actual main operations routing", { timeout: 30000 }, () => {
       child.kill("SIGTERM"); expect(await ended).toBe(0);
       const readonly = openReadOnly(f.databasePath);
       try {
-        expect(readonly.db.prepare("SELECT COUNT(*) AS count FROM managed_processes").get()).toEqual({ count: 0 });
+        // The startup restore-helper availability probe ("host-git") is a
+        // short-lived managed git helper, not a Native Provider: restored
+        // history must still never prepare or preflight a Provider runtime.
+        const processes = readonly.db.prepare("SELECT runtime_id, state FROM managed_processes").all() as Array<{ runtime_id: string; state: string }>;
+        for (const row of processes) {
+          expect(row.runtime_id).toBe("host-git");
+          expect(["stopped", "not_spawned", "root_exited", "unknown"]).toContain(row.state);
+        }
         expect(readonly.db.prepare("SELECT session_id FROM session_catalog").all()).toEqual([{ session_id: sessionId }]);
       }
       finally { readonly.close(); }

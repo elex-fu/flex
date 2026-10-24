@@ -14,6 +14,7 @@ import type { RpcRequest } from "../api/rpc-dispatcher.js";
 import { ContentStore } from "../content/content-store.js";
 import { FrameBudget } from "../content/frame-budget.js";
 import { assertHostOwner, type HostOwnerHandle } from "../lifecycle/host-owner.js";
+import { MANAGED_GIT_CHECKPOINT_OUTPUT_BYTES } from "../lifecycle/managed-git-runner.js";
 import { CommandEngine } from "../orchestration/command-engine.js";
 import type { ExecutionIntentRow } from "../orchestration/command-contract.js";
 import type { OperationIntentHandler } from "../orchestration/execution-worker.js";
@@ -303,7 +304,10 @@ export class HostCheckpoints {
       const result = await this.options.runGit!(Object.freeze({ ...request, binding })); this.assertOpen();
       if (captureContext) this.assertLease(captureContext); return result;
     } : undefined;
-    const driverOptions: CheckpointGitDriverOptions = runner ? { runGit: runner } : {};
+    // The managed runner rejects any requested output budget above its
+    // checkpoint policy ceiling, so the production driver must be constructed
+    // with budgets at or below it (its own defaults are larger).
+    const driverOptions: CheckpointGitDriverOptions = runner ? { runGit: runner, maxFileBytes: MANAGED_GIT_CHECKPOINT_OUTPUT_BYTES, maxCaptureBytes: MANAGED_GIT_CHECKPOINT_OUTPUT_BYTES } : {};
     const record = Object.freeze({ ...workspace, capabilities: [...workspace.capabilities] });
     const driver = this.options.driverFactory?.(record, driverOptions) ?? new CheckpointGitDriver(workspace.worktreeRoot, driverOptions);
     if (driver.workspace !== workspace.worktreeRoot) throw new CheckpointError("WORKSPACE_BINDING_CHANGED", "Checkpoint driver factory returned another checkout");

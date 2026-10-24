@@ -89,10 +89,16 @@ export async function importCompatibilityRun(options: ImportCompatibilityRunOpti
   if (entries.length !== read.entries.length || entries.some((entry) => entry.result === "failed")) throw new OperationsError("COMPATIBILITY_SOURCE_MISMATCH");
   const turns = new Set(entries.filter((entry) => entry.kind === "turn" && entry.capability === "turn" && entry.result === "passed").map((entry) => entry.nativeSessionIdHash + ":" + (entry.provider === "claude" ? entry.nativeResultIdHash : entry.nativeTurnIdHash)));
   if (turns.size < 10) throw new OperationsError("COMPATIBILITY_SCENE_INCOMPLETE");
+  // The destination endorsement must cover every capability the trusted set
+  // carries: a run with verified native-history recovery inspections keeps
+  // its recovery records importable, or the production manifest (which
+  // requires a trusted recovery entry) could never exist after import.
+  const passedRecords = entries.filter((entry) => entry.result === "passed" && entry.capability === entry.kind);
+  const capabilities = [...new Set(passedRecords.map((entry) => entry.kind))].sort() as ("turn" | "recovery")[];
   const payload = signCompatibilityPayload({ v: 2, kind: "compatibility-import", domain: "destination-endorsement",
     sourceHost: ticket.sourceHost, runId: ticket.runId, entryDigest: ticket.entryDigest, sceneVersion: ticket.sceneVersion,
     authorizationDigest: (options.authorization as { digest: string }).digest, readinessDigest: handshake.digest, artifactDigest,
-    evidenceSetDigest: compatibilityDigest(entries.map((entry) => entry.digest).sort()), capabilities: ["turn"], recordDigests: entries.filter((entry) => entry.kind === "turn" && entry.capability === "turn" && entry.result === "passed").map((entry) => entry.digest).sort(),
+    evidenceSetDigest: compatibilityDigest(entries.map((entry) => entry.digest).sort()), capabilities, recordDigests: passedRecords.map((entry) => entry.digest).sort(),
     issuedAt: new Date(now).toISOString(), expiresAt: new Date(Math.min(now + 86_400_000, Date.parse(handshake.createdAt) + 86_400_000, Date.parse(ticket.expiresAt))).toISOString(),
   }, options.destination);
   if (options.evidenceLogPath) {

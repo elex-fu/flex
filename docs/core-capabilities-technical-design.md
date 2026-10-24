@@ -2,7 +2,7 @@
 
 > 版本：v1.3.1（普通 macOS 受管执行）
 > 日期：2026-10-24（Asia/Shanghai）；初版：2026-10-18
-> 状态：**开发已恢复（2026-10-24 用户指令，按 G0 → M4 → R4 → R6 → R9 顺序继续）**。G0 固定源码完整回归已通过（串行全量 1317 passed / 0 failed，指纹一致）；M4 首份生产兼容产物与显式激活闭环已通过（2026-10-24，run-id `m4-final2`：真实 10-turn 场景 → 签名产物 → destination 导入 → activation verify/activate，普通合同下 workspace/provider 双资源激活成功）；当前项为 R4 真实恢复与备份恢复外部复核；回退仍待验收，检查点和恢复顺序见实施计划顶部。
+> 状态：**开发进行中（按 G0 → M4 → R4 → R6 → R9 顺序）**。G0 固定源码完整回归已通过（串行全量 1317 passed / 0 failed，指纹一致）；M4 首份生产兼容产物与显式激活闭环已通过（2026-10-24，run-id `m4-final2`：真实 10-turn 场景 → 签名产物 → destination 导入 → activation verify/activate，普通合同下 workspace/provider 双资源激活成功）；R4 真实恢复与备份恢复外部复核已通过（2026-10-24，L1–L4 四层：终态收据锚点 → 恢复检查证据链 → 备份恢复外部复核 → 生产路径端到端恢复链测试并修复 destination endorsement 缺 recovery 能力的生产缺陷）；当前项为 R6 双 Provider Native 回退锚点/完整回退；组合终验与物理手机（R9）待验收，检查点和恢复顺序见实施计划顶部。
 > 本轮起点：Flyx `003faa3`；本轮改动已全部提交入库并推送（`4af1af5` → `b60852c` → `0bbc950` → `0345f83`，`main` 与 `codex/flyx-optimization` 同点，工作区干净）；历史实现基线：`1108bed`；原分析基线：`c11e08d`；参考快照：Paseo `710851ccb`、T3 Code `4ba4871af`
 > 用户已明确：首版必须支持 macOS 本机执行，不能以 Linux Host 替代交付。
 
@@ -37,7 +37,7 @@
 | 进程/Git | 窄句柄、原始记录与受控 runner 已有模块验证；生产 supervisor 分支仍限定 Linux | 每 Turn 停止/续接、全局停止端口、共享关闭 deadline 已接线；mutating Git 套 repository 元数据锁；普通 macOS backend 已实机验收（M0/M3） |
 | macOS | 私有目录隔离已测试；全部后代停止、稳定身份绑定尚未成立 | 普通受管执行实机验收通过（进程组清理、双 Provider 真实任务/中断/跨进程续接 2/2）；`treeStopped=false` 诚实标记，ES 强监督后置为可选增强，不再是 C0 门槛 |
 | 会话 | Catalog、V2 RPC、独立事件、延迟加载、公开 SessionClient 已有 | Web 新建/命名/归档/关闭运行时与资源选择已接（CoreControls/四面板+真实 Host E2E）；并行状态展示待验收 |
-| 恢复 | inspect/reconcile/acknowledge、CLI 和 SDK 已有 | `NativeHistoryReaderFactory` 已注入 CatalogRecovery、restore inspect/confirm CLI 已注册；生产 manifest 恒 unknown、真实外部检查器占位；Web/手机 Recovery 面板已接 |
+| 恢复 | inspect/reconcile/acknowledge、CLI 和 SDK 已有 | `NativeHistoryReaderFactory` 已注入 CatalogRecovery、restore inspect/confirm CLI 已注册；R4 已通过（2026-10-24，L1–L4：终态收据锚点、恢复检查证据链、签名兼容 manifest 支撑生产 verified 状态、createRestoreExternalInspector 真实外部检查器、生产端到端恢复链测试并修复 destination endorsement 生产缺陷）；Web/手机 Recovery 面板已接 |
 | Worktree | journal/typed client 已有，调度器与关闭 fence 模块已验证 | 任务 permit（首版 2）、共享 common-dir 元数据锁、scheduler SQL 扫描修复与中央接线、归档/恢复互斥已实现；生产启用与真并行验收待 runner 注入 |
 | Checkpoint/回退 | 服务、受控恢复、journal 与 typed client 已有 | Checkpoint 中央组合（固定顺序捕获+projector v4 白名单投影）已接线；双 Provider 回退驱动与响应丢失 unknown 语义完成（仅 fixture），生产接线与真实回退待做 |
 | 客户端 | 草稿、Outbox、权威副本、引用读取、审批、最小 Expo 平台已有 | CoreControls/Web 四面板/手机最小面板已接通（真实 Host E2E 覆盖会话元数据/草稿/readiness）；剩余 Recovery/Diff/Worktree/Revert 浏览器 E2E 与真机验收 |

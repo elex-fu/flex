@@ -4,6 +4,7 @@ import { createHash } from "node:crypto";
 import { dirname, resolve } from "node:path";
 import type { HostIdentityFileV1 } from "../identity/host-identity.js";
 import { compatibilityDigest, signCompatibilityPayload, verifyCompatibilityPayload, type CompatibilityHostIdentity } from "./compatibility-integrity.js";
+import { sceneSegments } from "./compatibility-scenes.js";
 import { assertPrivateDirectory, OperationsError } from "../operations/operation-files.js";
 
 export type NativeCompatibilityEvidence = {
@@ -324,32 +325,55 @@ export interface CompatibilityEvidenceTrust {
   now?: number;
   maxAgeMs?: number;
 }
+/**
+ * Reads and fully re-verifies the destination endorsement (directory/file
+ * ownership and permissions, destination signature, structural integrity)
+ * without comparing its sceneVersion against any expected value. The
+ * endorsement's sceneVersion must still be a registered scene identity, so a
+ * caller can thread the verified scene back into its trust (§6: a c7-imported
+ * destination endorsement is only loadable with trust.sceneVersion = c7).
+ */
+function trustedEndorsementRecord(trust: CompatibilityEvidenceTrust, now: number): Record<string, unknown> | undefined {
+  if (trust.domain === "fixture" || !trust.destination || !trust.endorsementPath) return undefined;
+  try {
+    const parent = lstatSync(dirname(resolve(trust.endorsementPath)));
+    if (!parent.isDirectory() || parent.isSymbolicLink() || (parent.mode & 0o777) !== 0o700 || typeof process.getuid === "function" && parent.uid !== process.getuid()) return undefined;
+    const fd = openSync(trust.endorsementPath, constants.O_RDONLY | constants.O_NOFOLLOW);
+    let endorsement: Record<string, unknown> | undefined;
+    try {
+      const stat = fstatSync(fd);
+      if (!stat.isFile() || (stat.mode & 0o777) !== 0o600 || stat.size > READ_LIMIT_BYTES || typeof process.getuid === "function" && stat.uid !== process.getuid()) return undefined;
+      const candidate: unknown = JSON.parse(readFileSync(fd, "utf8"));
+      if (!verifyCompatibilityPayload(candidate, trust.destination)) return undefined;
+      endorsement = candidate;
+    } finally { closeSync(fd); }
+    if (endorsement.v !== 2 || endorsement.kind !== "compatibility-import" || endorsement.domain !== "destination-endorsement"
+      || Date.parse(String(endorsement.expiresAt)) <= now || !Number.isFinite(Date.parse(String(endorsement.expiresAt)))
+      || !Number.isFinite(Date.parse(String(endorsement.issuedAt))) || Date.parse(String(endorsement.issuedAt)) > now + 5_000 || !Array.isArray(endorsement.recordDigests) || !Array.isArray(endorsement.capabilities)
+      || typeof endorsement.sceneVersion !== "string" || sceneSegments(endorsement.sceneVersion) === undefined
+      || ["authorizationDigest", "readinessDigest", "artifactDigest", "evidenceSetDigest", "entryDigest"].some((key) => !MASK.test(String(endorsement![key])))
+      || endorsement.recordDigests.some((value) => typeof value !== "string" || !MASK.test(value))) return undefined;
+    return endorsement;
+  } catch { return undefined; }
+}
+
+/**
+ * The verified sceneVersion of a destination endorsement, for threading into
+ * destination trust construction (activation CLI, restore-external inspection,
+ * host activation trust). Undefined means the endorsement is absent or failed
+ * re-verification; callers then keep the c3 default.
+ */
+export function compatibilityEndorsementSceneVersion(endorsementPath: string, destination: CompatibilityHostIdentity, now: number = Date.now()): string | undefined {
+  return trustedEndorsementRecord({ destination, endorsementPath }, now)?.sceneVersion as string | undefined;
+}
+
 export function loadTrustedCompatibilityEvidence(path: string, limit?: number, trust: CompatibilityEvidenceTrust = {}): readonly CompatibilityEvidenceEntry[] {
   const read = readCompatibilityEvidence(path, limit);
   if (!read.available) throw new OperationsError("PROVIDER_COMPATIBILITY_EVIDENCE_MISSING");
   const now = trust.now ?? Date.now();
-  let endorsement: Record<string, unknown> | undefined;
-  if (trust.domain !== "fixture") {
-    if (!trust.destination || !trust.endorsementPath) return [];
-    try {
-      const parent = lstatSync(dirname(resolve(trust.endorsementPath)));
-      if (!parent.isDirectory() || parent.isSymbolicLink() || (parent.mode & 0o777) !== 0o700 || typeof process.getuid === "function" && parent.uid !== process.getuid()) return [];
-      const fd = openSync(trust.endorsementPath, constants.O_RDONLY | constants.O_NOFOLLOW);
-      try {
-        const stat = fstatSync(fd);
-        if (!stat.isFile() || (stat.mode & 0o777) !== 0o600 || stat.size > READ_LIMIT_BYTES || typeof process.getuid === "function" && stat.uid !== process.getuid()) return [];
-        const candidate: unknown = JSON.parse(readFileSync(fd, "utf8"));
-        if (!verifyCompatibilityPayload(candidate, trust.destination)) return [];
-        endorsement = candidate;
-      } finally { closeSync(fd); }
-      if (endorsement.v !== 2 || endorsement.kind !== "compatibility-import" || endorsement.domain !== "destination-endorsement"
-        || Date.parse(String(endorsement.expiresAt)) <= now || !Number.isFinite(Date.parse(String(endorsement.expiresAt)))
-        || !Number.isFinite(Date.parse(String(endorsement.issuedAt))) || Date.parse(String(endorsement.issuedAt)) > now + 5_000 || !Array.isArray(endorsement.recordDigests) || !Array.isArray(endorsement.capabilities)
-        || endorsement.sceneVersion !== (trust.sceneVersion ?? "flyx-c3-basic-v1")
-        || ["authorizationDigest", "readinessDigest", "artifactDigest", "evidenceSetDigest", "entryDigest"].some((key) => !MASK.test(String(endorsement![key])))
-        || endorsement.recordDigests.some((value) => typeof value !== "string" || !MASK.test(value))) return [];
-    } catch { return []; }
-  }
+  const endorsement = trust.domain === "fixture" ? undefined : trustedEndorsementRecord(trust, now);
+  if (trust.domain !== "fixture" && !endorsement) return [];
+  if (endorsement && endorsement.sceneVersion !== (trust.sceneVersion ?? "flyx-c3-basic-v1")) return [];
   return read.entries.filter((entry) => entry.trusted && (!endorsement || entry.runId === endorsement.runId && entry.entryDigest === endorsement.entryDigest
       && entry.host?.fingerprint === (endorsement.sourceHost as CompatibilityHostIdentity)?.fingerprint
       && (endorsement.recordDigests as unknown[]).includes(entry.digest) && (endorsement.capabilities as unknown[]).includes(entry.capability)

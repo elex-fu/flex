@@ -12,6 +12,7 @@ import { createProductionNativeRevert } from "./checkpoint/native-revert-product
 import type { HostRevertPorts } from "./checkpoint/host-checkpoints.js";
 import { HOST_EXECUTION_READINESS_CAPABILITY, HOST_EXECUTION_READINESS_RPC_SCOPES, hostExecutionReadinessRpc } from "./diagnostics/activation-rpc.js";
 import type { NativeCompatibilityArtifact } from "./diagnostics/compatibility-evidence.js";
+import { compatibilityEndorsementSceneVersion } from "./diagnostics/compatibility-evidence.js";
 import { createCompatibilityScenePolicy, type CompatibilityScenePolicy, type CompatibilityScenePolicyOptions } from "./diagnostics/compatibility-scene-policy.js";
 import { providerConfigurationFingerprint } from "./lifecycle/host-activation-load.js";
 import { createCatalogInteractionBindings } from "./interaction/catalog-interactions.js";
@@ -176,7 +177,14 @@ export async function createHostApplication(options: HostApplicationOptions) {
         runtimeId: "host-git", runtimeGeneration: 1, attemptId: operationId ?? randomUUID() };
     },
   }) : undefined;
-  const activationTrust = { destination: publicHostIdentity(identity), endorsementPath: options.compatibilityEndorsementPath ?? join(dirname(owner.databasePath), "compatibility-endorsement.json") };
+  // Design §6: thread the imported endorsement's verified scene so interactive
+  // (c4–c7) activations resolve their newestPassedArtifact; absent/unusable
+  // endorsement keeps the c3 default and fails closed as before.
+  const endorsementSceneVersion = compatibilityEndorsementSceneVersion(
+    options.compatibilityEndorsementPath ?? join(dirname(owner.databasePath), "compatibility-endorsement.json"),
+    publicHostIdentity(identity));
+  const activationTrust = { destination: publicHostIdentity(identity), endorsementPath: options.compatibilityEndorsementPath ?? join(dirname(owner.databasePath), "compatibility-endorsement.json"),
+    ...(endorsementSceneVersion ? { sceneVersion: endorsementSceneVersion } : {}) };
   const observation = options.execution?.observation ?? localActivationFacts({ compatibilityEvidencePath, privateRoots: privateDirectories, ...options.execution?.facts, compatibilityTrust: activationTrust });
   const query = createManagedWorkspaceQuery({
     journal: new SqliteProcessJournal(store.db, orderLog), privateRoots: privateDirectories,

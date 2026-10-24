@@ -17,7 +17,7 @@
     "test:e2e": "pnpm --filter @flyx/mvp-web test:e2e",
     "test:product": "node scripts/test-product.mjs",
     "test:fixtures": "node scripts/verify-fixtures.mjs",
-    "test:tooling": "node --test scripts/*.test.mjs",
+    "test:tooling": "node --test scripts/*.test.mjs scripts/compatibility/*.test.mjs",
     "typecheck:tests": "pnpm --filter '@flyx/*' -r --if-present typecheck:tests",
     "verify:clean": "node scripts/verify-clean.mjs",
     "fixture:prepare": "node scripts/provision-fixture-workspace.mjs"

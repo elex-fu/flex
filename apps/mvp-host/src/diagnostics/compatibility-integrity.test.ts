@@ -3,7 +3,7 @@ import { mkdtemp, readFile, rm, writeFile, mkdir, stat, chmod } from "node:fs/pr
 import { arch, release, tmpdir } from "node:os";
 import { join } from "node:path";
 import { generateHostIdentity, publicHostIdentity } from "../identity/host-identity.js";
-import { CompatibilityEvidenceRecorder, loadTrustedCompatibilityEvidence, readCompatibilityEvidence, compatibilityEvidenceArtifactDigest } from "./compatibility-evidence.js";
+import { CompatibilityEvidenceRecorder, loadTrustedCompatibilityEvidence, readCompatibilityEvidence, compatibilityEvidenceArtifactDigest, compatibilityEndorsementSceneVersion } from "./compatibility-evidence.js";
 import { compatibilityDigest, signCompatibilityPayload, verifyCompatibilityPayload } from "./compatibility-integrity.js";
 import { writeCompatibilityReadiness } from "./compatibility-readiness.js";
 
@@ -82,5 +82,30 @@ describe("signed compatibility artifacts", () => {
     await expect(writeCompatibilityReadiness({ ...options, workspace: "/tmp" })).rejects.toThrow("COMPATIBILITY_ISOLATION_REQUIRED");
     await chmod(directory, 0o755);
     await expect(writeCompatibilityReadiness(options)).rejects.toThrow("OPERATIONS_UNSAFE_DIRECTORY");
+  });
+});
+
+describe("destination endorsement scene threading (design §6)", () => {
+  const digests = { authorizationDigest: hash("a"), readinessDigest: hash("b"), artifactDigest: hash("c"), evidenceSetDigest: hash("d"), entryDigest: hash("e") };
+  function endorsementPayload(sceneVersion: string, issuedAt = "2026-01-01T00:00:00.000Z", expiresAt = "2100-01-01T00:00:00.000Z") {
+    return { v: 2, kind: "compatibility-import", domain: "destination-endorsement", sceneVersion, runId: "run-1", recordDigests: [hash("f")],
+      capabilities: ["turn", "approval", "interrupt", "reconnect"], issuedAt, expiresAt, ...digests };
+  }
+  it("reports the verified registered scene and refuses absent, unsigned or unregistered endorsements", async () => {
+    const directory = await root();
+    const destination = generateHostIdentity();
+    const destinationIdentity = publicHostIdentity(destination);
+    const endorsementPath = join(directory, "compatibility-endorsement.json");
+    await writeFile(endorsementPath, JSON.stringify(signCompatibilityPayload(endorsementPayload("flyx-c7-interactive-v1"), destination)) + "\n", { mode: 0o600 });
+    expect(compatibilityEndorsementSceneVersion(endorsementPath, destinationIdentity)).toBe("flyx-c7-interactive-v1");
+    // An endorsement signed by another destination is unusable.
+    expect(compatibilityEndorsementSceneVersion(endorsementPath, publicHostIdentity(generateHostIdentity()))).toBeUndefined();
+    // A scene identity outside the registry never threads into destination trust.
+    await writeFile(endorsementPath, JSON.stringify(signCompatibilityPayload(endorsementPayload("flyx-c99-unknown-v1"), destination)) + "\n", { mode: 0o600 });
+    expect(compatibilityEndorsementSceneVersion(endorsementPath, destinationIdentity)).toBeUndefined();
+    // An expired endorsement re-verifies to nothing.
+    await writeFile(endorsementPath, JSON.stringify(signCompatibilityPayload(endorsementPayload("flyx-c7-interactive-v1", "2000-01-01T00:00:00.000Z", "2000-01-02T00:00:00.000Z"), destination)) + "\n", { mode: 0o600 });
+    expect(compatibilityEndorsementSceneVersion(endorsementPath, destinationIdentity, Date.parse("2026-06-01T00:00:00.000Z"))).toBeUndefined();
+    expect(compatibilityEndorsementSceneVersion(join(directory, "absent.json"), destinationIdentity)).toBeUndefined();
   });
 });

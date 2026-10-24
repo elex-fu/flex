@@ -2,7 +2,7 @@
 // M4 destination-host bootstrap: initializes a dedicated destination Host
 // (identity + mirror + default provider instance registered with the measured
 // executable realpath) without any model call, version probe or activation.
-// Usage: node scripts/compatibility/destination-bootstrap.mjs --destination <dir> --provider claude --executable <path>
+// Usage: node scripts/compatibility/destination-bootstrap.mjs --destination <dir> --provider claude --executable <path> [--capabilities approval,interrupt,reconnect]
 import { execFile as execFileRaw } from "node:child_process";
 import { createServer } from "node:net";
 import { chmod, cp, mkdir, rm, writeFile } from "node:fs/promises";
@@ -13,6 +13,7 @@ import { join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 import { spawn } from "node:child_process";
+import { parseSceneCapabilities } from "./scene-capabilities.mjs";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 function dirname(path) { const parts = String(path).split("/"); parts.pop(); return parts.join("/") || "/"; }
@@ -20,12 +21,13 @@ const execFile = promisify(execFileRaw);
 const fail = (code) => { const error = new Error(code); error.code = code; throw error; };
 
 function parseArgs(argv) {
-  const options = { destination: undefined, provider: "claude", executable: undefined };
+  const options = { destination: undefined, provider: "claude", executable: undefined, capabilities: undefined };
   for (let index = 0; index < argv.length; index += 2) {
     const flag = argv[index], value = argv[index + 1];
     if (flag === "--destination") options.destination = value;
     else if (flag === "--provider") options.provider = value;
     else if (flag === "--executable") options.executable = value;
+    else if (flag === "--capabilities") options.capabilities = value;
     else fail("BOOTSTRAP_USAGE");
   }
   if (!options.destination?.startsWith("/") || !["claude", "codex"].includes(options.provider)
@@ -47,6 +49,10 @@ async function reservePort() {
 const options = parseArgs(process.argv.slice(2));
 const destination = resolve(options.destination);
 const provider = options.provider;
+// Design §6: --capabilities approval,interrupt,reconnect maps evidence scene
+// capabilities to the destination policy names activation and the web approval
+// card read; unknown/duplicated names refuse the bootstrap rather than skip.
+const sceneCapabilityPolicies = parseSceneCapabilities(options.capabilities);
 // The provider record must store the executable realpath: destination
 // activation compares the signed artifact's executablePath against it with
 // strict equality, and the ordinary-start metadata bootstrap persists the
@@ -96,11 +102,15 @@ await execFile("git", ["-C", workspace, "-c", "user.name=Flyx destination", "-c"
 // it to the same signed turn artifact — it is deliberately absent from the
 // per-scenario evidence map), so a destination that must accept real turns
 // from the web composer requests it alongside streamingText. Pure read-only
-// destinations drop it; interrupt/approval/reconnect arrive with their own scenes.
+// destinations drop it; interactive destinations add their scene capabilities
+// (approval→interactiveApprovals, interrupt, reconnect→resumeConversation)
+// through --capabilities: the bootstrap publishes a subset of the imported
+// endorsement, never more (import signs the capability list and activation
+// requires each requested capability on one signed run).
 const catalogConfigPath = join(destination, "catalog-config.json");
 await writeFile(catalogConfigPath, JSON.stringify({
-  workspaces: [{ workspaceId: "default-workspace", root: workspace, capabilities: ["streamingText", "workspaceWrite"] }],
-  providerInstances: [{ providerInstanceId: `default-${provider}`, provider, executable, policyCapabilities: ["streamingText", "workspaceWrite"] }],
+  workspaces: [{ workspaceId: "default-workspace", root: workspace, capabilities: ["streamingText", "workspaceWrite", ...sceneCapabilityPolicies] }],
+  providerInstances: [{ providerInstanceId: `default-${provider}`, provider, executable, policyCapabilities: ["streamingText", "workspaceWrite", ...sceneCapabilityPolicies] }],
 }) + "\n", { mode: 0o600 });
 await chmod(catalogConfigPath, 0o600);
 

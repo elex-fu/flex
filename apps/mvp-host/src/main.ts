@@ -28,6 +28,7 @@ import { writeCompatibilityReadiness } from "./diagnostics/compatibility-readine
 import { createIsolatedCompatibilityRun } from "./diagnostics/compatibility-run.js";
 import type { CompatibilityHostIdentity } from "./diagnostics/compatibility-integrity.js";
 import { parseCompatibilityCommand, runCompatibilityCommand } from "./diagnostics/compatibility-cli.js";
+import { compatibilityEndorsementSceneVersion } from "./diagnostics/compatibility-evidence.js";
 import { inspectCatalogStartupReadiness } from "./session/catalog-startup-readiness.js";
 import { createActivationOperationStore } from "./storage/activation-store.js";
 import { CatalogStore } from "./storage/catalog-store.js";
@@ -380,10 +381,16 @@ async function runActivationCommand(store: SqliteStore, owner: HostOwnerHandle, 
   const mirror = store.getHostIdentityMirror();
   if (!mirror) throw new OperationsError("BACKUP_IDENTITY_MISMATCH");
   const identity = await loadOrCreateHostIdentity({ directory: owner.identityDirectory!, expectedMirror: mirror });
+  // Design §6: the destination trust threads the verified endorsement scene so
+  // a c7-imported endorsement is loadable; without a usable endorsement the
+  // trust keeps the c3 default and loadTrustedCompatibilityEvidence fails closed.
+  const endorsementSceneVersion = compatibilityEndorsementSceneVersion(compatibilityEndorsementPathFor(owner.databasePath), publicHostIdentity(identity));
+  const endorsementTrust = { destination: publicHostIdentity(identity), endorsementPath: compatibilityEndorsementPathFor(owner.databasePath),
+    ...(endorsementSceneVersion ? { sceneVersion: endorsementSceneVersion } : {}) };
   const ordinaryFacts = process.platform === "darwin" ? macosManagedExecutionFacts({ compatibilityEvidencePath: compatibilityEvidencePathFor(owner.databasePath),
-    trust: { destination: publicHostIdentity(identity), endorsementPath: compatibilityEndorsementPathFor(owner.databasePath) } }) : {};
+    trust: endorsementTrust }) : {};
   const observation = localActivationFacts({ compatibilityEvidencePath: compatibilityEvidencePathFor(owner.databasePath), privateRoots, ...ordinaryFacts,
-    compatibilityTrust: { destination: publicHostIdentity(identity), endorsementPath: compatibilityEndorsementPathFor(owner.databasePath) } });
+    compatibilityTrust: endorsementTrust });
   const catalog = new CatalogStore(store);
   // The order ledger is anchored before any activation producer can launch.
   const orderLog = managedLaunchOrderLogFor(owner.databasePath);
@@ -442,7 +449,12 @@ async function openRestoreExternalInspection(store: SqliteStore, owner: HostOwne
   const journal = new SqliteProcessJournal(scratch, orderLog);
   const catalog = new CatalogStore(store);
   const inspectionRuntimeId = "restore-check-git";
-  const trust = { destination: publicHostIdentity(identity), endorsementPath: compatibilityEndorsementPathFor(owner.databasePath) };
+  // Same §6 threading as activation: the inspection trust reads the scene the
+  // imported endorsement actually attests, so recovered provider histories of
+  // interactive scenes re-verify instead of failing the c3 default filter.
+  const inspectionSceneVersion = compatibilityEndorsementSceneVersion(compatibilityEndorsementPathFor(owner.databasePath), publicHostIdentity(identity));
+  const trust = { destination: publicHostIdentity(identity), endorsementPath: compatibilityEndorsementPathFor(owner.databasePath),
+    ...(inspectionSceneVersion ? { sceneVersion: inspectionSceneVersion } : {}) };
   const privateRoots = privateRootsFor({ owner }, [dirname(owner.databasePath), owner.identityDirectory!, owner.coordinationDirectory!]);
   const ordinaryFacts: Partial<ReturnType<typeof macosManagedExecutionFacts>> = process.platform === "darwin" ? macosManagedExecutionFacts({ compatibilityEvidencePath: compatibilityEvidencePathFor(owner.databasePath), trust }) : {};
   const manifests = createNativeHistoryManifestSource({

@@ -8,6 +8,7 @@ import { createHostAttentionBindings, type HostAttention } from "./attention/hos
 import { createHostCatalogReadBindings, type HostCatalog, type HostCatalogOptions } from "./catalog/host-catalog.js";
 import { createCatalogLegacyHost } from "./catalog/catalog-legacy-host.js";
 import { createCatalogCheckpoints } from "./checkpoint/catalog-checkpoints.js";
+import { createProductionNativeRevert } from "./checkpoint/native-revert-production.js";
 import type { HostRevertPorts } from "./checkpoint/host-checkpoints.js";
 import { HOST_EXECUTION_READINESS_CAPABILITY, HOST_EXECUTION_READINESS_RPC_SCOPES, hostExecutionReadinessRpc } from "./diagnostics/activation-rpc.js";
 import type { NativeCompatibilityArtifact } from "./diagnostics/compatibility-evidence.js";
@@ -309,17 +310,15 @@ export async function createHostApplication(options: HostApplicationOptions) {
       },
     });
     devices = new DeviceRegistry(store, identity.hostId);
-    checkpointBindings = createCatalogCheckpoints(runningCatalog, views, runner, options.execution?.revert);
-    lifecycle.registerService({ drain: (deadline) => checkpointBindings!.checkpoints.drain(Math.max(0, deadline - Date.now())), seal: () => checkpointBindings!.checkpoints.seal() });
-    interactions = createCatalogInteractionBindings({ catalog: runningCatalog, assertAdmission });
-    const runningInteractions = interactions;
     // Design §8.2 trusted manifest source: shared by the Native read factory
-    // (handle-level, with transcript contract) and recovery admission
-    // (instance-level, no contract implied). The live resource port keeps the
-    // manifest's configurationFingerprint in the recovery domain the reader
-    // gate and recovery admission actually compare, derived from the live
-    // catalog rows — never echoed from the handle asking for it. The scene
-    // bootstrap authorizes the isolated run's own reads before import.
+    // (handle-level, with transcript contract), recovery admission
+    // (instance-level, no contract implied) and the production native revert
+    // ports (R6). The live resource port keeps the manifest's
+    // configurationFingerprint in the recovery domain the reader gate,
+    // recovery admission and the revert capability gate actually compare,
+    // derived from the live catalog rows — never echoed from the handle
+    // asking for it. The scene bootstrap authorizes the isolated run's own
+    // reads before import.
     const manifestSource = createNativeHistoryManifestSource({
       compatibilityEvidencePath, compatibilityTrust: activationTrust,
       ...(options.execution?.facts?.supervision ? { supervision: options.execution.facts.supervision } : {}),
@@ -335,6 +334,16 @@ export async function createHostApplication(options: HostApplicationOptions) {
       },
       resolveProvider: (providerInstanceId) => runningCatalog.catalog.provider(providerInstanceId),
     });
+    // Design R6: revert ports default to the production wiring derived from the
+    // trusted manifest, live catalog rows and the managed-process journal; the
+    // trusted `options.execution.revert` override still wins. Production revert
+    // requires the helper runner because HostCheckpoints only admits revert
+    // when restoreOptions.spawnHelper exists (fail-closed without it).
+    const productionRevert = runner && !options.execution?.revert ? createProductionNativeRevert({ store, owner, catalog: runningCatalog, views, manifestSource }) : undefined;
+    checkpointBindings = createCatalogCheckpoints(runningCatalog, views, runner, options.execution?.revert ?? productionRevert?.ports, productionRevert?.captureNativeAnchor);
+    lifecycle.registerService({ drain: (deadline) => checkpointBindings!.checkpoints.drain(Math.max(0, deadline - Date.now())), seal: () => checkpointBindings!.checkpoints.seal() });
+    interactions = createCatalogInteractionBindings({ catalog: runningCatalog, assertAdmission });
+    const runningInteractions = interactions;
     const nativeReceipts = new NativeTerminalReceiptStore(store.db);
     const nativeHistoryReaderFactory = options.execution?.recovery?.nativeHistoryReaderFactory ?? new NativeHistoryReaderFactory({
       assertBinding: (handle, checkoutRoot) => {

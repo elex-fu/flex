@@ -230,7 +230,7 @@ export class HostCheckpoints {
     await this.driver(resource.workspace.workspaceId).fingerprint(); this.assertOpen();
     let nativeRewind = false;
     const ports = this.options.revert;
-    if (this.helperAvailable && ports?.native && ports.verifiedNativeCapabilities && resource.session.nativeHandle && resource.providerInstance.verification.state === "verified") {
+    if (this.helperAvailable && (ports?.native || ports?.nativeFactory) && ports.verifiedNativeCapabilities && resource.session.nativeHandle && resource.providerInstance.verification.state === "verified") {
       const capabilities = await ports.verifiedNativeCapabilities(sessionId); this.assertOpen();
       const current = this.resource(sessionId);
       nativeRewind = current.providerInstance.providerInstanceId === resource.providerInstance.providerInstanceId && bindingDigest(current.session.nativeHandle) === bindingDigest(resource.session.nativeHandle) && current.providerInstance.verification.state === "verified" && capabilities.some((capability) => capability.kind === "conversation-rewind" && Boolean(capability.evidenceId && capability.driverVersion && capability.verifiedVersion) && capability.verifiedVersion === current.providerInstance.verification.runtimeVersion);

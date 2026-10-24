@@ -36,7 +36,7 @@ import { stageRaw } from "./revert-test-support.js";
 
 const cleanups: Array<() => void | Promise<void>> = [];
 afterEach(async () => { for (const cleanup of cleanups.splice(0).reverse()) await cleanup(); });
-async function fixture(input: { revert?: boolean; verified?: boolean; helper?: string } = {}) {
+async function fixture(input: { revert?: boolean; verified?: boolean; helper?: string; factory?: boolean } = {}) {
   const root = await temporaryRepository(); cleanups.push(() => removeFixture(root));
   const owner = createTestHostOwner(), store = openOwned({ databasePath: ":memory:", owner });
   cleanups.push(() => { store.close(); owner.release(); });
@@ -91,7 +91,10 @@ async function fixture(input: { revert?: boolean; verified?: boolean; helper?: s
     const registry = new ManagedProcessRegistry({ journal: new SqliteProcessJournal(store.db), context: () => context }); helperRegistries.push(registry);
     return registry.spawn(request.command, request.args, { env: request.env, stdio: ["pipe", "pipe", "pipe"] });
   };
-  const ports: HostRevertPorts = { acquire: async () => ({ lease }), dispatchContextFor: (context, operationId, attemptId) => ({ hostOwnerId: owner.ownerId, hostOwnerGeneration: owner.generation, sessionId: context.sessionId, flyxTurnId: operationId, runtimeId: "trusted-runtime-1", runtimeGeneration: context.runtimeGeneration, attemptId }), native,
+  const ports: HostRevertPorts = { acquire: async () => ({ lease }), dispatchContextFor: (context, operationId, attemptId) => ({ hostOwnerId: owner.ownerId, hostOwnerGeneration: owner.generation, sessionId: context.sessionId, flyxTurnId: operationId, runtimeId: "trusted-runtime-1", runtimeGeneration: context.runtimeGeneration, attemptId }),
+    // Production revert wiring (R6) supplies a journal-bound factory instead of
+    // a static port; the Engine-owned mutation journal is handed to the driver.
+    ...(input.factory ? { nativeFactory: () => native } : { native }),
     proveQuiescence: async () => ({ proven: true, proofId: "fixture-stopped-original-process-tree" }), projectSuccess, assertRestoreWriteReady,
     verifiedNativeCapabilities: async () => input.verified ? [{ kind: "conversation-rewind", evidenceId: "actual-test-version-evidence", driverVersion: "fixture-native-v1", verifiedVersion: "fixture-native-v1" }] : [],
   };
@@ -266,6 +269,18 @@ describe("owned checkpoint production factory and RPC", { timeout: 20_000 }, () 
     const command = { sessionId: f.session.sessionId, commandId: "bad-native-version", planId: page.planId, expectedSessionRevision: page.expectedSessionRevision, confirmation: true };
     await expect(f.rpc("checkpoint.executeRevert", command, command.commandId)).rejects.toMatchObject({ code: "PROVIDER_CAPABILITY_UNVERIFIED" }); expect(f.store.getCommandReceipt("device-1", command.commandId)).toBeUndefined(); expect(f.nativeCalls).toEqual([]);
     const provider = f.catalog.provider("provider-1")!; f.catalog.putProvider({ ...provider, verification: { ...provider.verification, runtimeVersion: "changed-registry-version" } }); expect((await f.host.capabilitiesForSession(f.session.sessionId, "device-1")).nativeRewind).toBe(false);
+  });
+  it("advertises and completes native rewind through a journal-bound nativeFactory without a static port", async () => {
+    const f = await fixture({ revert: true, verified: true, factory: true });
+    expect(f.ports.native).toBeUndefined();
+    const support = await f.host.capabilitiesForSession(f.session.sessionId, "device-1");
+    expect(support.nativeRewind).toBe(true); expect(support.capabilities).toEqual([CHECKPOINT_DIFF_CAPABILITY, CHECKPOINT_REVERT_CAPABILITY]);
+    const { page } = await f.targetAndPreview();
+    const command = { sessionId: f.session.sessionId, commandId: "factory-rewind", planId: page.planId, expectedSessionRevision: page.expectedSessionRevision, confirmation: true };
+    const accepted = CheckpointRevertOperationSchema.parse(await f.rpc("checkpoint.executeRevert", command, command.commandId));
+    expect(f.worker.scan()).toBe(1); await f.worker.drainDispatch();
+    const completed = CheckpointRevertOperationSchema.parse(await f.rpc("checkpoint.getRevertOperation", { sessionId: f.session.sessionId, operationId: accepted.operationId }));
+    expect(completed.status).toBe("completed"); expect(f.nativeCalls).toHaveLength(1); expect(f.projectSuccess).toHaveBeenCalledTimes(1);
   });
   it("accepts V2 command, receipt, journal and original dispatch together, then runs through actual Worker and atomic Timeline epoch", async () => {
     const f = await fixture({ revert: true, verified: true }); expect((await f.host.capabilitiesForSession(f.session.sessionId, "device-1")).capabilities).toEqual([CHECKPOINT_DIFF_CAPABILITY, CHECKPOINT_REVERT_CAPABILITY]);

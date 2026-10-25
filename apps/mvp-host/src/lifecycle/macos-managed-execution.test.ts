@@ -43,7 +43,12 @@ describe.runIf(process.platform === "darwin")("ordinary macOS process lifecycle"
     const child = f.launch("require('node:child_process').spawn(process.execPath,['-e','setInterval(()=>{},100)'],{stdio:'ignore'}).unref();");
     try {
       expect(await child.waitForExit(2000)).toBeDefined();
-      const result = await f.processes.closeAndWait(2000);
+      // The 2s budget of the assertions below is about group cleanup semantics
+      // (stopped + group gone, ordinary mode not claiming tree stop), not a
+      // timing guarantee: under full-suite CPU load the SIGKILL escalation and
+      // group-absence polling can exceed 2s (observed twice in full runs,
+      // passes 5/5 isolated). Keep the semantics, drop the implicit clock race.
+      const result = await f.processes.closeAndWait(10_000);
       expect(result.stopped).toBe(true); expect(result.treeStopped).toBe(false);
       expect(() => process.kill(-child.pid!, 0)).toThrow();
     } finally { await f.processes.closeAndWait(2000); f.processes.sealJournal(); }

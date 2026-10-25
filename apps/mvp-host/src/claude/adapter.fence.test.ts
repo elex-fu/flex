@@ -80,6 +80,42 @@ describe("Claude Engine dispatch fence", () => {
     await expect(second).resolves.toMatchObject({ status: "completed" });
   });
 
+  it("attaches native-ack evidence to the approval_resolved event", async () => {
+    const events: AdapterEvent[] = [];
+    const adapter = new ClaudeAdapter({ ...managed, workspace, onEvent: (event) => events.push(event) });
+    const started = deferred<void>();
+    const release = deferred<void>();
+    queryMock.mockReturnValueOnce({
+      async *[Symbol.asyncIterator]() { yield init(); started.resolve(); await release.promise; yield result(); },
+      interrupt: vi.fn(async () => {}), close: vi.fn(),
+    } as unknown as Query);
+    const approvalContext = context("approval-turn", 8);
+    const turn = adapter.runTurn("approval-turn", "task", undefined, approvalContext);
+    await started.promise;
+    const options = queryMock.mock.calls[0]![0].options;
+    const permission = (options.canUseTool as CanUseTool)("Write", { file_path: "approval-scene.txt", content: "OK" }, { toolUseID: "tool-approval", signal: new AbortController().signal } as Parameters<CanUseTool>[2]);
+    // The adapter awaits real workspace I/O before emitting approval_requested,
+    // so a setTimeout(0) macrotask can run first; wait for the event itself.
+    await vi.waitFor(() => {
+      if (!events.some((event) => event.kind === "approval_requested")) throw new Error("approval_requested not emitted yet");
+    });
+    const requested = events.find((event): event is Extract<AdapterEvent, { kind: "approval_requested" }> => event.kind === "approval_requested")!;
+    expect(requested.request.dispatchContext).toMatchObject({ nativeRequestId: "tool-approval", nativeMethod: "canUseTool/approval" });
+    expect(adapter.respondApproval(requested.request.approvalId, "allow_once")).toBe(true);
+    await expect(permission).resolves.toMatchObject({ behavior: "allow", updatedInput: { file_path: "approval-scene.txt" } });
+    expect(events.find((event): event is Extract<AdapterEvent, { kind: "approval_resolved" }> => event.kind === "approval_resolved")).toMatchObject({
+      approvalId: requested.request.approvalId,
+      toolUseId: "tool-approval",
+      action: "allow_once",
+      evidence: { kind: "native-ack", sourceId: "tool-approval", nativeRequestId: "tool-approval" },
+      turnId: "approval-turn",
+      generation: 8,
+      dispatchContext: approvalContext,
+    });
+    release.resolve();
+    await turn;
+  });
+
   it("keeps a late interrupt failure on the old captured context", async () => {
     const events: AdapterEvent[] = [];
     const adapter = new ClaudeAdapter({ ...managed, workspace, onEvent: (event) => events.push(event) });

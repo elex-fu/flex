@@ -27,7 +27,7 @@ import type {
   ProviderControlOutcome,
   ProviderEvidence,
 } from "./types.js";
-import { ManagedRuntimeController, inspectNativeVersion, type ManagedRuntimeOptions, type PreparedNativeRuntime } from "../provider/managed-runtime.js";
+import { ManagedRuntimeController, inspectNativeVersion, PRODUCER_STOP_DEADLINE_MS, type ManagedRuntimeOptions, type PreparedNativeRuntime } from "../provider/managed-runtime.js";
 import type { ProcessStopResult } from "../lifecycle/managed-process-registry.js";
 import { sameDispatchContext } from "../provider/runtime-registry.js";
 import { dispatchContextForTurn, fenceAdapterEvent } from "./types.js";
@@ -395,11 +395,16 @@ export class ClaudeAdapter implements ProviderAdapter {
     if (!active || !pending) return false;
     active.pending.delete(approvalId);
     pending.cleanup();
+    // The canUseTool promise resolution below IS the native acknowledgement;
+    // emitting it with the event lets the interaction ingest confirm the row
+    // (nativeRequestId equals the ApprovalRequest's dispatchContext binding).
+    const nativeRequestId = pending.request.dispatchContext?.nativeRequestId ?? pending.request.toolUseId;
     this.emit(active, {
       kind: "approval_resolved",
       approvalId,
       toolUseId: pending.request.toolUseId,
       action,
+      evidence: { kind: "native-ack", sourceId: nativeRequestId, nativeRequestId },
     });
     if (action === "allow_once") {
       pending.resolve({
@@ -439,11 +444,11 @@ export class ClaudeAdapter implements ProviderAdapter {
     if (result === "already_terminal" && active.nativeTerminal?.kind === "native-terminal") return { status: "already_terminal", evidence: active.nativeTerminal };
     return { status: "outcome_unknown", evidence: { kind: "unknown", reason: "INTERRUPT_DELIVERY_UNCONFIRMED" } };
   }
-  closeTurnAndWait(context: DispatchContext, deadlineMs = 5_000): Promise<ProcessStopResult> {
+  closeTurnAndWait(context: DispatchContext, deadlineMs = PRODUCER_STOP_DEADLINE_MS): Promise<ProcessStopResult> {
     return this.runtimes.closeTurnAndWait(context, deadlineMs);
   }
   close(): void { void this.closeAndWait().catch(() => {}); }
-  closeAndWait(deadlineMs = 5_000): Promise<ProcessStopResult> {
+  closeAndWait(deadlineMs = PRODUCER_STOP_DEADLINE_MS): Promise<ProcessStopResult> {
     if (this.closePromise) return this.closePromise;
     this.closing = true;
     const active = this.active;

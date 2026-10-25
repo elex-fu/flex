@@ -4,6 +4,7 @@ import { execFile, spawn } from "node:child_process";
 import { createRequire } from "node:module";
 import { createHash, randomUUID } from "node:crypto";
 import { chmod, cp, mkdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { openSync } from "node:fs";
 import { arch, release } from "node:os";
 import { createServer } from "node:net";
 import { dirname, join, resolve } from "node:path";
@@ -39,7 +40,10 @@ async function stopHost(child) {
   let forced = false;
   const exited = new Promise((done) => child.once("exit", done));
   child.kill("SIGTERM");
-  const timer = setTimeout(() => { forced = true; child.kill("SIGKILL"); }, 10_000);
+  // The host's graceful SIGTERM shutdown runs verified producer-stop (up to
+  // PRODUCER_STOP_DEADLINE_MS = 30s in the host build); SIGKILL before that
+  // would kill mid-stop and leave retained ownership blocking the restart.
+  const timer = setTimeout(() => { forced = true; child.kill("SIGKILL"); }, 45_000);
   await exited;
   clearTimeout(timer);
   return { status: forced ? "forced" : "graceful", code: child.exitCode };
@@ -67,7 +71,9 @@ async function startHost({ layer, combo, scratch, nativePath, runId, sceneVersio
   const controlled = join(scratch, layer);
   await mkdir(controlled, { recursive: true, mode: 0o700 });
   await chmod(controlled, 0o700);
-  await mkdir(join(controlled, "web"), { mode: 0o700 });
+  // recursive: the reconnect segment restarts the Host in the same controlled
+  // root and a plain mkdir would fail EEXIST against the surviving web/ dir.
+  await mkdir(join(controlled, "web"), { recursive: true, mode: 0o700 });
   const readinessPath = join(controlled, "ready.json");
   // A restart re-awaits readiness with the new pid: the previous process's
   // readiness file must be removed first or the pid comparison refuses it.
@@ -77,7 +83,10 @@ async function startHost({ layer, combo, scratch, nativePath, runId, sceneVersio
   const git = promisify(execFile);
   await git("git", ["init", "--quiet", workspace]);
   await git("git", ["-C", workspace, "add", "."]);
-  await git("git", ["-C", workspace, "-c", "user.name=Flyx compatibility", "-c", "user.email=compatibility@localhost", "commit", "--quiet", "-m", "isolated compatibility fixture"]);
+  // --allow-empty: the approval segment deletes approval-scene.txt between
+  // repetitions, so a restart may find a fixture tree with nothing new to
+  // commit; the baseline commit must still succeed deterministically.
+  await git("git", ["-C", workspace, "-c", "user.name=Flyx compatibility", "-c", "user.email=compatibility@localhost", "commit", "--quiet", "--allow-empty", "-m", "isolated compatibility fixture"]);
   const real = layer === "real";
   if (real && (!combo.authorizationPath || !combo.destinationHostPath)) throw coded("MATRIX_PREAUTHORIZED_RUN_REQUIRED");
   const candidateVersion = real ? (combo.provider === "codex" ? combo.codexCliVersion : combo.claudeCliVersion) : undefined;
@@ -108,7 +117,7 @@ async function startHost({ layer, combo, scratch, nativePath, runId, sceneVersio
       FLYX_COMPATIBILITY_REAL_ENABLED: real ? "1" : "0", FLYX_COMPATIBILITY_ENTRY_DIGEST: entryDigest ?? "",
       ...(real ? { FLYX_COMPATIBILITY_CANDIDATE_VERSION: candidateVersion } : {}),
       ...(provider === "claude" ? { FLYX_CLAUDE_EXECUTABLE: combo.executableSource === "sdk-bundled" ? "" : combo.executablePath ?? "claude" } : { FLYX_CODEX_EXECUTABLE: combo.executablePath ?? "codex" }),
-    }, stdio: ["ignore", "ignore", process.env.MATRIX_DEBUG_STDERR === "1" ? "inherit" : "ignore"],
+    }, stdio: ["ignore", process.env.MATRIX_HOST_LOG === "1" ? openSync(join(dirname(nativePath), `host-${layer}.log`), "a") : "ignore", process.env.MATRIX_DEBUG_STDERR === "1" ? "inherit" : "ignore"],
   });
   let spawnError;
   child.once("error", () => { spawnError = coded("HOST_SPAWN_FAILED"); });
@@ -130,6 +139,13 @@ export class RpcClient {
     if (frame?.type === "event") {
       this.events.push(frame.event); if (this.events.length > 1024) this.events.shift();
       for (const waiter of [...this.waiters]) if (waiter(frame.event)) this.waiters.delete(waiter);
+    }
+    // MATRIX_DEBUG_EVENTS=1 traces every inbound frame so a failed approval
+    // answer distinguishes "card never delivered" from "respond rejected with
+    // error code X" without re-reading host state after the fact.
+    if (process.env.MATRIX_DEBUG_EVENTS === "1") {
+      if (frame?.type === "event") log("event " + (frame.event?.type ?? "?") + " seq=" + (frame.event?.sequence ?? "?") + " turn=" + (frame.event?.payload?.turnId ?? "-") + " kind=" + (frame.event?.payload?.interactionKind ?? frame.event?.payload?.interactionId ?? "-") + " keys=" + Object.keys(frame.event?.payload ?? {}).join(","));
+      else if (frame?.type === "response") log("rpc#" + frame.id + (frame.ok ? " ok" : " error=" + JSON.stringify(frame.error ?? null)));
     }
   }
   call(method, payload, commandId, timeoutMs = 30_000) {
@@ -183,6 +199,12 @@ export async function openClient(info) {
 const RETRYABLE_ADMISSION = new Set(["WORKSPACE_BUSY", "TURN_BUSY"]);
 const ADMISSION_RETRY_DELAY_MS = 1_000;
 const ADMISSION_RETRY_LIMIT = 90;
+/** Matches an approval card for one turn across both wire shapes: the canonical interaction.requested (interactionKind "approval") and the legacy approval.requested commit. */
+export const approvalCardEvent = (turnId) => (event) => (event?.type === "approval.requested" || (event?.type === "interaction.requested" && event?.payload?.interactionKind === "approval")) && event?.payload?.turnId === turnId;
+/** Legacy approvalId for a matched card: approval.requested carries approvalId; an approval-kind interaction reuses its interactionId as the legacy approvalId (interaction-service.ts itemId()). */
+export function approvalIdOf(card) { return typeof card?.approvalId === "string" ? card.approvalId : typeof card?.interactionId === "string" ? card.interactionId : null; }
+/** Card version for the respond request: top-level on legacy commits, nested on interaction cards; 0 before any reservation. */
+export function approvalVersionOf(card) { return typeof card?.version === "number" ? card.version : typeof card?.interaction?.version === "number" ? card.interaction.version : 0; }
 async function runTurn(client, { layer, index, prompt, scenario = "turn", commandId, approvalAction = "deny" }) {
   const start = Date.now();
   const record = { layer, scenario, index, promptHash: hash(prompt), startedAt: new Date(start).toISOString(), turnIdHash: null, terminalType: null, result: "failed", errorCode: null, admissionRetries: 0 };
@@ -199,13 +221,33 @@ async function runTurn(client, { layer, index, prompt, scenario = "turn", comman
     if (!response.ok || typeof response.payload?.turnId !== "string") throw coded(response.error?.code ?? "TURN_ADMISSION_FAILED");
     turnId = response.payload.turnId; record.turnIdHash = hash(turnId);
     if (scenario === "approval") {
-      const request = await client.waitEvent((event) => event?.type === "approval.requested" && event?.payload?.turnId === turnId, 60_000);
-      const answer = await client.call("approval.respond", { approvalId: request.payload.approvalId, expectedVersion: request.payload.version ?? 0, action: approvalAction }, randomUUID());
-      if (!answer.ok) throw coded("APPROVAL_RESPONSE_FAILED");
+      // The Host's canonical interaction system raises approval cards as
+      // interaction.requested (interactionKind "approval"); for approval cards
+      // the interactionId IS the legacy approvalId (interaction-service.ts
+      // itemId()). Older hosts commit approval.requested directly. Accept both
+      // shapes so the responder matches whichever card the Host published.
+      // Codex turns routinely run 2-3 minutes under backend load and its
+      // model stream retries ("Reconnecting... n/5") can delay the first
+      // disk-writing tool call well past a minute; the card wait must cover
+      // the full turn budget, not just the median turn.
+      const request = await client.waitEvent(approvalCardEvent(turnId), 300_000);
+      const card = request.payload ?? {};
+      const approvalId = approvalIdOf(card);
+      if (!approvalId) throw coded("APPROVAL_ID_MISSING");
+      const answer = await client.call("approval.respond", { approvalId, expectedVersion: approvalVersionOf(card), action: approvalAction }, randomUUID());
+      // Surface the Host's own rejection code (APPROVAL_NOT_FOUND,
+      // INTERACTION_VERSION_CONFLICT, ...) in the turn record instead of
+      // masking it behind a generic wrapper.
+      if (!answer.ok) throw coded(answer.error?.code ?? "APPROVAL_RESPONSE_FAILED");
     } else if (scenario === "interrupt") {
       await client.waitEvent((event) => event?.type === "turn.started" && event?.payload?.turnId === turnId, 60_000);
+      // Interrupt only after the provider turn is bound: an interrupt issued
+      // before the native turn exists (codex app-server still establishing or
+      // reconnecting its stream) has no target, never confirms, and strands
+      // the execution in outcome_unknown with the workspace retained.
+      await client.waitEvent((event) => event?.type === "provider.turn.bound" && event?.payload?.turnId === turnId, 60_000);
       const interrupt = await client.call("session.interrupt", {}, randomUUID());
-      if (!interrupt.ok) throw coded("INTERRUPT_REQUEST_FAILED");
+      if (!interrupt.ok) throw coded(interrupt.error?.code ?? "INTERRUPT_REQUEST_FAILED");
     }
     const terminal = await client.waitTerminal(turnId, layer === "real" ? 300_000 : 30_000);
     record.terminalType = terminal.type;
@@ -220,11 +262,20 @@ async function runTurn(client, { layer, index, prompt, scenario = "turn", comman
   return record;
 }
 /** One scene segment's driving, against the currently-open client (design §4). */
-async function runSegment(segment, slot, commandIds, client, { layer, promptOverrides }) {
+async function runSegment(segment, slot, commandIds, client, { layer, promptOverrides, workspace }) {
   const records = [];
   for (let index = 1; index <= segment.repetitions; index += 1) {
-    const prompt = promptOverrides?.[segment.id] ?? segment.prompt;
+    // Per-slot prompt: the approval segment pins distinct content per
+    // repetition, so repetition 2 (whose history already contains repetition
+    // 1's identical request) must issue a fresh Write — a deterministic second
+    // approval card — instead of answering DONE text-only.
+    const prompt = promptOverrides?.[segment.id] ?? (segment.prompts?.[index - 1] ?? segment.prompt);
     if (segment.id === "approval") {
+      // Repetition 1's allow_once executed the Write and left
+      // approval-scene.txt behind. Delete the file so every repetition
+      // re-runs against a clean slate (defense in depth on top of the
+      // distinct per-slot prompts).
+      await rm(join(workspace, "approval-scene.txt"), { force: true });
       // First repetition allows the tool once (it executes), the second denies.
       records.push(await runTurn(client, { layer, index, prompt, scenario: "approval", approvalAction: index === 1 ? "allow_once" : "deny", ...(commandIds ? { commandId: commandIds[slot + index - 1] } : {}) }));
     } else if (segment.id === "interrupt") {
@@ -242,10 +293,20 @@ async function runLayer(layer, combo, context) {
   let restartBlocked = null;
   try {
     host = await startHost({ layer, combo, ...context });
+    // The persisted readiness must be the FIRST launch's handshake. The
+    // reconnect segment restarts the Host mid-run (host is reassigned below)
+    // and the restart's createdAt would post-date earlier native evidence
+    // records; the destination import window (entry.at >= handshake.createdAt
+    // - 1000) would then reject them as untrusted (COMPATIBILITY_SOURCE_
+    // MISMATCH). The first handshake's window covers the whole run: entries
+    // only need at >= createdAt - 1s, and there is no upper bound beyond now.
+    // Both processes sign with the same runId/entryDigest/sceneVersion and the
+    // same source identity, so downstream parsing is unaffected.
+    const firstHandshake = host.info;
     const observed = { nodeVersion: process.versions.node, os: process.platform + " " + release() + " " + arch(), ...host.info.observed };
     if (layer === "real") {
       const match = environmentMatches(combo, observed);
-      if (!match.matched) return layerResult = { outcome: { status: "skipped", completed: 0, reasonCode: "RUNTIME_COMBINATION_UNVERIFIED", reasons: match.reasonCodes }, observed, records, handshake: host.info };
+      if (!match.matched) return layerResult = { outcome: { status: "skipped", completed: 0, reasonCode: "RUNTIME_COMBINATION_UNVERIFIED", reasons: match.reasonCodes }, observed, records, handshake: firstHandshake };
     }
     let client = await openClient(host.info);
     try {
@@ -266,12 +327,12 @@ async function runLayer(layer, combo, context) {
           host = await startHost({ layer, combo, ...context });
           client = await openClient(host.info);
         }
-        records.push(...await runSegment(segment, slot, commandIds, client, { layer }));
+        records.push(...await runSegment(segment, slot, commandIds, client, { layer, workspace: join(context.scratch, layer, "workspace") }));
         slot += segment.commandCount;
       }
     } finally { client.close(); }
     const turns = records.filter((record) => record.scenario === "turn");
-    return layerResult = { records, observed, handshake: host.info, outcome: { status: restartBlocked || records.some((record) => record.result !== "passed") ? "failed" : "passed", completed: turns.filter((record) => record.result === "passed").length, ...(restartBlocked ? { reasonCode: restartBlocked } : {}),
+    return layerResult = { records, observed, handshake: firstHandshake, outcome: { status: restartBlocked || records.some((record) => record.result !== "passed") ? "failed" : "passed", completed: turns.filter((record) => record.result === "passed").length, ...(restartBlocked ? { reasonCode: restartBlocked } : {}),
       scenarioResults: Object.fromEntries(["approval", "interrupt", "reconnect", "recovery"].map((kind) => [kind, { status: records.some((record) => record.scenario === kind) ? records.filter((record) => record.scenario === kind).every((record) => record.result === "passed") ? "passed" : "failed" : "skipped", reasonCode: records.some((record) => record.scenario === kind) ? null : "SCENARIO_NOT_CONFIGURED" }])) } };
   } catch (error) { return layerResult = { records, observed: host?.info.observed ?? {}, outcome: { status: "blocked", completed: 0, reasonCode: code(error) } }; }
   finally {
@@ -364,7 +425,7 @@ export async function main(argv = process.argv.slice(2)) {
       await writeJson(resolve(options.config), config);
       log(combo.id + ": det=" + deterministic.outcome.status + " real=" + real.outcome.status + " current=" + evaluation.currentVerification);
       if (evaluation.currentVerification === "broken") exitCode = 1;
-    } finally { await rm(scratch, { recursive: true, force: true }); }
+    } finally { if (process.env.MATRIX_KEEP_SCRATCH !== "1") await rm(scratch, { recursive: true, force: true }); }
   }
   return exitCode;
 }

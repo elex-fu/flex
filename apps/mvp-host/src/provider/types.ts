@@ -83,6 +83,15 @@ export type AdapterEvent =
       approvalId: string;
       toolUseId: string;
       action: ApprovalAction | "expired" | "aborted";
+      /**
+       * Native acknowledgement of the resolution: the Provider-side promise
+       * resolved by respondApproval IS the native ack (canUseTool resolution
+       * for Claude, the RPC decision for Codex). Adapters attach it so the
+       * interaction ingest can upgrade the row to "confirmed", which the
+       * compatibility recorder requires as approval evidence. Expired and
+       * aborted resolutions carry no evidence.
+       */
+      evidence?: NativeInteractionEvidence;
     }
     | { kind: "diagnostic"; code: string; message: string; details?: unknown }
     | {

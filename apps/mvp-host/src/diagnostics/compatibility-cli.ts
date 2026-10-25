@@ -6,7 +6,7 @@ import { assertPrivateDirectory, OperationsError, readPrivateFile, syncDirectory
 import { authorizeCompatibilityRun, importCompatibilityRun } from "./compatibility-import.js";
 import type { CompatibilityHostIdentity } from "./compatibility-integrity.js";
 
-export type CompatibilityCommand = { kind: "compatibility-authorize"; sourceHostPath: string; runId: string; provider: "claude" | "codex"; entryDigest: string; artifactDigest: string; runtimeDigest: string; outputPath: string }
+export type CompatibilityCommand = { kind: "compatibility-authorize"; sourceHostPath: string; runId: string; provider: "claude" | "codex"; entryDigest: string; artifactDigest: string; runtimeDigest: string; outputPath: string; sceneVersion?: string | undefined }
   | { kind: "compatibility-import"; authorizationPath: string; readinessPath: string; evidencePath: string; outputPath: string };
 const invalid = (): never => { throw new OperationsError("COMPATIBILITY_COMMAND_INVALID"); };
 /** Local terminal command only; no RPC route and no implicit work from activation verify. */
@@ -14,20 +14,23 @@ export function parseCompatibilityCommand(args: readonly string[]): Compatibilit
   if (args[0] !== "compatibility") return undefined;
   const action = args[1];
   const flags: Record<string, string> = {};
-  const allowed = action === "authorize" ? ["--source-host", "--run-id", "--provider", "--entry-digest", "--artifact-digest", "--runtime-digest", "--output"]
+  // --scene is optional on authorize (design §5: the ticket pins the scene
+  // version; absent keeps the flyx-c3-basic-v1 default); every other flag is required.
+  const allowed = action === "authorize" ? ["--source-host", "--run-id", "--provider", "--entry-digest", "--artifact-digest", "--runtime-digest", "--output", "--scene"]
     : action === "import" ? ["--authorization", "--readiness", "--evidence", "--output"] : invalid();
   for (let index = 2; index < args.length; index += 2) {
     const flag = args[index]; const value = args[index + 1];
     if (!flag || !allowed.includes(flag) || flags[flag] !== undefined || !value || value.startsWith("--")) invalid();
     flags[flag!] = value!;
   }
-  if (allowed.some((flag) => !flags[flag])) invalid();
+  if (allowed.some((flag) => flag !== "--scene" && !flags[flag])) invalid();
   for (const flag of allowed.filter((flag) => ["--source-host", "--output", "--authorization", "--readiness", "--evidence"].includes(flag))) if (!isAbsolute(flags[flag]!)) invalid();
   if (action === "authorize") {
     if (!["claude", "codex"].includes(flags["--provider"]!) || !/^[a-zA-Z0-9-]{1,128}$/.test(flags["--run-id"]!)
       || ["--entry-digest", "--artifact-digest", "--runtime-digest"].some((flag) => !/^[a-f0-9]{64}$/.test(flags[flag]!))) invalid();
     return { kind: "compatibility-authorize", sourceHostPath: flags["--source-host"]!, runId: flags["--run-id"]!, provider: flags["--provider"] as "claude" | "codex",
-      entryDigest: flags["--entry-digest"]!, artifactDigest: flags["--artifact-digest"]!, runtimeDigest: flags["--runtime-digest"]!, outputPath: flags["--output"]! };
+      entryDigest: flags["--entry-digest"]!, artifactDigest: flags["--artifact-digest"]!, runtimeDigest: flags["--runtime-digest"]!, outputPath: flags["--output"]!,
+      ...(flags["--scene"] !== undefined ? { sceneVersion: flags["--scene"] } : {}) };
   }
   return { kind: "compatibility-import", authorizationPath: flags["--authorization"]!, readinessPath: flags["--readiness"]!, evidencePath: flags["--evidence"]!, outputPath: flags["--output"]! };
 }

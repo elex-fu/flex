@@ -6,6 +6,16 @@ import type { DispatchContext } from "./types.js";
 import { dispatchContextForTurn } from "./types.js";
 import { supportsNativeStop } from "../lifecycle/managed-stop-contract.js";
 
+/**
+ * Verified producer-stop deadline for turn finalize and host shutdown.
+ * The stop sequence itself escalates stdin.close → SIGTERM → SIGKILL and then
+ * polls for group absence; long codex turns with a live app-server process
+ * tree have repeatedly exceeded the previous 5s bound, flipping a healthy
+ * turn into RUNTIME_STOP_UNVERIFIED retention (observed codex r2/r4 and
+ * web-e2e-codex). Callers may still pass an explicit shorter deadline.
+ */
+export const PRODUCER_STOP_DEADLINE_MS = 30_000;
+
 export type NativeSpawnRequest = Omit<SpawnOptions, "cwd" | "env"> & { command: string; args: readonly string[]; cwd: string; env: NodeJS.ProcessEnv };
 export interface ProviderExecutionBoundary {
   spawn(registry: ManagedProcessRegistry, request: NativeSpawnRequest): ManagedChildHandle;
@@ -64,12 +74,12 @@ export class ManagedRuntimeController {
     this.runtimes.add(runtime);
     return runtime;
   }
-  async closeTurnAndWait(context: DispatchContext, deadlineMs = 5_000): Promise<ProcessStopResult> {
+  async closeTurnAndWait(context: DispatchContext, deadlineMs = PRODUCER_STOP_DEADLINE_MS): Promise<ProcessStopResult> {
     const results = await Promise.all([...this.runtimes].filter((runtime) => sameContext(runtime.context, context)).map((runtime) => runtime.closeAndWait(deadlineMs)));
     return { stopped: results.every((value) => value.stopped), treeStopped: results.every((value) => value.treeStopped), records: results.flatMap((value) => value.records) };
   }
   sealJournals(): void { for (const runtime of this.runtimes) runtime.registry.sealJournal(); }
-  closeAndWait(deadlineMs = 5_000): Promise<ProcessStopResult> {
+  closeAndWait(deadlineMs = PRODUCER_STOP_DEADLINE_MS): Promise<ProcessStopResult> {
     this.closing = true;
     this.closePromise ??= Promise.all([...this.runtimes].map((runtime) => runtime.closeAndWait(deadlineMs))).then((results) => ({ stopped: results.every((result) => result.stopped), treeStopped: results.every((result) => result.treeStopped), records: results.flatMap((result) => result.records) }));
     return this.closePromise;

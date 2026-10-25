@@ -6,10 +6,13 @@ import {
   sceneCommandCount,
   scenePrompts,
   sceneSegmentCommandIds,
+  sceneSegmentForPrompt,
+  sceneSegmentPrompts,
   sceneSegments,
   sceneVersionForSegments,
   SCENE_REGISTRY,
   COMPATIBILITY_SCENE_APPROVAL_PROMPT,
+  COMPATIBILITY_SCENE_APPROVAL_PROMPT_2,
   COMPATIBILITY_SCENE_BASIC_PROMPT,
   COMPATIBILITY_SCENE_INTERRUPT_PROMPT,
 } from "./compatibility-scenes.js";
@@ -53,13 +56,29 @@ describe("compatibility scene registry", () => {
     const c3 = compatibilitySceneCommandIds("flyx-c3-basic-v1", runId);
     const c4 = compatibilitySceneCommandIds("flyx-c4-approval-v1", runId);
     expect(c3.some((id) => c4.includes(id))).toBe(false);
-    expect(scenePrompts("flyx-c4-approval-v1")).toEqual([COMPATIBILITY_SCENE_BASIC_PROMPT, COMPATIBILITY_SCENE_APPROVAL_PROMPT]);
+    expect(scenePrompts("flyx-c4-approval-v1")).toEqual([COMPATIBILITY_SCENE_BASIC_PROMPT, COMPATIBILITY_SCENE_APPROVAL_PROMPT, COMPATIBILITY_SCENE_APPROVAL_PROMPT_2]);
     expect(scenePrompts("flyx-c5-interrupt-v1")).toEqual([COMPATIBILITY_SCENE_BASIC_PROMPT, COMPATIBILITY_SCENE_INTERRUPT_PROMPT]);
     // reconnect reuses the basic prompt, so its scene has one prompt
     expect(scenePrompts("flyx-c6-reconnect-v1")).toEqual([COMPATIBILITY_SCENE_BASIC_PROMPT]);
     expect(scenePrompts("flyx-c7-interactive-v1")).toEqual([
-      COMPATIBILITY_SCENE_BASIC_PROMPT, COMPATIBILITY_SCENE_APPROVAL_PROMPT, COMPATIBILITY_SCENE_INTERRUPT_PROMPT,
+      COMPATIBILITY_SCENE_BASIC_PROMPT, COMPATIBILITY_SCENE_APPROVAL_PROMPT, COMPATIBILITY_SCENE_APPROVAL_PROMPT_2, COMPATIBILITY_SCENE_INTERRUPT_PROMPT,
     ]);
+  });
+
+  it("pins a distinct approval prompt per repetition slot so repetition 2 forces its own tool call", () => {
+    // Regression (r5): with one shared prompt, repetition 2's request was
+    // already answered in conversation history and the model replied DONE
+    // text-only, so no second approval card was ever raised.
+    const segments = sceneSegments("flyx-c7-interactive-v1")!;
+    const approval = segments.find((segment) => segment.id === "approval")!;
+    expect(sceneSegmentPrompts(approval)).toEqual([COMPATIBILITY_SCENE_APPROVAL_PROMPT, COMPATIBILITY_SCENE_APPROVAL_PROMPT_2]);
+    expect(COMPATIBILITY_SCENE_APPROVAL_PROMPT).not.toBe(COMPATIBILITY_SCENE_APPROVAL_PROMPT_2);
+    // Segments without per-slot prompts keep one fixed prompt for all slots.
+    const basic = segments.find((segment) => segment.id === "basic")!;
+    expect(sceneSegmentPrompts(basic)).toHaveLength(10);
+    expect(new Set(sceneSegmentPrompts(basic))).toEqual(new Set([COMPATIBILITY_SCENE_BASIC_PROMPT]));
+    // A slot prompt resolves back to its own segment.
+    expect(sceneSegmentForPrompt("flyx-c7-interactive-v1", COMPATIBILITY_SCENE_APPROVAL_PROMPT_2)?.id).toBe("approval");
   });
 
   it("refuses unknown scene versions", () => {

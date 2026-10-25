@@ -1,6 +1,6 @@
 import type { ProviderId } from "@flyx/mvp-protocol";
 import type { SqliteStore } from "../storage/db.js";
-import { CatalogError } from "../storage/catalog-store.js";
+import { CatalogError, type CatalogStore } from "../storage/catalog-store.js";
 import { LocalCatalogConfigurationSchema, readLocalCatalogConfiguration, type LocalCatalogConfiguration } from "../session/configured-catalog.js";
 import type { HostCatalogOptions } from "./host-catalog.js";
 
@@ -41,4 +41,43 @@ export function readHostCatalogBootstrap(options: {
     throw new CatalogError("LEGACY_INITIAL_SESSION_REQUIRED", "Choose FLYX_LEGACY_WORKSPACE_ID and FLYX_LEGACY_PROVIDER_INSTANCE_ID from the local Catalog configuration");
   }
   return { configuration, initialLegacySession: { workspaceId, providerInstanceId } };
+}
+
+/**
+ * Restart revalidation source: the exact rows this Store already published. A
+ * restarted Host already has Sessions, so `readHostCatalogBootstrap` yields an
+ * empty environment configuration — environment defaults must never override
+ * an existing binding. The explicit local configuration step therefore
+ * revalidates the recorded rows instead, restoring the `configured` Provider
+ * state the startup readiness withdrawal reset, without ever introducing a
+ * binding the Store did not already hold. Disabled rows stay untouched: local
+ * revalidation must not re-enable a resource some other flow withdrew.
+ */
+export function storedCatalogConfiguration(catalog: CatalogStore): LocalCatalogConfiguration {
+  const legacyDefaultSessionId = catalog.legacyDefaultSessionId();
+  return LocalCatalogConfigurationSchema.parse({
+    workspaces: catalog.workspaces()
+      .filter((workspace) => workspace.state !== "disabled")
+      .map((workspace) => ({
+        workspaceId: workspace.workspaceId,
+        root: workspace.canonicalRoot,
+        repositoryId: workspace.repositoryId,
+        capabilities: [...workspace.capabilities],
+      })),
+    providerInstances: catalog.providers()
+      .filter((provider) => provider.state !== "disabled")
+      .map((provider) => ({
+        providerInstanceId: provider.providerInstanceId,
+        provider: provider.provider,
+        executable: provider.executable,
+        config: {
+          ...(provider.config.model ? { model: provider.config.model } : {}),
+          environment: { ...provider.config.environment },
+          sandboxRequired: true,
+        },
+        policyVersion: provider.policyVersion,
+        policyCapabilities: [...provider.policyCapabilities],
+      })),
+    ...(legacyDefaultSessionId ? { legacyDefaultSessionId } : {}),
+  });
 }

@@ -378,6 +378,27 @@ describe("Codex Engine dispatch fence", () => {
 });
 
 
+it("attaches native-ack evidence when respondApproval resolves the RPC decision", async () => {
+  const state = setup();
+  const first = state.adapter.runTurn("approval-evidence-turn", "first", undefined, context("approval-evidence-turn", 23));
+  await waitFor(() => state.events.some((event) => event.kind === "native_binding"));
+  state.client.serverRequest(77, "item/commandExecution/requestApproval", { threadId: "codex-thread-new", turnId: "codex-turn-1", itemId: "approval-item", command: "echo ok" });
+  const requested = state.events.find((event): event is Extract<AdapterEvent, { kind: "approval_requested" }> => event.kind === "approval_requested")!;
+  expect(requested.request.dispatchContext).toMatchObject({ nativeRequestId: "codex-rpc:number:77", nativeMethod: "item/commandExecution/requestApproval" });
+  expect(state.adapter.respondApproval(requested.request.approvalId, "allow_once")).toBe(true);
+  expect(state.client.responses).toContainEqual({ id: 77, result: { decision: "accept" } });
+  expect(state.events.find((event): event is Extract<AdapterEvent, { kind: "approval_resolved" }> => event.kind === "approval_resolved")).toMatchObject({
+    approvalId: requested.request.approvalId,
+    toolUseId: "approval-item",
+    action: "allow_once",
+    evidence: { kind: "native-ack", sourceId: "codex-rpc:number:77", nativeRequestId: "codex-rpc:number:77" },
+    turnId: "approval-evidence-turn",
+    generation: 23,
+  });
+  complete(state.client, "codex-turn-1", "done");
+  await first;
+});
+
 it("requires native Turn binding when a resumed runtime reuses an approval RPC ID", async () => {
   const state = setup();
   const first = state.adapter.runTurn("first-approval-turn", "first", "shared-thread", context("first-approval-turn", 21));

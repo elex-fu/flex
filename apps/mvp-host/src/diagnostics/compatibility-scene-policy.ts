@@ -16,13 +16,14 @@ import type { CompatibilityRunAuthorization } from "./compatibility-import.js";
 import { assertControlledCompatibilityEntry, COMPATIBILITY_SCENE_VERSION, type CompatibilityReadinessOptions } from "./compatibility-readiness.js";
 import {
   compatibilitySceneCommandIds as sceneRegistryCommandIds,
+  sceneSegmentPromptAt,
   sceneSegments,
   sceneSegmentCommandIds,
 } from "./compatibility-scenes.js";
 
 declare const scenePermit: unique symbol;
 declare const versionProbeAuthority: unique symbol;
-export type CompatibilityScenePermit = Readonly<{ kind: "compatibility-scene-start"; [scenePermit]: true }>;
+export type CompatibilityScenePermit = Readonly<{ kind: "compatibility-scene-start" | "compatibility-scene-control"; [scenePermit]: true }>;
 export type CompatibilityVersionProbeRequest = Readonly<{
   provider: "claude" | "codex"; executable: Readonly<{ path: string; digest: string }>;
   configFingerprint: string; runtimeDigest: string; operation: "--version";
@@ -37,6 +38,15 @@ export type CompatibilitySceneBinding = Readonly<{
 }>;
 export type CompatibilitySceneStart = Readonly<{
   actorId: string; commandId: string; method: string; prompt: string; requestHash: string; sessionId: string;
+}>;
+/**
+ * Control-method admission for the interactive scene segments: an answerable
+ * approval card and a delivered interrupt need the same local authority the
+ * start permit carries, otherwise the Host demands a verified Provider
+ * instance which only exists after destination import.
+ */
+export type CompatibilitySceneControl = Readonly<{
+  actorId: string; commandId: string; method: "session.interrupt" | "approval.respond"; requestHash: string; sessionId: string;
 }>;
 export type CompatibilityScenePolicyOptions = {
   authorization: unknown;
@@ -71,7 +81,7 @@ const within = (root: string, path: string) => { const value = relative(root, pa
 
 /** Opaque local authority for exactly one signed basic scene; it grants no remote management scope. */
 export class CompatibilityScenePolicy {
-  private readonly permits = new WeakMap<object, CompatibilitySceneStart>();
+  private readonly permits = new WeakMap<object, CompatibilitySceneStart | CompatibilitySceneControl>();
   readonly commandIds: readonly string[];
   /** commandId -> the fixed segment prompt pinned for that slot. */
   private readonly promptByCommandId: ReadonlyMap<string, string>;
@@ -86,7 +96,11 @@ export class CompatibilityScenePolicy {
     this.commandIds = sceneRegistryCommandIds(this.ticket.sceneVersion, this.ticket.runId);
     const pairs = new Map<string, string>();
     for (const segment of sceneSegments(this.ticket.sceneVersion)!) {
-      for (const commandId of sceneSegmentCommandIds(this.ticket.sceneVersion, this.ticket.runId, segment.id)) pairs.set(commandId, segment.prompt);
+      // Per-slot prompts: the approval segment pins a distinct prompt per
+      // repetition so each slot's admission checks its own pinned string.
+      sceneSegmentCommandIds(this.ticket.sceneVersion, this.ticket.runId, segment.id).forEach((commandId, index) => {
+        pairs.set(commandId, sceneSegmentPromptAt(segment, index));
+      });
     }
     this.promptByCommandId = pairs;
   }
@@ -167,8 +181,27 @@ export class CompatibilityScenePolicy {
     const permit = Object.freeze({ kind: "compatibility-scene-start" }) as CompatibilityScenePermit;
     this.permits.set(permit, Object.freeze({ ...input })); return permit;
   }
-  private original(permit: CompatibilityScenePermit): CompatibilitySceneStart {
-    const input = this.permits.get(permit); if (!input) return fail("COMPATIBILITY_SCENE_PERMIT_INVALID"); this.assertStart(input); return input;
+  /** Control scopes mirror the RPC dispatcher's session:write / approval:write split. */
+  private assertControl(input: CompatibilitySceneControl): void {
+    this.assertSource();
+    if (input.sessionId !== this.binding.sessionId
+      || (input.method !== "session.interrupt" && input.method !== "approval.respond")
+      || !input.commandId || input.commandId.length > 256
+      || this.commandIds.includes(input.commandId)
+      || !/^[a-f0-9]{64}$/.test(input.requestHash)) fail("COMPATIBILITY_SCENE_REQUEST_REJECTED");
+    this.options.assertBaseline(input.actorId, input.sessionId);
+    const actor = this.options.store.getDevice(input.actorId);
+    const requiredScope = input.method === "session.interrupt" ? "session:write" : "approval:write";
+    if (!actor || actor.revokedAt || actor.expiresAt && Date.parse(actor.expiresAt) <= this.now() || !actor.scopes.includes(requiredScope)) fail("COMPATIBILITY_SCENE_DEVICE_REJECTED");
+  }
+  authorizeControl(input: CompatibilitySceneControl): CompatibilityScenePermit {
+    this.assertControl(input);
+    const permit = Object.freeze({ kind: "compatibility-scene-control" }) as CompatibilityScenePermit;
+    this.permits.set(permit, Object.freeze({ ...input })); return permit;
+  }
+  private original(permit: CompatibilityScenePermit): CompatibilitySceneStart | CompatibilitySceneControl {
+    const input = this.permits.get(permit); if (!input) return fail("COMPATIBILITY_SCENE_PERMIT_INVALID");
+    if ("prompt" in input) this.assertStart(input); else this.assertControl(input); return input;
   }
   assertResource(permit: CompatibilityScenePermit, binding: CompatibilitySceneBinding): void {
     this.original(permit); if (!same(binding, this.binding)) fail("COMPATIBILITY_SCENE_BINDING_CHANGED");
@@ -181,7 +214,9 @@ export class CompatibilityScenePolicy {
   }
   assertAcceptInCommit<T>(permit: CompatibilityScenePermit, input: { request: CommandRequest; plan: CommandPlan<T> }): void {
     if (!this.options.store.db.inTransaction) fail("COMPATIBILITY_SCENE_TRANSACTION_REQUIRED");
-    const original = this.original(permit), { request, plan } = input;
+    const permitInput = this.original(permit), { request, plan } = input;
+    if (!("prompt" in permitInput)) fail("COMPATIBILITY_SCENE_REQUEST_REJECTED");
+    const original: CompatibilitySceneStart = permitInput;
     const segmentPrompt = this.promptByCommandId.get(original.commandId);
     if (!segmentPrompt) fail("COMPATIBILITY_SCENE_REQUEST_REJECTED");
     if (request.authSubjectId !== original.actorId || request.commandId !== original.commandId || request.method !== original.method

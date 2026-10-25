@@ -13,7 +13,7 @@ import type {
   ProviderControlOutcome,
   ProviderEvidence,
 } from "../provider/types.js";
-import { ManagedRuntimeController, inspectNativeVersion, type ManagedRuntimeOptions, type PreparedNativeRuntime } from "../provider/managed-runtime.js";
+import { ManagedRuntimeController, inspectNativeVersion, PRODUCER_STOP_DEADLINE_MS, type ManagedRuntimeOptions, type PreparedNativeRuntime } from "../provider/managed-runtime.js";
 import type { ProcessStopResult } from "../lifecycle/managed-process-registry.js";
 import { sameDispatchContext } from "../provider/runtime-registry.js";
 import { dispatchContextForTurn, fenceAdapterEvent } from "../provider/types.js";
@@ -338,7 +338,10 @@ export class CodexAdapter implements ProviderAdapter {
     if (!this.client.respond(pending.rpcId, { decision: action === "allow_once" ? "accept" : "decline" })) return false;
     active.pending.delete(approvalId);
     active.pendingByRpcId.delete(rpcIdKey(pending.rpcId));
-    this.emit(active, { kind: "approval_resolved", approvalId, toolUseId: pending.toolUseId, action });
+    // The accepted RPC decision IS the native acknowledgement; the request id
+    // binding must equal the ApprovalRequest's dispatchContext nativeRequestId.
+    const nativeRequestId = `codex-rpc:${rpcRequestKey(pending.rpcId)}`;
+    this.emit(active, { kind: "approval_resolved", approvalId, toolUseId: pending.toolUseId, action, evidence: { kind: "native-ack", sourceId: nativeRequestId, nativeRequestId } });
     return true;
   }
 
@@ -356,13 +359,13 @@ export class CodexAdapter implements ProviderAdapter {
     if (result === "accepted" && active.codexTurnId) return { status: "delivered", evidence: { kind: "native-ack", sourceId: `${active.codexTurnId}:interrupt` } };
     return { status: "outcome_unknown", evidence: { kind: "unknown", reason: "INTERRUPT_DELIVERY_UNCONFIRMED" } };
   }
-  async closeTurnAndWait(context: DispatchContext, deadlineMs = 5_000): Promise<ProcessStopResult> {
+  async closeTurnAndWait(context: DispatchContext, deadlineMs = PRODUCER_STOP_DEADLINE_MS): Promise<ProcessStopResult> {
     const active = this.active;
     if (active && sameDispatchContext(active.context, context) && active.client) await this.retireClient(active.client, deadlineMs, true);
     return this.runtimes.closeTurnAndWait(context, deadlineMs);
   }
   close(): void { void this.closeAndWait().catch(() => {}); }
-  closeAndWait(deadlineMs = 5_000): Promise<ProcessStopResult> {
+  closeAndWait(deadlineMs = PRODUCER_STOP_DEADLINE_MS): Promise<ProcessStopResult> {
     if (this.closePromise) return this.closePromise;
     this.closing = true;
     const active = this.active;

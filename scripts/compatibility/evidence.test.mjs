@@ -5,7 +5,7 @@ import { chmod, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { parseArgs, parseNativeEvidence, parseReadiness, readReadiness, evaluateVerification, nativeCounts, digest, canonicalJson, verifySignedPayload, compatibilitySceneCommandIds, sceneSegments, sceneCommandCount, SCENE_REGISTRY, SCENE_NAMES } from "./evidence.mjs";
-import { openClient, RpcClient } from "./run-matrix.mjs";
+import { openClient, RpcClient, approvalCardEvent, approvalIdOf, approvalVersionOf } from "./run-matrix.mjs";
 
 const h = (character) => character.repeat(64);
 const combo = { provider: "claude", status: "pending", nodeVersion: "24.18.0", os: "macOS 25.5.0 arm64", sdkVersion: "0.3.220", claudeCliVersion: "2.1.220", capabilities: ["interrupt"] };
@@ -91,6 +91,27 @@ test("terminal events received before start RPC response are retained", async ()
   const client = new RpcClient(ws);
   client.handleFrame({ type: "event", event: { type: "turn.completed", payload: { turnId: "fast" } } });
   assert.equal((await client.waitTerminal("fast", 1)).type, "turn.completed");
+});
+
+test("approval responder matches canonical interaction.requested cards and legacy approval.requested commits", async () => {
+  const ws = { send() {}, close() {} };
+  const client = new RpcClient(ws);
+  // Canonical card: the Host's interaction system; interactionId is the legacy approvalId, version nested.
+  client.handleFrame({ type: "event", event: { type: "interaction.requested", payload: { itemId: "approval-card-1", interactionId: "card-1", turnId: "turn-1", interactionKind: "approval", status: "pending", interaction: { version: 3 } } } });
+  // Non-approval interactions and other turns must never satisfy the wait.
+  client.handleFrame({ type: "event", event: { type: "interaction.requested", payload: { interactionId: "q-1", turnId: "turn-1", interactionKind: "question", status: "pending", interaction: { version: 0 } } } });
+  client.handleFrame({ type: "event", event: { type: "interaction.requested", payload: { interactionId: "card-2", turnId: "other-turn", interactionKind: "approval", status: "pending", interaction: { version: 0 } } } });
+  const card = await client.waitEvent(approvalCardEvent("turn-1"), 1);
+  assert.equal(approvalIdOf(card.payload), "card-1");
+  assert.equal(approvalVersionOf(card.payload), 3);
+  // Legacy card: approval.requested carries approvalId and top-level version.
+  client.handleFrame({ type: "event", event: { type: "approval.requested", payload: { approvalId: "legacy-1", turnId: "turn-2", version: 2 } } });
+  const legacy = await client.waitEvent(approvalCardEvent("turn-2"), 1);
+  assert.equal(approvalIdOf(legacy.payload), "legacy-1");
+  assert.equal(approvalVersionOf(legacy.payload), 2);
+  // A card without any id is rejected rather than silently answered.
+  assert.equal(approvalIdOf({ turnId: "turn-1" }), null);
+  assert.equal(approvalVersionOf({}), 0);
 });
 
 test("matrix client sends the exact loopback Origin through real HTTP/WebSocket auth", { timeout: 5_000 }, async () => {
@@ -233,5 +254,6 @@ test("script scene registry matches the built dist registry when present", async
     assert.deepEqual(distSegments.map((segment) => segment.id), segments.map((segment) => segment.id));
     assert.deepEqual(distSegments.map((segment) => segment.repetitions), segments.map((segment) => segment.repetitions));
     assert.deepEqual(distSegments.map((segment) => segment.prompt), segments.map((segment) => segment.prompt));
+    assert.deepEqual(distSegments.map((segment) => segment.prompts ?? null), segments.map((segment) => segment.prompts ?? null));
   }
 });

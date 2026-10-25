@@ -223,6 +223,28 @@ describe("typed atomic Interaction service", () => {
     f.service.recordDelivery(delivery.id, { kind: "local-delivery" });
     expect(f.store.getSession("session")!.revision).toBe(before);
   });
+  it("confirms the approval row from the adapter's native-ack evidence on approval_resolved", () => {
+    const f = setup();
+    const row = approval(f);
+    f.service.ingestApproval(interactionFence(f.context), { interactionId: row.approvalId, nativeRequestId: row.toolUseId, nativeMethod: "canUseTool/approval", request: { toolName: "Bash" }, createdAt: row.createdAt, expiresAt: f.native.expiresAt, approval: row });
+    f.service.respondLegacyApproval("device-a", "approve", row.approvalId, "allow_once");
+    ingestInteractionEvent(f.service, { kind: "approval_resolved", approvalId: row.approvalId, toolUseId: row.toolUseId, action: "allow_once", evidence: { kind: "native-ack", sourceId: row.toolUseId, nativeRequestId: row.toolUseId }, dispatchContext: f.context, turnId: f.turn.id, generation: f.turn.generation });
+    expect(f.service.interactions.get(row.approvalId)).toMatchObject({ status: "confirmed", deliveryState: "native_confirmation" });
+    expect(f.store.getCommandReceipt("device-a", "approve")?.state).toBe("completed");
+    // A later worker local-delivery settle is a no-op after confirmation.
+    const delivery = f.service.execution.forCommand("device-a", "approve")[0]!;
+    const before = f.store.getSession("session")!.revision;
+    f.service.recordDelivery(delivery.id, { kind: "local-delivery" });
+    expect(f.store.getSession("session")!.revision).toBe(before);
+  });
+  it("rejects mismatched native-ack evidence from approval_resolved instead of confirming", () => {
+    const f = setup();
+    const row = approval(f);
+    f.service.ingestApproval(interactionFence(f.context), { interactionId: row.approvalId, nativeRequestId: row.toolUseId, nativeMethod: "canUseTool/approval", request: { toolName: "Bash" }, createdAt: row.createdAt, expiresAt: f.native.expiresAt, approval: row });
+    f.service.respondLegacyApproval("device-a", "approve", row.approvalId, "allow_once");
+    expect(() => ingestInteractionEvent(f.service, { kind: "approval_resolved", approvalId: row.approvalId, toolUseId: row.toolUseId, action: "allow_once", evidence: { kind: "native-ack", sourceId: "other", nativeRequestId: "other" }, dispatchContext: f.context, turnId: f.turn.id, generation: f.turn.generation })).toThrow("INTERACTION_NATIVE_EVIDENCE_INVALID");
+    expect(f.service.interactions.get(row.approvalId)?.status).toBe("responding");
+  });
   it("adds one canonical supersession per interaction in a compound terminal commit", () => {
     const f = setup();
     f.ingest();

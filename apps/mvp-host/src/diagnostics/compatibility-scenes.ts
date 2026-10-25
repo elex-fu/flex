@@ -18,6 +18,15 @@ export type CompatibilitySceneSegment = Readonly<{
   id: CompatibilitySceneSegmentId;
   /** Fixed per scene version; pinned end-to-end by the scene policy. */
   prompt: string;
+  /**
+   * Distinct per-slot prompts (length === commandCount) for segments whose
+   * repetitions must each force their own tool call. When omitted, every slot
+   * uses `prompt`. The approval segment pins distinct file contents so
+   * repetition 2 — whose history already contains repetition 1's identical
+   * request — can only comply by issuing a fresh disk-writing tool call,
+   * which deterministically raises the second approval card.
+   */
+  prompts?: readonly string[];
   /** Segment turns per run. Every scene keeps the 10-turn basic baseline. */
   repetitions: number;
   /** Command-id family size for this segment (one command per turn). */
@@ -28,6 +37,13 @@ export type CompatibilitySceneSegment = Readonly<{
 export const COMPATIBILITY_SCENE_BASIC_PROMPT = "回复 OK 两个字母，不要做任何其他事";
 /** The approval prompt forces a disk-writing tool call in the workspace. */
 export const COMPATIBILITY_SCENE_APPROVAL_PROMPT = "在当前工作区创建文件 approval-scene.txt，内容为 OK，然后回复 DONE，不要做任何其他事";
+/**
+ * Repetition 2 asks for different file content: repetition 1's allow_once
+ * already created the OK file (and its exchange is in the conversation
+ * history), so an identical prompt lets the model answer DONE text-only.
+ * Distinct content leaves a fresh Write as the only compliant action.
+ */
+export const COMPATIBILITY_SCENE_APPROVAL_PROMPT_2 = "在当前工作区创建文件 approval-scene.txt，内容为 DENIED，然后回复 DONE，不要做任何其他事";
 /** The interrupt prompt runs long enough to be interrupted mid-turn. */
 export const COMPATIBILITY_SCENE_INTERRUPT_PROMPT = "从 1 数到 50，每数一个数字就输出一次，不要做任何其他事";
 /** The reconnect turn reuses the basic prompt; the restart is the event. */
@@ -37,7 +53,9 @@ export const BASIC_SEGMENT: CompatibilitySceneSegment = Object.freeze({
   id: "basic", prompt: COMPATIBILITY_SCENE_BASIC_PROMPT, repetitions: 10, commandCount: 10, capability: "turn",
 });
 const APPROVAL_SEGMENT: CompatibilitySceneSegment = Object.freeze({
-  id: "approval", prompt: COMPATIBILITY_SCENE_APPROVAL_PROMPT, repetitions: 2, commandCount: 2, capability: "approval",
+  id: "approval", prompt: COMPATIBILITY_SCENE_APPROVAL_PROMPT,
+  prompts: Object.freeze([COMPATIBILITY_SCENE_APPROVAL_PROMPT, COMPATIBILITY_SCENE_APPROVAL_PROMPT_2]),
+  repetitions: 2, commandCount: 2, capability: "approval",
 });
 const INTERRUPT_SEGMENT: CompatibilitySceneSegment = Object.freeze({
   id: "interrupt", prompt: COMPATIBILITY_SCENE_INTERRUPT_PROMPT, repetitions: 1, commandCount: 1, capability: "interrupt",
@@ -76,16 +94,26 @@ export function sceneVersionForSegments(ids: readonly CompatibilitySceneSegmentI
   return undefined;
 }
 
+/** Per-slot prompt of a segment: `prompts[slot]` when pinned, else the fixed prompt. */
+export function sceneSegmentPromptAt(segment: CompatibilitySceneSegment, index: number): string {
+  return segment.prompts?.[index] ?? segment.prompt;
+}
+
+/** Per-slot prompts of a segment, in consumption order (length === commandCount). */
+export function sceneSegmentPrompts(segment: CompatibilitySceneSegment): readonly string[] {
+  return Array.from({ length: segment.commandCount }, (_, index) => sceneSegmentPromptAt(segment, index));
+}
+
 /** Ordered unique prompts of a scene, in consumption order (assertStart accepts exactly these). */
 export function scenePrompts(sceneVersion: string): readonly string[] {
   const segments = sceneSegments(sceneVersion);
   if (!segments) throw Object.assign(new Error("COMPATIBILITY_SCENE_VERSION_UNSUPPORTED"), { code: "COMPATIBILITY_SCENE_VERSION_UNSUPPORTED" });
-  return [...new Set(segments.map((segment) => segment.prompt))];
+  return [...new Set(segments.flatMap((segment) => sceneSegmentPrompts(segment)))];
 }
 
 /** Segment for one of the scene's prompts (unique prompts guaranteed by scenePrompts). */
 export function sceneSegmentForPrompt(sceneVersion: string, prompt: string): CompatibilitySceneSegment | undefined {
-  return sceneSegments(sceneVersion)?.find((segment) => segment.prompt === prompt);
+  return sceneSegments(sceneVersion)?.find((segment) => sceneSegmentPrompts(segment).includes(prompt));
 }
 
 function sceneCommandPrefix(sceneVersion: string, runId: string): string {

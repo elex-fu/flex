@@ -8,6 +8,7 @@ import { managedLaunchOrderLogFor } from "../lifecycle/managed-launch-order-log.
 import { SystemProcessInspector } from "../lifecycle/process-inspector.js";
 import { prepareNativeExecutionBoundary, type NativeBoundaryAssessment } from "../lifecycle/native-execution-boundary.js";
 import { inspectNativeBoundaryStop } from "../lifecycle/native-boundary-proof.js";
+import { PRODUCER_STOP_DEADLINE_MS } from "./managed-runtime.js";
 import { hasManagedStopContract } from "../lifecycle/managed-stop-contract.js";
 import { validateTreeStopEvidence } from "../lifecycle/managed-process-evidence.js";
 import { dispatchContextForTurn, type DispatchContext, type ProviderId } from "./types.js";
@@ -62,12 +63,12 @@ export class HostManagedRuntime {
       try { validateTreeStopEvidence(record.stopProof, record.processIdentity, record.boundaryEvidence, record.processGroup); return true; } catch { return false; }
     }));
   }
-  async closeTurnAndWait(context: DispatchContext, deadlineMs = 5_000): Promise<ProcessStopResult> {
+  async closeTurnAndWait(context: DispatchContext, deadlineMs = PRODUCER_STOP_DEADLINE_MS): Promise<ProcessStopResult> {
     const results = await Promise.all([...(this.turnRegistries.get(key(context)) ?? [])].map((registry) => registry.closeAndWait(deadlineMs)));
     const result = { stopped: results.every((value) => value.stopped), treeStopped: results.every((value) => value.treeStopped), records: results.flatMap((value) => value.records) };
     this.stops.set(key(context), result); return result;
   }
-  closeAndWait(deadlineMs = 5_000): Promise<ProcessStopResult> {
+  closeAndWait(deadlineMs = PRODUCER_STOP_DEADLINE_MS): Promise<ProcessStopResult> {
     this.closing = true;
     this.closePromise ??= (async () => {
       const deadlineAt=Date.now()+Math.max(0,deadlineMs);

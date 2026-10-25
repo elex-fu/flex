@@ -7,6 +7,7 @@ import { installedProviderRuntimeFacts } from "../diagnostics/compatibility-runt
 import { measuredHostBuildDigest } from "../diagnostics/planned-native-artifact.js";
 import { publicHostIdentity, type HostIdentityFileV1 } from "../identity/host-identity.js";
 import type { CompatibilityEvidenceTrust } from "../diagnostics/compatibility-evidence.js";
+import { compatibilityEndorsementSceneVersion } from "../diagnostics/compatibility-evidence.js";
 import { newestPassedArtifact, fileIdentity, providerConfigurationFingerprint } from "./host-activation-load.js";
 import type { ProviderInstanceRecord } from "../storage/catalog-store.js";
 import { MACOS_MANAGED_STOP_CONTRACT } from "./managed-stop-contract.js";
@@ -35,6 +36,20 @@ export function macosManagedExecutionFacts(options: { compatibilityEvidencePath:
   };
 }
 
+/**
+ * Design §6: the execution facts' runtime closure resolves the newest passed
+ * artifact through the same destination trust as the activation CLI and the
+ * Host application graph. Without the verified endorsement sceneVersion an
+ * imported c4–c7 activation fails closed at boot (PROVIDER_RUNTIME_UNAVAILABLE
+ * withdrawal), because loadTrustedCompatibilityEvidence keeps the c3 default.
+ */
+export function macosExecutionFactsTrust(options: { identity: HostIdentityFileV1; compatibilityEndorsementPath: string }): CompatibilityEvidenceTrust {
+  const destination = publicHostIdentity(options.identity);
+  const endorsementSceneVersion = compatibilityEndorsementSceneVersion(options.compatibilityEndorsementPath, destination);
+  return { destination, endorsementPath: options.compatibilityEndorsementPath,
+    ...(endorsementSceneVersion ? { sceneVersion: endorsementSceneVersion } : {}) };
+}
+
 export async function createMacosManagedExecution(options: { identity: HostIdentityFileV1; compatibilityEvidencePath: string;
   compatibilityEndorsementPath: string; worktreesRoot: string;
   /** Isolated compatibility run (M4); undefined for the ordinary online Host. */
@@ -46,5 +61,5 @@ export async function createMacosManagedExecution(options: { identity: HostIdent
       compatibilityRecorder: () => options.compatibility!.compatibilityRecorder(),
       compatibilityScene: () => options.compatibility!.compatibilityScene() } : {}),
     facts: macosManagedExecutionFacts({ compatibilityEvidencePath: options.compatibilityEvidencePath,
-      trust: { destination: publicHostIdentity(options.identity), endorsementPath: options.compatibilityEndorsementPath } }) };
+      trust: macosExecutionFactsTrust(options) }) };
 }

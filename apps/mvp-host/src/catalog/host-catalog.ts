@@ -536,9 +536,16 @@ export class HostCatalog {
             }
             return this.executionResponse(prior.response, prior, sessionId, explicit);
         }
-        const scene = starting ? this.options.nativeScenePolicy?.() : undefined;
-        const authorization = scene?.authorizeStart({ actorId: command.authSubjectId, commandId: command.commandId,
-          method: frame.method, prompt: (input as { prompt: string }).prompt, requestHash: request.requestHash, sessionId });
+        // Control methods (interrupt, approval.respond) need their own scene
+        // permit on a scene-authorized Host: without it the admission chain
+        // falls back to demanding an already-verified Provider instance, which
+        // only exists after destination import, and an approval card raised by
+        // an interactive scene segment could never be answered.
+        const control = frame.method === "session.interrupt" || frame.method === "approval.respond";
+        const scene = starting || control ? this.options.nativeScenePolicy?.() : undefined;
+        const authorization = starting ? scene?.authorizeStart({ actorId: command.authSubjectId, commandId: command.commandId,
+          method: frame.method, prompt: (input as { prompt: string }).prompt, requestHash: request.requestHash, sessionId })
+          : control ? scene?.authorizeControl({ actorId: command.authSubjectId, commandId: command.commandId, method: frame.method as "session.interrupt" | "approval.respond", requestHash: request.requestHash, sessionId }) : undefined;
         if (starting) {
             this.options.assertNativeReady?.(resolved, authorization);
             resolved = this.registry.assertExecutionResources(sessionId, authorization);
@@ -551,8 +558,10 @@ export class HostCatalog {
             throw new CatalogError("SESSION_REVISION_CONFLICT");
         // Controls bind to the original runtime: an in-progress shared load is
         // awaited (and its resource checks give the precise refusal) before
-        // the actor authority is rechecked post-load.
-        const runtime = await this.registry.ensureLoaded(sessionId, starting ? authorization : undefined);
+        // the actor authority is rechecked post-load. A control scene permit
+        // rides the same load so executionTarget's verified-instance gate is
+        // satisfied exactly like a start permit.
+        const runtime = await this.registry.ensureLoaded(sessionId, authorization);
         this.target(context, sessionId, scope);
         let current = this.registry.resolve(sessionId);
         if (starting) { this.options.assertNativeReady?.(current, authorization); current = this.registry.assertExecutionResources(sessionId, authorization); }

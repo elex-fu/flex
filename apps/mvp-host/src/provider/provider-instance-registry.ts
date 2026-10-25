@@ -27,7 +27,7 @@ const CAPABILITY_SCOPES:Readonly<Record<string,string>>={streamingText:"session:
 export class ProviderInstanceRegistry {
   constructor(readonly catalog:CatalogStore) {}
   get(id:string) {return this.catalog.provider(id);}
-  require(id:string):ProviderInstanceRecord {const provider=this.get(id);if(!provider)throw new CatalogError("PROVIDER_INSTANCE_NOT_FOUND");if(provider.state!=="configured")throw new CatalogError("PROVIDER_INSTANCE_UNAVAILABLE");return provider;}
+  require(id:string):ProviderInstanceRecord {const provider=this.get(id);if(!provider)throw new CatalogError("PROVIDER_INSTANCE_NOT_FOUND");if(provider.state!=="configured")throw new CatalogError("PROVIDER_INSTANCE_UNAVAILABLE",`PROVIDER_INSTANCE_UNAVAILABLE (state=${provider.state})`);return provider;}
   /** Current local executable plus trusted verification, before Native preparation. */
   requireExecution(id:string,scene?:CompatibilitySceneAuthority):ProviderInstanceRecord {
     const provider=this.require(id);

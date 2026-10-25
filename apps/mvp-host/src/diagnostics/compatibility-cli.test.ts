@@ -22,6 +22,8 @@ describe("local compatibility maintenance commands", () => {
     const sourcePath = join(directory, "source-public.json"); await writeFile(sourcePath, JSON.stringify(publicHostIdentity(source)), { mode: 0o600 });
     const output = join(directory, "authorization.json");
     const command = parseCompatibilityCommand(["compatibility", "authorize", "--source-host", sourcePath, "--run-id", "run-1", "--provider", "claude", "--entry-digest", hash("a"), "--artifact-digest", hash("b"), "--runtime-digest", hash("c"), "--output", output])!;
+    expect(command.sceneVersion).toBeUndefined();
+    expect(parseCompatibilityCommand(["compatibility", "authorize", "--source-host", sourcePath, "--run-id", "run-1", "--provider", "claude", "--entry-digest", hash("a"), "--artifact-digest", hash("b"), "--runtime-digest", hash("c"), "--output", output, "--scene", "flyx-c7-interactive-v1"])!.sceneVersion).toBe("flyx-c7-interactive-v1");
     const assertActive = vi.fn(); const store = { getHostIdentityMirror: () => getHostIdentityMirror(destination) };
     await expect(runCompatibilityCommand(command, { owner: { mode: "runtime", databasePath: "/host.sqlite", assertActive }, identity: destination, store })).rejects.toThrow("COMPATIBILITY_MAINTENANCE_REQUIRED");
     await expect(runCompatibilityCommand(command, { owner: { mode: "maintenance", databasePath: "/host.sqlite", assertActive }, identity: source, store })).rejects.toThrow("COMPATIBILITY_MAINTENANCE_REQUIRED");
@@ -31,6 +33,19 @@ describe("local compatibility maintenance commands", () => {
     expect(ticket.sourceHost).toEqual(publicHostIdentity(source)); expect(ticket.provider).toBe("claude");
     expect(ticket.nonce).toHaveLength(32); expect(text).not.toContain(destination.ed25519SecretKey);
     expect((await stat(output)).mode & 0o777).toBe(0o600); expect(assertActive).toHaveBeenCalled();
+  });
+  it("pins the scene version into the authorize ticket and refuses unregistered scenes", async () => {
+    const directory = await root(); const source = generateHostIdentity(); const destination = generateHostIdentity();
+    const sourcePath = join(directory, "source-public.json"); await writeFile(sourcePath, JSON.stringify(publicHostIdentity(source)), { mode: 0o600 });
+    const output = join(directory, "authorization.json");
+    const base = ["compatibility", "authorize", "--source-host", sourcePath, "--run-id", "run-1", "--provider", "claude", "--entry-digest", hash("a"), "--artifact-digest", hash("b"), "--runtime-digest", hash("c"), "--output", output];
+    const assertActive = vi.fn(); const store = { getHostIdentityMirror: () => getHostIdentityMirror(destination) };
+    await runCompatibilityCommand(parseCompatibilityCommand([...base, "--scene", "flyx-c7-interactive-v1"])!, { owner: { mode: "maintenance", databasePath: "/host.sqlite", assertActive }, identity: destination, store });
+    const ticket = JSON.parse(await readFile(output, "utf8"));
+    expect(ticket.sceneVersion).toBe("flyx-c7-interactive-v1");
+    expect(verifyCompatibilityPayload(ticket, publicHostIdentity(destination))).toBe(true);
+    await expect(runCompatibilityCommand(parseCompatibilityCommand([...base, "--scene", "flyx-c99-unknown-v1"])!, { owner: { mode: "maintenance", databasePath: "/host.sqlite", assertActive }, identity: destination, store })).rejects.toThrow("COMPATIBILITY_SCENE_VERSION_UNSUPPORTED");
+    expect(() => parseCompatibilityCommand([...base, "--scene", "--scene"])).toThrow("COMPATIBILITY_COMMAND_INVALID");
   });
   it("rejects fixture-domain readiness, unpinned source identities and foreign destination authorization", async () => {
     const directory = await root(); const source = generateHostIdentity(); const destination = generateHostIdentity();

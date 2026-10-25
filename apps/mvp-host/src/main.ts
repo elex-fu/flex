@@ -10,7 +10,7 @@ import { createPairingConfirmation, parseHostCommand, type HostCommand } from ".
 import { getHostIdentityMirror, loadOrCreateHostIdentity, publicHostIdentity, rotateHostIdentity, type HostIdentityFileV1 } from "./identity/host-identity.js";
 import type { HostServer } from "./server.js";
 import { createHostApplication } from "./host-application.js";
-import { readHostCatalogBootstrap } from "./catalog/local-host-configuration.js";
+import { readHostCatalogBootstrap, storedCatalogConfiguration } from "./catalog/local-host-configuration.js";
 import { runOfflineRecovery } from "./connectivity/recovery-cli.js";
 import { HOST_OPERATIONS_CLI_USAGE, runHostOperationsCommand } from "./connectivity/operations-cli.js";
 import { verifyOfflineHostQuiescence } from "./connectivity/offline-quiescence.js";
@@ -242,8 +242,15 @@ async function main(): Promise<void> {
       // its realpath and moves the provider instance to "configured", which
       // both the scene policy's executable binding and the execution
       // admission (PROVIDER_INSTANCE_UNAVAILABLE otherwise) require. Sessions
-      // are idle and unloaded at this point, so revalidation is safe.
-      await application.catalog.revalidateConfiguration(bootstrap.configuration);
+      // are idle and unloaded at this point, so revalidation is safe. A
+      // restarted Host already has Sessions, so its environment bootstrap is
+      // empty (environment defaults never override an existing binding); the
+      // step then revalidates the exact rows this Store already published,
+      // restoring the "configured" state the startup readiness withdrawal
+      // reset for Providers without persisted activation evidence.
+      await application.catalog.revalidateConfiguration(
+        bootstrap.configuration.providerInstances?.length ? bootstrap.configuration : storedCatalogConfiguration(application.catalog.catalog),
+      );
       const artifact = await isolatedCompatibility.start(application, {
         path: resolve(process.env.FLYX_COMPATIBILITY_READINESS_PATH ?? ""), baseUrl: address,
         pairingToken: server.auth.pairingUrlToken, provider, identity, runId: process.env.FLYX_COMPATIBILITY_RUN_ID ?? "",

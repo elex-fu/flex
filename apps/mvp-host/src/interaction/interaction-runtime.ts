@@ -66,7 +66,7 @@ export function ingestInteractionEvent(service: InteractionService, event: Adapt
     if (event.action === "expired" || event.action === "aborted" || !reservation)
       service.resolveNative(row.interactionId, event.action === "expired" ? "expired" : "superseded", binding);
     else
-      service.recordDelivery(reservation.intentId, { kind: "local-delivery" }, binding);
+      service.recordDelivery(reservation.intentId, event.evidence?.kind === "native-ack" ? event.evidence : { kind: "local-delivery" }, binding);
     return true;
   }
   if (event.kind !== "approval_requested")

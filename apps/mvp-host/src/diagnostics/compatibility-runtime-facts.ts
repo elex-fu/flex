@@ -185,7 +185,11 @@ export function createCompatibilityCommittedRecorder(options: {
           if (!row.native_request_id || !row.native_method) continue;
           await recorder.record({ provider: facts.provider, kind: "approval", capability: "approval", result: "passed",
               nativeEvent: row.native_method, nativeSourceId: compatibilityInteractionAnchor(row), nativeRequestId: row.native_request_id,
-              ...(facts.provider === "claude" ? { nativeResultId: facts.nativeSourceId } : { nativeTurnId: String(facts.binding.native_turn_id) }),
+              // An approval is pinned by the interaction anchor, never by the
+              // Turn's terminal result: a claude record whose nativeResultId
+              // differs from its nativeSourceId is refused as an unsupported
+              // source by provenance, and codex pins the turn id instead.
+              ...(facts.provider === "codex" ? { nativeTurnId: String(facts.binding.native_turn_id) } : {}),
               nativeSessionId: String(facts.binding.native_session_id), attemptId: context.attemptId, launchRef: facts.matches[0]!.id, stopRef: facts.matches[0]!.id,
               evidenceCode: "NATIVE_APPROVAL_CONFIRMED" });
         }

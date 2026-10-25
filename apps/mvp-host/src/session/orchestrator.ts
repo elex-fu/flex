@@ -16,6 +16,7 @@ import { openOwned } from "../storage/open-store.js";
 import { HostLifecycle } from "../lifecycle/host-lifecycle.js";
 import { OperationRegistry, type OperationKind } from "../lifecycle/operation-registry.js";
 import { HostManagedRuntime } from "../provider/native-runtime-factory.js";
+import { PRODUCER_STOP_DEADLINE_MS } from "../provider/managed-runtime.js";
 import type { NativeBoundaryAssessment, prepareNativeExecutionBoundary } from "../lifecycle/native-execution-boundary.js";
 import type { ProcessStopResult } from "../lifecycle/managed-process-registry.js";
 import { WorkspaceLease } from "../workspace/workspace-lease.js";
@@ -864,8 +865,8 @@ export class SessionOrchestrator {
       let adapterStop: ProcessStopResult | undefined, managedStop: ProcessStopResult | undefined;
       try {
         const stopped = await boundedTurnStop(Promise.all([
-          this.adapter.closeTurnAndWait?.(context, 5_000), this.nativeRuntime?.closeTurnAndWait(context, 5_000),
-        ]), 5_000);
+          this.adapter.closeTurnAndWait?.(context, PRODUCER_STOP_DEADLINE_MS), this.nativeRuntime?.closeTurnAndWait(context, PRODUCER_STOP_DEADLINE_MS),
+        ]), PRODUCER_STOP_DEADLINE_MS);
         if (!stopped) { if (!this.worker.isSealed) this.retainExecution(intent, "producer_stop_unverified"); return; }
         [adapterStop, managedStop] = stopped;
       } catch { if (!this.worker.isSealed) this.retainExecution(intent, "producer_stop_unverified"); return; }

@@ -48,9 +48,10 @@ export const digest = (value) => createHash("sha256").update(canonicalJson(value
 // is caught by the tooling suite after a rebuild.
 export const SCENE_BASIC_PROMPT = "回复 OK 两个字母，不要做任何其他事";
 export const SCENE_APPROVAL_PROMPT = "在当前工作区创建文件 approval-scene.txt，内容为 OK，然后回复 DONE，不要做任何其他事";
+export const SCENE_APPROVAL_PROMPT_2 = "在当前工作区创建文件 approval-scene.txt，内容为 DENIED，然后回复 DONE，不要做任何其他事";
 export const SCENE_INTERRUPT_PROMPT = "从 1 数到 50，每数一个数字就输出一次，不要做任何其他事";
 const BASIC_SEGMENT = Object.freeze({ id: "basic", prompt: SCENE_BASIC_PROMPT, repetitions: 10, commandCount: 10, capability: "turn" });
-const APPROVAL_SEGMENT = Object.freeze({ id: "approval", prompt: SCENE_APPROVAL_PROMPT, repetitions: 2, commandCount: 2, capability: "approval" });
+const APPROVAL_SEGMENT = Object.freeze({ id: "approval", prompt: SCENE_APPROVAL_PROMPT, prompts: Object.freeze([SCENE_APPROVAL_PROMPT, SCENE_APPROVAL_PROMPT_2]), repetitions: 2, commandCount: 2, capability: "approval" });
 const INTERRUPT_SEGMENT = Object.freeze({ id: "interrupt", prompt: SCENE_INTERRUPT_PROMPT, repetitions: 1, commandCount: 1, capability: "interrupt" });
 const RECONNECT_SEGMENT = Object.freeze({ id: "reconnect", prompt: SCENE_BASIC_PROMPT, repetitions: 1, commandCount: 1, capability: "reconnect" });
 export const SCENE_REGISTRY = new Map([

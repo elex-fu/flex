@@ -32,7 +32,7 @@
       "executableSource": "sdk-bundled",
       "decision": "locked-candidate",
       "hostVersion": "unknown",
-      "status": "pending",
+      "status": "deterministic-verified",
       "observed": {
         "nodeVersion": "24.18.0",
         "sdkVersion": "0.3.220",
@@ -50,7 +50,61 @@
         "interrupt",
         "reconnect"
       ],
-      "sceneVersion": "flyx-c7-interactive-v1"
+      "sceneVersion": "flyx-c7-interactive-v1",
+      "lastRun": {
+        "runId": "3f28cbe7-30f0-4f62-a26d-4191cfa0a888",
+        "at": "2026-10-24T16:25:04.152Z",
+        "deterministic": {
+          "status": "passed",
+          "completed": 10,
+          "scenarioResults": {
+            "approval": {
+              "status": "skipped",
+              "reasonCode": "SCENARIO_NOT_CONFIGURED"
+            },
+            "interrupt": {
+              "status": "skipped",
+              "reasonCode": "SCENARIO_NOT_CONFIGURED"
+            },
+            "reconnect": {
+              "status": "skipped",
+              "reasonCode": "SCENARIO_NOT_CONFIGURED"
+            },
+            "recovery": {
+              "status": "skipped",
+              "reasonCode": "SCENARIO_NOT_CONFIGURED"
+            }
+          },
+          "shutdown": "graceful"
+        },
+        "real": {
+          "status": "skipped",
+          "completed": 0,
+          "reasonCode": "REAL_EXECUTION_NOT_ENABLED"
+        },
+        "result": "deterministic-verified",
+        "nativeEvidence": {
+          "counts": {
+            "turn": 0,
+            "approval": 0,
+            "question": 0,
+            "interrupt": 0,
+            "stop": 0,
+            "reconnect": 0,
+            "recovery": 0,
+            "rewind": 0
+          },
+          "invalid": 0,
+          "complete": false,
+          "capabilities": {}
+        }
+      },
+      "evidence": {
+        "readiness": "/Users/lex/play/flyx/.flyx-evidence/sdk-0.3.220_cli-2.1.220_node-24.18.0/3f28cbe7-30f0-4f62-a26d-4191cfa0a888/readiness.json",
+        "summary": "/Users/lex/play/flyx/.flyx-evidence/sdk-0.3.220_cli-2.1.220_node-24.18.0/3f28cbe7-30f0-4f62-a26d-4191cfa0a888/summary.json",
+        "turns": "/Users/lex/play/flyx/.flyx-evidence/sdk-0.3.220_cli-2.1.220_node-24.18.0/3f28cbe7-30f0-4f62-a26d-4191cfa0a888/turns.jsonl",
+        "native": "/Users/lex/play/flyx/.flyx-evidence/sdk-0.3.220_cli-2.1.220_node-24.18.0/3f28cbe7-30f0-4f62-a26d-4191cfa0a888/native.jsonl"
+      }
     },
     {
       "id": "cli-2.1.216_node-24.18.0",
@@ -62,7 +116,7 @@
       "executablePath": "/Users/lex/.local/bin/claude",
       "decision": "locked-candidate",
       "hostVersion": "unknown",
-      "status": "pending",
+      "status": "fully-verified",
       "notes": [
         "M4 目标组合：系统安装的 claude 2.1.216（/Users/lex/.local/bin/claude，symlink 由 Host 解析为真实文件并测量 digest）。candidate claudeCliVersion=2.1.216 由 run-matrix --prepare 计入候选 artifact，真实场景内由受管 --version 探针独立观测；二者不一致一律拒绝。",
         "2026-10-24（任务 #19 真实网页 E2E）：run web-e2e-claude 10/10 真实 turn 通过后导入并激活到独立目的地 dest-claude，网页端驱动真实 Claude Code CLI 2.1.216 会话（glm-5.3[1m]）完成文本 turn，返回精确 REAL-CLAUDE-E2E-OK。Write/Bash 审批卡按 flyx-c3-basic-v1 能力范围呈只读（interactiveApprovals 未验证），10 分钟过期自动拒绝，磁盘零未授权写入。"
@@ -74,13 +128,90 @@
         "interrupt",
         "reconnect"
       ],
-      "sceneVersion": "flyx-c7-interactive-v1"
+      "sceneVersion": "flyx-c7-interactive-v1",
+      "lastRun": {
+        "runId": "scene-claude-interactive-r8",
+        "at": "2026-10-25T00:09:39.379Z",
+        "deterministic": {
+          "status": "passed",
+          "completed": 10,
+          "scenarioResults": {
+            "approval": {
+              "status": "skipped",
+              "reasonCode": "SCENARIO_NOT_CONFIGURED"
+            },
+            "interrupt": {
+              "status": "skipped",
+              "reasonCode": "SCENARIO_NOT_CONFIGURED"
+            },
+            "reconnect": {
+              "status": "skipped",
+              "reasonCode": "SCENARIO_NOT_CONFIGURED"
+            },
+            "recovery": {
+              "status": "skipped",
+              "reasonCode": "SCENARIO_NOT_CONFIGURED"
+            }
+          },
+          "shutdown": "graceful"
+        },
+        "real": {
+          "status": "passed",
+          "completed": 11,
+          "scenarioResults": {
+            "approval": {
+              "status": "passed",
+              "reasonCode": null
+            },
+            "interrupt": {
+              "status": "passed",
+              "reasonCode": null
+            },
+            "reconnect": {
+              "status": "skipped",
+              "reasonCode": "SCENARIO_NOT_CONFIGURED"
+            },
+            "recovery": {
+              "status": "skipped",
+              "reasonCode": "SCENARIO_NOT_CONFIGURED"
+            }
+          },
+          "shutdown": "graceful"
+        },
+        "result": "fully-verified",
+        "nativeEvidence": {
+          "counts": {
+            "turn": 13,
+            "approval": 2,
+            "question": 0,
+            "interrupt": 1,
+            "stop": 0,
+            "reconnect": 1,
+            "recovery": 0,
+            "rewind": 0
+          },
+          "invalid": 0,
+          "complete": true,
+          "capabilities": {
+            "turn": true,
+            "approval": true,
+            "interrupt": true,
+            "reconnect": true
+          }
+        }
+      },
+      "evidence": {
+        "readiness": "/Users/lex/play/flyx/.flyx-evidence/cli-2.1.216_node-24.18.0/scene-claude-interactive-r8/readiness.json",
+        "summary": "/Users/lex/play/flyx/.flyx-evidence/cli-2.1.216_node-24.18.0/scene-claude-interactive-r8/summary.json",
+        "turns": "/Users/lex/play/flyx/.flyx-evidence/cli-2.1.216_node-24.18.0/scene-claude-interactive-r8/turns.jsonl",
+        "native": "/Users/lex/play/flyx/.flyx-evidence/cli-2.1.216_node-24.18.0/scene-claude-interactive-r8/native.jsonl"
+      }
     },
     {
       "id": "codex-measured-runtime-pending",
       "provider": "codex",
       "decision": "pending-measurement",
-      "status": "pending",
+      "status": "fully-verified",
       "codexCliVersion": "0.164.0",
       "nodeVersion": "24.18.0",
       "os": "macOS 25.5.0 arm64",
@@ -97,7 +228,84 @@
         "Exact CLI executable digest/version, Node/OS, adapter/runtime artifact and supervision contract must be measured before real evidence can qualify. No inferred compatibility from the Claude row.",
         "2026-10-24（任务 #19 实测填写）：codexCliVersion 取自 `codex --version`（codex-cli 0.164.0）；executablePath 为 R6 双 Provider 回退验证用的本地安装 /tmp/codex-cli-probe/node_modules/.bin/codex；nodeVersion/os 为本机锁定运行时。candidate 摘要由 run-matrix --prepare 计入，真实场景内由受管 --version 探针独立复核。",
         "2026-10-24（任务 #19 真实网页 E2E）：run web-e2e-codex 10/10 真实 turn 通过（首次运行第 9 个 turn 结束后的 5s 受管停止验证超时触发 HOST_RECOVERY_REQUIRED 翻转为重跑一次通过；该 5s 终验时限对长 turn 是已观察的脆弱点），导入并激活到独立目的地 dest-codex，网页端驱动真实 Codex CLI 0.164.0 会话（thread 01a16e0c-…，含 5 次 app-server 断线自动重连）完成文本 turn，返回精确 REAL-CODEX-E2E-OK。"
-      ]
+      ],
+      "lastRun": {
+        "runId": "scene-codex-interactive-r7",
+        "at": "2026-10-25T03:29:34.138Z",
+        "deterministic": {
+          "status": "passed",
+          "completed": 10,
+          "scenarioResults": {
+            "approval": {
+              "status": "skipped",
+              "reasonCode": "SCENARIO_NOT_CONFIGURED"
+            },
+            "interrupt": {
+              "status": "skipped",
+              "reasonCode": "SCENARIO_NOT_CONFIGURED"
+            },
+            "reconnect": {
+              "status": "skipped",
+              "reasonCode": "SCENARIO_NOT_CONFIGURED"
+            },
+            "recovery": {
+              "status": "skipped",
+              "reasonCode": "SCENARIO_NOT_CONFIGURED"
+            }
+          },
+          "shutdown": "graceful"
+        },
+        "real": {
+          "status": "passed",
+          "completed": 11,
+          "scenarioResults": {
+            "approval": {
+              "status": "passed",
+              "reasonCode": null
+            },
+            "interrupt": {
+              "status": "passed",
+              "reasonCode": null
+            },
+            "reconnect": {
+              "status": "skipped",
+              "reasonCode": "SCENARIO_NOT_CONFIGURED"
+            },
+            "recovery": {
+              "status": "skipped",
+              "reasonCode": "SCENARIO_NOT_CONFIGURED"
+            }
+          },
+          "shutdown": "graceful"
+        },
+        "result": "fully-verified",
+        "nativeEvidence": {
+          "counts": {
+            "turn": 13,
+            "approval": 2,
+            "question": 0,
+            "interrupt": 1,
+            "stop": 0,
+            "reconnect": 1,
+            "recovery": 0,
+            "rewind": 0
+          },
+          "invalid": 0,
+          "complete": true,
+          "capabilities": {
+            "turn": true,
+            "approval": true,
+            "interrupt": true,
+            "reconnect": true
+          }
+        }
+      },
+      "evidence": {
+        "readiness": "/Users/lex/play/flyx/.flyx-evidence/codex-measured-runtime-pending/scene-codex-interactive-r7/readiness.json",
+        "summary": "/Users/lex/play/flyx/.flyx-evidence/codex-measured-runtime-pending/scene-codex-interactive-r7/summary.json",
+        "turns": "/Users/lex/play/flyx/.flyx-evidence/codex-measured-runtime-pending/scene-codex-interactive-r7/turns.jsonl",
+        "native": "/Users/lex/play/flyx/.flyx-evidence/codex-measured-runtime-pending/scene-codex-interactive-r7/native.jsonl"
+      }
     }
   ],
   "sceneVersion": "flyx-c7-interactive-v1"

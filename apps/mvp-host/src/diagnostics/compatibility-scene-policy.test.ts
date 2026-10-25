@@ -13,11 +13,12 @@ import { ExecutionStore } from "../storage/execution-store.js";
 import { authorizeCompatibilityRun } from "./compatibility-import.js";
 import { compatibilityEvidenceArtifactDigest, type CompatibilityEvidenceArtifact } from "./compatibility-evidence.js";
 import { COMPATIBILITY_BASIC_PROMPT } from "./compatibility-readiness.js";
-import { createCompatibilityScenePolicy, createCompatibilityVersionProbeAuthority, compatibilitySceneCommandIds, type CompatibilityScenePermit } from "./compatibility-scene-policy.js";
+import { compatibilitySceneCommandIds, COMPATIBILITY_SCENE_APPROVAL_PROMPT, COMPATIBILITY_SCENE_APPROVAL_PROMPT_2 } from "./compatibility-scenes.js";
+import { createCompatibilityScenePolicy, createCompatibilityVersionProbeAuthority, type CompatibilityScenePermit } from "./compatibility-scene-policy.js";
 const cleanup: Array<() => Promise<void>> = []; const originalArgv = [...process.argv];
 afterEach(async () => { vi.unstubAllEnvs(); process.argv = [...originalArgv]; for (const close of cleanup.splice(0).reverse()) await close(); });
 const rawHash = (value: string) => createHash("sha256").update(value).digest("hex");
-async function fixture() {
+async function fixture(sceneVersion?: string) {
   const root = await realpath(await mkdtemp(join(tmpdir(), "flyx-scene-policy-"))); await chmod(root, 0o700);
   const workspace = join(root, "workspace"), identityDirectory = join(root, "identity"), dist = join(root, "dist"), entryPath = join(dist, "main.js"), executable = join(root, "provider-cli");
   await mkdir(workspace); await mkdir(join(workspace, ".git")); await mkdir(dist);
@@ -32,7 +33,7 @@ async function fixture() {
     adapterId: "codex-app-server", adapterVersion: "fixture", supervisionContractId: "fixture-no-native-launch", runtimeVersion: "fixture", runtimeDigest: "c".repeat(64), nodeVersion: process.versions.node, os: process.platform + " " + release() + " " + arch() };
   const runId = "fixture-run"; let now = Date.now();
   const authorization = authorizeCompatibilityRun(destination, { provider: "codex", artifactDigest: compatibilityEvidenceArtifactDigest({ ...artifact, provider: "codex" } as CompatibilityEvidenceArtifact), runtimeDigest: artifact.runtimeDigest,
-    runId, sourceHost: publicHostIdentity(identity), entryDigest: rawHash("// structural fixture; never launched\n"), now });
+    runId, sourceHost: publicHostIdentity(identity), entryDigest: rawHash("// structural fixture; never launched\n"), ...(sceneVersion ? { sceneVersion } : {}), now });
   for (const [key, value] of Object.entries({ FLYX_TEST_CONTROLLED_ENTRY: "1", FLYX_COMPATIBILITY_MODE: "isolated", FLYX_COMPATIBILITY_REAL_ENABLED: "1", RUN_REAL_CODEX: "1", FLYX_COMPATIBILITY_RUN_ID: runId, FLYX_COMPATIBILITY_ROOT: root, FLYX_COMPATIBILITY_ENTRY_DIGEST: authorization.entryDigest })) vi.stubEnv(key, value);
   process.argv[1] = entryPath;
   const binding = { sessionId: session.id, workspaceId: session.workspaceId, canonicalRoot: workspace, checkoutRoot: workspace, providerInstanceId: "provider", provider: "codex" as const, configurationFingerprint: artifact.configFingerprint };
@@ -40,7 +41,7 @@ async function fixture() {
   const options = { authorization, expectedDestination: publicHostIdentity(destination), entry: { path: join(root, "ready.json"), baseUrl: "http://127.0.0.1:1234", pairingToken: "x".repeat(32), provider: "codex" as const, identity, runId, entryPath, databasePath: owner.databasePath, identityDirectory, workspace, artifact, authMode: "unknown" as const },
     store, owner, currentBinding: () => binding, measureArtifact: () => artifact, assertBaseline: () => { if (!baseline) throw new Error("NATIVE_BOUNDARY_UNAVAILABLE"); }, now: () => now };
   const policy = await createCompatibilityScenePolicy(options);
-  const ids = compatibilitySceneCommandIds(runId);
+  const ids = compatibilitySceneCommandIds("flyx-c3-basic-v1", runId);
   const request = (index = 0): CommandRequest => ({ authSubjectId: "actor", commandId: ids[index]!, method: "session.startTurn", requestHash: hashCommandRequest("session.startTurn", { prompt: COMPATIBILITY_BASIC_PROMPT }), targetSessionId: session.id,
     requestFormatVersion: 2, actorKind: "device", dispatchBinding: { hostOwnerId: owner.ownerId, hostOwnerGeneration: owner.generation, runtimeId: "runtime" } });
   const permit = (index = 0) => { const req = request(index); return policy.authorizeStart({ actorId: req.authSubjectId, commandId: req.commandId, method: req.method, prompt: COMPATIBILITY_BASIC_PROMPT, requestHash: req.requestHash, sessionId: session.id }); };
@@ -106,5 +107,47 @@ describe("opaque isolated first-scene policy", () => {
     expect(() => f.policy.assertResource(allowed, f.binding)).toThrow("COMPATIBILITY_SCENE_ARTIFACT_CHANGED"); f.artifact.runtimeDigest = "c".repeat(64);
     await writeFile(f.entryPath, "// changed build"); expect(() => f.policy.assertResource(allowed, f.binding)).toThrow("COMPATIBILITY_BUILD_MISMATCH");
     await writeFile(f.entryPath, "// structural fixture; never launched\n"); f.expire(); expect(() => f.policy.assertResource(allowed, f.binding)).toThrow("COMPATIBILITY_AUTHORIZATION_INVALID");
+  });
+  it("pins a distinct prompt per approval slot so repetition 2 must issue its own fresh tool call", async () => {
+    // Regression (r5): with one pinned prompt for both approval command ids,
+    // repetition 2's identical request was already answered in conversation
+    // history, so the model replied DONE text-only and never raised the
+    // second approval card. Each approval slot now pins its own prompt, so
+    // admission rejects the other slot's prompt.
+    const f = await fixture("flyx-c7-interactive-v1");
+    const ids = compatibilitySceneCommandIds("flyx-c7-interactive-v1", "fixture-run");
+    const [approval1, approval2] = [ids[10]!, ids[11]!];
+    const start = (commandId: string, prompt: string) => f.policy.authorizeStart({ actorId: "actor", commandId, method: "session.startTurn", prompt, requestHash: rawHash(commandId + prompt), sessionId: f.session.id });
+    expect(() => start(approval1, COMPATIBILITY_SCENE_APPROVAL_PROMPT)).not.toThrow();
+    expect(() => start(approval1, COMPATIBILITY_SCENE_APPROVAL_PROMPT_2)).toThrow("COMPATIBILITY_SCENE_REQUEST_REJECTED");
+    expect(() => start(approval2, COMPATIBILITY_SCENE_APPROVAL_PROMPT_2)).not.toThrow();
+    expect(() => start(approval2, COMPATIBILITY_SCENE_APPROVAL_PROMPT)).toThrow("COMPATIBILITY_SCENE_REQUEST_REJECTED");
+    // The two slot prompts are distinct strings with distinct file contents.
+    expect(COMPATIBILITY_SCENE_APPROVAL_PROMPT).not.toBe(COMPATIBILITY_SCENE_APPROVAL_PROMPT_2);
+  });
+  it("authorizes control permits for interrupt and approval respond with the same admission surface", async () => {
+    const f = await fixture();
+    f.store.createDevice({ id: "approver", hostId: f.identity.hostId, platform: "test", scopes: ["session:read", "approval:write"], credentialKind: "browser-session", credentialRevision: 1, createdAt: new Date().toISOString() });
+    const provider = { providerInstanceId: f.binding.providerInstanceId, provider: "codex" as const, executable: f.artifact.executablePath, policyCapabilities: ["streamingText"] } as never;
+    const interrupt = f.policy.authorizeControl({ actorId: "actor", commandId: "control-interrupt-1", method: "session.interrupt", requestHash: rawHash("interrupt"), sessionId: f.session.id });
+    expect(() => f.policy.assertResource(interrupt, f.binding)).not.toThrow();
+    expect(() => f.policy.assertProvider(interrupt, provider)).not.toThrow();
+    const respond = f.policy.authorizeControl({ actorId: "approver", commandId: "control-respond-1", method: "approval.respond", requestHash: rawHash("respond"), sessionId: f.session.id });
+    expect(() => f.policy.assertResource(respond, f.binding)).not.toThrow();
+    // A control permit never substitutes for a start permit in commit validation.
+    f.store.db.transaction(() => { expect(() => f.policy.assertAcceptInCommit(respond, { request: f.request(), plan: { result: {} } })).toThrow("COMPATIBILITY_SCENE_REQUEST_REJECTED"); }).immediate();
+  });
+  it("refuses control permits with wrong scope, session, method, slot collision or malformed hash", async () => {
+    const f = await fixture();
+    const base = { actorId: "actor", commandId: "control-1", method: "approval.respond" as const, requestHash: rawHash("x"), sessionId: f.session.id };
+    // The fixture actor holds session:write only; approval:write is required.
+    expect(() => f.policy.authorizeControl(base)).toThrow("COMPATIBILITY_SCENE_DEVICE_REJECTED");
+    const interrupt = { ...base, method: "session.interrupt" as const };
+    expect(() => f.policy.authorizeControl({ ...interrupt, sessionId: "other-session" })).toThrow("COMPATIBILITY_SCENE_REQUEST_REJECTED");
+    expect(() => f.policy.authorizeControl({ ...interrupt, commandId: f.ids[0]! })).toThrow("COMPATIBILITY_SCENE_REQUEST_REJECTED");
+    expect(() => f.policy.authorizeControl({ ...interrupt, requestHash: "not-hex" })).toThrow("COMPATIBILITY_SCENE_REQUEST_REJECTED");
+    expect(() => f.policy.authorizeControl({ ...interrupt, method: "session.startTurn" as never })).toThrow("COMPATIBILITY_SCENE_REQUEST_REJECTED");
+    const permit = f.policy.authorizeControl(interrupt);
+    f.setBaseline(false); expect(() => f.policy.assertResource(permit, f.binding)).toThrow("NATIVE_BOUNDARY_UNAVAILABLE");
   });
 });

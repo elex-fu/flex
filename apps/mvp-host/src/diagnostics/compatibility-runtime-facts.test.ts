@@ -77,8 +77,9 @@ describe("compatibility runtime facts with explicit structural source fixtures",
 });
 
 /** The full committed-stop fact chain a verified recovery inspection re-proves: original binding, terminal event, live resource rows and the provider-launch journal. */
-async function recoveryFixture() {
+async function recoveryFixture(provider:"codex"|"claude"="codex") {
   const f=await fixture(); const {db}=f;
+  f.provider.provider=provider;
   recordManagedVersionObservation(db,f.provider,f.observation,()=>{});
   const journal=new SqliteProcessJournal(db);
   const identity={pid:12346,platform:"linux" as const,birth:{kind:"linux" as const,bootId:"22222222-2222-4222-8222-222222222222",startTicks:"101"}};
@@ -95,10 +96,12 @@ async function recoveryFixture() {
     providerInstance:{providerInstanceId:f.provider.providerInstanceId,provider:f.provider.provider,executable:f.executable,config:f.provider.config,policyVersion:f.provider.policyVersion,policyCapabilities:f.provider.policyCapabilities},
     workspace:{canonicalRoot:f.directory,worktreeRoot:f.directory,checkoutKey:"checkout-key",repositoryId:"repository",kind:"local"}});
   db.prepare("INSERT INTO native_turn_bindings(turn_id,attempt_id,provider,provider_instance_id,session_id,native_session_id,native_turn_id,workspace_path,configuration_fingerprint,verified_version,context_json) VALUES(?,?,?,?,?,?,?,?,?,?,?)")
-    .run(f.context.flyxTurnId,f.context.attemptId,"codex",f.provider.providerInstanceId,f.context.sessionId,"native-session","native-turn",f.directory,recoveryFingerprint,"unknown",JSON.stringify(f.context));
+    .run(f.context.flyxTurnId,f.context.attemptId,provider,f.provider.providerInstanceId,f.context.sessionId,"native-session",
+      provider==="claude"?null:"native-turn",f.directory,recoveryFingerprint,"unknown",JSON.stringify(f.context));
   db.prepare("INSERT INTO session_events VALUES(?,?,?,?,?)").run("committed-turn-event",f.context.sessionId,1,"turn.completed",
     JSON.stringify({dispatchContext:f.context,terminalEvidence:{kind:"native-terminal",sourceId:"native-source"}}));
-  for (const [key,value] of Object.entries({FLYX_COMPATIBILITY_MODE:"isolated",FLYX_COMPATIBILITY_REAL_ENABLED:"1",RUN_REAL_CODEX:"1"})) vi.stubEnv(key,value);
+  for (const [key,value] of Object.entries({FLYX_COMPATIBILITY_MODE:"isolated",FLYX_COMPATIBILITY_REAL_ENABLED:"1",
+    ...(provider==="claude"?{RUN_REAL_CLAUDE:"1"}:{RUN_REAL_CODEX:"1"})})) vi.stubEnv(key,value);
   const path=join(f.directory,"native.jsonl");
   const assertSceneObservation=vi.fn();
   const recorder=()=>createCompatibilityCommittedRecorder({db,identity:generateHostIdentity(),path,runId:"fixture-run",entryDigest:hash("f"),
@@ -198,6 +201,24 @@ describe("committed-stop interactive evidence recorder",()=>{
     await second.drain();
     const finalEntries=readCompatibilityEvidence(f.path).entries;
     expect(finalEntries.filter((entry)=>entry.kind==="approval")).toHaveLength(1);
+  });
+  it("records a claude approval pinned by the interaction anchor without claiming the turn's terminal result id",async()=>{
+    const f=await recoveryFixture("claude");
+    f.db.prepare(`INSERT INTO interactions(interaction_id,session_id,turn_id,kind,attempt_id,runtime_id,runtime_generation,native_request_id,native_method,status,created_at)
+      VALUES(?,?,?,?,?,?,?,?,?,?,?)`)
+      .run("interaction-claude",f.context.sessionId,f.context.flyxTurnId,"approval",f.context.attemptId,f.context.runtimeId,f.context.runtimeGeneration,
+        "toolu-claude","canUseTool/approval","confirmed","2026-01-01T00:00:00.000Z");
+    f.db.prepare("INSERT INTO interaction_delivery_evidence VALUES(?,?,?,?,?)")
+      .run("delivery-claude","interaction-claude","native-ack","native-ack-source","2026-01-01T00:00:00.000Z");
+    const recorder=f.recorder();
+    await recorder.afterCommittedNativeStop(f.context);
+    await recorder.drain();
+    const entries=readCompatibilityEvidence(f.path).entries;
+    expect(entries).toHaveLength(2);
+    expect(entries[0]).toMatchObject({provider:"claude",kind:"turn",capability:"turn",result:"passed",evidenceCode:"NATIVE_TERMINAL_COMPLETED"});
+    expect(entries[1]).toMatchObject({provider:"claude",kind:"approval",capability:"approval",result:"passed",
+      evidenceCode:"NATIVE_APPROVAL_CONFIRMED",nativeEvent:"canUseTool/approval",launchRef:"fixture-turn-process",stopRef:"fixture-turn-process"});
+    expect(entries[1]?.nativeRequestIdHash).toMatch(/^[a-f0-9]{64}$/);
   });
   it("records a reconnect capability when the start intent resumed the pre-restart native session",async()=>{
     const f=await recoveryFixture();

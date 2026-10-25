@@ -1,6 +1,41 @@
 # Interactive capability scenes: approval / interrupt / reconnect (c4–c7)
 
-Status: design accepted 2026-10-24. Companion of `docs/design/compatibility-pipeline.md` §6.3.
+Status: design accepted 2026-10-24; **implemented and fully verified 2026-10-25 (both providers)**. Companion of `docs/design/compatibility-pipeline.md` §6.3.
+
+Verification record (2026-10-25, macOS real runs, commit `5dfa372`):
+
+- **Claude r8** (`.flyx-evidence/*/scene-claude-interactive-r8`): det+real passed;
+  real layer 10/10 basic turns, approval ×2 (allow→file written / deny→denied),
+  interrupt (turn.cancelled), reconnect (host restart + post-restart turn);
+  native evidence complete, invalid 0. Destination `dest-claude`: import →
+  activation verify/activate → `interactiveApprovals` published → **web
+  approval-card E2E**: card raised in browser, respond → native confirmation
+  in UI, file written on allow; activation survives host boot.
+- **Codex r7** (`.flyx-evidence/codex-measured-runtime-pending/scene-codex-interactive-r7`):
+  `det=passed real=passed current=fully-verified`; real layer 10/10 basic turns
+  (46–179 s each), **approval ×2** (196 s / 252 s — first codex approval cards
+  ever observed), interrupt (turn.cancelled, 167 s), reconnect (graceful
+  verified shutdown, host restart, post-restart turn completed); native
+  evidence `complete:true`, `invalid:0`, counts turn:13/approval:2/interrupt:1/
+  reconnect:1. Destination `dest-codex`: import → activation verify/activate →
+  capabilities `interactiveApprovals,interrupt,resumeConversation,
+  streamingText,workspaceWrite`; boot check clean (no withdrawal).
+- Root causes found and fixed on the way (all in `5dfa372`):
+  - `PRODUCER_STOP_DEADLINE_MS = 30_000` threaded through
+    orchestrator/adapters/runtimes — the previous 5 s finalize bound was
+    exceeded by codex app-server tree stop verification, flipping healthy
+    turns into `RUNTIME_STOP_UNVERIFIED` retention (codex r2/r4).
+  - run-matrix: interrupt now waits for `provider.turn.bound` (an interrupt
+    before the native turn binds has no target and strands the turn in
+    outcome_unknown), approval-card wait 300 s (codex backend latency),
+    stopHost SIGKILL grace 45 s (covers the host's 30 s verified stop).
+  - §6 fail-closed risk covered by `macos-managed-execution.trust.test.ts`:
+    the verified destination endorsement sceneVersion threads into
+    `macosExecutionFactsTrust`, so an imported c7 activation survives boot.
+  - Codex r6 approval-rep1 timeout root cause: model went off-script and
+    requested access outside the workspace; the adapter's workspace guard
+    auto-declined (`CODEX_APPROVAL_OUTSIDE_WORKSPACE`) — correct fail-closed
+    behavior, not a defect; rerun (r7) passed.
 
 ## 1. Problem
 

@@ -203,19 +203,35 @@ export class ManagedProcessRegistry {
     if (entry.record.state === "not_spawned") return true;
     const group = entry.record.processGroup;
     let proof = group === undefined ? "unknown" : (this.options.groupExists ?? groupExists)(group);
-    if (this.options.stopMode === "managed_process_group" && group !== undefined && proof === "present") {
+    if (this.options.stopMode === "managed_process_group" && group !== undefined && proof !== "absent") {
       // A root may exit while its tools still hold the group and stdio. Clean
       // that original group too; ChildProcess.kill deliberately refuses an exited root.
+      // proof === "unknown" enters this path as well: on macOS kill(-pgid, 0)
+      // returns EPERM (not ESRCH) while un-reaped zombie descendants still
+      // occupy the group (observed codex r11). "unknown" means the group's
+      // absence cannot be proven yet — keep polling within the deadline and
+      // only "absent" ever counts as proof.
       for (const signal of ["SIGTERM", "SIGKILL"] as const) {
         try { (this.options.signalGroup ?? ((pid, value) => process.kill(-pid, value)))(group, signal); }
         catch (error) { if ((error as NodeJS.ErrnoException).code !== "ESRCH") break; }
         const until = signal === "SIGTERM" ? Date.now() + Math.max(0, (deadline - Date.now()) / 2) : deadline;
         do {
           proof = (this.options.groupExists ?? groupExists)(group);
-          if (proof !== "present" || Date.now() >= until) break;
+          if (proof === "absent" || Date.now() >= until) break;
           await new Promise((resolve) => setTimeout(resolve, Math.min(20, Math.max(0, until - Date.now()))));
         } while (true);
         if (proof !== "present") break;
+      }
+      if (proof === "unknown") {
+        // No signal can reap an un-reaped zombie; only the system reaper can
+        // turn the EPERM window into ESRCH. Keep asking through the full
+        // deadline — a later "absent" still proves the stop, anything else
+        // settles fail-closed below.
+        while (Date.now() < deadline) {
+          proof = (this.options.groupExists ?? groupExists)(group);
+          if (proof !== "unknown") break;
+          await new Promise((resolve) => setTimeout(resolve, Math.min(20, Math.max(0, deadline - Date.now()))));
+        }
       }
     }
     if (this.options.stopMode !== "managed_process_group" && entry.exited && proof === "absent" && this.options.verifyDescendantStop) {

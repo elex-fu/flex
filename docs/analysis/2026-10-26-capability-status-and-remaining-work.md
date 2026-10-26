@@ -8,17 +8,17 @@
 
 里程碑链 **G0 → M4 → R4 → R6 → R9（组合链路 + A11 真并行）→ 交互能力场景 c4–c7** 全部真实验收通过（Claude 与 Codex 双 Provider）。核心平台闭环已完整：受管执行与验证停止、检查点/回退、独立 checkout 真并行、兼容证据→授权→导入→激活信任链、审批/中断/重连交互能力。**写盘工具死锁在无应答审批卡上的问题已闭环**：destination 按证据发布 `interactiveApprovals`，卡片在网页可答（allow 落盘 / deny 拒绝均有原生确认）。
 
-剩余全部是收尾项，无平台级未解问题：网页端中断验证留档、四面板浏览器 E2E、resume 生产实测、worktree 创建操作重启找回、物理手机验收（唯一硬阻塞：本机无 adb 设备）。
+剩余全部是收尾项，无平台级未解问题：网页端中断验证留档（#33 三项中断链路缺陷已修复 `44d766f`/`b5d043a`/`5276aba`，Claude 侧网页 E2E 已通过；Codex 侧 r11 blocked 已根因修复——macOS zombie-EPERM 组检查误判 + `finish()` 5s 退役截止截断了 30s 停止验证，r12 重跑中）、四面板浏览器 E2E、resume 生产实测、worktree 创建操作重启找回、物理手机验收（唯一硬阻塞：本机无 adb 设备）。
 
 ## 2. 能力状态总览
 
 | 能力域 | 状态 | 验收证据（最新） | 关键实现锚点 |
 | --- | --- | --- | --- |
-| 受管执行 + 验证停止 | ✅ 实机通过 | M0/M1（2026-10-24 前）；本轮根因修复后 r5/r6/r7 basic 10/10 | `ManagedProcessRegistry` 进程组、`managed-stop-contract`；`PRODUCER_STOP_DEADLINE_MS=30_000`（`managed-runtime.ts`，修复 codex r2/r4 `RUNTIME_STOP_UNVERIFIED` 保留级联） |
+| 受管执行 + 验证停止 | ✅ 实机通过 | M0/M1（2026-10-24 前）；本轮根因修复后 r5/r6/r7 basic 10/10 | `ManagedProcessRegistry` 进程组、`managed-stop-contract`；`PRODUCER_STOP_DEADLINE_MS=30_000`（`managed-runtime.ts`，修复 codex r2/r4 `RUNTIME_STOP_UNVERIFIED` 保留级联）；r11 根因修复：zombie-EPERM 组检查继续轮询至截止（macOS `kill(-pgid,0)` 对未 reap 的僵尸成员返回 EPERM 而非 ESRCH）+ codex `finish()` 退役改用 30s 截止（`closeAndWait` 记忆首个截止） |
 | 兼容证据 → 激活信任链 | ✅ 生产闭环 | M4（2026-10-24，c3 `fully-verified`） | prepare → authorize（60 分钟单次 ticket）→ 真实场景 → import（destination 签名 endorsement）→ activation verify/activate |
 | 交互能力（c4–c7） | ✅ 双 Provider 真实验收（2026-10-25） | Claude r8、Codex r7（`det=passed real=passed current=fully-verified`，原生证据 complete / invalid 0） | 场景注册表 `compatibility-scenes.ts`（`flyx-c7-interactive-v1` = basic×10+approval×2+interrupt×1+reconnect×1）、recorder/provenance 扩展、import 能力携带、destination 按 endorsement 发布 |
 | 审批卡（网页可答） | ✅ E2E 通过 | dest-claude：弹卡→respond→UI 内"Native response confirmed"→allow 落盘 / deny 拒绝 | `catalog-interactions` 双端能力门 + 适配器 `respondApproval`（Claude `canUseTool` / Codex `item/*/requestApproval`，工作区外守卫自动拒绝） |
-| 中断 | ✅ 真实验收（compat RPC 驱动） | 双 Provider interrupt 段 turn.cancelled + 原生停止证明 | `session.interrupt`；run-matrix 修正为 `provider.turn.bound` 后再发（否则无目标、turn 停留 outcome_unknown） |
+| 中断 | ✅ 真实验收（compat RPC 驱动 + 网页 E2E 留档） | 双 Provider interrupt 段 turn.cancelled + 原生停止证明；Claude 网页中断 E2E EXIT=0（2026-10-27，含中止后 follow-up 恢复、零诊断事件）；Codex 网页侧 r11 进行中 | `session.interrupt`（trailing expectedRevision，`44d766f`）；适配器 60s 重投递窗口（`b5d043a`）；`startTurn` 等待在途 finalize（`5276aba`）；run-matrix `provider.turn.bound` 后再发 |
 | 重连 | ✅ 真实验收 | 双 Provider：graceful 验证停止 → Host 重启 → 重启后新 turn 成功 | destination 发布 `resumeConversation`；§6 信任穿线（`macosExecutionFactsTrust`，导入激活 boot 不 fail-closed，有专项测试） |
 | 真实恢复 + 备份外部复核 | ✅ L1–L4 通过（2026-10-24） | R4 | 原始终态收据锚点、恢复检查证据链、DB 兄弟 0600 launch/stop 顺序账本、生产端到端恢复链测试 |
 | Native 回退 | ✅ L1 生产接线 + L2 双 Provider 真实完整回退（2026-10-24，A9/A10） | R6 | `native-revert-production.ts`；Codex `thread/resume`+`thread/revert`、Claude `forkSession`；响应丢失/崩溃语义（applied/unknown，绝不二次派发） |
@@ -26,7 +26,11 @@
 | Web UI（会话/草稿/readiness/审批卡） | ✅ 已测（真实 Host E2E + 浏览器 E2E） | C8 浏览器部分 | CoreControls 共享控制器；审批卡网页 E2E 已留档 |
 | 手机最小面板 | ✅ 代码接通（回执核对） | 浏览器模拟；真机归 #18 | Expo 壳 + `client-core` |
 
-测试基线：全量 `pnpm test:product` 1407 通过 / 1 失败（该失败为已知全量负载 flake，已修复 `c79dd3d`：语义断言不变，停止预算 2s→10s；修复后定向 2×5/5）。
+测试基线：全量 `pnpm test:product` 1417 通过 / 0 失败（2026-10-27，含 #33 三项修复与 r11 两项根因修复的回归测试）。
+
+### #33 网页端 streaming turn 中断被 SESSION_REVISION_CONFLICT 拒绝 —— 已修复（2026-10-27，`44d766f` / `b5d043a` / `5276aba`）
+
+首次网页中断驱动暴露三个叠加缺陷，均已修复并带回归测试：(a) `session.interrupt` 对 `expectedRevision` 精确匹配，streaming turn 推进 revision 后客户端副本滞后即被拒（改为接受 trailing revision，`startTurn`/`approval.respond` 仍精确匹配）；(b) Claude 适配器遗留的 5s 中断确认计时器在重投递控制请求悬挂时误报 `INTERRUPT_UNCONFIRMED`（改为 fire-and-forget 重投递 + 同步重挂，60s 窗口为唯一后障，悬挂投递不再阻塞链条）；(c) 中止后 follow-up `startTurn` 撞上仍在途的 post-turn checkpoint finalize 被 `WORKSPACE_BUSY` 静默丢弃（`startTurn` 现等待在途 finalize，默认 15s；真正被持有的 lease 仍立即拒绝）。修复后 Claude compat 链以 r13 重跑通过，网页中断驱动 EXIT=0 且 DB 零诊断事件。
 
 ## 3. 双 Provider 交互能力矩阵（真实证据）
 
@@ -44,11 +48,10 @@
 
 按建议顺序排列；均已在任务列表登记（编号对应）。
 
-### T1（#29，已重定义）网页端真实中断验证留档
-- **现状修正**：计划 §C8 所记"Web interrupt 仍走 `host.interrupt` 未统一"已过时——代码中不存在 `host.interrupt`；`use-host.ts webInterrupt` 已在 canonical+catalog 模式走 `CoreControls.interrupt()`（`session.interrupt` + expectedRevision + `TURN_NOT_INTERRUPTIBLE` 防线），仅 legacy 回退直发 `session.interrupt`。**统一工作实际已完成，缺的只是网页端真实中断的 E2E 留档**（对标已完成的网页审批卡 E2E）。
-- **实现方式**：复用 `/tmp/flyx-real-e2e/approval-drive.mjs` 的 Playwright 驱动骨架改为 interrupt 驱动：boot dest host → 发长任务（可复用中断场景 prompt"从 1 数到 50…"）→ 点"中止当前 Turn"→ 断言 turn 终态 cancelled + 卡片状态 + Host 日志中断收据；Claude 与 Codex 各一次。产物落 `docs/BROWSER_ACCEPTANCE.md` 同级的现有浏览器验收记录格式。
+### T1（#29）网页端真实中断验证留档 —— Claude 半已完成
+- **现状（2026-10-27）**：入口统一已核实完成（代码中不存在 `host.interrupt`；`use-host.ts webInterrupt` 走 `CoreControls.interrupt()`）。#33 三项修复落地后，Claude 侧网页中断 E2E 已通过留档：Playwright 驱动（`/tmp/flyx-real-e2e/interrupt-drive.mjs`）对 dest-claude EXIT=0——streaming 长任务 → 点"中止当前 Turn" → turn 终态 `cancelled`（`aborted_streaming` + native-terminal 停止证据）→ 中断按钮清空、composer 就绪 → follow-up 提示词正常完成（"收到"）；DB 零诊断事件（无 SESSION_REVISION_CONFLICT / INTERRUPT_UNCONFIRMED / WORKSPACE_BUSY）。证据：`docs/design/interactive-scenes.md` 头部 2026-10-26→27 验证记录。
+- **剩余**：Codex 侧同款驱动。r10 真实运行被 approval rep1 `EVENT_TIMEOUT`（300s 无审批卡）+ 关停非零退出拖成 `HOST_STOP_UNVERIFIED`（r9 同段通过，判为偶发）。r11 带 `MATRIX_KEEP_SCRATCH=1 MATRIX_HOST_LOG=1 MATRIX_DEBUG_EVENTS=1` 重跑，real 仍 `blocked HOST_STOP_UNVERIFIED`，但保留证据完成完整根因（见 [interactive-scenes](../design/interactive-scenes.md) r11 记录）：(a) 组 SIGTERM 后 codex 原生二进制后代以未 reap 的孤儿僵尸占据 pgid，macOS `kill(-pgid,0)` 返回 EPERM 而非 ESRCH，`groupExists` 映射为 `"unknown"` 后轮询立即中断——已修复为 `"unknown"` 在截止内继续轮询、仅 `"absent"` 构成证明（fail-closed 语义不变）；(b) codex `finish()` 以 5s 默认退役 client，而 `registry.closeAndWait` 记忆首个截止，30s 的 `PRODUCER_STOP_DEADLINE_MS` 从未生效——已改为 30s。两项修复均带回归测试。通过后走 import → activation → boot-dest-codex → 同一驱动留档（dist 重建使全部 endorsement 失效，claude 侧同步以 r14 重跑）。
 - **验收标准**：网页点击后 turn 到达 `turn.cancelled`，native 停止证明存在，UI 无悬挂 activeTurn；两 Provider 各一份截图 + 日志。
-- **预估**：小（半天内）。
 
 ### T2（#28）Web 四面板（Recovery/Diff/Worktree/Revert）浏览器 E2E
 - **现状**：CoreControls 控制器与四面板已接线，会话元数据/草稿/readiness 有真实 Host E2E；四个高危面板缺浏览器层场景。

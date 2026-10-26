@@ -818,7 +818,12 @@ export class CodexAdapter implements ProviderAdapter {
     active.deferred.length = 0;
     if (outcome.evidence?.kind === "native-terminal") this.lastNativeTerminal = { context: active.context, evidence: outcome.evidence };
     const normalized: TurnOutcome = outcome.evidence ? outcome : { ...outcome, evidence: { kind: "unknown", reason: "native_outcome_unconfirmed" } };
-    const retiring = this.rotateClientEachTurn && active.client ? this.retireClient(active.client, 5_000, true) : Promise.resolve();
+    // Retire with the full producer stop deadline: registry.closeAndWait
+    // memoizes the first deadline it receives, so the 5s default here would
+    // cap the orchestrator's 30s closeTurnAndWait (codex r11: the app-server
+    // tree's zombie-EPERM window outlived 5s and settled
+    // PROCESS_TREE_STOP_UNPROVEN before the longer deadline could apply).
+    const retiring = this.rotateClientEachTurn && active.client ? this.retireClient(active.client, PRODUCER_STOP_DEADLINE_MS, true) : Promise.resolve();
     void retiring.catch(() => {}).then(() => {
       // Publish the known business terminal only after the original process stop
       // attempt has settled, so normal retirement does not create a premature

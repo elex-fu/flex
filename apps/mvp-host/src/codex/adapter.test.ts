@@ -10,6 +10,7 @@ import type {
   JsonRpcId,
 } from "./app-server-client.js";
 import type { AdapterEvent, DispatchContext } from "../provider/types.js";
+import { PRODUCER_STOP_DEADLINE_MS } from "../provider/managed-runtime.js";
 
 class FakeAppServerClient implements AppServerClient {
   readonly requests: Array<{ method: string; params: JsonObject }> = [];
@@ -121,6 +122,23 @@ describe("CodexAdapter", () => {
     const state = setup({ onClient: (client) => { client.turnStart = () => { requested.resolve(); return response.promise; }; } });
     const turn = state.adapter.runTurn("malformed-turn", "task"); await requested.promise; response.resolve({ turn: { status: "inProgress" } });
     expect(await turn).toMatchObject({ status: "outcome_unknown", evidence: { kind: "unknown" } }); expect(state.events.some((event) => event.kind === "turn_failed")).toBe(false);
+  });
+  it("retires the finished turn's client with the full producer stop deadline, not the 5s default", async () => {
+    // codex r11: finish() retired the client with retireClient's 5s default
+    // while ManagedProcessRegistry.closeAndWait memoizes the first deadline it
+    // receives, so the orchestrator's 30s PRODUCER_STOP_DEADLINE_MS could
+    // never take effect and the app-server tree's stop window outlived 5s.
+    const stop = deferred<import("../lifecycle/managed-process-registry.js").ProcessStopResult>(); const stopping = deferred<void>();
+    const bound = deferred<void>(); let original: FakeAppServerClient | undefined; let closeDeadline: number | undefined;
+    const state = setup({ rotateClientEachTurn: true,
+      onClient: (client) => { if (!original) { original = client; Object.assign(client, { closeAndWait: vi.fn((deadlineMs?: number) => { closeDeadline = deadlineMs; client.closed = true; stopping.resolve(); return stop.promise; }) }); } },
+      onEvent: (event) => { if (event.kind === "native_binding") bound.resolve(); },
+    });
+    const turn = state.adapter.runTurn("deadline-turn", "task", undefined, context("deadline-turn", 61)); await bound.promise;
+    complete(original!, "codex-turn-1"); await stopping.promise;
+    stop.resolve({ stopped: true, treeStopped: true, records: [] });
+    expect(await turn).toMatchObject({ status: "completed" });
+    expect(closeDeadline).toBe(PRODUCER_STOP_DEADLINE_MS);
   });
   it("quiesces per-attempt clients before returning native terminal and resumes on a new client", async () => {
     const stop = deferred<import("../lifecycle/managed-process-registry.js").ProcessStopResult>(); const stopping = deferred<void>();

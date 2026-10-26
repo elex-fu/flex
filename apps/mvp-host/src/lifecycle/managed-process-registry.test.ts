@@ -1,9 +1,10 @@
 import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
 import type { ChildProcess, spawn } from "node:child_process";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import Database from "better-sqlite3";
 import { MANAGED_PROCESS_SCHEMA, MANAGED_PROCESS_IDENTITY_SCHEMA, SqliteProcessJournal, ManagedProcessRegistry, processIdentityDigest, type ManagedProcessRecord } from "./managed-process-registry.js";
+import { MACOS_MANAGED_STOP_CONTRACT } from "./managed-stop-contract.js";
 
 const context = { hostOwnerId: "owner", hostOwnerGeneration: 1, runtimeId: "runtime", runtimeGeneration: 2, attemptId: "attempt" };
 function fixture(group: "present" | "absent" | "unknown" = "absent") {
@@ -19,6 +20,23 @@ function fixture(group: "present" | "absent" | "unknown" = "absent") {
     verifyDescendantStop: (record) => ({ kind: "verified-tree-stop", sourceId: "controlled-tree-stop", contractId: "fixture-descendant-contract", identityDigest: processIdentityDigest(record.processIdentity!) }),
   });
   return { registry, child, records, spawned: () => spawned };
+}
+
+/** A darwin managed-process-group registry whose group observations are scripted per call. */
+function managedGroupFixture(check: (call: number) => "present" | "absent" | "unknown") {
+  const child = new EventEmitter() as ChildProcess;
+  Object.assign(child, { pid: 5_000_000, stdin: new PassThrough(), kill: () => true });
+  const records: ManagedProcessRecord[] = [];
+  let calls = 0;
+  const signalGroup = vi.fn();
+  const registry = new ManagedProcessRegistry({
+    journal: { save: (record) => records.push({ ...record }) }, context: () => context,
+    spawn: (() => child) as typeof spawn, stopMode: "managed_process_group",
+    groupExists: () => check(++calls), signalGroup,
+    identify: (pid) => ({ pid, platform: "darwin" }),
+  });
+  const boundary = { proof: { platform: "darwin" as const, managedStopContractId: MACOS_MANAGED_STOP_CONTRACT }, launchDigest: "a".repeat(64) };
+  return { registry, child, records, boundary, signalGroup, calls: () => calls };
 }
 
 describe("managed process ownership", () => {
@@ -47,6 +65,29 @@ describe("managed process ownership", () => {
     registry.spawn("fixture", [], {}); child.emit("exit", 0, null);
     expect((await registry.closeAndWait(0)).treeStopped).toBe(false);
     expect(records.at(-1)?.errorCode).toBe("PROCESS_TREE_STOP_UNPROVEN");
+  });
+  it("keeps polling an EPERM-unknown group and proves the stop once the reaper clears it", async () => {
+    // codex r11: after the group SIGTERM a codex descendant died as an
+    // un-reaped orphan zombie; on macOS kill(-pgid, 0) returns EPERM (not
+    // ESRCH) for such a group, groupExists maps that to "unknown", and the
+    // old poll loop broke instantly on "unknown" — PROCESS_TREE_STOP_UNPROVEN
+    // was persisted ~30ms after root exit. "unknown" must be polled like
+    // "present": only a later "absent" observation ever proves the stop.
+    const f = managedGroupFixture((call) => (call <= 3 ? "unknown" : "absent"));
+    f.registry.spawn("fixture", [], {}, f.boundary); f.child.emit("exit", 0, null);
+    expect((await f.registry.closeAndWait(2_000)).stopped).toBe(true);
+    expect(f.calls()).toBeGreaterThan(3); // the unknown window was polled, not surrendered
+    expect(f.signalGroup).toHaveBeenCalled();
+    expect(f.records.at(-1)).toMatchObject({ state: "stopped", stopProof: { kind: "managed-group-stop", processGroup: 5_000_000, groupAbsent: true } });
+  });
+  it("waits out a persistent EPERM-zombie window and settles fail-closed only at the deadline", async () => {
+    const f = managedGroupFixture(() => "unknown");
+    f.registry.spawn("fixture", [], {}, f.boundary); f.child.emit("exit", 0, null);
+    const startedAt = Date.now();
+    expect((await f.registry.closeAndWait(300)).treeStopped).toBe(false);
+    expect(Date.now() - startedAt).toBeGreaterThanOrEqual(250); // it waited the deadline out, not an instant break
+    expect(f.calls()).toBeGreaterThanOrEqual(5);
+    expect(f.records.at(-1)).toMatchObject({ state: "unknown", errorCode: "PROCESS_TREE_STOP_UNPROVEN" });
   });
   it("rejects an unwritable launching journal without starting a process", () => {
     let spawnCount = 0;

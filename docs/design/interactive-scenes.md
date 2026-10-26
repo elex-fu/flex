@@ -37,16 +37,97 @@ Verification record (2026-10-25, macOS real runs, commit `5dfa372`):
     auto-declined (`CODEX_APPROVAL_OUTSIDE_WORKSPACE`) — correct fail-closed
     behavior, not a defect; rerun (r7) passed.
 
+Verification record (2026-10-26→27, web interrupt chain fixes + web-side interrupt evidence, tasks #33/#29):
+
+- Three defects surfaced by the first web interrupt drive against dest-claude
+  (r12 generation) and fixed — all with regression tests, suite 154 files /
+  1414 tests / 0 failed:
+  - `44d766f` — `session.interrupt` exact-match on `expectedRevision` rejected
+    a client whose replica lagged a streaming turn's revision advance
+    (`SESSION_REVISION_CONFLICT`). The catalog now accepts a trailing
+    expected revision (only the newest is honored); `startTurn` /
+    `approval.respond` keep exact-match.
+  - `b5d043a` — the Claude adapter's legacy 5 s interrupt-confirm timer fired
+    `INTERRUPT_UNCONFIRMED` while a retry delivery's `interrupt()` control
+    request hung unresolved (claude-cli init phase acknowledges but ignores
+    interrupts). Retry deliveries are now fire-and-forget with synchronous
+    re-arm; the 60 s `INTERRUPT_RETRY_WINDOW_MS` is the sole backstop, and
+    redelivery keeps ticking past a hung delivery until the CLI aborts.
+  - `5276aba` — a follow-up `startTurn` landing while `finalizeTurnInternal`
+    still held the checkout lease for the post-turn checkpoint was rejected
+    `WORKSPACE_BUSY` before any receipt existed and the prompt was silently
+    lost. `startTurn` now busy-waits (default 15 s, `startTurnBusyWaitMs`)
+    for in-flight finalizations; a genuinely retained lease with nothing in
+    flight still rejects `WORKSPACE_BUSY` immediately.
+- **Claude r13** (`.flyx-evidence/cli-2.1.216_node-24.18.0/scene-claude-interactive-r13`):
+  rebuilt dist → det+real passed (approval + interrupt scenarios passed);
+  `runtimeDigest 69c221550e75899511459c82130f50a72c6389ad790cdc4089704d2b1bd1d93e`
+  (entry digest unchanged `23aa004a…`). Destination `dest-claude`: endorsement
+  imported → activation verify (`b86c846f-ef44-443a-a512-40eb6020b43f`) →
+  activate (`r13-activation-claude`).
+- **Web interrupt E2E, Claude half — PASSED** (Playwright drive
+  `/tmp/flyx-real-e2e/interrupt-drive.mjs` against dest-claude, EXIT=0):
+  pair → new session → streaming counting prompt → click 中止当前 Turn →
+  terminal card `cancelled` (attempt 3; attempts 1–2 raced natural completion,
+  the drive's designed retry loop) → interrupt button cleared + composer ready →
+  follow-up prompt completed with 收到. DB timeline (session
+  `7d5fb35b-b9f1-43e3-ae1b-d8a901b665df`): `turn.cancelled` ×2
+  (`aborted_streaming`, native-terminal evidence, seq 118/127) each followed by
+  `checkpoint.captured`, follow-up `turn.completed` seq 136; execution intents
+  2 cancelled + 5 completed; **zero diagnostic events** (no
+  SESSION_REVISION_CONFLICT / INTERRUPT_UNCONFIRMED / WORKSPACE_BUSY) — the
+  post-cancel follow-up directly exercised the `5276aba` busy-wait path.
+- **Codex r10** (`scene-codex-interactive-r10`): `det=passed`, real layer
+  `blocked HOST_STOP_UNVERIFIED` — the first approval repetition hit
+  `EVENT_TIMEOUT` at 300 s waiting for the approval card that never arrived
+  (turns.jsonl rep1: 339 s, `terminalType:null`; rep2 passed 20 s later,
+  interrupt passed), and the final stop exited non-zero downstream of the
+  wedged turn. r9 passed the identical segment; scratch/host logs were not
+  retained.
+- **Codex r11** (`scene-codex-interactive-r11`, `MATRIX_KEEP_SCRATCH=1
+  MATRIX_HOST_LOG=1 MATRIX_DEBUG_EVENTS=1`, scratch DB + host log retained):
+  `det=passed`, real layer `blocked HOST_STOP_UNVERIFIED` — but this time the
+  failure is narrow and fully root-caused from the retained evidence. All 10
+  basic turns plus the four `CODEX_TURN_ERROR` "Reconnecting n/5" retries
+  completed; of 45 managed processes 44 stopped cleanly with managed-group-stop
+  proofs (the 22:29 spawn→stop→proof churn of the reconnect storm). The final
+  app-server relaunch (pid 14941) persisted `unknown /
+  PROCESS_TREE_STOP_UNPROVEN` at 22:31:11.434, ~30 ms after root exit, then
+  cascaded `session.recovery.blocked (producer_stop_unverified)` →
+  `host.shutdown.unknown (SHUTDOWN_STOP_UNPROVEN)`. Two defects, both fixed
+  with regression tests:
+  - **Zombie-EPERM group check (root cause)**: after the group SIGTERM a codex
+    native-binary descendant died as an un-reaped orphan zombie still
+    occupying pgid 14941. On macOS `kill(-pgid, 0)` returns **EPERM (not
+    ESRCH)** for a group whose remaining members are un-reaped zombies
+    (empirically probed: EPERM appears right after the group SIGTERM and
+    persists through the full 5–7 s observation window, `ps` shows the member
+    as `Z <defunct>`). `groupExists` maps EPERM to `"unknown"` and
+    `stopEntry`'s poll loop broke instantly on `"unknown"` — no wait, no
+    proof. Fix: in the managed-process-group path `"unknown"` is now polled
+    like `"present"` within the deadline (the group is still signalled; a
+    post-signal wait rides the zombie window out to the full deadline), and
+    only a later `"absent"` observation ever proves the stop — fail-closed
+    semantics unchanged (a window that never clears still settles
+    `PROCESS_TREE_STOP_UNPROVEN`, now at the deadline instead of instantly).
+  - **5 s retire deadline in `finish()`**: codex `adapter.finish()` retired
+    the turn's client with `retireClient`'s 5 s default even though
+    `PRODUCER_STOP_DEADLINE_MS = 30_000` was introduced for exactly this tree
+    (`managed-runtime.ts`, codex r2/r4) — and `registry.closeAndWait`
+    memoizes the first deadline it receives, so the orchestrator's later 30 s
+    `closeTurnAndWait` could never take effect. Fix: `finish()` now retires
+    with the full 30 s producer stop deadline.
+  r12 re-runs the chain after the dist rebuild (any rebuild invalidates every
+  endorsement via `runtimeDigest` — claude r14 must re-run as well).
+
 Remaining follow-ups (tracked as tasks #28–#31, #18; 2026-10-26):
 
-- **#29 网页端真实中断验证留档（已重定义，2026-10-26 核实）**：计划
-  §C8 所记"Web interrupt 仍走 `host.interrupt`"已过时——代码中不存在
-  `host.interrupt` RPC；`use-host.ts webInterrupt` 在 canonical+catalog
-  模式已走 `CoreControls.interrupt()`（`session.interrupt` +
-  expectedRevision + `TURN_NOT_INTERRUPTIBLE` 防线），legacy 回退也直发
-  `session.interrupt`。入口统一实际已完成；剩余仅为对标 dest-claude 网页
-  审批卡 E2E，补一次网页端真实中断验证留档（本场景目前的 interrupt 证据
-  来自 compat RPC 驱动，网页面板未单独留档）。详见
+- **#29 网页端真实中断验证留档（Claude 半已留档，2026-10-27）**：入口统一
+  已核实完成（见上）；Claude 侧网页中断 E2E 已通过并留档（上方 2026-10-26→27
+  验证记录：EXIT=0、turn.cancelled + 原生停止证据、follow-up 恢复、零诊断
+  事件）。剩余仅 Codex 侧（r11 已 blocked 并完成根因修复——zombie-EPERM
+  组检查 + `finish()` 5s 退役截止（见上 r11 记录）；r12 重跑 + 同一驱动
+  留档，claude 侧需随 dist 重建以 r14 重跑）。详见
   `docs/analysis/2026-10-26-capability-status-and-remaining-work.md` T1。
 - **#28 Web 四面板浏览器 E2E**（Recovery/Diff/Worktree/Revert，A5/A6/A13
   其余部分）：与交互场景无依赖，属 C8 收尾。

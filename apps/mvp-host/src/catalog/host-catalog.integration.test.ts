@@ -180,6 +180,18 @@ describe("production Host catalog binding", () => {
         await expect(f.rpc("session.startTurn", { ...input, sessionId: f.host.legacySessionId }, "start-second")).rejects.toMatchObject({ code: "COMMAND_ID_REUSED" });
         await expect(f.rpc("session.startTurn", { ...input, prompt: "changed" }, "start-second")).rejects.toMatchObject({ code: "COMMAND_ID_REUSED" });
     });
+    it("accepts an interrupt whose expectedRevision trails a streaming session but never one ahead of the Host", async () => {
+        const f = await fixture();
+        const id = f.host.legacySessionId;
+        // Simulate the streaming race: every appended timeline item advances the
+        // session revision, so the client's replica snapshot trails the Host.
+        f.store.db.prepare("UPDATE sessions SET revision=revision+5 WHERE id=?").run(id);
+        const trailing = (f.store.getSession(id)!.revision ?? 0) - 5;
+        expect(await f.rpc("session.interrupt", { sessionId: id, expectedRevision: trailing }, "trailing-interrupt")).toMatchObject({ sessionId: id, status: "already_terminal", receipt: { state: "completed" } });
+        await expect(f.rpc("session.interrupt", { sessionId: id, expectedRevision: (f.store.getSession(id)!.revision ?? 0) + 1 }, "ahead-interrupt")).rejects.toMatchObject({ code: "SESSION_REVISION_CONFLICT" });
+        // startTurn and approval.respond keep the exact-match guard.
+        await expect(f.rpc("session.startTurn", { sessionId: id, prompt: "stale", expectedRevision: trailing }, "stale-start")).rejects.toMatchObject({ code: "SESSION_REVISION_CONFLICT" });
+    });
     it("reads persisted terminal receipts for unloaded/archived targets and never crosses V1 hashes", async () => {
         const f = await fixture();
         const second = (await f.create("second")).session;

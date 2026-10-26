@@ -554,7 +554,15 @@ export class HostCatalog {
         const snapshot = this.store.getSession(sessionId);
         if (starting && snapshot?.recoveryState === "blocked")
             throw new CatalogError("RECOVERY_BLOCKED");
-        if ("expectedRevision" in input && input.expectedRevision !== undefined && snapshot?.revision !== input.expectedRevision)
+        // A streaming turn advances the session revision with every appended timeline
+        // item, so an exact match would reject every interrupt issued against a live
+        // turn (the client's replica snapshot is always a few items behind). Interrupt
+        // targets whatever turn the runtime currently owns, so it only requires the
+        // client's observed revision to not be ahead of the Host; startTurn and
+        // approval.respond keep the exact-match guard.
+        const expectedRevision = "expectedRevision" in input && typeof input.expectedRevision === "number" ? input.expectedRevision : undefined;
+        if (expectedRevision !== undefined && snapshot?.revision !== expectedRevision
+            && !(frame.method === "session.interrupt" && snapshot !== undefined && expectedRevision < snapshot.revision))
             throw new CatalogError("SESSION_REVISION_CONFLICT");
         // Controls bind to the original runtime: an in-progress shared load is
         // awaited (and its resource checks give the precise refusal) before

@@ -91,6 +91,88 @@ describe("managed SDK runtime integration", () => {
     try { const turn = adapter.runTurn(context.flyxTurnId, "task", undefined, context); await started.promise; expect(await adapter.interrupt()).toBe("accepted"); ended.resolve(); expect(await turn).toMatchObject({ status: "outcome_unknown", evidence: { kind: "unknown" } }); expect(events.some((event) => event.kind === "turn_cancelled")).toBe(false); }
     finally { ended.resolve(); await adapter.closeAndWait(); }
   });
+  it("re-delivers an acknowledged-but-ignored interrupt until the CLI aborts, mapping the abort to a cancelled turn", async () => {
+    // Ground truth from claude-cli 2.1.216 / claude-agent-sdk 0.3.220: an
+    // interrupt delivered during the CLI's init phase is acknowledged without
+    // being acted on, and the turn runs to natural completion.  The adapter
+    // must keep re-delivering so a decided interrupt still sticks.
+    const f = managed(); const events: AdapterEvent[] = []; const ready = barrier(); const acted = barrier();
+    let deliveries = 0;
+    const queryFactory = (() => ({
+      async *[Symbol.asyncIterator]() { yield init; ready.resolve(); await acted.promise; yield { ...result, terminal_reason: "aborted_streaming" } as unknown as SDKMessage; },
+      close() {},
+      interrupt: async () => { deliveries++; if (deliveries >= 3) acted.resolve(); },
+    }) as unknown as Query) as typeof import("@anthropic-ai/claude-agent-sdk").query;
+    const adapter = new ClaudeAdapter({ ...f.options, workspace, queryFactory, onEvent: (event) => events.push(event) });
+    vi.useFakeTimers();
+    try {
+      const turn = adapter.runTurn(context.flyxTurnId, "task", undefined, context);
+      await ready.promise;
+      expect(await adapter.interrupt()).toBe("accepted");
+      expect(deliveries).toBe(1);
+      await vi.advanceTimersByTimeAsync(1_000); // init-phase redelivery: still ignored
+      expect(deliveries).toBe(2);
+      expect(events.some((event) => event.kind === "diagnostic" && event.code === "INTERRUPT_UNCONFIRMED")).toBe(false);
+      await vi.advanceTimersByTimeAsync(1_000); // second redelivery acts: the CLI aborts the stream
+      expect(deliveries).toBe(3);
+      expect(await turn).toMatchObject({ status: "cancelled", evidence: { kind: "native-terminal", sourceId: "native-result-uuid" } });
+      expect(events.some((event) => event.kind === "turn_cancelled")).toBe(true);
+      expect(events.some((event) => event.kind === "diagnostic" && event.code === "INTERRUPT_UNCONFIRMED")).toBe(false);
+    } finally { vi.useRealTimers(); acted.resolve(); await adapter.closeAndWait(); }
+  });
+  it("keeps re-delivering while an earlier interrupt() delivery hangs, and does not report INTERRUPT_UNCONFIRMED at 5s", async () => {
+    // r12 evidence: a retry delivery's interrupt() promise never settled
+    // (the CLI init phase ignores the control request), which stalled the
+    // retry chain and let the legacy 5s confirm timer fire INTERRUPT_UNCONFIRMED
+    // at ~6s.  The loop must keep ticking and a later delivery must still win.
+    const f = managed(); const events: AdapterEvent[] = []; const ready = barrier(); const acted = barrier();
+    let deliveries = 0;
+    const queryFactory = (() => ({
+      async *[Symbol.asyncIterator]() { yield init; ready.resolve(); await acted.promise; yield { ...result, terminal_reason: "aborted_streaming" } as unknown as SDKMessage; },
+      close() {},
+      interrupt: () => {
+        deliveries++;
+        if (deliveries === 2) return new Promise<void>(() => {}); // hung control request
+        if (deliveries >= 3) acted.resolve();
+        return Promise.resolve();
+      },
+    }) as unknown as Query) as typeof import("@anthropic-ai/claude-agent-sdk").query;
+    const adapter = new ClaudeAdapter({ ...f.options, workspace, queryFactory, onEvent: (event) => events.push(event) });
+    vi.useFakeTimers();
+    try {
+      const turn = adapter.runTurn(context.flyxTurnId, "task", undefined, context);
+      await ready.promise;
+      expect(await adapter.interrupt()).toBe("accepted");
+      await vi.advanceTimersByTimeAsync(6_000); // past the old 5s confirm deadline, with one delivery hung
+      expect(events.some((event) => event.kind === "diagnostic" && event.code === "INTERRUPT_UNCONFIRMED")).toBe(false);
+      expect(deliveries).toBe(3); // ticks continued past the hung delivery until the CLI aborted
+      expect(await turn).toMatchObject({ status: "cancelled", evidence: { kind: "native-terminal", sourceId: "native-result-uuid" } });
+      expect(events.some((event) => event.kind === "turn_cancelled")).toBe(true);
+      expect(events.some((event) => event.kind === "diagnostic" && event.code === "INTERRUPT_UNCONFIRMED")).toBe(false);
+    } finally { vi.useRealTimers(); acted.resolve(); await adapter.closeAndWait(); }
+  });
+  it("stops re-delivering after the interrupt retry window and reports INTERRUPT_UNCONFIRMED", async () => {
+    const f = managed(); const events: AdapterEvent[] = []; const ready = barrier(); const closed = barrier();
+    let deliveries = 0;
+    const queryFactory = (() => ({
+      async *[Symbol.asyncIterator]() { yield init; ready.resolve(); await closed.promise; },
+      close() { closed.resolve(); },
+      interrupt: async () => { deliveries++; },
+    }) as unknown as Query) as typeof import("@anthropic-ai/claude-agent-sdk").query;
+    const adapter = new ClaudeAdapter({ ...f.options, workspace, queryFactory, onEvent: (event) => events.push(event) });
+    vi.useFakeTimers();
+    try {
+      const turn = adapter.runTurn(context.flyxTurnId, "task", undefined, context);
+      await ready.promise;
+      expect(await adapter.interrupt()).toBe("accepted");
+      await vi.advanceTimersByTimeAsync(59_000);
+      expect(events.some((event) => event.kind === "diagnostic" && event.code === "INTERRUPT_UNCONFIRMED")).toBe(false);
+      expect(deliveries).toBeGreaterThan(3);
+      await vi.advanceTimersByTimeAsync(2_000); // window exhausted: backstop closes the query
+      expect(await turn).toMatchObject({ status: "outcome_unknown", evidence: { kind: "unknown" } });
+      expect(events.some((event) => event.kind === "diagnostic" && event.code === "INTERRUPT_UNCONFIRMED")).toBe(true);
+    } finally { vi.useRealTimers(); closed.resolve(); await adapter.closeAndWait(); }
+  });
   it("refuses a private-read-only boundary without descendant stop before creating any production registry", async () => {
     const factory = vi.fn(() => { throw new Error("must not create registry"); });
     const controller = new ManagedRuntimeController({ processRegistryFactory: factory, executionBoundary: async () => ({

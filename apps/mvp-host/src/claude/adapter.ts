@@ -48,7 +48,11 @@ const MAX_APPROVAL_INPUT_BYTES = 128 * 1024;
 const MAX_TOOL_OUTPUT_BYTES = 64 * 1024;
 const MAX_ASSISTANT_MESSAGE_BYTES = 1024 * 1024;
 const TURN_TIMEOUT_MS = 15 * 60 * 1000;
-const INTERRUPT_CONFIRM_TIMEOUT_MS = 5_000;
+// The CLI acknowledges an interrupt delivered during its init phase (before
+// the first API request) without acting on it, so a single delivery can be
+// silently ignored.  Re-deliver until the query reaches a terminal state.
+const INTERRUPT_RETRY_INTERVAL_MS = 1_000;
+const INTERRUPT_RETRY_WINDOW_MS = 60_000;
 
 type PendingApproval = {
   request: ApprovalRequest;
@@ -78,7 +82,7 @@ type ActiveQuery = {
   toolInputJson: Map<string, string>;
   sessionIdChanged: boolean;
   timer?: NodeJS.Timeout;
-  interruptTimer?: NodeJS.Timeout;
+  interruptRetryTimer?: NodeJS.Timeout;
 };
 
 export type ClaudeAdapterOptions = ManagedRuntimeOptions & {
@@ -280,7 +284,7 @@ export class ClaudeAdapter implements ProviderAdapter {
     } finally {
       active.resultSeen = true;
       if (active.timer) clearTimeout(active.timer);
-      if (active.interruptTimer) clearTimeout(active.interruptTimer);
+      if (active.interruptRetryTimer) clearTimeout(active.interruptRetryTimer);
       this.cleanupApprovals(active, "aborted");
       try { active.query?.close?.(); } catch { /* The managed stop proof remains authoritative. */ }
       // Cleanup failure retains the independent execution gate; it never erases a native business terminal.
@@ -366,18 +370,7 @@ export class ClaudeAdapter implements ProviderAdapter {
     try {
       await active.query.interrupt();
       active.interruptAcknowledged = true;
-      active.interruptTimer = setTimeout(() => {
-        if (this.active === active && !active.resultSeen) {
-          active.interruptTimedOut = true;
-          this.emit(active, {
-            kind: "diagnostic",
-            code: "INTERRUPT_UNCONFIRMED",
-            message: `Claude did not reach a terminal state within ${INTERRUPT_CONFIRM_TIMEOUT_MS}ms`,
-            details: { reason },
-          });
-          active.query.close?.();
-        }
-      }, INTERRUPT_CONFIRM_TIMEOUT_MS);
+      this.armInterruptRetry(active, reason, Date.now());
       return "accepted";
     } catch (error) {
       this.emit(active, {
@@ -387,6 +380,52 @@ export class ClaudeAdapter implements ProviderAdapter {
       });
       return "unavailable";
     }
+  }
+
+  /**
+   * Keep re-delivering `query.interrupt()` until the query reaches a terminal
+   * state.  The CLI's init phase acknowledges an interrupt without acting on
+   * it (verified against claude-cli 2.1.216 / claude-agent-sdk 0.3.220): the
+   * turn then runs to natural completion and the decided interrupt is lost.
+   * Each delivery is fire-and-forget because a control request can also hang
+   * indefinitely in that phase; the next tick must never wait on it.
+   * Retries are bounded by INTERRUPT_RETRY_WINDOW_MS, after which the
+   * INTERRUPT_UNCONFIRMED backstop closes the query.
+   */
+  private armInterruptRetry(active: ActiveQuery, reason: string, firstDeliveryAt: number): void {
+    if (this.active !== active || active.resultSeen || active.interruptTimedOut) return;
+    if (!active.query) return;
+    if (active.interruptRetryTimer) clearTimeout(active.interruptRetryTimer);
+    active.interruptRetryTimer = setTimeout(() => {
+      if (this.active !== active || active.resultSeen || !active.interruptRequested || active.interruptTimedOut) return;
+      if (Date.now() - firstDeliveryAt >= INTERRUPT_RETRY_WINDOW_MS) {
+        this.confirmInterruptTimeout(active, reason);
+        return;
+      }
+      void active.query!.interrupt().then(
+        () => {
+          if (this.active === active) active.interruptAcknowledged = true;
+        },
+        () => {
+          // A failed redelivery is not a native terminal fact; the next tick
+          // retries until the window or a terminal state ends the loop.
+        },
+      );
+      this.armInterruptRetry(active, reason, firstDeliveryAt);
+    }, INTERRUPT_RETRY_INTERVAL_MS);
+  }
+
+  private confirmInterruptTimeout(active: ActiveQuery, reason: string): void {
+    if (this.active !== active || active.resultSeen || active.interruptTimedOut) return;
+    active.interruptTimedOut = true;
+    if (active.interruptRetryTimer) clearTimeout(active.interruptRetryTimer);
+    this.emit(active, {
+      kind: "diagnostic",
+      code: "INTERRUPT_UNCONFIRMED",
+      message: `Claude did not reach a terminal state within ${INTERRUPT_RETRY_WINDOW_MS}ms of the interrupt`,
+      details: { reason },
+    });
+    active.query?.close?.();
   }
 
   respondApproval(approvalId: string, action: ApprovalAction): boolean {

@@ -105,7 +105,7 @@
 | C5 / W2-F | HostCheckpoints 中央构造并注册为首个 domain port；bindWorker/executionBinding 注入；固定顺序（permit→lease→before→终态→停止证明→after）；captureBefore 失败先于 prompt；projector v4 | R5 组合已接线 | 生产启用依赖 runner 注入（R0/R1）；A8 精确 Diff 场景与捕获失败/业务结果分离验收 |
 | C6 / W2-G | Codex rollback / Claude fork 驱动 prepare/apply/query 与响应丢失 unknown 语义完成；受管 transport（StdioAppServerClient+node helper）已实现；**生产接线完成（2026-10-24）**：`native-revert-production.ts` 默认构造 + `nativeFactory` journal 绑定 + `captureNativeAnchor` 接入 + manifest 门控 capability | R6 L1+L2 已通过（2026-10-24）；R9 组合链路（含 preview 拒绝、blocked 恢复 inspect 与 rollbackToSafety）已通过（2026-10-24） | 剩余：A11 独立 checkout 真并行随 R9 收尾；resume（新会话续接）生产实测 |
 | C7 / W1-C | 调度/fence 已验证；工作区已实现任务 permit（首版 2）+锁序、common-dir 元数据锁（unknown retain/跨重启恢复）、scheduler SQL 扫描修复、managed/scheduled HostWorktrees 中央接线、归档/恢复互斥与路径冲突观测；A11 生产入口真并行/互斥/隔离已通过（2026-10-24，`host-application.r9-parallel.test.ts`） | R7+A11 已通过（2026-10-24） | 剩余：锁/停止恢复实机验收（随物理手机）；进程重启找回原创建操作 |
-| C8 / W3-H、W3-I | CoreControls 共享控制器、Web 四面板全接线（含真实 Host E2E：会话元数据/草稿/readiness）、手机最小面板与回执核对 | R8 开发中，浏览器部分已测 | Recovery/Diff/Worktree/Revert 浏览器 E2E；Web interrupt 统一；最终生产构建、双 Provider 与物理手机（R9） |
+| C8 / W3-H、W3-I | CoreControls 共享控制器、Web 四面板全接线（含真实 Host E2E：会话元数据/草稿/readiness）、手机最小面板与回执核对 | R8 开发中，浏览器部分已测 | Recovery/Diff/Worktree/Revert 浏览器 E2E；网页端真实中断 E2E 留档（入口统一已完成，见 2026-10-26 核实）；最终生产构建、双 Provider 与物理手机（R9） |
 
 以下是 `1108bed` 已核对缺口在当前工作区的对照结果（实现均未提交，尚需 §7 的独立验证；"已接线"指组合代码存在于生产模块并有定向测试，不是生产验收通过）：
 
@@ -244,7 +244,7 @@
 
 **责任范围**：`apps/mvp-web/src/app.tsx`、`use-host.ts` 及小面板/控制器；`packages/client-core/src/{session,recovery,checkpoint,worktree}-client.ts`；`apps/mobile/src/`。
 
-**工作区状态（2026-10-23 对照）**：第 1–4、6 条大部分已实现——`CoreControls` 共享控制器（会话/中断/Recovery/Turn Diff+回退/Worktree 全链路，Outbox 防重+generation 隔离+稳定 commandId 续建第二份回执），Web 四面板全接线并移除旧会话选择器，真实 Host E2E 覆盖会话元数据闭环/草稿隔离/readiness 原因码（断言零 Provider 构造），手机接最小面板（会话/中断/Recovery/只读 Diff）+回执核对。剩余：Recovery/Diff/Worktree/Revert 的浏览器 E2E 场景（A5/A6/A13 其余部分）；Web 端 interrupt 仍走 host.interrupt 未统一；复杂回退/归档按计划留在 Web；真机与生产构建归 R9。
+**工作区状态（2026-10-23 对照）**：第 1–4、6 条大部分已实现——`CoreControls` 共享控制器（会话/中断/Recovery/Turn Diff+回退/Worktree 全链路，Outbox 防重+generation 隔离+稳定 commandId 续建第二份回执），Web 四面板全接线并移除旧会话选择器，真实 Host E2E 覆盖会话元数据闭环/草稿隔离/readiness 原因码（断言零 Provider 构造），手机接最小面板（会话/中断/Recovery/只读 Diff）+回执核对。剩余：Recovery/Diff/Worktree/Revert 的浏览器 E2E 场景（A5/A6/A13 其余部分）；网页端真实中断 E2E 留档（2026-10-26 核实：Web interrupt 入口已统一走 `CoreControls.interrupt()`→`session.interrupt`，此前“仍走 host.interrupt 未统一”的记录过时，`host.interrupt` RPC 并不存在）；复杂回退/归档按计划留在 Web；真机与生产构建归 R9。
 
 1. Web 先接 Session 新建/命名/归档/关闭运行时和资源选择；会话创建后保持 Provider/workspace 绑定，“换 Provider”通过新会话完成。readiness 展示可读、可执行与待核对原因。
 2. Recovery 面板直接消费 `RecoveryEvidence.nextSteps`，保留原 attempt/evidenceId/expectedRecoveryRevision；明确选择 unknown acknowledgement 后才提交对应语义，动作完成后重读权威快照。

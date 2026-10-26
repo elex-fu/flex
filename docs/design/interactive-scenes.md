@@ -39,10 +39,15 @@ Verification record (2026-10-25, macOS real runs, commit `5dfa372`):
 
 Remaining follow-ups (tracked as tasks #28–#31, #18; 2026-10-26):
 
-- **#29 Web 端 interrupt 入口统一**：计划 §C8 记录 Web 中断仍走
-  `host.interrupt` 未统一到本场景已验证的 `session.interrupt` 路径；统一后
-  对标 dest-claude 网页审批卡 E2E 做一次网页端真实中断验证（本场景目前
-  的 interrupt 证据来自 compat RPC 驱动，网页面板未单独留档）。
+- **#29 网页端真实中断验证留档（已重定义，2026-10-26 核实）**：计划
+  §C8 所记"Web interrupt 仍走 `host.interrupt`"已过时——代码中不存在
+  `host.interrupt` RPC；`use-host.ts webInterrupt` 在 canonical+catalog
+  模式已走 `CoreControls.interrupt()`（`session.interrupt` +
+  expectedRevision + `TURN_NOT_INTERRUPTIBLE` 防线），legacy 回退也直发
+  `session.interrupt`。入口统一实际已完成；剩余仅为对标 dest-claude 网页
+  审批卡 E2E，补一次网页端真实中断验证留档（本场景目前的 interrupt 证据
+  来自 compat RPC 驱动，网页面板未单独留档）。详见
+  `docs/analysis/2026-10-26-capability-status-and-remaining-work.md` T1。
 - **#28 Web 四面板浏览器 E2E**（Recovery/Diff/Worktree/Revert，A5/A6/A13
   其余部分）：与交互场景无依赖，属 C8 收尾。
 - **#30 resume（新会话续接）生产实测**：本场景的 reconnect 段验证的是

@@ -1,6 +1,6 @@
 # Interactive capability scenes: approval / interrupt / reconnect (c4–c7)
 
-Status: design accepted 2026-10-24; **implemented and fully verified 2026-10-25 (both providers)**. Companion of `docs/design/compatibility-pipeline.md` §6.3.
+Status: design accepted 2026-10-24; **implemented and fully verified 2026-10-25 (both providers)**. Companion of `docs/core-capabilities-technical-design.md` §6.3.
 
 Verification record (2026-10-25, macOS real runs, commit `5dfa372`):
 
@@ -36,6 +36,24 @@ Verification record (2026-10-25, macOS real runs, commit `5dfa372`):
     requested access outside the workspace; the adapter's workspace guard
     auto-declined (`CODEX_APPROVAL_OUTSIDE_WORKSPACE`) — correct fail-closed
     behavior, not a defect; rerun (r7) passed.
+
+Remaining follow-ups (tracked as tasks #28–#31, #18; 2026-10-26):
+
+- **#29 Web 端 interrupt 入口统一**：计划 §C8 记录 Web 中断仍走
+  `host.interrupt` 未统一到本场景已验证的 `session.interrupt` 路径；统一后
+  对标 dest-claude 网页审批卡 E2E 做一次网页端真实中断验证（本场景目前
+  的 interrupt 证据来自 compat RPC 驱动，网页面板未单独留档）。
+- **#28 Web 四面板浏览器 E2E**（Recovery/Diff/Worktree/Revert，A5/A6/A13
+  其余部分）：与交互场景无依赖，属 C8 收尾。
+- **#30 resume（新会话续接）生产实测**：本场景的 reconnect 段验证的是
+  Host 重启+重启后新 turn；`resumeConversation` 能力已随 endorsement 发布，
+  但"新会话续接原 native 会话"尚无独立生产实测记录（矩阵内 turn 2+ 的
+  `resumeSessionId` 自动续接不算独立验收）。
+- **#31 进程重启找回原 worktree 创建操作**：C7 剩余，与交互场景无关。
+- **#18 物理手机验收**：R9 唯一硬阻塞（缺 adb 设备），网络切换/后台恢复
+  待硬件。
+- 非目标不变：question 场景（`structuredQuestions`）与
+  `conversationRewind` 仍未实现，registry 已预留段位。
 
 ## 1. Problem
 

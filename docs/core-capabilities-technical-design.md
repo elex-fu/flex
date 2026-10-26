@@ -186,7 +186,7 @@ rtk proxy node apps/mvp-host/dist/main.js activation inspect <operationId>
 
 当前 recorder 与真实 adapter/recovery 尚未组合，真实 main 也未写 runner 期待的 readiness 文件。补齐时，受限本地验证模式应以 runId、构建/入口、Host 身份、观察版本绑定原子写入的私有握手文件；不导出到公开 RPC，不用旧文件或测试入口冒充生产 main。验证入口只接受固定隔离场景与已验证后端，不提供远程绕过激活的通用开关。
 
-本轮细化为以下有界流程，相关模块与 CLI 正在集成，尚不代表真实验证已通过：
+本轮细化为以下有界流程（**状态更新 2026-10-26**：该流程已全部实现并经双 Provider 真实验收——基本场景 c3 于 2026-10-24 通过（M4，`fully-verified`）；交互场景 c4–c7 于 2026-10-25 通过（Claude r8 与 Codex r7 双 Provider：approval×2 / interrupt / reconnect 全段真实记录，destination 导入+激活后发布 `interactiveApprovals`/`interrupt`/`resumeConversation`，含 dest-claude 网页审批卡 E2E 与 dest-codex boot 复核；验证记录见 [交互场景设计](./design/interactive-scenes.md) 头部。实现中发现并修复 finalize 停止预算 5s→`PRODUCER_STOP_DEADLINE_MS=30s` 的 RUNTIME_STOP_UNVERIFIED 根因））：
 
 1. `run-matrix --prepare` 在独立私有目录生成 source identity、runId 与构建准备信息，不调用 Provider。
 2. 生产 Host 停止后，由 maintenance CLI `compatibility authorize` 对独立 source 公钥、runId、Provider、构建/运行时/产物摘要和固定场景集签发短期授权。source Host 与生产 Host 身份不同，不能直接要求二者 fingerprint 相同。

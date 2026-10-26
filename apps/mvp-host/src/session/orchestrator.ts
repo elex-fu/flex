@@ -117,6 +117,8 @@ export type OrchestratorOptions = {
   /** Managed Git runner for status/Diff reads; without it those reads stay unavailable. */
   gitRunner?: GitServiceRunner;
   shutdownDeadlineMs?: number;
+  /** Bounded wait for an in-flight post-turn finalization before startTurn rejects WORKSPACE_BUSY. */
+  startTurnBusyWaitMs?: number;
 };
 
 export type RuntimeCloseReport = { closed: boolean; producerStopped: boolean; clean: boolean; state: "stopped" | "recovery_required"; stopped: boolean; recoveryRequired: boolean };
@@ -152,6 +154,13 @@ export function bindRecoveryInspectionRecorder(
 }
 
 const MAX_PROMPT_BYTES = 16 * 1024;
+// A just-terminal Turn's post-turn checkpoint (captureAfter) still holds the
+// checkout lease for a bounded window. An immediate follow-up startTurn must
+// wait for that finalization instead of rejecting WORKSPACE_BUSY with no
+// receipt, turn, or event — the client treats that error as terminal and the
+// prompt would be lost (observed in scene-claude-interactive-r12).
+const WORKSPACE_BUSY_WAIT_MS = 15_000;
+const WORKSPACE_BUSY_POLL_MS = 100;
 
 export class SessionOrchestrator {
   readonly requestFormatVersions = [1, 2] as const;
@@ -197,6 +206,9 @@ export class SessionOrchestrator {
   private readonly onExecutionBlocked: OrchestratorOptions["onExecutionBlocked"];
   private readonly capturedBefore = new Set<string>();
   private readonly finalizations = new Map<string, Promise<void>>();
+  /** In-flight finalizeTurnInternal calls (post-turn checkpoint + lease release). */
+  private finalizingTurns = 0;
+  private readonly startTurnBusyWaitMs: number;
   private readonly executionPermits: HostExecutionPermits | undefined;
   private readonly taskPermits = new Map<string, HostExecutionPermit>();
   private readonly permitWaits = new Map<string, AbortController>();
@@ -212,6 +224,7 @@ export class SessionOrchestrator {
 
   constructor(options: OrchestratorOptions) {
     this.executionPermits = options.executionPermits;
+    this.startTurnBusyWaitMs = options.startTurnBusyWaitMs ?? WORKSPACE_BUSY_WAIT_MS;
     this.checkNativeReady = options.assertNativeReady;
     this.nativeScenePolicy = options.nativeScenePolicy;
     this.compatibilityRecorder = options.compatibilityRecorder;
@@ -719,7 +732,18 @@ export class SessionOrchestrator {
         throw new OrchestratorError("TURN_BUSY", "The current session already has an active turn", true);
       }
       this.cancelCheckpointPreviewForNewTask();
-      if (this.activeWorkspaceLease || this.preparingAttempts.size) throw new OrchestratorError("WORKSPACE_BUSY", "Checkout ownership remains retained", true);
+      if (this.activeWorkspaceLease || this.preparingAttempts.size) {
+        // The just-terminal Turn's finalization (post-turn checkpoint + lease
+        // release) is still in flight; wait for it instead of dropping the
+        // follow-up. A retained execution with nothing in flight keeps the
+        // immediate WORKSPACE_BUSY error semantics.
+        const deadline = Date.now() + this.startTurnBusyWaitMs;
+        while ((this.activeWorkspaceLease || this.preparingAttempts.size) && Date.now() < deadline) {
+          if (this.degraded || this.worker.isSealed || (!this.finalizingTurns && !this.preparingAttempts.size)) break;
+          await new Promise((resolve) => setTimeout(resolve, WORKSPACE_BUSY_POLL_MS));
+        }
+        if (this.activeWorkspaceLease || this.preparingAttempts.size) throw new OrchestratorError("WORKSPACE_BUSY", "Checkout ownership remains retained", true);
+      }
       const leaseOperationId = randomUUID();
       if (this.executionPermits) {
         return this.commandEngine.commitRequest(request, (facts, clock) => {
@@ -853,7 +877,11 @@ export class SessionOrchestrator {
   }
   private finalizeTurn(intent: ExecutionIntentRow, outcome: ProviderOutcome, hook: ExecutionWorkerOptions["afterTerminal"]): Promise<void> {
     let work = this.finalizations.get(intent.attemptId);
-    if (!work) { work = this.finalizeTurnInternal(intent, outcome, hook); this.finalizations.set(intent.attemptId, work); }
+    if (!work) {
+      this.finalizingTurns++;
+      work = this.finalizeTurnInternal(intent, outcome, hook).finally(() => { this.finalizingTurns--; });
+      this.finalizations.set(intent.attemptId, work);
+    }
     return work;
   }
   private async finalizeTurnInternal(intent: ExecutionIntentRow, outcome: ProviderOutcome, hook: ExecutionWorkerOptions["afterTerminal"]): Promise<void> {

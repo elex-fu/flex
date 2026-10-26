@@ -205,7 +205,7 @@ export const approvalCardEvent = (turnId) => (event) => (event?.type === "approv
 export function approvalIdOf(card) { return typeof card?.approvalId === "string" ? card.approvalId : typeof card?.interactionId === "string" ? card.interactionId : null; }
 /** Card version for the respond request: top-level on legacy commits, nested on interaction cards; 0 before any reservation. */
 export function approvalVersionOf(card) { return typeof card?.version === "number" ? card.version : typeof card?.interaction?.version === "number" ? card.interaction.version : 0; }
-async function runTurn(client, { layer, index, prompt, scenario = "turn", commandId, approvalAction = "deny" }) {
+async function runTurn(client, { layer, index, prompt, scenario = "turn", commandId, approvalAction = "deny", provider = "claude" }) {
   const start = Date.now();
   const record = { layer, scenario, index, promptHash: hash(prompt), startedAt: new Date(start).toISOString(), turnIdHash: null, terminalType: null, result: "failed", errorCode: null, admissionRetries: 0 };
   let turnId;
@@ -241,11 +241,19 @@ async function runTurn(client, { layer, index, prompt, scenario = "turn", comman
       if (!answer.ok) throw coded(answer.error?.code ?? "APPROVAL_RESPONSE_FAILED");
     } else if (scenario === "interrupt") {
       await client.waitEvent((event) => event?.type === "turn.started" && event?.payload?.turnId === turnId, 60_000);
-      // Interrupt only after the provider turn is bound: an interrupt issued
-      // before the native turn exists (codex app-server still establishing or
-      // reconnecting its stream) has no target, never confirms, and strands
-      // the execution in outcome_unknown with the workspace retained.
-      await client.waitEvent((event) => event?.type === "provider.turn.bound" && event?.payload?.turnId === turnId, 60_000);
+      // Interrupt only after the native turn is bound — but only for providers
+      // that have a native turn binding: codex app-server can still be
+      // establishing or reconnecting its stream when the Flyx turn starts, and
+      // an interrupt issued then has no native target, never confirms, and
+      // strands the execution in outcome_unknown with the workspace retained.
+      // The Claude adapter exposes no native turn id (the SDK query is
+      // abortable from dispatch), so it never emits provider.turn.bound;
+      // waiting for it unconditionally makes every Claude interrupt segment
+      // time out while the turn runs to natural completion (observed r9).
+      // For Claude, turn.started is the binding boundary (verified r8).
+      if (provider === "codex") {
+        await client.waitEvent((event) => event?.type === "provider.turn.bound" && event?.payload?.turnId === turnId, 60_000);
+      }
       const interrupt = await client.call("session.interrupt", {}, randomUUID());
       if (!interrupt.ok) throw coded(interrupt.error?.code ?? "INTERRUPT_REQUEST_FAILED");
     }
@@ -262,7 +270,7 @@ async function runTurn(client, { layer, index, prompt, scenario = "turn", comman
   return record;
 }
 /** One scene segment's driving, against the currently-open client (design §4). */
-async function runSegment(segment, slot, commandIds, client, { layer, promptOverrides, workspace }) {
+async function runSegment(segment, slot, commandIds, client, { layer, promptOverrides, workspace, provider = "claude" }) {
   const records = [];
   for (let index = 1; index <= segment.repetitions; index += 1) {
     // Per-slot prompt: the approval segment pins distinct content per
@@ -279,7 +287,7 @@ async function runSegment(segment, slot, commandIds, client, { layer, promptOver
       // First repetition allows the tool once (it executes), the second denies.
       records.push(await runTurn(client, { layer, index, prompt, scenario: "approval", approvalAction: index === 1 ? "allow_once" : "deny", ...(commandIds ? { commandId: commandIds[slot + index - 1] } : {}) }));
     } else if (segment.id === "interrupt") {
-      records.push(await runTurn(client, { layer, index, prompt, scenario: "interrupt", ...(commandIds ? { commandId: commandIds[slot + index - 1] } : {}) }));
+      records.push(await runTurn(client, { layer, index, prompt, scenario: "interrupt", provider, ...(commandIds ? { commandId: commandIds[slot + index - 1] } : {}) }));
     } else {
       records.push(await runTurn(client, { layer, index, prompt, ...(commandIds ? { commandId: commandIds[slot + index - 1] } : {}) }));
     }
@@ -327,7 +335,7 @@ async function runLayer(layer, combo, context) {
           host = await startHost({ layer, combo, ...context });
           client = await openClient(host.info);
         }
-        records.push(...await runSegment(segment, slot, commandIds, client, { layer, workspace: join(context.scratch, layer, "workspace") }));
+        records.push(...await runSegment(segment, slot, commandIds, client, { layer, workspace: join(context.scratch, layer, "workspace"), provider: combo.provider }));
         slot += segment.commandCount;
       }
     } finally { client.close(); }

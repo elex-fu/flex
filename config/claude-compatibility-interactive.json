@@ -130,8 +130,8 @@
       ],
       "sceneVersion": "flyx-c7-interactive-v1",
       "lastRun": {
-        "runId": "scene-claude-interactive-r8",
-        "at": "2026-10-25T00:09:39.379Z",
+        "runId": "scene-claude-interactive-r14",
+        "at": "2026-10-27T00:15:35.311Z",
         "deterministic": {
           "status": "passed",
           "completed": 10,
@@ -201,10 +201,10 @@
         }
       },
       "evidence": {
-        "readiness": "/Users/lex/play/flyx/.flyx-evidence/cli-2.1.216_node-24.18.0/scene-claude-interactive-r8/readiness.json",
-        "summary": "/Users/lex/play/flyx/.flyx-evidence/cli-2.1.216_node-24.18.0/scene-claude-interactive-r8/summary.json",
-        "turns": "/Users/lex/play/flyx/.flyx-evidence/cli-2.1.216_node-24.18.0/scene-claude-interactive-r8/turns.jsonl",
-        "native": "/Users/lex/play/flyx/.flyx-evidence/cli-2.1.216_node-24.18.0/scene-claude-interactive-r8/native.jsonl"
+        "readiness": "/Users/lex/play/flyx/.flyx-evidence/cli-2.1.216_node-24.18.0/scene-claude-interactive-r14/readiness.json",
+        "summary": "/Users/lex/play/flyx/.flyx-evidence/cli-2.1.216_node-24.18.0/scene-claude-interactive-r14/summary.json",
+        "turns": "/Users/lex/play/flyx/.flyx-evidence/cli-2.1.216_node-24.18.0/scene-claude-interactive-r14/turns.jsonl",
+        "native": "/Users/lex/play/flyx/.flyx-evidence/cli-2.1.216_node-24.18.0/scene-claude-interactive-r14/native.jsonl"
       }
     },
     {
@@ -230,8 +230,8 @@
         "2026-10-24（任务 #19 真实网页 E2E）：run web-e2e-codex 10/10 真实 turn 通过（首次运行第 9 个 turn 结束后的 5s 受管停止验证超时触发 HOST_RECOVERY_REQUIRED 翻转为重跑一次通过；该 5s 终验时限对长 turn 是已观察的脆弱点），导入并激活到独立目的地 dest-codex，网页端驱动真实 Codex CLI 0.164.0 会话（thread 01a16e0c-…，含 5 次 app-server 断线自动重连）完成文本 turn，返回精确 REAL-CODEX-E2E-OK。"
       ],
       "lastRun": {
-        "runId": "scene-codex-interactive-r7",
-        "at": "2026-10-25T03:29:34.138Z",
+        "runId": "scene-codex-interactive-r12",
+        "at": "2026-10-27T00:02:41.132Z",
         "deterministic": {
           "status": "passed",
           "completed": 10,
@@ -301,10 +301,10 @@
         }
       },
       "evidence": {
-        "readiness": "/Users/lex/play/flyx/.flyx-evidence/codex-measured-runtime-pending/scene-codex-interactive-r7/readiness.json",
-        "summary": "/Users/lex/play/flyx/.flyx-evidence/codex-measured-runtime-pending/scene-codex-interactive-r7/summary.json",
-        "turns": "/Users/lex/play/flyx/.flyx-evidence/codex-measured-runtime-pending/scene-codex-interactive-r7/turns.jsonl",
-        "native": "/Users/lex/play/flyx/.flyx-evidence/codex-measured-runtime-pending/scene-codex-interactive-r7/native.jsonl"
+        "readiness": "/Users/lex/play/flyx/.flyx-evidence/codex-measured-runtime-pending/scene-codex-interactive-r12/readiness.json",
+        "summary": "/Users/lex/play/flyx/.flyx-evidence/codex-measured-runtime-pending/scene-codex-interactive-r12/summary.json",
+        "turns": "/Users/lex/play/flyx/.flyx-evidence/codex-measured-runtime-pending/scene-codex-interactive-r12/turns.jsonl",
+        "native": "/Users/lex/play/flyx/.flyx-evidence/codex-measured-runtime-pending/scene-codex-interactive-r12/native.jsonl"
       }
     }
   ],

@@ -120,15 +120,48 @@ Verification record (2026-10-26→27, web interrupt chain fixes + web-side inter
   r12 re-runs the chain after the dist rebuild (any rebuild invalidates every
   endorsement via `runtimeDigest` — claude r14 must re-run as well).
 
+- **Codex r12** (`scene-codex-interactive-r12`, dist rebuilt with both r11
+  fixes; entry digest unchanged `23aa004a…`, artifact `06bfdbf1…`, runtime
+  `3d175bfe…`): full chain prepare → destination authorize → `real=passed`
+  (11/11 segments, RUN_REAL_CODEX=1 with scratch/host-log/debug-events
+  retention) → import → activation verify (`bb4b0c1c-…`) → activate
+  (`activate-r12-codex`). Native evidence **17/17 records passed** (turn:13 /
+  approval:2 / interrupt:1 / reconnect:1), every record with a stopRef —
+  the r11 `HOST_STOP_UNVERIFIED` failure did not reproduce. The interrupt
+  segment's interrupted turn again emitted the expected cancel-time
+  `CODEX_TURN_ERROR` stream diagnostics and the chain settled clean.
+- **Claude r14** (`scene-claude-interactive-r14`, same dist rebuild;
+  artifact `9d917df4…`): full chain prepare → authorize → `real=passed`
+  (11/11) → import → activation verify (`90177618-…`) → activate
+  (`activate-r14-claude`). Native evidence **17/17 records passed**.
+- **Web interrupt E2E, Codex half — PASSED** (same Playwright drive against
+  dest-codex with the r12 endorsement activated, EXIT=0): pair → new session
+  → streaming counting prompt → click 中止当前 Turn (first attempt; the
+  300 s streaming wait replaced the claude-tuned 120 s — codex first token
+  runs 46–179 s) → terminal card `cancelled` → interrupt button cleared +
+  composer ready → follow-up prompt `completed`. DB (session
+  `adf2c914-74a0-442e-94c1-8743d09e3e03`): interrupted turn `6a39247f…`
+  `cancelled`, follow-up `b51d00e4…` `completed`; across both attempts
+  **160/160 managed processes `stopped` with managed-group-stop proofs** —
+  the exact zombie-EPERM path that broke r11 settles clean under the web
+  drive. Diagnostics: only the documented OpenAI "Reconnecting n/5"
+  environment noise (8 events, 4 per turn); **zero**
+  SESSION_REVISION_CONFLICT / INTERRUPT_UNCONFIRMED / WORKSPACE_BUSY.
+  Operational notes (both known defects, not regressions): dest-codex's
+  `web/` root is empty after destination-bootstrap and had to be copied from
+  dest-claude; each drive needs the pairing-grant reset cycle
+  (`DELETE FROM pairing_grants` + host reboot) because
+  `createPairingGrant`'s `ON CONFLICT DO NOTHING` blocks the
+  `FLYX_PAIRING_TOKEN` re-arm once a grant row exists.
+
 Remaining follow-ups (tracked as tasks #28–#31, #18; 2026-10-26):
 
-- **#29 网页端真实中断验证留档（Claude 半已留档，2026-10-27）**：入口统一
-  已核实完成（见上）；Claude 侧网页中断 E2E 已通过并留档（上方 2026-10-26→27
-  验证记录：EXIT=0、turn.cancelled + 原生停止证据、follow-up 恢复、零诊断
-  事件）。剩余仅 Codex 侧（r11 已 blocked 并完成根因修复——zombie-EPERM
-  组检查 + `finish()` 5s 退役截止（见上 r11 记录）；r12 重跑 + 同一驱动
-  留档，claude 侧需随 dist 重建以 r14 重跑）。详见
-  `docs/analysis/2026-10-26-capability-status-and-remaining-work.md` T1。
+- **#29 网页端真实中断验证留档 —— 已完成（双 Provider，2026-10-28）**：入口统一
+  已核实完成（见上）；Claude 侧（2026-10-27）与 Codex 侧（r12 激活后，见上
+  "Web interrupt E2E, Codex half — PASSED" 记录）网页中断 E2E 均以 EXIT=0
+  通过并留档：turn.cancelled + 原生停止证据（codex 侧 160/160 受管进程
+  managed-group-stop）、follow-up 恢复、零 SESSION_REVISION_CONFLICT /
+  INTERRUPT_UNCONFIRMED / WORKSPACE_BUSY。
 - **#28 Web 四面板浏览器 E2E**（Recovery/Diff/Worktree/Revert，A5/A6/A13
   其余部分）：与交互场景无依赖，属 C8 收尾。
 - **#30 resume（新会话续接）生产实测**：本场景的 reconnect 段验证的是
